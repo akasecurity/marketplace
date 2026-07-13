@@ -1,0 +1,31 @@
+{
+  "name": "akasecurity-marketplace",
+  "version": "0.1.0",
+  "categories": ["Developer Tools", "Security"],
+  "plugins": [
+    {
+      "name": "flightcrew",
+      "url": "https://github.com/akasecurity/flightcrew-skills",
+      "category": "Developer Tools",
+      "status": "available",
+      "harnesses": ["claude", "codex", "cursor", "gemini", "kimi", "opencode", "pi"],
+      "description": "An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives — report-only."
+    },
+    {
+      "name": "claude-tools",
+      "url": "https://github.com/akasecurity/claude-tools",
+      "category": "Security",
+      "status": "available",
+      "harnesses": ["claude"],
+      "description": "The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave, on an isolated profile. Full kit installs via shell/npm/Homebrew; the guard-hooks plugin installs via the marketplace."
+    },
+    {
+      "name": "ai-tc",
+      "url": "https://github.com/akasecurity/ai-tc",
+      "category": "Security",
+      "status": "coming-soon",
+      "harnesses": ["claude"],
+      "description": "AI Traffic Control (ai-tc) — intercept, inspect, and govern prompts and responses from AI coding tools: scan for PII, credentials, and OWASP findings, then warn, redact, or block, logged locally with slash-command reports and an optional web dashboard."
+    }
+  ]
+}
