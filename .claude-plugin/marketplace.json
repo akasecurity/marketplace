@@ -1,0 +1,30 @@
+{
+  "name": "akasecurity",
+  "owner": {
+    "name": "AKA Security",
+    "url": "https://github.com/akasecurity"
+  },
+  "metadata": {
+    "description": "AKA Security tools for coding agents",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "flightcrew",
+      "source": {
+        "source": "github",
+        "repo": "akasecurity/flightcrew-skills"
+      },
+      "description": "An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives — report-only."
+    },
+    {
+      "name": "claude-tools",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/akasecurity/claude-tools.git",
+        "path": "plugins/claude-tools"
+      },
+      "description": "The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. The full kit installs via shell/npm/Homebrew; this is the guard-hooks plugin."
+    }
+  ]
+}
