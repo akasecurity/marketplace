@@ -49,7 +49,7 @@ See [flightcrew-skills](https://github.com/akasecurity/flightcrew-skills) and
 **Standalone CLI** (no coding agent): `brew install akasecurity/tap/aka-claude-tools` or
 `brew install akasecurity/tap/flightcrew` — see
 [homebrew-tap](https://github.com/akasecurity/homebrew-tap). **ai-tc**'s CLI (bin: `aka`) installs via
-its bootstrap installer: `curl -fsSL https://raw.githubusercontent.com/akasecurity/ai-tc/cli-latest/tools/installer/install.sh | sh`.
+`npm install -g @akasecurity/cli` — optional; the marketplace plugin above is the default install.
 
 > Codex and Antigravity currently install **flightcrew** (multi-harness). `claude-tools` and `ai-tc`
 > are Claude Code tools; on other harnesses install `claude-tools` via its shell kit / Homebrew.
