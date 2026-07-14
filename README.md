@@ -12,7 +12,7 @@ From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its 
 |---|---|---|---|
 | **flightcrew** | An independent multi-model review crew for coding agents — two blind cross-family reads plus an independent judge that filters false positives. Report-only. | `flightcrew@akasecurity` | ✅ available |
 | **claude-tools** | The security defaults Claude Code doesn't ship with — guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. | `claude-tools@akasecurity` | ✅ available |
-| **ai-tc** — AI Traffic Control | Intercept, inspect, and govern prompts and responses from AI coding tools — scan for PII, credentials, and OWASP findings, then warn, redact, or block. | `ai-tc@akasecurity` | 🚧 landing soon |
+| **ai-tc** — AI Traffic Control | An open-source control plane for coding agents — intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then monitors, warns, redacts, or blocks before anything reaches the model. Runs entirely locally. | `ai-tc@akasecurity` | ✅ available |
 
 ## Install
 
@@ -24,6 +24,7 @@ Claude Code:
 /plugin marketplace add akasecurity/marketplace
 /plugin install flightcrew@akasecurity
 /plugin install claude-tools@akasecurity
+/plugin install ai-tc@akasecurity
 ```
 
 Codex:
@@ -47,16 +48,11 @@ See [flightcrew-skills](https://github.com/akasecurity/flightcrew-skills) and
 
 **Standalone CLI** (no coding agent): `brew install akasecurity/tap/aka-claude-tools` or
 `brew install akasecurity/tap/flightcrew` — see
-[homebrew-tap](https://github.com/akasecurity/homebrew-tap).
+[homebrew-tap](https://github.com/akasecurity/homebrew-tap). **ai-tc**'s CLI installs directly via
+`npm install -g @akasecurity/cli` (bin: `aka`).
 
 > Codex and Antigravity currently install **flightcrew** (multi-harness). `claude-tools` and `ai-tc`
 > are Claude Code tools; on other harnesses install `claude-tools` via its shell kit / Homebrew.
-
-## ai-tc — landing soon
-
-The **AI Traffic Control** (`ai-tc`) plugin is listed above but not yet installable from the
-marketplace. It's tracked here so the roster is complete; the entry becomes live when the tool is
-public. Until then, `/plugin install ai-tc@akasecurity` is not expected to work.
 
 ## About
 

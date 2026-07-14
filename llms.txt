@@ -8,7 +8,7 @@ Add the marketplace once, install any tool. On Claude Code: `/plugin marketplace
 
 - [flightcrew](https://github.com/akasecurity/flightcrew-skills) — An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives. Report-only. Available on all seven harnesses. Install: `/plugin install flightcrew@akasecurity`.
 - [claude-tools](https://github.com/akasecurity/claude-tools) — The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave, on an isolated profile. The full kit installs via shell/npm/Homebrew; the guard-hooks plugin installs via the marketplace. Install: `/plugin install claude-tools@akasecurity`.
-- [ai-tc — AI Traffic Control](https://github.com/akasecurity/ai-tc) — Intercept, inspect, and govern prompts and responses from AI coding tools: scan for PII, credentials, and OWASP findings, then warn, redact, or block, logged locally with slash-command reports and a web dashboard. **Landing soon** — not yet installable.
+- [ai-tc — AI Traffic Control](https://github.com/akasecurity/ai-tc) — An open-source control plane for coding agents: intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then enforces policy (monitor, warn, redact, or block) before anything reaches the model. Runs entirely locally with 100+ built-in detections. Install: `/plugin install ai-tc@akasecurity`.
 
 ## Manifests
 
