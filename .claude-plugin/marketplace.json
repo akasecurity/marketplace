@@ -30,7 +30,7 @@
       "name": "ai-tc",
       "source": {
         "source": "npm",
-        "package": "@akasecurity/plugin-claude-code"
+        "package": "@akasecurity/ai-tc"
       },
       "description": "AI Traffic Control (ai-tc) — intercept, inspect, and govern prompts and responses from AI coding tools: scan for PII, credentials, and OWASP findings, then warn, redact, or block, logged locally with slash-command reports and an optional web dashboard."
     }
