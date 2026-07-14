@@ -30,9 +30,9 @@
       "name": "ai-tc",
       "source": {
         "source": "npm",
-        "package": "@akasecurity/cli"
+        "package": "@akasecurity/ai-tc"
       },
-      "description": "AI Traffic Control (ai-tc) — intercept, inspect, and govern prompts and responses from AI coding tools: scan for PII, credentials, and OWASP findings, then warn, redact, or block, logged locally with slash-command reports and an optional web dashboard."
+      "description": "AI Traffic Control (ai-tc) — an open-source control plane for coding agents: intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then enforces policy (monitor, warn, redact, or block) before anything reaches the model. Runs entirely locally with 100+ built-in detections — no backend, nothing leaves your machine."
     }
   ]
 }
