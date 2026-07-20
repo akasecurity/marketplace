@@ -1,12 +1,12 @@
 # akasecurity/marketplace
 
-> The one place to discover and install AKA Security's tools for coding agents. A cross-harness plugin marketplace: add it once and get every AKA Security tool your harness supports — Claude Code and Codex have native marketplace aggregators here; other harnesses (Cursor, Gemini, Kimi, OpenCode, Pi) install per-tool via the documented commands. First-party today (flightcrew, claude-tools, and AI Traffic Control), structured to open to community submissions later. Each listed tool is licensed in its own repository (licensing varies by project).
+> The one place to discover and install AKA Security's tools for coding agents. A cross-harness plugin marketplace: add it once and get every AKA Security tool your harness supports — Claude Code and Codex have native marketplace aggregators here; other harnesses (Cursor, Gemini, Kimi, OpenCode, Pi) install per-tool via the documented commands. First-party today (preflight, claude-tools, and AI Traffic Control), structured to open to community submissions later. Each listed tool is licensed in its own repository (licensing varies by project).
 
 Add the marketplace once, install any tool. On Claude Code: `/plugin marketplace add akasecurity/marketplace` then `/plugin install <name>@akasecurity`. The marketplace references each tool's own repository — nothing is vendored here — so a tool's own releases flow through automatically.
 
 ## The tools
 
-- [flightcrew](https://github.com/akasecurity/flightcrew-skills) — An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives. Report-only. Available on all seven harnesses. Install: `/plugin install flightcrew@akasecurity`.
+- [preflight](https://github.com/akasecurity/preflight-skills) — An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives. Report-only. Available on all seven harnesses. Install: `/plugin install preflight@akasecurity`.
 - [claude-tools](https://github.com/akasecurity/claude-tools) — The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave, on an isolated profile. The full kit installs via shell/npm/Homebrew; the guard-hooks plugin installs via the marketplace. Install: `/plugin install claude-tools@akasecurity`.
 - [ai-tc — AI Traffic Control](https://github.com/akasecurity/ai-tc) — An open-source control plane for coding agents: intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then enforces policy (monitor, warn, redact, or block) before anything reaches the model. Runs entirely locally with 100+ built-in detections. Install: `/plugin install ai-tc@akasecurity`.
 

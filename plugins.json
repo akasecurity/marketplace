@@ -4,8 +4,8 @@
   "categories": ["Developer Tools", "Security"],
   "plugins": [
     {
-      "name": "flightcrew",
-      "url": "https://github.com/akasecurity/flightcrew-skills",
+      "name": "preflight",
+      "url": "https://github.com/akasecurity/preflight-skills",
       "category": "Developer Tools",
       "status": "available",
       "harnesses": ["claude", "codex", "cursor", "gemini", "kimi", "opencode", "pi"],

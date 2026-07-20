@@ -10,10 +10,10 @@
   },
   "plugins": [
     {
-      "name": "flightcrew",
+      "name": "preflight",
       "source": {
         "source": "github",
-        "repo": "akasecurity/flightcrew-skills"
+        "repo": "akasecurity/preflight-skills"
       },
       "description": "An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives — report-only."
     },
