@@ -5,11 +5,11 @@
   },
   "plugins": [
     {
-      "name": "flightcrew",
-      "displayName": "Flightcrew Skills",
+      "name": "preflight",
+      "displayName": "Preflight Skills",
       "source": {
         "source": "url",
-        "url": "https://github.com/akasecurity/flightcrew-skills.git"
+        "url": "https://github.com/akasecurity/preflight-skills.git"
       },
       "policy": {
         "installation": "AVAILABLE",
