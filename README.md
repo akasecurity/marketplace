@@ -64,7 +64,8 @@ The `ai-tc` entry in `.claude-plugin/marketplace.json` names an **exact** npm ve
 (`source.version`), so `/plugin install ai-tc@akasecurity` — and the plugin auto-update pass on
 machines that have it on — resolves to that version rather than to whatever npm's `latest` tag
 points at. A new ai-tc release reaches marketplace users only when a commit here advances the
-pin; that commit is the audit trail.
+pin; that commit is the audit trail. (The pin exists from `fleet-v2` / today's `main` onward —
+`fleet-v1` predates it and its ai-tc entry is unpinned.)
 
 Managed fleets go one step further and register this marketplace at a signed `fleet-v<N>` tag
 instead of `main`, so they move versions only when their own configuration moves the tag they
