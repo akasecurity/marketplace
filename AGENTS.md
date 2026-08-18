@@ -47,7 +47,11 @@ Don't "fix" it by copying entries across.
 (`source.version`). Claude Code honours it on install and in its plugin auto-update pass, so a
 new `@akasecurity/ai-tc-claude-code` publish reaches nobody through this marketplace until a
 commit here moves the pin. That is the point: the pin is the audit trail, and it is what stops a
-fleet from advancing because a publish happened. Only this file carries it —
+fleet from advancing because a publish happened. It holds for `main` and for `fleet-v2` onward;
+`fleet-v1` predates it — its ai-tc entry names only the package — so a marketplace registered at
+`fleet-v1` (or any pre-pin commit) with auto-update on installs npm `latest` on every pass. The
+tag stays (never move a tag), but it is not a rollback target for the plugin version: a rollback
+is a new tag pinning the lower version. Only this file carries it —
 `.agents/plugins/marketplace.json` does not list ai-tc, and `plugins.json` has no source/version
 field — so "change all four" does not apply to a version bump.
 
@@ -59,12 +63,20 @@ at that commit → version, registry → integrity), so:
 - **Never move, delete or re-sign an existing `fleet-v<N>` tag.** A tag that no longer resolves
   to its recorded commit is treated as a supply-chain event on the fleet side, not a typo.
 - **A plugin release is a two-commit affair:** (1) here, bump `source.version` in one commit
-  (`npm view @akasecurity/ai-tc-claude-code@<v> dist.shasum` to confirm the version exists on
-  the public registry) and cut `fleet-v<N+1>` at that commit — `git tag -s fleet-v<N+1> -m
-  '<why>'`, `git push origin fleet-v<N+1>`; (2) the fleet configuration then advances its recorded
+  and cut `fleet-v<N+1>` at that commit — `git tag -s fleet-v<N+1> -m '<why>'`,
+  `git push origin fleet-v<N+1>`; (2) the fleet configuration then advances its recorded
   commit, its template's `ref`, and its integrity record for the new version together. Do the
   marketplace half first: until the fleet side advances, its devices keep installing from the
-  old tag, which still names the old version.
+  old tag, which still names the old (pinned) version.
+- **Pre-flight before the tag, registry-explicit.** The tag is permanent, so confirm the version
+  on the **public** registry with the scope mapping pinned — a scoped `.npmrc` in your cwd can
+  silently route `@akasecurity` to another registry that serves different bytes for the same
+  version:
+  `npm view @akasecurity/ai-tc-claude-code@<v> dist --@akasecurity:registry=https://registry.npmjs.org`
+  (or `curl -s https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code | jq '.versions["<v>"].dist'`).
+  Managed fleets also require the publish to carry provenance from ai-tc's release workflow;
+  `npm audit signatures` in a scratch dir that installs exactly `<v>` shows it. A version that
+  fails either check must not be pinned.
 - The pin bump and the tag are separate acts on purpose. A pin commit that no tag points at is
   visible to `main` installers only; a fleet only moves when its own configuration moves to the
   new tag.
