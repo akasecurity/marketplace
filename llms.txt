@@ -2,7 +2,7 @@
 
 > The one place to discover and install AKA Security's tools for coding agents. A cross-harness plugin marketplace: add it once and get every AKA Security tool your harness supports — Claude Code and Codex have native marketplace aggregators here; other harnesses (Cursor, Gemini, Kimi, OpenCode, Pi) install per-tool via the documented commands. First-party today (preflight, claude-tools, and AI Traffic Control), structured to open to community submissions later. Each listed tool is licensed in its own repository (licensing varies by project).
 
-Add the marketplace once, install any tool. On Claude Code: `/plugin marketplace add akasecurity/marketplace` then `/plugin install <name>@akasecurity`. The marketplace references each tool's own repository — nothing is vendored here — so a tool's own releases flow through automatically.
+Add the marketplace once, install any tool. On Claude Code: `/plugin marketplace add akasecurity/marketplace` then `/plugin install <name>@akasecurity`. The marketplace references each tool's own repository — nothing is vendored here — so a tool's own releases flow through automatically, with one exception: ai-tc's npm source is pinned to an exact version (`source.version` in the Claude Code manifest) and advances only by a commit here; managed fleets additionally register the marketplace at a signed `fleet-v<N>` tag rather than `main`.
 
 ## The tools
 

@@ -2,7 +2,9 @@
 
 **One place to install AKA Security's tools for coding agents.** Add the marketplace once and
 install any tool your harness supports. First-party today; the manifests reference each tool's own
-repository (nothing is vendored here), so a tool's own releases flow through automatically.
+repository (nothing is vendored here), so a tool's own releases flow through automatically —
+except **ai-tc**, whose npm source is pinned to an exact version and moves only when a commit here
+moves it (see [Version pinning](#version-pinning)).
 
 From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its own repository.
 
@@ -55,6 +57,19 @@ then run `aka init` — it detects whether the Claude Code plugin is installed a
 
 > Codex and Antigravity currently install **preflight** (multi-harness). `claude-tools` and `ai-tc`
 > are Claude Code tools; on other harnesses install `claude-tools` via its shell kit / Homebrew.
+
+## Version pinning
+
+The `ai-tc` entry in `.claude-plugin/marketplace.json` names an **exact** npm version
+(`source.version`), so `/plugin install ai-tc@akasecurity` — and the plugin auto-update pass on
+machines that have it on — resolves to that version rather than to whatever npm's `latest` tag
+points at. A new ai-tc release reaches marketplace users only when a commit here advances the
+pin; that commit is the audit trail.
+
+Managed fleets go one step further and register this marketplace at a signed `fleet-v<N>` tag
+instead of `main`, so they move versions only when their own configuration moves the tag they
+pin. Those tags are treated as immutable once pushed: a release cuts the **next** tag, never
+re-points an existing one. `preflight` and `claude-tools` still float on their default branches.
 
 ## About
 

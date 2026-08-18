@@ -7,7 +7,8 @@ global layer — never repeats them.
 
 The **public** first-party plugin marketplace for AKA Security. It is a thin index: it holds no
 plugin code, only manifests that reference each tool's own repository, so a tool's releases flow
-through without a change here.
+through without a change here — with one deliberate exception, `ai-tc`, whose npm source is
+pinned to an exact version (see "ai-tc is pinned" below).
 
 Public. Everything committed is visible immediately.
 
@@ -39,6 +40,36 @@ Don't "fix" it by copying entries across.
 4. Renames do not propagate on their own. After a rename, check `akasecurity/.github`
    (`profile/README.md`), `akasecurity/homebrew-tap` (README + formula), and `akasecurity/ai-tc-docs`
    (`overrides/home.html`) for the old name.
+
+## ai-tc is pinned; `fleet-v<N>` tags
+
+`.claude-plugin/marketplace.json` pins the `ai-tc` entry's npm source to an **exact** version
+(`source.version`). Claude Code honours it on install and in its plugin auto-update pass, so a
+new `@akasecurity/ai-tc-claude-code` publish reaches nobody through this marketplace until a
+commit here moves the pin. That is the point: the pin is the audit trail, and it is what stops a
+fleet from advancing because a publish happened. Only this file carries it —
+`.agents/plugins/marketplace.json` does not list ai-tc, and `plugins.json` has no source/version
+field — so "change all four" does not apply to a version bump.
+
+Managed fleets register this marketplace at a **signed, annotated `fleet-v<N>` tag** rather than
+`main`, and record out-of-band the commit each tag must resolve to plus the pinned version's
+registry integrity. Their checks re-derive that chain from the live world (tag → commit, manifest
+at that commit → version, registry → integrity), so:
+
+- **Never move, delete or re-sign an existing `fleet-v<N>` tag.** A tag that no longer resolves
+  to its recorded commit is treated as a supply-chain event on the fleet side, not a typo.
+- **A plugin release is a two-commit affair:** (1) here, bump `source.version` in one commit
+  (`npm view @akasecurity/ai-tc-claude-code@<v> dist.shasum` to confirm the version exists on
+  the public registry) and cut `fleet-v<N+1>` at that commit — `git tag -s fleet-v<N+1> -m
+  '<why>'`, `git push origin fleet-v<N+1>`; (2) the fleet configuration then advances its recorded
+  commit, its template's `ref`, and its integrity record for the new version together. Do the
+  marketplace half first: until the fleet side advances, its devices keep installing from the
+  old tag, which still names the old version.
+- The pin bump and the tag are separate acts on purpose. A pin commit that no tag points at is
+  visible to `main` installers only; a fleet only moves when its own configuration moves to the
+  new tag.
+
+`preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
 
 ## Workflow
 
