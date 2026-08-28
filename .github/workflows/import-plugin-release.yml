@@ -25,6 +25,14 @@ name: import-plugin-release
 # payload still gets the untrusted-input treatment: shape-validated before first use,
 # referenced only through env (data to the shell, never syntax), and every registry
 # fact re-derived rather than believed.
+#
+# The payload names WHICH package was published, and that is all it decides. It
+# selects the manifest entry to advance (by source.package) and, through
+# RELEASE_PIPELINE below, the release workflow and tag its provenance must bind
+# to — but the binding itself is a workflow-controlled constant, never taken from
+# the payload, or a dispatcher could nominate the workflow that is meant to
+# vouch for it. A package this marketplace does not pin is a green no-op; one it
+# pins but that RELEASE_PIPELINE does not describe is refused.
 
 on:
   repository_dispatch:
@@ -32,8 +40,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Exact x.y.z of @akasecurity/ai-tc-claude-code to import (manual fallback for a missed dispatch)"
+        description: "Exact x.y.z to import (manual fallback for a missed dispatch)"
         required: true
+        type: string
+      package:
+        description: "npm package that was published"
+        required: false
+        default: "@akasecurity/ai-tc-claude-code"
         type: string
 
 # Two releases racing would rewrite the same pin from the same base; serialize them
@@ -59,14 +72,14 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      NPM_PKG: "@akasecurity/ai-tc-claude-code"
       MANIFEST: .claude-plugin/marketplace.json
       # What the publish must ATTEST to — a different question from what the registry
       # serves. integrity/shasum prove the tarball has not been altered; they say
-      # nothing about who built it. These constants name OUR release pipeline.
+      # nothing about who built it. This constant names OUR release repository; the
+      # per-package workflow and tag live in RELEASE_PIPELINE in the gate below.
       PROV_REPO: https://github.com/akasecurity/ai-tc
-      PROV_WORKFLOW: .github/workflows/release-plugin-claude.yml
-      # The dispatch payload (or the manual input), env-only from here on.
+      # The dispatch payload (or the manual inputs), env-only from here on.
+      PAYLOAD_PACKAGE: ${{ github.event.client_payload.package || inputs.package }}
       PAYLOAD_VERSION: ${{ github.event.client_payload.version || inputs.version }}
       PAYLOAD_SHASUM: ${{ github.event.client_payload.shasum }}
       PAYLOAD_INTEGRITY: ${{ github.event.client_payload.integrity }}
@@ -92,17 +105,43 @@ jobs:
           node-version: "24"
 
       # Everything that can end the run without a PR, decided in one place before a
-      # single network call: version shape (pre-releases are never pinned — the pin
-      # gate elsewhere requires exact x.y.z, and so does this repo), already-pinned,
-      # and semver direction. Skips are green with a ::notice, so a duplicate
-      # dispatch or an rc publish is a non-event, not a red run.
-      - name: gate on the version (shape, direction)
+      # single network call: package shape and whether it is one we pin, version
+      # shape (pre-releases are never pinned — the pin gate elsewhere requires
+      # exact x.y.z, and so does this repo), already-pinned, and semver direction.
+      # Skips are green with a ::notice, so a duplicate dispatch, an rc publish or
+      # a release of a plugin this marketplace does not carry is a non-event, not
+      # a red run.
+      #
+      # The manifest entry is resolved BY PACKAGE. It used to be looked up by the
+      # literal name "ai-tc" against a hardcoded package, while the version came
+      # from the payload — so a dispatch for any other plugin was not declined, it
+      # was read as an ai-tc release at that plugin's version and advanced the
+      # wrong pin. The packages share a version line, so the wrong version usually
+      # EXISTS and the import verified and opened a PR rather than failing.
+      - name: gate on the package and version (shape, pinned, direction)
         id: gate
         run: |
           set -eu
           python3 - <<'PY'
           import json, os, re, sys
 
+          # What a publish of each package must ATTEST to. Workflow-controlled and
+          # deliberately not derived from the payload: the payload says which
+          # package was published, this says what a publish of it has to prove.
+          # Taking the workflow path from the dispatch would let a dispatcher
+          # nominate the workflow that is supposed to vouch for it.
+          RELEASE_PIPELINE = {
+              "@akasecurity/ai-tc-claude-code": {
+                  "workflow": ".github/workflows/release-plugin-claude.yml",
+                  "tag_prefix": "plugin-claude-v",
+              },
+              "@akasecurity/ai-tc-codex": {
+                  "workflow": ".github/workflows/release-plugin-codex.yml",
+                  "tag_prefix": "plugin-codex-v",
+              },
+          }
+
+          package = (os.environ.get("PAYLOAD_PACKAGE") or "").strip()
           version = (os.environ.get("PAYLOAD_VERSION") or "").strip()
           out = open(os.environ["GITHUB_OUTPUT"], "a")
 
@@ -111,29 +150,53 @@ jobs:
               print("proceed=false", file=out)
               sys.exit(0)
 
+          # Shape first: everything below indexes a dict or a manifest with it.
+          if not re.fullmatch(r"@[a-z0-9-]+/[a-z0-9._-]+", package):
+              sys.exit(f"FAIL: package {package!r} is not a scoped npm package name")
           if not re.fullmatch(r"\d+\.\d+\.\d+", version):
               skip(f"version {version!r} is not an exact x.y.z (pre-releases are never pinned)")
 
+          # Which entry this package pins, if any. No entry is a green no-op:
+          # ai-tc releases plugins this marketplace does not carry, and their
+          # doorbell reaching here is not an error, it is nothing to do.
           doc = json.load(open(os.environ["MANIFEST"]))
-          entry = next((p for p in doc.get("plugins", []) if p.get("name") == "ai-tc"), None)
-          if entry is None or entry.get("source", {}).get("package") != os.environ["NPM_PKG"]:
-              sys.exit(f"FAIL: {os.environ['MANIFEST']} has no ai-tc entry pinning "
-                       f"{os.environ['NPM_PKG']} — the manifest and this workflow have diverged")
+          entry = next((p for p in doc.get("plugins", [])
+                        if p.get("source", {}).get("package") == package), None)
+          if entry is None:
+              skip(f"{os.environ['MANIFEST']} pins no entry for {package}")
+          name = entry.get("name") or ""
+          if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+              sys.exit(f"FAIL: the entry pinning {package} has an unusable name {name!r} — "
+                       "it names the branch and the commit this run would create")
+
+          # Pinned but undescribed is the one refusal here: we would have to verify
+          # provenance against SOME workflow, and guessing is how a tarball gets
+          # bound to the wrong pipeline.
+          pipeline = RELEASE_PIPELINE.get(package)
+          if pipeline is None:
+              sys.exit(f"FAIL: {os.environ['MANIFEST']} pins {package} but this workflow "
+                       "declares no release pipeline for it, so there is nothing to bind its "
+                       "provenance to. Add it to RELEASE_PIPELINE.")
+
           current = entry["source"].get("version") or ""
           if not re.fullmatch(r"\d+\.\d+\.\d+", current):
               sys.exit(f"FAIL: current pin {current!r} is not an exact x.y.z")
 
           new, cur = (tuple(map(int, v.split("."))) for v in (version, current))
           if new == cur:
-              skip(f"{version} is already the pinned version")
+              skip(f"{version} is already the pinned version for {package}")
           if new < cur:
-              skip(f"{version} is lower than the current pin {current} — a rollback "
+              skip(f"{version} is lower than the current {package} pin {current} — a rollback "
                    "is a human act (a new tag pinning the lower version), not an import")
 
           print("proceed=true", file=out)
+          print(f"package={package}", file=out)
+          print(f"entry={name}", file=out)
           print(f"version={version}", file=out)
           print(f"current={current}", file=out)
-          print(f"importing {version} over the current pin {current}")
+          print(f"prov_workflow={pipeline['workflow']}", file=out)
+          print(f"prov_ref=refs/tags/{pipeline['tag_prefix']}{version}", file=out)
+          print(f"importing {package} {version} over the current {name} pin {current}")
           PY
 
       # ONE registry round trip for both fields (two `npm view` calls could straddle
@@ -146,6 +209,7 @@ jobs:
       - name: registry dist for the exact version, cross-checked against the dispatch
         if: steps.gate.outputs.proceed == 'true'
         env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
           NPM_VER: ${{ steps.gate.outputs.version }}
         run: |
           set -eu
@@ -185,8 +249,10 @@ jobs:
       - name: provenance binds the tarball to ai-tc's release workflow
         if: steps.gate.outputs.proceed == 'true'
         env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
           NPM_VER: ${{ steps.gate.outputs.version }}
-          PROV_REF: refs/tags/plugin-claude-v${{ steps.gate.outputs.version }}
+          PROV_WORKFLOW: ${{ steps.gate.outputs.prov_workflow }}
+          PROV_REF: ${{ steps.gate.outputs.prov_ref }}
         run: |
           set -eu
           work=$(mktemp -d)
@@ -266,6 +332,7 @@ jobs:
       - name: advance the pin (byte-stable), and prove it advanced
         if: steps.gate.outputs.proceed == 'true'
         env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
           NPM_VER: ${{ steps.gate.outputs.version }}
         run: |
           set -eu
@@ -273,22 +340,24 @@ jobs:
           import json, os, sys
 
           path, version = os.environ["MANIFEST"], os.environ["NPM_VER"]
+          package = os.environ["NPM_PKG"]
           raw = open(path, "rb").read().decode()
           doc = json.loads(raw)
           if json.dumps(doc, indent=2, ensure_ascii=False) + "\n" != raw:
               sys.exit(f"FAIL: {path} does not round-trip through json.dumps(indent=2) — "
                        "rewriting it would churn unrelated bytes; move the pin by hand")
-          entry = next(p for p in doc["plugins"] if p.get("name") == "ai-tc")
+          entry = next(p for p in doc["plugins"]
+                       if p.get("source", {}).get("package") == package)
           old = entry["source"]["version"]
           entry["source"]["version"] = version
           with open(path, "w", encoding="utf-8") as f:
               f.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
           reparsed = next(p for p in json.load(open(path))["plugins"]
-                          if p.get("name") == "ai-tc")["source"]["version"]
+                          if p.get("source", {}).get("package") == package)["source"]["version"]
           if reparsed != version or reparsed == old:
               sys.exit(f"FAIL: the pin did not advance: old={old!r} new={reparsed!r} "
                        f"wanted={version!r}")
-          print(f"OK: {path} pin {old} -> {reparsed}, and the result still parses")
+          print(f"OK: {path} {package} pin {old} -> {reparsed}, and the result still parses")
           PY
           # The charter's own pre-push gate (AGENTS.md, "Workflow"), verbatim.
           jq empty "$MANIFEST" && echo "ok $MANIFEST"
@@ -296,19 +365,22 @@ jobs:
       - name: open the pin PR
         if: steps.gate.outputs.proceed == 'true'
         env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
+          ENTRY: ${{ steps.gate.outputs.entry }}
           NPM_VER: ${{ steps.gate.outputs.version }}
           CURRENT: ${{ steps.gate.outputs.current }}
-          PROV_REF: refs/tags/plugin-claude-v${{ steps.gate.outputs.version }}
+          PROV_WORKFLOW: ${{ steps.gate.outputs.prov_workflow }}
+          PROV_REF: ${{ steps.gate.outputs.prov_ref }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          branch="bot/pin-ai-tc-${NPM_VER}"
+          branch="bot/pin-${ENTRY}-${NPM_VER}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
           git add "$MANIFEST"
-          git commit -m "feat: advance the ai-tc pin to ${NPM_VER}"
-          # The branch is bot-owned by construction (bot/pin-ai-tc-<version>), so a
+          git commit -m "feat: advance the ${ENTRY} pin to ${NPM_VER}"
+          # The branch is bot-owned by construction (bot/pin-<entry>-<version>), so a
           # re-run for the same version may overwrite its own earlier attempt.
           git push --force origin "HEAD:refs/heads/${branch}"
 
@@ -324,7 +396,7 @@ jobs:
 
           e = os.environ
           run_url = f"{e['GITHUB_SERVER_URL']}/{e['GITHUB_REPOSITORY']}/actions/runs/{e['GITHUB_RUN_ID']}"
-          print(f"""Advances the `ai-tc` pin in `.claude-plugin/marketplace.json`: `{e['CURRENT']}` -> `{e['NPM_VER']}`.
+          print(f"""Advances the `{e['ENTRY']}` pin in `.claude-plugin/marketplace.json`: `{e['CURRENT']}` -> `{e['NPM_VER']}`.
 
           Opened by [import-plugin-release]({run_url}), which re-derived the pre-flight from the live registry before touching the pin — nothing was taken from the dispatch payload on trust.
 
@@ -342,5 +414,5 @@ jobs:
           3. advance the fleet configuration's recorded commit, template ref, and integrity record for `{e['NPM_VER']}` together.""")
           PY
           gh pr create --base main --head "$branch" \
-            --title "feat: advance the ai-tc pin to ${NPM_VER}" \
+            --title "feat: advance the ${ENTRY} pin to ${NPM_VER}" \
             --body-file /tmp/pr-body.md
