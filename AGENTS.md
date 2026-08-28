@@ -94,3 +94,17 @@ done
 ```
 
 A malformed manifest breaks `/plugin marketplace add` for every user at once.
+
+## The one workflow: import-plugin-release
+
+"No CI" above still describes how changes land: nothing in this repo tests, gates, or
+auto-merges anything. The one workflow, `.github/workflows/import-plugin-release.yml`, is a
+release robot, not a test gate. When ai-tc's release workflow announces a publish
+(`repository_dispatch`, event type `plugin-release`) — or a maintainer runs it by hand with a
+version — it re-derives the "Pre-flight before the tag" checklist above as code, against the
+live registry and trusting nothing from the payload: a registry-explicit dist read, and the
+provenance binding to ai-tc's own release workflow at that version's tag. If everything holds,
+it opens a `bot/pin-ai-tc-<version>` PR moving `source.version`; a version that is already
+pinned, lower than the pin, or not an exact `x.y.z` logs why and opens nothing. Its only output
+is a PR: the human merge and the signed `fleet-v<N+1>` tag remain the promotion, exactly as
+"ai-tc is pinned" describes.
