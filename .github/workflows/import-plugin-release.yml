@@ -1,0 +1,346 @@
+name: import-plugin-release
+
+# The release robot for the ai-tc pin (AGENTS.md, "ai-tc is pinned"): when
+# akasecurity/ai-tc's release workflow announces a publish (repository_dispatch,
+# event type plugin-release), or a maintainer runs it by hand with a version, this
+# workflow re-derives the "Pre-flight before the tag" checklist as code — against the
+# live registry, trusting nothing from the payload — and opens a PR advancing
+# .claude-plugin/marketplace.json's source.version. It only ever opens PRs: the human
+# merge and the signed fleet-v<N+1> tag remain the promotion.
+#
+# What must hold before a PR exists:
+#
+#   dist       — registry-explicit `npm view` of the exact version; when the dispatch
+#                carried shasum/integrity they must match what the registry serves.
+#   provenance — `npm audit signatures` over a scratch install of exactly that
+#                version, then the SLSA attestation must bind the tarball to ai-tc's
+#                own release workflow at that version's own tag. A cryptographically
+#                valid attestation alone proves only that SOMEONE published with
+#                provenance; the repository/workflow/ref binding carries the security.
+#   direction  — the pin only ever advances: the same version is a no-op, and a lower
+#                one logs and exits green. A rollback is a human act (AGENTS.md: a
+#                rollback is a new tag pinning the lower version), never an import.
+#
+# Sending a repository_dispatch already takes contents:write on THIS repo, but the
+# payload still gets the untrusted-input treatment: shape-validated before first use,
+# referenced only through env (data to the shell, never syntax), and every registry
+# fact re-derived rather than believed.
+
+on:
+  repository_dispatch:
+    types: [plugin-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact x.y.z of @akasecurity/ai-tc-claude-code to import (manual fallback for a missed dispatch)"
+        required: true
+        type: string
+
+# Two releases racing would rewrite the same pin from the same base; serialize them
+# instead. cancel-in-progress is false so a run is never interrupted between
+# verifying a version and opening its PR.
+concurrency:
+  group: import-plugin-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    name: verify against the registry, then open the pin PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The job-level GITHUB_TOKEN is all this needs: push the bot branch (contents)
+    # and open the PR (pull-requests). Opening PRs with the built-in token also
+    # requires the repo/org setting "Allow GitHub Actions to create and approve
+    # pull requests" to be on.
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      NPM_PKG: "@akasecurity/ai-tc-claude-code"
+      MANIFEST: .claude-plugin/marketplace.json
+      # What the publish must ATTEST to — a different question from what the registry
+      # serves. integrity/shasum prove the tarball has not been altered; they say
+      # nothing about who built it. These constants name OUR release pipeline.
+      PROV_REPO: https://github.com/akasecurity/ai-tc
+      PROV_WORKFLOW: .github/workflows/release-plugin-claude.yml
+      # The dispatch payload (or the manual input), env-only from here on.
+      PAYLOAD_VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      PAYLOAD_SHASUM: ${{ github.event.client_payload.shasum }}
+      PAYLOAD_INTEGRITY: ${{ github.event.client_payload.integrity }}
+    steps:
+      # persist-credentials stays ON (the default, spelled out): this job's whole
+      # point is to push a branch, and the persisted credential is the job-scoped
+      # GITHUB_TOKEN declared above — not a hazard the secret-free fleet checks
+      # need to shed.
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified via the GitHub API).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: true
+
+      # Pins the npm the provenance step below depends on: on an older system npm,
+      # `npm audit signatures --json` returns an EMPTY verified set rather than an
+      # error — a shape that reads as "no attestation" and would refuse a perfectly
+      # good release. Known-good on npm 11 (node 24); do not drop this to inherit
+      # whatever the runner image ships, because the failure mode is a false
+      # positive on a supply-chain assert, which is the worst kind.
+      # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (verified via the GitHub API).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      # Everything that can end the run without a PR, decided in one place before a
+      # single network call: version shape (pre-releases are never pinned — the pin
+      # gate elsewhere requires exact x.y.z, and so does this repo), already-pinned,
+      # and semver direction. Skips are green with a ::notice, so a duplicate
+      # dispatch or an rc publish is a non-event, not a red run.
+      - name: gate on the version (shape, direction)
+        id: gate
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          version = (os.environ.get("PAYLOAD_VERSION") or "").strip()
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+
+          def skip(msg):
+              print(f"::notice::{msg} — no PR")
+              print("proceed=false", file=out)
+              sys.exit(0)
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              skip(f"version {version!r} is not an exact x.y.z (pre-releases are never pinned)")
+
+          doc = json.load(open(os.environ["MANIFEST"]))
+          entry = next((p for p in doc.get("plugins", []) if p.get("name") == "ai-tc"), None)
+          if entry is None or entry.get("source", {}).get("package") != os.environ["NPM_PKG"]:
+              sys.exit(f"FAIL: {os.environ['MANIFEST']} has no ai-tc entry pinning "
+                       f"{os.environ['NPM_PKG']} — the manifest and this workflow have diverged")
+          current = entry["source"].get("version") or ""
+          if not re.fullmatch(r"\d+\.\d+\.\d+", current):
+              sys.exit(f"FAIL: current pin {current!r} is not an exact x.y.z")
+
+          new, cur = (tuple(map(int, v.split("."))) for v in (version, current))
+          if new == cur:
+              skip(f"{version} is already the pinned version")
+          if new < cur:
+              skip(f"{version} is lower than the current pin {current} — a rollback "
+                   "is a human act (a new tag pinning the lower version), not an import")
+
+          print("proceed=true", file=out)
+          print(f"version={version}", file=out)
+          print(f"current={current}", file=out)
+          print(f"importing {version} over the current pin {current}")
+          PY
+
+      # ONE registry round trip for both fields (two `npm view` calls could straddle
+      # a registry change, comparing an integrity from one read against a shasum
+      # from another). Registry-explicit — the @akasecurity scope mapping pinned on
+      # the command — so nothing ambient to the runner can route the read to a
+      # registry serving different bytes for the same version. Registry-derived
+      # bytes are read out with json.load and never reach a shell that could
+      # interpret them.
+      - name: registry dist for the exact version, cross-checked against the dispatch
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_VER: ${{ steps.gate.outputs.version }}
+        run: |
+          set -eu
+          npm view "${NPM_PKG}@${NPM_VER}" dist --json \
+            --@akasecurity:registry=https://registry.npmjs.org > /tmp/dist.json
+          python3 - <<'PY'
+          import json, os, sys
+
+          d = json.load(open("/tmp/dist.json"))
+          sha, integ = d.get("shasum", ""), d.get("integrity", "")
+          if not sha or not integ:
+              sys.exit(f"FAIL: the registry returned no dist fields: {d}")
+          for name, got, claimed in (("shasum", sha, os.environ.get("PAYLOAD_SHASUM", "")),
+                                     ("integrity", integ, os.environ.get("PAYLOAD_INTEGRITY", ""))):
+              if claimed and claimed != got:
+                  sys.exit(f"FAIL: dispatched {name} {claimed!r} != registry {name} {got!r} — "
+                           "the payload disagrees with the registry; import nothing")
+          # $GITHUB_ENV is line-oriented; an embedded newline would smuggle extra
+          # variables into every later step.
+          for key, value in (("NPM_SHASUM", sha), ("NPM_INTEGRITY", integ)):
+              if "\n" in value or "\r" in value:
+                  sys.exit(f"FAIL: {key} is not a single-line string: {value!r}")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              print(f"NPM_SHASUM={sha}", file=env)
+              print(f"NPM_INTEGRITY={integ}", file=env)
+          claimed = bool(os.environ.get("PAYLOAD_SHASUM") or os.environ.get("PAYLOAD_INTEGRITY"))
+          print(f"OK: registry dist read for {os.environ['NPM_PKG']}@{os.environ['NPM_VER']}"
+                + (" matches the dispatch payload" if claimed
+                   else " (manual run: no payload to cross-check)"))
+          PY
+
+      # The half that would notice a stolen publish token: integrity/shasum only
+      # drift if the RECORDED version's bytes change, whereas an attacker publishes
+      # a NEW version — the binding below is what refuses it. --ignore-scripts: the
+      # package is installed solely so npm can verify it; nothing here needs its
+      # code to have run.
+      - name: provenance binds the tarball to ai-tc's release workflow
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_VER: ${{ steps.gate.outputs.version }}
+          PROV_REF: refs/tags/plugin-claude-v${{ steps.gate.outputs.version }}
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          if ! ( cd "$work" \
+                 && npm init -y >/dev/null 2>&1 \
+                 && npm install --ignore-scripts --no-audit --no-fund \
+                      --@akasecurity:registry=https://registry.npmjs.org \
+                      "$NPM_PKG@$NPM_VER" >/dev/null \
+                 && npm audit signatures --json --include-attestations > sig.json ); then
+            echo "FAIL: npm could not verify the registry signature or attestation for $NPM_PKG@$NPM_VER"
+            cat "$work/sig.json" 2>/dev/null || true
+            exit 1
+          fi
+          echo "toolchain: node $(node -v) / npm $(npm -v)"
+
+          set +e
+          python3 - "$work/sig.json" <<'PY'
+          import base64, json, os, sys
+
+          SLSA = "https://slsa.dev/provenance/v1"
+          pkg, ver = os.environ["NPM_PKG"], os.environ["NPM_VER"]
+          want = {"repository": os.environ["PROV_REPO"],
+                  "path": os.environ["PROV_WORKFLOW"],
+                  "ref": os.environ["PROV_REF"]}
+
+          d = json.load(open(sys.argv[1]))
+          if d.get("invalid"):
+              sys.exit(f"FAIL: npm reports INVALID signatures/attestations: {d['invalid']}")
+          entry = next((v for v in d.get("verified", [])
+                        if v.get("name") == pkg and v.get("version") == ver), None)
+          if entry is None:
+              sys.exit(f"FAIL: {pkg}@{ver} carries no VERIFIED attestation (npm 'missing': "
+                       f"{d.get('missing')}). Every release of this package is published by "
+                       "GitHub Actions with provenance, so one without it did not come from "
+                       "the release pipeline.")
+          bundles = [b for b in entry.get("attestationBundles", [])
+                     if b.get("predicateType") == SLSA]
+          if not bundles:
+              sys.exit(f"FAIL: {pkg}@{ver} has no {SLSA} attestation; got "
+                       f"{[b.get('predicateType') for b in entry.get('attestationBundles', [])]}")
+
+          payload = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
+          pred = payload.get("predicate", {})
+          got = pred.get("buildDefinition", {}).get("externalParameters", {}).get("workflow", {})
+          builder = pred.get("runDetails", {}).get("builder", {}).get("id", "")
+
+          bad = [f"{k}: attested {got.get(k)!r} != required {v!r}"
+                 for k, v in want.items() if got.get(k) != v]
+          if "github-hosted" not in builder:
+              bad.append(f"builder {builder!r} is not a github-hosted runner")
+          if bad:
+              sys.exit("FAIL: the attestation does not bind this tarball to ai-tc's release "
+                       "workflow:\n  - " + "\n  - ".join(bad) + "\n  A cryptographically valid "
+                       "attestation is NOT sufficient — anyone can publish with provenance from "
+                       "their own repository.")
+          print(f"OK: {pkg}@{ver} attested by {got['repository']} :: {got['path']} @ {got['ref']}")
+          PY
+          rc=$?
+          set -e
+
+          if [ "$rc" -ne 0 ]; then
+            # A failure here is either a real supply-chain signal or a toolchain
+            # problem, and the two must never be confused. Dump enough to tell them
+            # apart.
+            echo "--- diagnostics ---"
+            echo "node $(node -v) / npm $(npm -v)"
+            ls -d "$work/node_modules/$NPM_PKG" 2>/dev/null || echo "package NOT in node_modules — install did not land"
+            echo "--- raw npm audit output ---"
+            head -c 3000 "$work/sig.json"
+            exit 1
+          fi
+
+      # Byte-stability is proven, not assumed: the parsed document must serialize
+      # back to the file's exact bytes BEFORE the edit, so the rewrite can only ever
+      # change the one version string. If the file's formatting ever drifts from
+      # json.dumps(indent=2), refuse to rewrite it wholesale.
+      - name: advance the pin (byte-stable), and prove it advanced
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_VER: ${{ steps.gate.outputs.version }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, sys
+
+          path, version = os.environ["MANIFEST"], os.environ["NPM_VER"]
+          raw = open(path, "rb").read().decode()
+          doc = json.loads(raw)
+          if json.dumps(doc, indent=2, ensure_ascii=False) + "\n" != raw:
+              sys.exit(f"FAIL: {path} does not round-trip through json.dumps(indent=2) — "
+                       "rewriting it would churn unrelated bytes; move the pin by hand")
+          entry = next(p for p in doc["plugins"] if p.get("name") == "ai-tc")
+          old = entry["source"]["version"]
+          entry["source"]["version"] = version
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+          reparsed = next(p for p in json.load(open(path))["plugins"]
+                          if p.get("name") == "ai-tc")["source"]["version"]
+          if reparsed != version or reparsed == old:
+              sys.exit(f"FAIL: the pin did not advance: old={old!r} new={reparsed!r} "
+                       f"wanted={version!r}")
+          print(f"OK: {path} pin {old} -> {reparsed}, and the result still parses")
+          PY
+          # The charter's own pre-push gate (AGENTS.md, "Workflow"), verbatim.
+          jq empty "$MANIFEST" && echo "ok $MANIFEST"
+
+      - name: open the pin PR
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_VER: ${{ steps.gate.outputs.version }}
+          CURRENT: ${{ steps.gate.outputs.current }}
+          PROV_REF: refs/tags/plugin-claude-v${{ steps.gate.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          branch="bot/pin-ai-tc-${NPM_VER}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "$MANIFEST"
+          git commit -m "feat: advance the ai-tc pin to ${NPM_VER}"
+          # The branch is bot-owned by construction (bot/pin-ai-tc-<version>), so a
+          # re-run for the same version may overwrite its own earlier attempt.
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != "0" ]; then
+            echo "::notice::a PR for ${branch} is already open — branch updated, not opening another"
+            exit 0
+          fi
+
+          # The body is built by python from env — markdown backticks and shell
+          # heredoc expansion are a bad mix.
+          python3 - > /tmp/pr-body.md <<'PY'
+          import os
+
+          e = os.environ
+          run_url = f"{e['GITHUB_SERVER_URL']}/{e['GITHUB_REPOSITORY']}/actions/runs/{e['GITHUB_RUN_ID']}"
+          print(f"""Advances the `ai-tc` pin in `.claude-plugin/marketplace.json`: `{e['CURRENT']}` -> `{e['NPM_VER']}`.
+
+          Opened by [import-plugin-release]({run_url}), which re-derived the pre-flight from the live registry before touching the pin — nothing was taken from the dispatch payload on trust.
+
+          Verified against `https://registry.npmjs.org`:
+
+          - package: `{e['NPM_PKG']}@{e['NPM_VER']}`
+          - shasum: `{e['NPM_SHASUM']}`
+          - integrity: `{e['NPM_INTEGRITY']}`
+          - provenance: the SLSA attestation binds the tarball to `{e['PROV_REPO']}` :: `{e['PROV_WORKFLOW']}` @ `{e['PROV_REF']}` (`npm audit signatures` over a scratch `--ignore-scripts` install of exactly this version, on a github-hosted builder)
+
+          Merging is the human half of the promotion, and on its own it moves `main` installers only. Managed fleets move when a maintainer signs the next tag and the fleet configuration advances (AGENTS.md, "ai-tc is pinned; `fleet-v<N>` tags"):
+
+          1. merge this PR;
+          2. `git tag -s fleet-v<N+1> -m '<why>'` at the merge commit, `git push origin fleet-v<N+1>`;
+          3. advance the fleet configuration's recorded commit, template ref, and integrity record for `{e['NPM_VER']}` together.""")
+          PY
+          gh pr create --base main --head "$branch" \
+            --title "feat: advance the ai-tc pin to ${NPM_VER}" \
+            --body-file /tmp/pr-body.md
