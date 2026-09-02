@@ -94,3 +94,32 @@ done
 ```
 
 A malformed manifest breaks `/plugin marketplace add` for every user at once.
+
+## The one workflow: import-plugin-release
+
+"No CI" above still describes how changes land: nothing in this repo tests, gates, or
+auto-merges anything. The one workflow, `.github/workflows/import-plugin-release.yml`, is a
+release robot, not a test gate. When ai-tc's release workflow announces a publish
+(`repository_dispatch`, event type `plugin-release`) — or a maintainer runs it by hand with a
+package and version — it re-derives the "Pre-flight before the tag" checklist above as code,
+against the live registry and trusting nothing from the payload: a registry-explicit dist read,
+and the provenance binding to ai-tc's own release workflow at that version's tag. If everything
+holds, it opens a `bot/pin-<entry>-<version>` PR moving that entry's `source.version`; a version
+that is already pinned, lower than the pin, or not an exact `x.y.z` logs why and opens nothing.
+Its only output is a PR: the human merge and the signed `fleet-v<N+1>` tag remain the promotion,
+exactly as "ai-tc is pinned" describes.
+
+**Which entry it advances comes from the payload's package**, matched against `source.package` —
+not from the plugin's name, and not from a package this workflow assumes. ai-tc publishes more
+plugins than this marketplace carries, so the doorbell rings here for releases with no pin to
+advance: a package no entry pins is a **green no-op**. The one refusal is a package this
+marketplace *does* pin that `RELEASE_PIPELINE` (in the workflow) does not describe — there would
+be no declared release workflow to bind its provenance to, and guessing is how a tarball gets
+attributed to the wrong pipeline. **Adding an npm-pinned plugin therefore means adding its
+release workflow path and tag prefix to `RELEASE_PIPELINE` in the same commit**, or its first
+dispatch fails.
+
+That mapping is workflow-controlled on purpose and must never be read from the payload: the
+payload says *which* package was published, and `RELEASE_PIPELINE` says what a publish of it has
+to prove. Taking the workflow path from the dispatch would let whoever sends it nominate the
+workflow that is supposed to vouch for it.
