@@ -1,0 +1,626 @@
+name: import-plugin-release
+
+# The release robot for the ai-tc pin (AGENTS.md, "ai-tc is pinned"): when
+# akasecurity/ai-tc's release workflow announces a publish (repository_dispatch,
+# event type plugin-release), or a maintainer runs it by hand with a version, this
+# workflow re-derives the "Pre-flight before the tag" checklist as code — against the
+# live registry, trusting nothing from the payload — and opens a PR advancing
+# .claude-plugin/marketplace.json's source.version. It only ever opens PRs: the human
+# merge and the signed fleet-v<N+1> tag remain the promotion.
+#
+# What must hold before a PR exists:
+#
+#   dist       — registry-explicit `npm view` of the exact version; when the dispatch
+#                carried shasum/integrity they must match what the registry serves.
+#   provenance — `npm audit signatures` over a scratch install of exactly that
+#                version, then the SLSA attestation must bind the tarball to ai-tc's
+#                own release workflow at that version's own tag, and its attested
+#                sha512 subject must be the integrity the dist read recorded (the two
+#                are independent registry reads; unbound, the PR could advertise
+#                bytes provenance never covered). A cryptographically valid
+#                attestation alone proves only that SOMEONE published with
+#                provenance; the repository/workflow/ref binding carries the security.
+#   direction  — the pin only ever advances: the same version is a no-op, and a lower
+#                one logs and exits green. A rollback is a human act (AGENTS.md: a
+#                rollback is a new tag pinning the lower version), never an import.
+#
+# Sending a repository_dispatch already takes contents:write on THIS repo, but the
+# payload still gets the untrusted-input treatment: shape-validated before first use,
+# referenced only through env (data to the shell, never syntax), and every registry
+# fact re-derived rather than believed.
+#
+# The payload names WHICH package was published, and that is all it decides. It
+# selects the manifest entry to advance (by source.package) and, through
+# RELEASE_PIPELINE below, the release workflow and tag its provenance must bind
+# to — but the binding itself is a workflow-controlled constant, never taken from
+# the payload, or a dispatcher could nominate the workflow that is meant to
+# vouch for it. A package this marketplace does not pin is a green no-op; one it
+# pins but that RELEASE_PIPELINE does not describe is refused.
+
+on:
+  repository_dispatch:
+    types: [plugin-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact x.y.z to import (manual fallback for a missed dispatch)"
+        required: true
+        type: string
+      package:
+        description: "npm package that was published"
+        required: false
+        default: "@akasecurity/ai-tc-claude-code"
+        type: string
+
+# Serialize only what would actually collide: a redelivery of the SAME publish.
+# A concurrency group holds at most one PENDING run, so a group shared by every
+# import means a third dispatch cancels a second one still waiting — and ai-tc cuts
+# every plugin's tag in one wave, so simultaneous dispatches are the normal case,
+# not the race. A cancelled run opens no PR and logs no skip, which would lose a
+# genuine release silently. Keying by package and version leaves distinct imports
+# free to run alongside each other (they touch different bot branches and different
+# pins), while a redelivery still queues behind its own run. Serializing never gave
+# two different versions a different base anyway: main only moves when a human
+# merges, so the second PR is cut from the same commit either way.
+# cancel-in-progress is false so a run is never interrupted between verifying a
+# version and opening its PR.
+concurrency:
+  group: import-plugin-release-${{ github.event.client_payload.package || inputs.package }}@${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    name: verify against the registry, then open the pin PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The job-level GITHUB_TOKEN is all this needs: push the bot branch (contents)
+    # and open the PR (pull-requests). Opening PRs with the built-in token also
+    # requires the repo/org setting "Allow GitHub Actions to create and approve
+    # pull requests" to be on.
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      MANIFEST: .claude-plugin/marketplace.json
+      # What the publish must ATTEST to — a different question from what the registry
+      # serves. integrity/shasum prove the tarball has not been altered; they say
+      # nothing about who built it. This constant names OUR release repository; the
+      # per-package workflow and tag live in RELEASE_PIPELINE in the gate below.
+      PROV_REPO: https://github.com/akasecurity/ai-tc
+      # The dispatch payload (or the manual inputs), env-only from here on.
+      PAYLOAD_PACKAGE: ${{ github.event.client_payload.package || inputs.package }}
+      PAYLOAD_VERSION: ${{ github.event.client_payload.version || inputs.version }}
+      PAYLOAD_SHASUM: ${{ github.event.client_payload.shasum }}
+      PAYLOAD_INTEGRITY: ${{ github.event.client_payload.integrity }}
+    steps:
+      # persist-credentials stays ON (the default, spelled out): this job's whole
+      # point is to push a branch, and the persisted credential is the job-scoped
+      # GITHUB_TOKEN declared above — not a hazard the secret-free fleet checks
+      # need to shed.
+      # ref is the default branch, spelled out: the Actions "Use workflow from"
+      # selector decides what an unpinned checkout gets, so a manual run started
+      # from a feature branch would gate against THAT branch's manifest, commit the
+      # pin on its head, and open a PR whose diff against main carries every
+      # unrelated change on it — under a body asserting only the pin moved.
+      # repository_dispatch always runs on the default branch, so this only
+      # constrains the manual fallback.
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified via the GitHub API).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: true
+          ref: ${{ github.event.repository.default_branch }}
+
+      # Pins the npm the provenance step below depends on: on an older system npm,
+      # `npm audit signatures --json` returns an EMPTY verified set rather than an
+      # error — a shape that reads as "no attestation" and would refuse a perfectly
+      # good release. Known-good on npm 11 (node 24); do not drop this to inherit
+      # whatever the runner image ships, because the failure mode is a false
+      # positive on a supply-chain assert, which is the worst kind.
+      # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (verified via the GitHub API).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      # Everything that can end the run without a PR, decided in one place before a
+      # single network call: package shape and whether it is one we pin, version
+      # shape (pre-releases are never pinned — the pin gate elsewhere requires
+      # exact x.y.z, and so does this repo), already-pinned, and semver direction.
+      # Skips are green with a ::notice, so a duplicate dispatch, an rc publish or
+      # a release of a plugin this marketplace does not carry is a non-event, not
+      # a red run.
+      #
+      # The manifest entry is resolved BY PACKAGE. It used to be looked up by the
+      # literal name "ai-tc" against a hardcoded package, while the version came
+      # from the payload — so a dispatch for any other plugin was not declined, it
+      # was read as an ai-tc release at that plugin's version and advanced the
+      # wrong pin. The packages share a version line, so the wrong version usually
+      # EXISTS and the import verified and opened a PR rather than failing.
+      - name: gate on the package and version (shape, pinned, direction)
+        id: gate
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          # What a publish of each package must ATTEST to. Workflow-controlled and
+          # deliberately not derived from the payload: the payload says which
+          # package was published, this says what a publish of it has to prove.
+          # Taking the workflow path from the dispatch would let a dispatcher
+          # nominate the workflow that is supposed to vouch for it.
+          #
+          # Only packages MANIFEST itself can pin belong here. This workflow reads
+          # and advances that one file, so an entry for a package pinned in another
+          # aggregator would be unreachable config advertising automation that
+          # cannot run. Pinning a new npm package means adding it here in the same
+          # commit — the gate refuses a pinned-but-undescribed package rather than
+          # guessing which pipeline vouches for it.
+          RELEASE_PIPELINE = {
+              "@akasecurity/ai-tc-claude-code": {
+                  "workflow": ".github/workflows/release-plugin-claude.yml",
+                  "tag_prefix": "plugin-claude-v",
+              },
+          }
+
+          # Exact x.y.z, ASCII and canonical. `\d` also matches Arabic-Indic and
+          # fullwidth digits, which int() then parses happily, and leading zeros
+          # sail through npm's own coercion: "0.9.09" would pass this gate AND the
+          # dist read (npm serves 0.9.9's bytes for it) only to fail the provenance
+          # check, whose message reads as a supply-chain alarm.
+          SEMVER = re.compile(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}")
+
+          def pinned_package(plugin):
+              """The npm package a manifest entry pins, or None if it pins none.
+
+              `source` is a bare string for path-sourced plugins, which .get() would
+              raise on — and this runs over every entry in the file, including on
+              the green-no-op path for a package this marketplace does not carry.
+              """
+              source = plugin.get("source")
+              return source.get("package") if isinstance(source, dict) else None
+
+          package = (os.environ.get("PAYLOAD_PACKAGE") or "").strip()
+          version = (os.environ.get("PAYLOAD_VERSION") or "").strip()
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+
+          def skip(msg):
+              print(f"::notice::{msg} — no PR")
+              print("proceed=false", file=out)
+              sys.exit(0)
+
+          # Shape first: everything below indexes a dict or a manifest with it.
+          if not re.fullmatch(r"@[a-z0-9-]+/[a-z0-9._-]+", package):
+              sys.exit(f"FAIL: package {package!r} is not a scoped npm package name")
+          # An ABSENT version is a broken payload contract, not a pre-release, and it
+          # gets the same red treatment as an absent package. Green-skipping it would
+          # read as "an rc publish, nothing to do" while silently disabling every
+          # future import: nothing else in this repo reddens when the pin stops
+          # advancing.
+          if not version:
+              sys.exit("FAIL: the dispatch carried no version. A plugin-release payload must "
+                       "set client_payload.version (a manual run supplies it as an input); a "
+                       "publish that announces no version cannot be imported, and treating "
+                       "that as a skip would silently stop every later import.")
+          if not SEMVER.fullmatch(version):
+              skip(f"version {version!r} is not an exact x.y.z (pre-releases are never pinned)")
+
+          # Which entry this package pins, if any. No entry is a green no-op:
+          # ai-tc releases plugins this marketplace does not carry, and their
+          # doorbell reaching here is not an error, it is nothing to do.
+          doc = json.load(open(os.environ["MANIFEST"]))
+          entry = next((p for p in doc.get("plugins", [])
+                        if pinned_package(p) == package), None)
+          if entry is None:
+              skip(f"{os.environ['MANIFEST']} pins no entry for {package}")
+          name = entry.get("name") or ""
+          if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+              sys.exit(f"FAIL: the entry pinning {package} has an unusable name {name!r} — "
+                       "it names the branch and the commit this run would create")
+
+          # Pinned but undescribed is the one refusal here: we would have to verify
+          # provenance against SOME workflow, and guessing is how a tarball gets
+          # bound to the wrong pipeline.
+          pipeline = RELEASE_PIPELINE.get(package)
+          if pipeline is None:
+              sys.exit(f"FAIL: {os.environ['MANIFEST']} pins {package} but this workflow "
+                       "declares no release pipeline for it, so there is nothing to bind its "
+                       "provenance to. Add it to RELEASE_PIPELINE.")
+
+          current = entry["source"].get("version") or ""
+          if not SEMVER.fullmatch(current):
+              sys.exit(f"FAIL: current pin {current!r} is not an exact x.y.z")
+
+          new, cur = (tuple(map(int, v.split("."))) for v in (version, current))
+          if new == cur:
+              skip(f"{version} is already the pinned version for {package}")
+          if new < cur:
+              skip(f"{version} is lower than the current {package} pin {current} — a rollback "
+                   "is a human act (a new tag pinning the lower version), not an import")
+
+          print("proceed=true", file=out)
+          print(f"package={package}", file=out)
+          print(f"entry={name}", file=out)
+          print(f"version={version}", file=out)
+          print(f"current={current}", file=out)
+          print(f"prov_workflow={pipeline['workflow']}", file=out)
+          print(f"prov_ref=refs/tags/{pipeline['tag_prefix']}{version}", file=out)
+          print(f"importing {package} {version} over the current {name} pin {current}")
+          PY
+
+      # ONE registry round trip for both fields (two `npm view` calls could straddle
+      # a registry change, comparing an integrity from one read against a shasum
+      # from another). Registry-explicit — the scope mapping pinned on the command,
+      # derived from the package being read — so nothing ambient to the runner can
+      # route the read to a registry serving different bytes for the same version.
+      # Registry-derived bytes are read out with json.load and never reach a shell
+      # that could interpret them.
+      - name: registry dist for the exact version, cross-checked against the dispatch
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
+          NPM_VER: ${{ steps.gate.outputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -eu
+          # Derived from the package, not hardcoded to one scope: a pin in another
+          # scope would otherwise carry no mapping at all and fall back to whatever
+          # registry is ambient on the runner — silently, which is the failure this
+          # flag exists to prevent.
+          registry_flag="--${NPM_PKG%%/*}:registry=https://registry.npmjs.org"
+          # The doorbell rings seconds after `npm publish`, so a read replica can
+          # still answer a definitive 404 for a version that genuinely exists. npm's
+          # own fetch retries do not cover a 404, and failing here would send a
+          # maintainer to the manual fallback — the toil this workflow removes.
+          for attempt in 1 2 3 4 5; do
+            if npm view "${NPM_PKG}@${NPM_VER}" dist --json "$registry_flag" > /tmp/dist.json; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "FAIL: the registry did not serve ${NPM_PKG}@${NPM_VER} after 5 attempts"
+              exit 1
+            fi
+            echo "the registry has not served ${NPM_PKG}@${NPM_VER} yet (attempt ${attempt}/5); waiting 20s"
+            sleep 20
+          done
+          python3 - <<'PY'
+          import json, os, sys
+
+          d = json.load(open("/tmp/dist.json"))
+          sha, integ = d.get("shasum", ""), d.get("integrity", "")
+          if not sha or not integ:
+              sys.exit(f"FAIL: the registry returned no dist fields: {d}")
+          for name, got, claimed in (("shasum", sha, os.environ.get("PAYLOAD_SHASUM", "")),
+                                     ("integrity", integ, os.environ.get("PAYLOAD_INTEGRITY", ""))):
+              if claimed and claimed != got:
+                  sys.exit(f"FAIL: dispatched {name} {claimed!r} != registry {name} {got!r} — "
+                           "the payload disagrees with the registry; import nothing")
+          # $GITHUB_ENV is line-oriented; an embedded newline would smuggle extra
+          # variables into every later step.
+          for key, value in (("NPM_SHASUM", sha), ("NPM_INTEGRITY", integ)):
+              if "\n" in value or "\r" in value:
+                  sys.exit(f"FAIL: {key} is not a single-line string: {value!r}")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              print(f"NPM_SHASUM={sha}", file=env)
+              print(f"NPM_INTEGRITY={integ}", file=env)
+          # Whether there was a payload to check against is a question about the
+          # EVENT, not about which fields happened to arrive: labelling a dispatch
+          # that sent no dist fields "manual run" hides a dispatcher that quietly
+          # stopped sending them, and the header's promise that a dispatched shasum
+          # must match the registry would degrade to "matches if one is sent".
+          claimed = bool(os.environ.get("PAYLOAD_SHASUM") or os.environ.get("PAYLOAD_INTEGRITY"))
+          dispatched = os.environ.get("EVENT_NAME") == "repository_dispatch"
+          if claimed:
+              note = " matches the dispatch payload"
+          elif dispatched:
+              print("::warning::this plugin-release dispatch carried no shasum/integrity, so the "
+                    "registry read could not be cross-checked against the payload")
+              note = " — the dispatch carried no dist fields, so NOTHING was cross-checked"
+          else:
+              note = " (manual run: no payload to cross-check)"
+          print(f"OK: registry dist read for {os.environ['NPM_PKG']}@{os.environ['NPM_VER']}" + note)
+          PY
+
+      # The half that would notice a stolen publish token: integrity/shasum only
+      # drift if the RECORDED version's bytes change, whereas an attacker publishes
+      # a NEW version — the binding below is what refuses it. --ignore-scripts: the
+      # package is installed solely so npm can verify it; nothing here needs its
+      # code to have run.
+      - name: provenance binds the tarball to ai-tc's release workflow
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
+          NPM_VER: ${{ steps.gate.outputs.version }}
+          PROV_WORKFLOW: ${{ steps.gate.outputs.prov_workflow }}
+          PROV_REF: ${{ steps.gate.outputs.prov_ref }}
+        run: |
+          set -eu
+          registry_flag="--${NPM_PKG%%/*}:registry=https://registry.npmjs.org"
+          work=$(mktemp -d)
+          verifier="$work/verify-attestation.py"
+
+          # The verdict itself, written out once and re-run after each attempt below.
+          # It exits 75 (EX_TEMPFAIL) for the one verdict a retry can change — "no
+          # attestation THERE YET" — and 1 for every verdict that will not.
+          cat > "$verifier" <<'PY'
+          import base64, json, os, sys
+
+          SLSA = "https://slsa.dev/provenance/v1"
+          NOT_INDEXED_YET = 75
+
+          pkg, ver = os.environ["NPM_PKG"], os.environ["NPM_VER"]
+          want = {"repository": os.environ["PROV_REPO"],
+                  "path": os.environ["PROV_WORKFLOW"],
+                  "ref": os.environ["PROV_REF"]}
+
+          d = json.load(open(sys.argv[1]))
+          if d.get("invalid"):
+              sys.exit(f"FAIL: npm reports INVALID signatures/attestations: {d['invalid']}")
+          entry = next((v for v in d.get("verified", [])
+                        if v.get("name") == pkg and v.get("version") == ver), None)
+          if entry is None:
+              print(f"FAIL: {pkg}@{ver} carries no VERIFIED attestation (npm 'missing': "
+                    f"{d.get('missing')}). Every release of this package is published by "
+                    "GitHub Actions with provenance, so one without it did not come from "
+                    "the release pipeline — unless the registry has not finished indexing "
+                    "it, which is why this verdict is retried before it stands.",
+                    file=sys.stderr)
+              sys.exit(NOT_INDEXED_YET)
+          bundles = [b for b in entry.get("attestationBundles", [])
+                     if b.get("predicateType") == SLSA]
+          if not bundles:
+              sys.exit(f"FAIL: {pkg}@{ver} has no {SLSA} attestation; got "
+                       f"{[b.get('predicateType') for b in entry.get('attestationBundles', [])]}")
+
+          payload = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
+          pred = payload.get("predicate", {})
+          got = pred.get("buildDefinition", {}).get("externalParameters", {}).get("workflow", {})
+          builder = pred.get("runDetails", {}).get("builder", {}).get("id", "")
+
+          # The attestation has to cover the SAME tarball the dist step read. npm
+          # binds it to the bytes IT resolved, so these are two independent registry
+          # reads: without this comparison they could straddle a change, and the PR
+          # body would advertise — and step 3 would write into the fleet's integrity
+          # record — bytes that provenance never vouched for.
+          integrity = os.environ.get("NPM_INTEGRITY", "")
+          if not integrity.startswith("sha512-"):
+              sys.exit(f"FAIL: the dist read recorded no sha512 integrity to bind "
+                       f"against: {integrity!r}")
+          dist_sha512 = base64.b64decode(integrity.split("-", 1)[1]).hex()
+          attested = {(s.get("digest") or {}).get("sha512", "")
+                      for s in payload.get("subject", [])}
+          if dist_sha512 not in attested:
+              sys.exit("FAIL: the attestation covers a different tarball than the dist read: "
+                       f"attested sha512 {sorted(attested)} does not include {dist_sha512} "
+                       f"({integrity}). The two registry reads disagree about the bytes; "
+                       "import nothing.")
+
+          bad = [f"{k}: attested {got.get(k)!r} != required {v!r}"
+                 for k, v in want.items() if got.get(k) != v]
+          if "github-hosted" not in builder:
+              bad.append(f"builder {builder!r} is not a github-hosted runner")
+          if bad:
+              # An off-tag publish from our OWN repository and workflow is a different
+              # event from a tarball built somewhere else. Both are refused — this
+              # import binds a release to its own tag — but "anyone can publish with
+              # provenance" would send the reader hunting a stolen token that is not
+              # there.
+              if (got.get("repository") == want["repository"]
+                      and got.get("path") == want["path"]
+                      and str(got.get("ref", "")).startswith("refs/heads/")):
+                  sys.exit(f"FAIL: {pkg}@{ver} was published by {want['repository']} :: "
+                           f"{want['path']} from {got.get('ref')!r}, not from its tag "
+                           f"{want['ref']!r}. A manual run of the release workflow "
+                           "(publish=true) publishes off-tag, and an attestation is immutable, "
+                           "so this version can never satisfy the tag binding: re-release it "
+                           "from its tag, or advance the pin by hand. This is NOT a "
+                           "stolen-token signal.")
+              sys.exit("FAIL: the attestation does not bind this tarball to ai-tc's release "
+                       "workflow:\n  - " + "\n  - ".join(bad) + "\n  A cryptographically valid "
+                       "attestation is NOT sufficient — anyone can publish with provenance from "
+                       "their own repository.")
+          print(f"OK: {pkg}@{ver} attested by {got['repository']} :: {got['path']} @ "
+                f"{got['ref']}, covering the exact tarball the dist read recorded ({integrity})")
+          PY
+
+          if ! ( cd "$work" && npm init -y >/dev/null 2>&1 ); then
+            echo "FAIL(toolchain): could not create the scratch package on this runner."
+            echo "This is a runner/npm problem, NOT a signature or attestation result."
+            exit 1
+          fi
+          echo "toolchain: node $(node -v) / npm $(npm -v)"
+
+          # Install, audit and verdict are reported apart, because a failure of the
+          # first two is a toolchain problem and reporting it as "could not verify the
+          # signature or attestation" is exactly the confusion this step's diagnostics
+          # exist to prevent. Attestation indexing also lags publish, and a
+          # not-yet-indexed attestation is indistinguishable from an absent one in the
+          # JSON — so that verdict is retried, and only becomes the supply-chain
+          # refusal it reads as once the window closes.
+          for attempt in 1 2 3 4 5; do
+            if ! ( cd "$work" && npm install --ignore-scripts --no-audit --no-fund \
+                     "$registry_flag" "$NPM_PKG@$NPM_VER" >/dev/null 2>"$work/install.err" ); then
+              if [ "$attempt" -eq 5 ]; then
+                echo "FAIL(toolchain): npm could not install $NPM_PKG@$NPM_VER after 5 attempts."
+                echo "This is a registry/network problem, NOT a signature or attestation result:"
+                head -c 2000 "$work/install.err" || true
+                exit 1
+              fi
+              echo "the install did not land (attempt ${attempt}/5); waiting 20s"
+              sleep 20
+              continue
+            fi
+
+            ( cd "$work" && npm audit signatures --json --include-attestations > sig.json ) || true
+            if [ ! -s "$work/sig.json" ]; then
+              if [ "$attempt" -eq 5 ]; then
+                echo "FAIL(toolchain): npm audit signatures produced no output after 5 attempts."
+                echo "This is a runner/npm problem, NOT a signature or attestation result."
+                exit 1
+              fi
+              echo "npm audit signatures produced no output (attempt ${attempt}/5); waiting 20s"
+              sleep 20
+              continue
+            fi
+
+            set +e
+            python3 "$verifier" "$work/sig.json"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$rc" -eq 75 ] && [ "$attempt" -lt 5 ]; then
+              echo "the attestation for $NPM_PKG@$NPM_VER is not indexed yet (attempt ${attempt}/5); waiting 20s"
+              sleep 20
+              continue
+            fi
+            # A standing verdict: either a real supply-chain signal or a toolchain
+            # problem, and the two must never be confused. Dump enough to tell them
+            # apart.
+            echo "--- diagnostics ---"
+            echo "node $(node -v) / npm $(npm -v)"
+            ls -d "$work/node_modules/$NPM_PKG" 2>/dev/null || echo "package NOT in node_modules — install did not land"
+            echo "--- raw npm audit output ---"
+            head -c 3000 "$work/sig.json"
+            exit 1
+          done
+
+      # Byte-stability is proven, not assumed: the parsed document must serialize
+      # back to the file's exact bytes BEFORE the edit, so the rewrite can only ever
+      # change the one version string. If the file's formatting ever drifts from
+      # json.dumps(indent=2), refuse to rewrite it wholesale.
+      - name: advance the pin (byte-stable), and prove it advanced
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
+          NPM_VER: ${{ steps.gate.outputs.version }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, sys
+
+          # `source` is a bare string for path-sourced plugins; .get() would raise on
+          # one of those before ever reaching the entry this run is here to advance.
+          def pinned_package(plugin):
+              source = plugin.get("source")
+              return source.get("package") if isinstance(source, dict) else None
+
+          path, version = os.environ["MANIFEST"], os.environ["NPM_VER"]
+          package = os.environ["NPM_PKG"]
+          raw = open(path, "rb").read().decode()
+          doc = json.loads(raw)
+          if json.dumps(doc, indent=2, ensure_ascii=False) + "\n" != raw:
+              sys.exit(f"FAIL: {path} does not round-trip through json.dumps(indent=2) — "
+                       "rewriting it would churn unrelated bytes; move the pin by hand")
+          entry = next(p for p in doc["plugins"] if pinned_package(p) == package)
+          old = entry["source"]["version"]
+          entry["source"]["version"] = version
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+          reparsed = next(p for p in json.load(open(path))["plugins"]
+                          if pinned_package(p) == package)["source"]["version"]
+          if reparsed != version or reparsed == old:
+              sys.exit(f"FAIL: the pin did not advance: old={old!r} new={reparsed!r} "
+                       f"wanted={version!r}")
+          print(f"OK: {path} {package} pin {old} -> {reparsed}, and the result still parses")
+          PY
+          # The charter's own pre-push gate (AGENTS.md, "Workflow"), verbatim.
+          jq empty "$MANIFEST" && echo "ok $MANIFEST"
+
+      - name: open the pin PR
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          NPM_PKG: ${{ steps.gate.outputs.package }}
+          ENTRY: ${{ steps.gate.outputs.entry }}
+          NPM_VER: ${{ steps.gate.outputs.version }}
+          CURRENT: ${{ steps.gate.outputs.current }}
+          PROV_WORKFLOW: ${{ steps.gate.outputs.prov_workflow }}
+          PROV_REF: ${{ steps.gate.outputs.prov_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          branch="bot/pin-${ENTRY}-${NPM_VER}"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "$MANIFEST"
+          git commit -m "feat: advance the ${ENTRY} pin to ${NPM_VER}"
+          # The branch is bot-owned by construction (bot/pin-<entry>-<version>), so a
+          # re-run for the same version may overwrite its own earlier attempt.
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          # Ask for OUR branch on this base, explicitly. `gh pr list --head` matches a
+          # head ref NAME in any repository, forks included, so on a public repo
+          # anyone could open a bot/pin-<entry>-<version> PR and this check would read
+          # it as the bot's own work and open nothing. And a FAILED query must not
+          # read as "already open" either: the exit status of a command substitution
+          # inside `[ ]` is discarded, so an API hiccup would have taken the
+          # already-open branch and ended the run green with no PR at all.
+          if ! open_prs=$(gh api "repos/${GITHUB_REPOSITORY}/pulls" -X GET \
+                            -f state=open -f base=main -f "head=${owner}:${branch}" \
+                            --jq 'length'); then
+            echo "FAIL: could not determine whether a PR for ${branch} is already open;"
+            echo "the branch is pushed, so re-run this workflow once the API is answering."
+            exit 1
+          fi
+          if [ "$open_prs" != "0" ]; then
+            echo "::notice::a PR for ${branch} is already open — branch updated, not opening another"
+            exit 0
+          fi
+
+          # The body is built by python from env — markdown backticks and shell
+          # heredoc expansion are a bad mix.
+          python3 - > /tmp/pr-body.md <<'PY'
+          import os
+
+          e = os.environ
+          run_url = f"{e['GITHUB_SERVER_URL']}/{e['GITHUB_REPOSITORY']}/actions/runs/{e['GITHUB_RUN_ID']}"
+          print(f"""Advances the `{e['ENTRY']}` pin in `.claude-plugin/marketplace.json`: `{e['CURRENT']}` -> `{e['NPM_VER']}`.
+
+          Opened by [import-plugin-release]({run_url}), which re-derived the pre-flight from the live registry before touching the pin — nothing was taken from the dispatch payload on trust.
+
+          Verified against `https://registry.npmjs.org`:
+
+          - package: `{e['NPM_PKG']}@{e['NPM_VER']}`
+          - shasum: `{e['NPM_SHASUM']}`
+          - integrity: `{e['NPM_INTEGRITY']}`
+          - provenance: the SLSA attestation binds the tarball to `{e['PROV_REPO']}` :: `{e['PROV_WORKFLOW']}` @ `{e['PROV_REF']}` (`npm audit signatures` over a scratch `--ignore-scripts` install of exactly this version, on a github-hosted builder), and its attested sha512 subject is the integrity recorded above — the attestation covers the same bytes this read saw, not merely some tarball of the same version
+
+          Merging is the human half of the promotion, and on its own it moves `main` installers only. Managed fleets move when a maintainer signs the next tag and the fleet configuration advances (AGENTS.md, "ai-tc is pinned; `fleet-v<N>` tags"):
+
+          1. merge this PR;
+          2. `git tag -s fleet-v<N+1> -m '<why>'` at the merge commit, `git push origin fleet-v<N+1>`;
+          3. advance the fleet configuration's recorded commit, template ref, and integrity record for `{e['NPM_VER']}` together.""")
+          PY
+          gh pr create --base main --head "$branch" \
+            --title "feat: advance the ${ENTRY} pin to ${NPM_VER}" \
+            --body-file /tmp/pr-body.md
+
+          # Close the pin PRs this one supersedes. Every bot/pin-<entry>-* PR edits
+          # the same source.version line from the same base, so once a newer one
+          # exists the older ones can only conflict — and merging a stale one would
+          # walk the pin backwards. Only LOWER versions are closed: two imports can
+          # now run alongside each other, so a higher one may legitimately be open.
+          # Failing to close is a warning, never a reason to fail an import that is
+          # already open.
+          export REPO_OWNER="$owner" BRANCH_PREFIX="bot/pin-${ENTRY}-" BRANCH="$branch"
+          superseded=$(gh pr list --state open --base main --limit 100 \
+            --json number,headRefName,headRepositoryOwner \
+            --jq '.[] | select(.headRepositoryOwner.login == env.REPO_OWNER)
+                      | select(.headRefName | startswith(env.BRANCH_PREFIX))
+                      | select(.headRefName != env.BRANCH)
+                      | "\(.number) \(.headRefName)"') || {
+            echo "::warning::could not list open pin PRs to supersede; older ones may still be open"
+            superseded=""
+          }
+          printf '%s\n' "$superseded" | while read -r number ref; do
+            [ -n "${number:-}" ] || continue
+            other="${ref#bot/pin-"${ENTRY}"-}"
+            [ "$other" != "${NPM_VER}" ] || continue
+            [ "$(printf '%s\n%s\n' "$other" "${NPM_VER}" | sort -V | head -1)" = "$other" ] || continue
+            gh pr close "$number" --comment "Superseded by the ${ENTRY} pin advance to \`${NPM_VER}\`. This PR moves the same \`source.version\` line from the same base, so it can now only conflict; a rollback to \`${other}\` would be a new tag pinning the lower version, not this PR." \
+              || echo "::warning::could not close superseded PR #${number}"
+          done
