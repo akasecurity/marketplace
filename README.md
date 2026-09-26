@@ -12,7 +12,7 @@ From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its 
 
 | Tool | What it does | Install handle | Status |
 |---|---|---|---|
-| **preflight** | An independent multi-model review crew for coding agents — two blind cross-family reads plus an independent judge that filters false positives. Report-only. | `preflight@akasecurity` | ✅ available |
+| **preflight** | An independent multi-model review crew for coding agents — two blind cross-family reads plus an independent judge that filters false positives, report-only. Plus `secure-research`: cited web research spread across several search engines. | `preflight@akasecurity` | ✅ available |
 | **claude-tools** | The security defaults Claude Code doesn't ship with — guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. | `claude-tools@akasecurity` | ✅ available |
 | **ai-tc** — AI Traffic Control | An open-source control plane for coding agents — intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then monitors, warns, redacts, or blocks before anything reaches the model. Runs entirely locally. | `ai-tc@akasecurity` | ✅ available |
 
