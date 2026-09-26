@@ -9,7 +9,7 @@
       "category": "Developer Tools",
       "status": "available",
       "harnesses": ["claude", "codex", "cursor", "gemini", "kimi", "opencode", "pi"],
-      "description": "An independent multi-model review crew for coding agents: two blind cross-family reads plus an independent judge that filters false positives — report-only."
+      "description": "An independent multi-model review crew for coding agents (two blind cross-family reads plus an independent judge that filters false positives, report-only), plus secure-research: cited web research spread across several search engines."
     },
     {
       "name": "claude-tools",
