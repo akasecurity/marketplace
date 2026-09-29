@@ -549,3 +549,84 @@ class TestClassifyMigrations(unittest.TestCase):
     def test_a_journal_tag_that_is_not_a_migration_name_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + ("../../x",), {}))
+
+
+def fake_verify(version):
+    return rc.VerifiedRelease(version, ts.INTEGRITY, ts.SHASUM, ts.ATTESTED[version], ts.RUN_URL)
+
+
+class TestSafetyEntry(unittest.TestCase):
+    def test_computed_from_the_highest_pinned_version_below(self):
+        calls = []
+
+        def classify(start, end):
+            calls.append((start, end))
+            return rc.Classification("not-rollback-safe", ["0029_migration"])
+
+        entry = rc.safety_entry("0.9.12", {"0.9.9", "0.9.10", "0.9.14"}, verify=fake_verify, classify=classify)
+        self.assertEqual(calls, [(ts.ATTESTED["0.9.10"], ts.ATTESTED["0.9.12"])])
+        self.assertEqual(list(entry), ["classification", "from", "to", "migrations"])
+        self.assertEqual(
+            entry,
+            {
+                "classification": "not-rollback-safe",
+                "from": ts.ATTESTED["0.9.10"],
+                "to": ts.ATTESTED["0.9.12"],
+                "migrations": ["0029_migration"],
+            },
+        )
+
+    def test_nothing_pinned_below_is_refused(self):
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.safety_entry("0.9.8", {"0.9.9"}, verify=fake_verify, classify=lambda a, b: None)
+
+
+class TestRollbackFloor(unittest.TestCase):
+    SAFETY = {"versions": copy.deepcopy(ts.SEED)}
+
+    def test_the_seed_refuses_a_rollback_from_0_9_14_to_0_9_13(self):
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.13", "0.9.14"), "0.9.14")
+
+    def test_the_lowest_flagged_version_in_range_is_the_floor(self):
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.8", "0.9.14"), "0.9.9")
+
+    def test_additive_versions_set_no_floor(self):
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}, "0.9.12", "0.9.13"))
+
+    def test_the_target_itself_is_never_the_floor(self):
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.12": dict(ts.SEED["0.9.12"])}}, "0.9.12", "0.9.13"))
+
+    def test_a_flag_above_the_highest_pinned_version_is_ignored(self):
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.15": dict(ts.SEED["0.9.14"])}}, "0.9.13", "0.9.14"))
+
+    def test_a_malformed_or_missing_entry_counts_as_flagged(self):
+        self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": "additive"}}, "0.9.13", "0.9.14"), "0.9.14")
+        # A pinned version with no entry at all (a break-glass pin, a restore) is flagged too.
+        additive = {"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}
+        pinned = {"0.9.12", "0.9.13", "0.9.14"}
+        self.assertEqual(rc.rollback_floor(additive, "0.9.12", "0.9.14", pinned=pinned), "0.9.14")
+        self.assertIsNone(rc.rollback_floor(additive, "0.9.12", "0.9.13", pinned=pinned))
+
+    def test_a_malformed_file_is_refused(self):
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
+
+
+class TestSafetyProblems(unittest.TestCase):
+    def test_the_seed_is_well_formed(self):
+        self.assertEqual(rc.safety_problems({"versions": ts.SEED}), [])
+
+    def test_each_malformation_is_named(self):
+        good = dict(ts.SEED["0.9.14"])
+        cases = {
+            "shape": {"versions": []},
+            "extra top-level key": {"versions": {}, "notes": "x"},
+            "version": {"versions": {"0.9": good}},
+            "key order": {"versions": {"0.9.14": {k: good[k] for k in ("from", "classification", "to", "migrations")}}},
+            "classification": {"versions": {"0.9.14": {**good, "classification": "safe"}}},
+            "commit": {"versions": {"0.9.14": {**good, "from": "abc"}}},
+            "migration": {"versions": {"0.9.14": {**good, "migrations": ["../x"]}}},
+        }
+        for name, doc in cases.items():
+            with self.subTest(name):
+                self.assertNotEqual(rc.safety_problems(doc), [])

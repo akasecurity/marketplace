@@ -639,3 +639,63 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
         )
     flagged = any(kind != "additive" for kind in kinds.values())
     return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
+
+
+SAFETY_KEYS = ["classification", "from", "to", "migrations"]
+
+
+def safety_problems(doc) -> list:
+    """What is wrong with a rollback-safety.json document (empty = well formed)."""
+    if not isinstance(doc, dict) or list(doc) != ["versions"] or not isinstance(doc["versions"], dict):
+        return [f'{SAFETY_FILE} must be exactly {{"versions": {{...}}}}']
+    problems = []
+    for version, entry in doc["versions"].items():
+        where = f"{SAFETY_FILE} {version!r}"
+        if not SEMVER.fullmatch(version):
+            problems.append(f"{where}: not an exact x.y.z")
+            continue
+        if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
+            problems.append(f"{where}: keys must be exactly {SAFETY_KEYS}, in that order")
+            continue
+        if entry["classification"] not in ("additive", "not-rollback-safe"):
+            problems.append(f"{where}: classification must be additive or not-rollback-safe")
+        for key in ("from", "to"):
+            if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
+                problems.append(f"{where}: {key} must be a 40-hex commit id")
+        migrations = entry["migrations"]
+        if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
+            problems.append(f"{where}: migrations must be a list of migration tags")
+    return problems
+
+
+def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=classify_migrations) -> dict:
+    """The rollback-safety.json entry for version: its migrations since the highest pinned
+    version below it, classified, with the two attested commits."""
+    below = [p for p in pinned if vkey(p) < vkey(version)]
+    if not below:
+        raise ReleaseCheckError("safety", f"no pinned version is below {version} to compute its migrations from")
+    start = verify(max(below, key=vkey)).git_commit
+    end = verify(version).git_commit
+    result = classify(start, end)
+    return {"classification": result.classification, "from": start, "to": end, "migrations": list(result.migrations)}
+
+
+def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
+    """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
+    or None. Anything but an explicit "additive" entry counts as flagged, and so does a
+    version in `pinned` with no entry at all: a pin that reached main without a computed
+    entry (a break-glass merge, a restore, a hand-run import) is no evidence of safety."""
+    versions = safety.get("versions") if isinstance(safety, dict) else None
+    if not isinstance(versions, dict):
+        raise ReleaseCheckError("safety", f'{SAFETY_FILE} must be {{"versions": {{...}}}}')
+    low, high = vkey(target), vkey(highest_pinned)
+    candidates = set(versions) | {v for v in pinned if isinstance(v, str)}
+    flagged = [
+        version
+        for version in candidates
+        if isinstance(version, str)
+        and SEMVER.fullmatch(version)
+        and low < vkey(version) <= high
+        and not (isinstance(versions.get(version), dict) and versions[version].get("classification") == "additive")
+    ]
+    return min(flagged, key=vkey) if flagged else None
