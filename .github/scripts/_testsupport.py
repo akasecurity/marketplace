@@ -208,20 +208,35 @@ def dist_url(version):
     return f"{rc.packument_url()}/{version}"
 
 
-def compare_url(commit):
-    return f"{rc.AI_TC_API}/compare/{commit}...main?per_page=1"
+# The commit ai-tc's main branch points at in the fakes. Not any release's attested commit.
+MAIN_SHA = "e" * 40
+
+
+def main_ref_url():
+    return f"{rc.AI_TC_API}/git/ref/heads/main"
+
+
+def main_ref_body(sha=MAIN_SHA):
+    """What GET git/ref/heads/main answers."""
+    return {"ref": "refs/heads/main", "object": {"sha": sha, "type": "commit"}}
+
+
+def compare_url(commit, main_sha=MAIN_SHA):
+    return f"{rc.AI_TC_API}/compare/{commit}...{main_sha}?per_page=1"
 
 
 def contents_url(path, commit):
     return f"{rc.AI_TC_API}/contents/{path}?ref={commit}"
 
 
-def release_routes(version, *, compare="ahead", commit=None, integrity=INTEGRITY):
-    """The registry and GitHub answers for a release that passes every check."""
+def release_routes(version, *, compare="ahead", commit=None, integrity=INTEGRITY, main_sha=MAIN_SHA):
+    """The registry and GitHub answers for a release that passes every check: main's head
+    read, then the comparison against the sha that read returned."""
     commit = commit or ATTESTED.get(version, "c" * 40)
     return {
         dist_url(version): (200, {"version": version, "dist": {"integrity": integrity, "shasum": SHASUM}}),
-        compare_url(commit): (200, {"status": compare, "ahead_by": 1, "behind_by": 0}),
+        main_ref_url(): (200, main_ref_body(main_sha)),
+        compare_url(commit, main_sha): (200, {"status": compare, "ahead_by": 1, "behind_by": 0}),
     }
 
 

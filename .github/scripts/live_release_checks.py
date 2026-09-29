@@ -22,7 +22,8 @@ class TestLiveRelease(unittest.TestCase):
         self.assertEqual(rc.commit_on_ai_tc_main(ts.ATTESTED["0.9.14"]), "ahead")
 
     def test_the_reverse_comparison_is_behind(self):
-        status, body = rc.http_fetch(f"{rc.AI_TC_API}/compare/main...{ts.ATTESTED['0.9.14']}?per_page=1", {})
+        head = rc.ai_tc_main_head()
+        status, body = rc.http_fetch(f"{rc.AI_TC_API}/compare/{head}...{ts.ATTESTED['0.9.14']}?per_page=1", {})
         self.assertEqual((status, json.loads(body)["status"]), (200, "behind"))
 
     def test_0_9_14_verifies_end_to_end(self):

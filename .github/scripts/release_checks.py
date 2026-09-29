@@ -532,10 +532,36 @@ def release_run_url(statement: dict) -> str:
     return url
 
 
+def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
+    """The commit ai-tc's main branch points at, read by the fully qualified ref. The short
+    name `main` is ambiguous where a tag of that name exists, and ai-tc forbids no such tag,
+    so nothing here compares against the name. A failed or malformed read is no verdict."""
+    url = f"{AI_TC_API}/git/ref/heads/main"
+    status, body = fetch(url, {})
+    if status != 200:
+        raise InfraError("commit-on-main", f"GET {url} answered {status}")
+    try:
+        ref = json.loads(body)
+    except ValueError as exc:
+        raise InfraError("commit-on-main", f"GET {url} answered non-JSON: {exc}") from exc
+    obj = ref.get("object") if isinstance(ref, dict) else None
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (
+        not isinstance(ref, dict)
+        or ref.get("ref") != "refs/heads/main"
+        or not isinstance(sha, str)
+        or not SHA40.fullmatch(sha)
+    ):
+        raise InfraError("commit-on-main", f"GET {url} answered a body that names no commit for refs/heads/main")
+    return sha
+
+
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
-    """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main. Refuses
-    behind (built on main's tip, never merged), diverged, 404 and every error."""
-    url = f"{AI_TC_API}/compare/{git_commit}...main?per_page=1"
+    """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
+    against main's head as resolved from its full ref. Refuses behind (built on main's tip,
+    never merged), diverged, 404 and every error."""
+    head = ai_tc_main_head(fetch=fetch)
+    url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
     if status in (404, 422):
         raise ReleaseCheckError("commit-on-main", f"GitHub cannot compare {git_commit} with ai-tc main ({status})")
@@ -545,7 +571,7 @@ def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
     if result not in ("ahead", "identical"):
         raise ReleaseCheckError(
             "commit-on-main",
-            f"compare {git_commit}...main is {result!r}: the attested commit is not on ai-tc main",
+            f"compare {git_commit}...{head} is {result!r}: the attested commit is not on ai-tc main",
         )
     return result
 
