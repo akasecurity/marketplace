@@ -187,3 +187,69 @@ def vkey(version: str) -> tuple:
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z")
     return tuple(int(part) for part in version.split("."))
+
+
+def _git(repo_dir: str, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, *args], check=True, capture_output=True, text=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", "") or str(exc)
+        raise InfraError("git", f"git {' '.join(args)} failed: {detail.strip()[:500]}") from exc
+    return result.stdout
+
+
+def main_ref(repo_dir: str) -> str:
+    """origin/main when the checkout has it (fresh in CI), else a local main (a test repo)."""
+    for ref in ("refs/remotes/origin/main", "refs/heads/main"):
+        probe = subprocess.run(
+            ["git", "-C", repo_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            return ref
+    raise InfraError("git", f"{repo_dir} has neither refs/remotes/origin/main nor refs/heads/main")
+
+
+def fleet_tags(repo_dir: str) -> list:
+    """Every fleet-v<N> tag, in numeric order."""
+    names = _git(repo_dir, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags/fleet-v*").split()
+    return sorted((n for n in names if FLEET_TAG.fullmatch(n)), key=lambda n: int(n[len("fleet-v"):]))
+
+
+def _read_manifest(repo_dir: str, rev: str):
+    return parse_json(_git(repo_dir, "show", f"{rev}:{MANIFEST}"))
+
+
+def _tag_pin(repo_dir: str, tag: str) -> str | None:
+    """What a historical tag pins. Lenient: an unreadable or unpinned tag pins nothing."""
+    try:
+        doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
+        pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
+    except (ReleaseCheckError, ValueError):
+        return None
+    return entry_version(pins[0]) if len(pins) == 1 else None
+
+
+def pins_by_ref(repo_dir: str) -> dict:
+    """{"main": <pin>, "fleet-v1": <pin>, ...}. Strict for main, lenient for history."""
+    try:
+        main_doc = _read_manifest(repo_dir, main_ref(repo_dir))
+    except ValueError as exc:
+        raise ReleaseCheckError("manifest", f"main's {MANIFEST} does not parse: {exc}") from exc
+    pins = {"main": entry_version(find_ai_tc_entry(main_doc))}
+    for tag in fleet_tags(repo_dir):
+        pins[tag] = _tag_pin(repo_dir, tag)
+    return pins
+
+
+def pinned_versions(repo_dir: str) -> set:
+    """Every exact version main or any fleet-v tag pins."""
+    return {v for v in pins_by_ref(repo_dir).values() if v}
+
+
+def tag_pinned_versions(repo_dir: str) -> set:
+    """Every exact version some fleet-v tag pins: the only rollback targets."""
+    return {v for ref, v in pins_by_ref(repo_dir).items() if ref != "main" and v}

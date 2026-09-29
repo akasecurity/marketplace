@@ -97,3 +97,56 @@ class TestSelectEntry(unittest.TestCase):
         self.assertLess(rc.vkey("0.9.9"), rc.vkey("0.9.10"))
         with self.assertRaises(rc.ReleaseCheckError):
             rc.vkey("latest")
+
+
+class TestPinnedVersions(unittest.TestCase):
+    def setUp(self):
+        self.repo = ts.Repo(self)
+        unpinned = ts.manifest()
+        del ts.ai_tc(unpinned)["source"]["version"]
+        self.repo.commit(unpinned)
+        self.repo.tag("fleet-v1")
+        self.repo.commit(ts.manifest("0.9.6"))
+        self.repo.tag("fleet-v2")
+        self.repo.commit(ts.manifest("0.9.11"))  # pinned on main once, never tagged
+        self.repo.commit(ts.manifest("0.9.12"))
+        self.repo.tag("fleet-v10")  # numeric order, not text order
+        self.repo.commit(ts.manifest("0.9.13"))
+        self.repo.tag("release-1")  # not a fleet tag: ignored here
+        self.repo.commit(ts.manifest("0.9.14"))
+
+    def test_main_and_every_fleet_tag(self):
+        self.assertEqual(rc.pinned_versions(self.repo.path), {"0.9.6", "0.9.12", "0.9.14"})
+
+    def test_pins_by_ref_names_each_ref_in_numeric_tag_order(self):
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [("main", "0.9.14"), ("fleet-v1", None), ("fleet-v2", "0.9.6"), ("fleet-v10", "0.9.12")],
+        )
+
+    def test_tag_pinned_versions_leave_out_main(self):
+        self.assertEqual(rc.tag_pinned_versions(self.repo.path), {"0.9.6", "0.9.12"})
+
+    def test_origin_main_wins_over_a_stale_local_main(self):
+        older = ts.git(self.repo.path, "rev-parse", "HEAD~1").strip()
+        ts.git(self.repo.path, "update-ref", "refs/remotes/origin/main", older)
+        self.assertEqual(rc.main_ref(self.repo.path), "refs/remotes/origin/main")
+        self.assertEqual(rc.pins_by_ref(self.repo.path)["main"], "0.9.13")
+
+    def test_main_without_the_entry_pins_nothing(self):
+        doc = ts.manifest()
+        del doc["plugins"][2]
+        self.repo.commit(doc)
+        self.assertIsNone(rc.pins_by_ref(self.repo.path)["main"])
+
+    def test_an_ambiguous_main_is_refused(self):
+        doc = ts.manifest()
+        doc["plugins"].append(copy.deepcopy(doc["plugins"][2]))
+        self.repo.commit(doc)
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.pinned_versions(self.repo.path)
+
+    def test_a_repository_without_main_is_infrastructure(self):
+        ts.git(self.repo.path, "branch", "-m", "main", "trunk")
+        with self.assertRaises(rc.InfraError):
+            rc.pinned_versions(self.repo.path)
