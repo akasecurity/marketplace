@@ -767,3 +767,224 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     if "metadata" in base and not _integrity_only(base["metadata"]):
         return "human"
     return "advance" if vkey(new) > vkey(old) else "rollback"
+
+
+# The rulesets this repository must carry: name -> (target, rule types). Bypass lists are
+# visible only to admins, so they are proven by probe when the rulesets are created.
+EXPECTED_RULESETS = {
+    "main": ("branch", {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}),
+    "tags-locked": ("tag", {"creation", "update", "deletion"}),
+    "fleet-tags-create": ("tag", {"creation"}),
+    "fleet-tags-immutable": ("tag", {"update", "deletion", "non_fast_forward"}),
+    "bot-branches": ("branch", {"creation", "update", "deletion"}),
+    "x4-branches": ("branch", {"creation", "update", "deletion"}),
+    "x4-tags": ("tag", {"creation", "update", "deletion"}),
+}
+
+# name -> (the accepted conditions.ref_name include lists, the exclude list). A ruleset
+# retargeted away from its refs keeps rules that still read correctly while it protects
+# nothing, so the patterns are audited too. main is named, never ~DEFAULT_BRANCH: a
+# default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
+# `/`), so bot-branches lists both depths, and tags-locked is ~ALL or, where GitHub refuses
+# ~ALL on a tag ruleset, the two tag globs that cover the same refs.
+EXPECTED_REF_PATTERNS = {
+    "main": ([["refs/heads/main"]], []),
+    "tags-locked": ([["~ALL"], ["refs/tags/*", "refs/tags/**/*"]], ["refs/tags/fleet-v*"]),
+    "fleet-tags-create": ([["refs/tags/fleet-v*"]], []),
+    "fleet-tags-immutable": ([["refs/tags/fleet-v*"]], []),
+    "bot-branches": ([["refs/heads/bot/*", "refs/heads/bot/**/*"]], []),
+    "x4-branches": ([["refs/heads/x4/*"]], []),
+    "x4-tags": ([["refs/tags/x4/*"]], []),
+}
+
+
+def snapshot_tags(repo_dir: str) -> list:
+    """[{tag, object, commit}] for every fleet-v tag: the frozen list's shape."""
+    return [
+        {
+            "tag": tag,
+            "object": _git(repo_dir, "rev-parse", f"refs/tags/{tag}").strip(),
+            "commit": _git(repo_dir, "rev-parse", f"refs/tags/{tag}^{{commit}}").strip(),
+        }
+        for tag in fleet_tags(repo_dir)
+    ]
+
+
+def parse_tag_message(text: str) -> dict:
+    """A fleet-v tag message: the subject line, then `key: value` lines (the first one wins)."""
+    lines = text.splitlines()
+    fields = {"subject": lines[0].strip() if lines else ""}
+    for line in lines[1:]:
+        match = re.fullmatch(r"([a-z][a-z-]*): (.+)", line.strip())
+        if match and match.group(1) not in fields:
+            fields[match.group(1)] = match.group(2).strip()
+    return fields
+
+
+def _tag_rows(path: str, label: str, problems: list):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            rows = parse_json(handle.read())
+    except (OSError, ValueError) as exc:
+        problems.append(f"the {label} {path} is unreadable: {exc}")
+        return None
+    well_formed = isinstance(rows, list) and all(
+        isinstance(r, dict)
+        and set(r) == {"tag", "object", "commit"}
+        and isinstance(r["tag"], str)
+        and FLEET_TAG.fullmatch(r["tag"])
+        and isinstance(r["object"], str)
+        and SHA40.fullmatch(r["object"])
+        and isinstance(r["commit"], str)
+        and SHA40.fullmatch(r["commit"])
+        for r in rows
+    )
+    if not well_formed:
+        problems.append(f"the {label} {path} must be a list of {{tag, object, commit}} rows")
+        return None
+    return rows
+
+
+def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
+    """The checks for a tag cut after the frozen list, i.e. by tag-release."""
+    problems = []
+    commit = row["commit"]
+    if here is None:
+        problems.append(f"{name}'s commit {commit} is not on main's first-parent history")
+    elif previous[0] is not None and here <= previous[0]:
+        problems.append(f"{name}'s commit is not later on main than {previous[1]}'s")
+    message = parse_tag_message(_git(repo_dir, "for-each-ref", "--format=%(contents)", f"refs/tags/{name}"))
+    recorded = message.get("version", "")
+    if message["subject"] != f"{name}: ai-tc {recorded}":
+        problems.append(f"{name}'s subject {message['subject']!r} is not '{name}: ai-tc <version>'")
+    try:
+        entry = find_ai_tc_entry(_read_manifest(repo_dir, commit))
+        expected = "entry removed" if entry is None else entry_version(entry)
+    except (ReleaseCheckError, ValueError) as exc:
+        expected = f"an unreadable manifest ({exc})"
+    if recorded != expected:
+        problems.append(f"{name} records version {recorded!r}, but the manifest at its commit pins {expected!r}")
+    number = re.fullmatch(r"#?([1-9][0-9]*)", message.get("pr", ""))
+    if number is None:
+        problems.append(f"{name} names no PR (a 'pr: <number>' line)")
+        return problems
+    status, body = fetch(f"{MARKETPLACE_API}/pulls/{number.group(1)}", {})
+    if status != 200:
+        problems.append(f"{name}: GET pull {number.group(1)} answered {status}")
+        return problems
+    pull = json.loads(body)
+    author = (pull.get("user") or {}).get("login")
+    if BOT_LOGIN is None:
+        problems.append(f"{name}: no bot identity is configured (release_checks.BOT_LOGIN), so no tag after the frozen list can be confirmed")
+    elif author != BOT_LOGIN:
+        problems.append(
+            f"{name}: PR #{number.group(1)} was opened by {author}, not the bot App ({BOT_LOGIN}); "
+            f"a break-glass PR's tag stays red until a reviewed PR adds it to {FROZEN_TAGS_FILE}"
+        )
+    if not pull.get("merged_at") or pull.get("merge_commit_sha") != commit:
+        problems.append(f"{name}: PR #{number.group(1)} is not merged with {commit} as its merge commit")
+    return problems
+
+
+def _main_ruleset_problems(rules: dict) -> list:
+    problems = []
+    review = rules.get("pull_request") or {}
+    count = review.get("required_approving_review_count")
+    if not isinstance(count, int) or count < 1:
+        problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
+    for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+        if review.get(key) is not True:
+            problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
+    if review.get("allowed_merge_methods") != ["squash"]:
+        problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
+    checks = (rules.get("required_status_checks") or {}).get("required_status_checks") or []
+    if not any(
+        isinstance(c, dict) and c.get("context") == "validate" and c.get("integration_id") == GITHUB_ACTIONS_APP_ID
+        for c in checks
+    ):
+        problems.append("ruleset 'main' does not require the validate check from the GitHub Actions app")
+    return problems
+
+
+def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
+    """Every expected ruleset exists, is active, targets the right refs and has its rules."""
+    status, body = fetch(f"{MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100", {})
+    if status != 200:
+        return [f"could not list the repository's rulesets (HTTP {status})"]
+    listed = {r.get("name"): r for r in json.loads(body) if isinstance(r, dict)}
+    problems = []
+    for name, (target, rule_types) in EXPECTED_RULESETS.items():
+        summary = listed.get(name)
+        if summary is None:
+            problems.append(f"ruleset {name!r} does not exist")
+            continue
+        status, body = fetch(f"{MARKETPLACE_API}/rulesets/{summary.get('id')}", {})
+        if status != 200:
+            problems.append(f"ruleset {name!r}: GET answered {status}")
+            continue
+        ruleset = json.loads(body)
+        if ruleset.get("enforcement") != "active":
+            problems.append(f"ruleset {name!r} is {ruleset.get('enforcement')!r}, not active")
+        if ruleset.get("target") != target:
+            problems.append(f"ruleset {name!r} targets {ruleset.get('target')!r}, not {target!r}")
+        includes, exclude = EXPECTED_REF_PATTERNS[name]
+        ref_name = (ruleset.get("conditions") or {}).get("ref_name") or {}
+        got_include, got_exclude = sorted(ref_name.get("include") or []), sorted(ref_name.get("exclude") or [])
+        if got_include not in [sorted(option) for option in includes] or got_exclude != sorted(exclude):
+            wanted = " or ".join(str(sorted(option)) for option in includes)
+            problems.append(
+                f"ruleset {name!r} covers include {got_include} exclude {got_exclude}, "
+                f"not include {wanted} exclude {sorted(exclude)}"
+            )
+        rules = {r.get("type"): r.get("parameters") or {} for r in ruleset.get("rules") or [] if isinstance(r, dict)}
+        missing = sorted(rule_types - set(rules))
+        if missing:
+            problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")
+        if name == "main":
+            problems.extend(_main_ruleset_problems(rules))
+    return problems
+
+
+def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
+    """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
+    detection, not prevention: the rulesets prevent, and this notices when one was edited."""
+    problems = []
+    current = {row["tag"]: row for row in snapshot_tags(repo_dir)}
+    for name in _git(repo_dir, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags").split():
+        if not FLEET_TAG.fullmatch(name):
+            problems.append(f"tag {name!r} exists: no tag other than fleet-v<N> may exist")
+    frozen = _tag_rows(frozen_path, "frozen tag list", problems)
+    if frozen is None:
+        return problems
+    compared = [("frozen list", frozen)]
+    if previous_path is not None and os.path.exists(previous_path):
+        compared.append(("previous run", _tag_rows(previous_path, "previous run's tag list", problems) or []))
+    for label, rows in compared:
+        for row in rows:
+            now = current.get(row["tag"])
+            if now is None:
+                problems.append(f"{row['tag']} is in the {label} but no longer exists")
+            elif now != row:
+                problems.append(
+                    f"{row['tag']} changed since the {label}: {row['object']} -> {row['commit']} "
+                    f"is now {now['object']} -> {now['commit']}"
+                )
+    for name, row in current.items():
+        if _git(repo_dir, "cat-file", "-t", row["object"]).strip() != "tag":
+            problems.append(f"{name} is a lightweight tag; every fleet-v tag is annotated")
+    numbers = sorted(int(name[len("fleet-v"):]) for name in current)
+    if numbers != list(range(1, len(numbers) + 1)):
+        problems.append(f"fleet-v numbering is not contiguous from 1: {numbers}")
+    frozen_names = {row["tag"] for row in frozen}
+    order = _git(repo_dir, "rev-list", "--first-parent", "--reverse", main_ref(repo_dir)).split()
+    position = {commit: index for index, commit in enumerate(order)}
+    previous = (None, None)
+    for name in fleet_tags(repo_dir):
+        row = current[name]
+        here = position.get(row["commit"])
+        if name not in frozen_names:
+            problems.extend(_audit_new_tag(repo_dir, name, row, here, previous, fetch))
+        previous = (here, name)
+    if check_rulesets:
+        problems.extend(audit_rulesets(fetch=fetch))
+    return problems

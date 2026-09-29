@@ -722,3 +722,256 @@ class TestDiffMode(unittest.TestCase):
         head["plugins"].append(copy.deepcopy(head["plugins"][2]))
         with self.assertRaises(rc.ReleaseCheckError):
             rc.diff_mode(ts.manifest(), head)
+
+
+BOT = "aka-marketplace-bot[bot]"
+
+
+class TestParseTagMessage(unittest.TestCase):
+    def test_subject_and_fields(self):
+        fields = rc.parse_tag_message("fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\npr: #14\ndrill: true\n")
+        self.assertEqual(fields["subject"], "fleet-v9: ai-tc 0.9.15")
+        self.assertEqual((fields["version"], fields["pr"], fields["drill"]), ("0.9.15", "#14", "true"))
+
+    def test_the_first_value_wins(self):
+        self.assertEqual(rc.parse_tag_message("s\nversion: 1\nversion: 2")["version"], "1")
+
+
+class TestAuditTags(unittest.TestCase):
+    def setUp(self):
+        self.repo = ts.Repo(self)
+        for number, version in ((1, "0.9.6"), (2, "0.9.8"), (3, "0.9.9")):
+            self.repo.commit(ts.manifest(version), message=f"pin {version}")
+            self.repo.tag(f"fleet-v{number}", f"fleet-v{number}: a message cut by hand")
+        self.scratch = ts.Repo(self)  # lists live outside the audited repository
+        self.frozen = self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
+        self.fetch = ts.FakeFetch()
+        patcher = mock.patch.object(rc, "BOT_LOGIN", BOT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def audit(self, **kwargs):
+        return rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch, check_rulesets=False, **kwargs)
+
+    def cut(self, version, number, **kwargs):
+        commit = self.repo.commit(ts.manifest(version), message=f"pin {version}")
+        self.tag_at(commit, version, number, **kwargs)
+        return commit
+
+    def tag_at(self, commit, version, number, *, pr=12, author=BOT, merged=True, merge_commit=None, subject=None, recorded=None):
+        recorded = recorded or version
+        lines = [
+            subject or f"fleet-v{number}: ai-tc {recorded}",
+            "",
+            f"version: {recorded}",
+            f"integrity: {ts.INTEGRITY}",
+            f"pr: {pr}",
+            "approver: venuverse",
+            "store-migration: additive",
+        ]
+        self.repo.tag(f"fleet-v{number}", "\n".join(lines), rev=commit)
+        self.fetch.routes[f"{rc.MARKETPLACE_API}/pulls/{pr}"] = (
+            200,
+            {
+                "number": pr,
+                "user": {"login": author},
+                "merged_at": "2026-10-01T00:00:00Z" if merged else None,
+                "merge_commit_sha": merge_commit or commit,
+            },
+        )
+
+    def test_untouched_frozen_tags_pass(self):
+        self.assertEqual(self.audit(), [])
+
+    def test_the_snapshot_has_the_frozen_list_shape(self):
+        rows = rc.snapshot_tags(self.repo.path)
+        self.assertEqual([r["tag"] for r in rows], ["fleet-v1", "fleet-v2", "fleet-v3"])
+        self.assertTrue(all(set(r) == {"tag", "object", "commit"} and r["object"] != r["commit"] for r in rows))
+
+    def test_a_moved_frozen_tag_is_caught(self):
+        ts.git(self.repo.path, "tag", "-f", "-a", "fleet-v2", "-m", "moved", "HEAD")
+        self.assertTrue(any("fleet-v2 changed since the frozen list" in p for p in self.audit()))
+
+    def test_a_deleted_frozen_tag_is_caught(self):
+        ts.git(self.repo.path, "tag", "-d", "fleet-v3")
+        self.assertTrue(any("fleet-v3 is in the frozen list but no longer exists" in p for p in self.audit()))
+
+    def test_any_other_tag_is_caught(self):
+        self.repo.tag("main", "a shadow of the branch")
+        self.assertTrue(any("tag 'main' exists" in p for p in self.audit()))
+
+    def test_a_lightweight_fleet_tag_is_caught(self):
+        self.repo.commit(ts.manifest("0.9.10"))
+        self.repo.tag("fleet-v4", lightweight=True)
+        self.assertTrue(any("fleet-v4 is a lightweight tag" in p for p in self.audit()))
+
+    def test_a_gap_in_numbering_is_caught(self):
+        self.cut("0.9.10", 5)
+        self.assertTrue(any("not contiguous" in p for p in self.audit()))
+
+    def test_a_bot_tag_at_its_merge_commit_passes(self):
+        self.cut("0.9.10", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_removal_is_recorded_as_entry_removed(self):
+        doc = ts.manifest()
+        del doc["plugins"][2]
+        self.tag_at(self.repo.commit(doc), "entry removed", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_tag_that_misstates_the_version_is_caught(self):
+        self.cut("0.9.10", 4, recorded="0.9.11")
+        self.assertTrue(any("records version '0.9.11'" in p for p in self.audit()))
+
+    def test_a_malformed_subject_is_caught(self):
+        self.cut("0.9.10", 4, subject="fleet-v4 ai-tc 0.9.10")
+        self.assertTrue(any("subject" in p for p in self.audit()))
+
+    def test_a_tag_off_main_is_caught(self):
+        ts.git(self.repo.path, "checkout", "-q", "-b", "side")
+        commit = self.repo.commit(ts.manifest("0.9.10"))
+        ts.git(self.repo.path, "checkout", "-q", "main")
+        self.tag_at(commit, "0.9.10", 4)
+        self.assertTrue(any("not on main's first-parent history" in p for p in self.audit()))
+
+    def test_a_tag_earlier_than_its_predecessor_is_caught(self):
+        self.cut("0.9.10", 4)
+        fleet_v3_commit = ts.git(self.repo.path, "rev-parse", "fleet-v3^{commit}").strip()
+        self.tag_at(fleet_v3_commit, "0.9.9", 5, pr=13)
+        self.assertTrue(any("fleet-v5's commit is not later on main than fleet-v4's" in p for p in self.audit()))
+
+    def test_a_human_pr_is_caught(self):
+        self.cut("0.9.10", 4, author="venuverse")
+        self.assertTrue(any("not the bot App" in p for p in self.audit()))
+
+    def test_an_unmerged_pr_is_caught(self):
+        self.cut("0.9.10", 4, merged=False)
+        self.assertTrue(any("is not merged" in p for p in self.audit()))
+
+    def test_a_different_merge_commit_is_caught(self):
+        self.cut("0.9.10", 4, merge_commit="d" * 40)
+        self.assertTrue(any("is not merged with" in p for p in self.audit()))
+
+    def test_no_bot_identity_confirms_no_new_tag(self):
+        self.cut("0.9.10", 4)
+        with mock.patch.object(rc, "BOT_LOGIN", None):
+            self.assertTrue(any("no bot identity is configured" in p for p in self.audit()))
+
+    def test_a_break_glass_tag_clears_once_the_frozen_list_names_it(self):
+        self.cut("0.9.10", 4, author="venuverse")
+        self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
+        self.assertEqual(self.audit(), [])
+
+    def test_the_previous_run_catches_a_later_move(self):
+        commit = self.cut("0.9.10", 4)
+        previous = self.scratch.write("previous.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
+        ts.git(self.repo.path, "tag", "-d", "fleet-v4")
+        self.tag_at(commit, "0.9.10", 4, pr=13)  # the same commit, a new tag object
+        self.assertTrue(any("fleet-v4 changed since the previous run" in p for p in self.audit(previous_path=previous)))
+
+    def test_an_unreadable_frozen_list_is_a_problem(self):
+        self.frozen = os.path.join(self.scratch.path, "absent.json")
+        self.assertTrue(any("unreadable" in p for p in self.audit()))
+
+    def test_the_rulesets_are_audited_when_asked(self):
+        self.fetch.routes.update(ruleset_routes())
+        self.assertEqual(rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch), [])
+
+
+def ruleset_routes(overrides=None, missing=()):
+    listing, routes = [], {}
+    for number, (name, (target, types)) in enumerate(rc.EXPECTED_RULESETS.items(), start=1):
+        if name in missing:
+            continue
+        listing.append({"id": number, "name": name, "target": target, "enforcement": "active"})
+        rules = [{"type": t} for t in sorted(types)]
+        if name == "main":
+            rules = [
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_approving_review_count": 1,
+                        "require_code_owner_review": True,
+                        "dismiss_stale_reviews_on_push": True,
+                        "require_last_push_approval": True,
+                        "required_review_thread_resolution": False,
+                        "allowed_merge_methods": ["squash"],
+                    },
+                },
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": False,
+                        "required_status_checks": [{"context": "validate", "integration_id": 15368}],
+                    },
+                },
+            ]
+        includes, exclude = rc.EXPECTED_REF_PATTERNS[name]
+        body = {
+            "id": number,
+            "name": name,
+            "target": target,
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(includes[0]), "exclude": list(exclude)}},
+            "rules": rules,
+        }
+        body.update((overrides or {}).get(name, {}))
+        routes[f"{rc.MARKETPLACE_API}/rulesets/{number}"] = (200, body)
+    routes[f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"] = (200, listing)
+    return routes
+
+
+class TestAuditRulesets(unittest.TestCase):
+    def test_the_seven_rulesets_as_specified_pass(self):
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes())), [])
+        # Where GitHub refuses ~ALL on a tag ruleset, the two tag globs cover the same refs.
+        globs = {"include": ["refs/tags/**/*", "refs/tags/*"], "exclude": ["refs/tags/fleet-v*"]}
+        routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
+
+    def test_a_missing_ruleset_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(missing=("x4-tags",))))
+        self.assertEqual(problems, ["ruleset 'x4-tags' does not exist"])
+
+    def test_a_disabled_ruleset_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"enforcement": "disabled"}})))
+        self.assertEqual(problems, ["ruleset 'fleet-tags-immutable' is 'disabled', not active"])
+
+    def test_a_missing_rule_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"bot-branches": {"rules": [{"type": "creation"}]}})))
+        self.assertEqual(problems, ["ruleset 'bot-branches' lacks rules: deletion, update"])
+
+    def test_a_wrong_target_or_ref_pattern_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"tags-locked": {"target": "branch"}})))
+        self.assertEqual(problems, ["ruleset 'tags-locked' targets 'branch', not 'tag'"])
+        retargeted = {"main": {"conditions": {"ref_name": {"include": ["refs/heads/trunk"], "exclude": []}}}}
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(retargeted)))
+        self.assertEqual(
+            problems,
+            ["ruleset 'main' covers include ['refs/heads/trunk'] exclude [], not include ['refs/heads/main'] exclude []"],
+        )
+        # A probe pattern left in fleet-tags-immutable after the probe is caught too.
+        probe = {"include": ["refs/tags/fleet-v*", "refs/tags/ruleset-probe-*"], "exclude": []}
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"conditions": {"ref_name": probe}}})))
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
+
+    def test_main_must_be_squash_only_and_require_validate_from_actions(self):
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        main["rules"][2]["parameters"]["allowed_merge_methods"] = ["merge", "squash"]
+        main["rules"][3]["parameters"]["required_status_checks"] = [{"context": "validate"}]
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            [
+                "ruleset 'main': allowed_merge_methods is ['merge', 'squash'], not ['squash']",
+                "ruleset 'main' does not require the validate check from the GitHub Actions app",
+            ],
+        )
+
+    def test_an_unlistable_repository_is_a_problem(self):
+        fetch = ts.FakeFetch({f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100": (403, b"")})
+        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["could not list the repository's rulesets (HTTP 403)"])
