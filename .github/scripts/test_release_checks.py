@@ -152,6 +152,58 @@ class TestPinnedVersions(unittest.TestCase):
             rc.pinned_versions(self.repo.path)
 
 
+class TestPinnedVersionsReadFailures(unittest.TestCase):
+    """A tag that cannot be READ is no verdict. It must never be taken as a tag that pins
+    nothing: that would drop a version from the candidate floor and the rollback floor."""
+
+    def ledger(self):
+        repo = ts.Repo(self)
+        for number, version in enumerate(("0.9.12", "0.9.13", "0.9.14", "0.9.15"), start=1):
+            repo.commit(ts.manifest(version))
+            repo.tag(f"fleet-v{number}")
+        return repo
+
+    def delete_blob(self, repo, tag):
+        blob = ts.git(repo.path, "rev-parse", f"refs/tags/{tag}^{{commit}}:{rc.MANIFEST}").strip()
+        loose = os.path.join(repo.path, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+
+    def test_a_tag_whose_manifest_object_is_gone_is_infrastructure(self):
+        repo = self.ledger()
+        self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+        self.delete_blob(repo, "fleet-v3")
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
+                call(repo.path)
+            self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_without_the_manifest_file_is_infrastructure(self):
+        repo = self.ledger()
+        ts.git(repo.path, "rm", "-q", rc.MANIFEST)
+        ts.git(repo.path, "commit", "-q", "-m", "drop the manifest")
+        repo.tag("fleet-v5")
+        with self.assertRaises(rc.InfraError):
+            rc.pinned_versions(repo.path)
+
+    def test_a_manifest_that_does_not_parse_still_pins_nothing(self):
+        repo = self.ledger()
+        repo.commit(files={rc.MANIFEST: "{ not json"})
+        repo.tag("fleet-v5")
+        repo.commit(ts.manifest("0.9.15"))
+        pins = rc.pins_by_ref(repo.path)
+        self.assertIsNone(pins["fleet-v5"])
+        self.assertEqual(pins["fleet-v3"], "0.9.14")
+
+    def test_a_checkout_without_any_fleet_tag_is_infrastructure(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.14"))
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
+                call(repo.path)
+            self.assertEqual(caught.exception.check, "git")
+
+
 class TestHttpHeaders(unittest.TestCase):
     def test_a_token_goes_only_to_the_github_api(self):
         self.assertTrue(rc._sends_token_to(f"{rc.AI_TC_API}/compare/a...main"))
@@ -222,15 +274,18 @@ class TestNpmCandidates(unittest.TestCase):
 class FakeRun:
     """Stands in for subprocess.run, answering by npm sub-command."""
 
-    def __init__(self, *, install=(0,), audit=(1, "{}")):
+    def __init__(self, *, install=(0,), audit=(1, "{}"), npm_version="11.19.0"):
         self.install = list(install)
         self.audit = audit
+        self.npm_version = npm_version
         self.calls = []
 
     def __call__(self, args, **kwargs):
         self.calls.append((list(args), kwargs.get("cwd")))
         if args[:2] == ["npm", "init"]:
             return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["npm", "--version"]:
+            return subprocess.CompletedProcess(args, 0, self.npm_version + "\n", "")
         if args[:2] == ["npm", "install"]:
             code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
             return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
@@ -276,6 +331,68 @@ class TestNpmAuditSignatures(unittest.TestCase):
     def test_non_json_audit_output_is_toolchain(self):
         with self.assertRaises(rc.InfraError):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
+
+    def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "")), sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_late_audit_answer_is_used(self):
+        answers = ["", "", json.dumps(ts.audit_output("0.9.14"))]
+        run = FakeRun()
+
+        def audit_run(args, **kwargs):
+            if args[:2] == ["npm", "audit"]:
+                return subprocess.CompletedProcess(args, 1, answers.pop(0), "")
+            return run(args, **kwargs)
+
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=audit_run, sleep=lambda s: None)
+        self.assertEqual(result["verified"][0]["version"], "0.9.14")
+
+    def test_npms_own_error_document_is_toolchain_not_a_verdict(self):
+        error = json.dumps({"error": {"summary": "found no installed dependencies to audit", "detail": ""}})
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, error)), sleep=lambda s: None)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+
+    def test_an_error_document_never_reaches_a_provenance_refusal(self):
+        error = json.dumps({"error": {"summary": "audit endpoint unavailable"}, "invalid": [], "verified": []})
+        with self.assertRaises(rc.InfraError):
+            rc.verify_release(
+                "0.9.14",
+                fetch=ts.FakeFetch(ts.release_routes("0.9.14")),
+                audit=lambda package, version: rc.npm_audit_signatures(
+                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None
+                ),
+                sleep=lambda s: None,
+            )
+
+    def test_output_that_is_not_a_report_object_is_toolchain(self):
+        for text in ("[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}'):
+            with self.subTest(text=text), self.assertRaises(rc.InfraError):
+                rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, text)), sleep=lambda s: None)
+
+    def test_a_report_with_nothing_verified_is_still_a_verdict(self):
+        report = rc.npm_audit_signatures(
+            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=lambda s: None
+        )
+        self.assertEqual(report["invalid"], [])
+
+    def test_an_npm_older_than_11_is_toolchain(self):
+        for version in ("10.9.2", "9.0.0"):
+            with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
+                rc.npm_audit_signatures(
+                    rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
+                    sleep=lambda s: None,
+                )
+            self.assertEqual(caught.exception.check, "toolchain")
+
+    def test_an_unreadable_npm_version_is_toolchain(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(npm_version="banana"), sleep=lambda s: None)
 
     def test_missing_npm_is_toolchain(self):
         def run(args, **kwargs):
@@ -1082,3 +1199,33 @@ class TestCli(unittest.TestCase):
         repo = self.repo()
         code, out, _ = cli("snapshot-tags", "--repo", repo.path)
         self.assertEqual((code, [r["tag"] for r in json.loads(out)]), (0, ["fleet-v1"]))
+
+    def numeric_order_repo(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.9"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.10"))
+        repo.tag("fleet-v2")
+        repo.commit(ts.manifest("0.9.14"))
+        return repo
+
+    def test_versions_are_ordered_numerically_wherever_the_cli_lists_or_picks_one(self):
+        repo = self.numeric_order_repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=[]):
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        self.assertEqual((code, json.loads(out)["pinned"]), (0, ["0.9.9", "0.9.10", "0.9.14"]))
+        versions = {"0.9.9": {**ts.SEED["0.9.9"], "classification": "additive"}, "0.9.10": {**ts.SEED["0.9.10"], "classification": "additive"}, "0.9.14": ts.SEED["0.9.14"]}
+        safety = repo.write("safety.json", rc.dump_json({"versions": versions}))
+        code, out, _ = cli("floor", "0.9.10", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["highest_pinned"], result["floor"]), (1, "0.9.14", "0.9.14"))
+
+    def test_the_highest_pin_is_the_numerically_highest_when_text_order_would_pick_another(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.9"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.10"))
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        code, out, _ = cli("floor", "0.9.9", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["highest_pinned"], result["floor"]), (1, "0.9.10", "0.9.10"))
