@@ -217,3 +217,69 @@ class TestNpmCandidates(unittest.TestCase):
     def test_a_registry_error_is_infrastructure(self):
         with self.assertRaises(rc.InfraError):
             rc.npm_candidates(set(), fetch=ts.FakeFetch({rc.packument_url(): (503, b"")}))
+
+
+class FakeRun:
+    """Stands in for subprocess.run, answering by npm sub-command."""
+
+    def __init__(self, *, install=(0,), audit=(1, "{}")):
+        self.install = list(install)
+        self.audit = audit
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((list(args), kwargs.get("cwd")))
+        if args[:2] == ["npm", "init"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["npm", "install"]:
+            code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
+            return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
+        code, out = self.audit
+        return subprocess.CompletedProcess(args, code, out, "")
+
+
+class TestNpmAuditSignatures(unittest.TestCase):
+    def test_installs_exactly_the_version_from_npmjs_without_scripts_in_a_scratch_dir(self):
+        run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        install = next(a for a, _ in run.calls if a[:2] == ["npm", "install"])
+        self.assertIn("--ignore-scripts", install)
+        self.assertIn("--@akasecurity:registry=https://registry.npmjs.org", install)
+        self.assertEqual(install[-1], "@akasecurity/ai-tc-claude-code@0.9.14")
+        self.assertEqual(result["verified"][0]["version"], "0.9.14")
+        cwds = {cwd for _, cwd in run.calls}
+        self.assertEqual(len(cwds), 1)
+        self.assertNotEqual(cwds.pop(), os.getcwd())
+
+    def test_the_audit_asks_for_attestations(self):
+        run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+
+    def test_install_is_retried_then_reported_as_toolchain(self):
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(install=(1,)), sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_late_install_success_is_used(self):
+        run = FakeRun(install=(1, 1, 0), audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(sum(1 for a, _ in run.calls if a[:2] == ["npm", "install"]), 3)
+
+    def test_empty_audit_output_is_toolchain(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "  ")), sleep=lambda s: None)
+
+    def test_non_json_audit_output_is_toolchain(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
+
+    def test_missing_npm_is_toolchain(self):
+        def run(args, **kwargs):
+            raise FileNotFoundError("npm")
+
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)

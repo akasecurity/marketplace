@@ -307,3 +307,49 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     exact = {v for v in names if isinstance(v, str) and SEMVER.fullmatch(v)}
     floor = max((vkey(v) for v in pinned), default=None)
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
+
+
+def _npm(run, args: list, work: str):
+    try:
+        return run(["npm", *args], cwd=work, capture_output=True, text=True)
+    except OSError as exc:
+        raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
+
+
+def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, sleep=time.sleep) -> dict:
+    """Run `npm audit signatures --json --include-attestations` over a scratch,
+    --ignore-scripts install of exactly package@version from npmjs.
+
+    npm does the cryptography (the registry signature and the sigstore bundle); the
+    caller judges what the attestation binds. Needs npm 11 (Node 24): an older npm
+    returns an EMPTY verified set, which reads as "no attestation" and would refuse a
+    good release."""
+    registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
+    with tempfile.TemporaryDirectory() as work:
+        init = _npm(run, ["init", "-y"], work)
+        if init.returncode != 0:
+            raise InfraError("toolchain", f"npm init failed: {init.stderr[:2000]}")
+        for attempt in range(1, ATTEMPTS + 1):
+            install = _npm(
+                run,
+                ["install", "--ignore-scripts", "--no-audit", "--no-fund", registry_flag, f"{package}@{version}"],
+                work,
+            )
+            if install.returncode == 0:
+                break
+            if attempt == ATTEMPTS:
+                raise InfraError(
+                    "toolchain",
+                    f"npm could not install {package}@{version} after {ATTEMPTS} attempts "
+                    f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
+                )
+            sleep(RETRY_SECONDS)
+        # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
+        # exit status is not.
+        audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
+    if not audit.stdout.strip():
+        raise InfraError("toolchain", "npm audit signatures printed nothing (NOT a signature result)")
+    try:
+        return json.loads(audit.stdout)
+    except ValueError as exc:
+        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
