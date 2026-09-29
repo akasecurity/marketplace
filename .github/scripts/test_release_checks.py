@@ -1043,10 +1043,20 @@ def ruleset_routes(overrides=None, missing=()):
 class TestAuditRulesets(unittest.TestCase):
     def test_the_seven_rulesets_as_specified_pass(self):
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes())), [])
-        # Where GitHub refuses ~ALL on a tag ruleset, the two tag globs cover the same refs.
+        # The include list is compared as a set: GitHub may return the globs in either order.
         globs = {"include": ["refs/tags/**/*", "refs/tags/*"], "exclude": ["refs/tags/fleet-v*"]}
         routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
+
+    def test_tags_locked_on_all_is_caught(self):
+        # GitHub documents ~ALL as every branch; on a tag ruleset it could lock no tag.
+        on_all = {"include": ["~ALL"], "exclude": ["refs/tags/fleet-v*"]}
+        routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": on_all}}})
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            ["ruleset 'tags-locked' covers include ['~ALL'] exclude ['refs/tags/fleet-v*'], "
+             "not include ['refs/tags/*', 'refs/tags/**/*'] exclude ['refs/tags/fleet-v*']"],
+        )
 
     def test_a_missing_ruleset_is_caught(self):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(missing=("x4-tags",))))

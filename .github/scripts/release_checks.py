@@ -831,11 +831,11 @@ EXPECTED_RULESETS = {
 # retargeted away from its refs keeps rules that still read correctly while it protects
 # nothing, so the patterns are audited too. main is named, never ~DEFAULT_BRANCH: a
 # default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
-# `/`), so bot-branches lists both depths, and tags-locked is ~ALL or, where GitHub refuses
-# ~ALL on a tag ruleset, the two tag globs that cover the same refs.
+# `/`), so bot-branches and tags-locked each list both depths. tags-locked never uses ~ALL:
+# GitHub documents it as every branch, and on a tag ruleset it could lock no tag.
 EXPECTED_REF_PATTERNS = {
     "main": ([["refs/heads/main"]], []),
-    "tags-locked": ([["~ALL"], ["refs/tags/*", "refs/tags/**/*"]], ["refs/tags/fleet-v*"]),
+    "tags-locked": ([["refs/tags/*", "refs/tags/**/*"]], ["refs/tags/fleet-v*"]),
     "fleet-tags-create": ([["refs/tags/fleet-v*"]], []),
     "fleet-tags-immutable": ([["refs/tags/fleet-v*"]], []),
     "bot-branches": ([["refs/heads/bot/*", "refs/heads/bot/**/*"]], []),
