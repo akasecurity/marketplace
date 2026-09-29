@@ -429,7 +429,49 @@ class TestVerifyRelease(unittest.TestCase):
 
     def test_the_commit_check_asks_whether_main_is_ahead_of_the_commit(self):
         _, fetch = self.verify()
-        self.assertIn(f"{rc.AI_TC_API}/compare/{ts.ATTESTED['0.9.14']}...main?per_page=1", fetch.urls())
+        self.assertIn(ts.compare_url(ts.ATTESTED["0.9.14"]), fetch.urls())
+
+    def test_the_comparison_is_made_against_the_resolved_head_of_main_never_the_name(self):
+        # A tag named main in ai-tc could make the short name ambiguous, so the branch is read
+        # by its fully qualified ref and the comparison names the sha that read returned.
+        other = "d" * 40
+        _, fetch = self.verify(routes=ts.release_routes("0.9.14", main_sha=other))
+        commit = ts.ATTESTED["0.9.14"]
+        urls = fetch.urls()
+        self.assertEqual(
+            [u for u in urls if u.startswith(f"{rc.AI_TC_API}/")],
+            [ts.main_ref_url(), f"{rc.AI_TC_API}/compare/{commit}...{other}?per_page=1"],
+        )
+        self.assertFalse([u for u in urls if "...main" in u])
+
+    def test_a_failed_main_ref_read_is_no_verdict(self):
+        for status, body in ((404, {"message": "Not Found"}), (403, b""), (502, b"")):
+            with self.subTest(status=status):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.main_ref_url()] = (status, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+
+    def test_a_malformed_main_ref_is_no_verdict(self):
+        good = ts.main_ref_body()
+        for label, body in (
+            ("not json", b"<html>"),
+            ("a list", [good]),
+            ("no object", {"ref": "refs/heads/main"}),
+            ("object not a mapping", {"ref": "refs/heads/main", "object": "abc"}),
+            ("no sha", {"ref": "refs/heads/main", "object": {}}),
+            ("short sha", {"ref": "refs/heads/main", "object": {"sha": "abc123"}}),
+            ("uppercase sha", {"ref": "refs/heads/main", "object": {"sha": "E" * 40}}),
+            ("sha not a string", {"ref": "refs/heads/main", "object": {"sha": 7}}),
+            ("another ref", {**good, "ref": "refs/tags/main"}),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.main_ref_url()] = (200, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
 
     def test_identical_to_main_passes(self):
         self.verify(routes=ts.release_routes("0.9.14", compare="identical"))
