@@ -1224,7 +1224,16 @@ class TestCli(unittest.TestCase):
         with mock.patch.object(rc, "npm_candidates", return_value=[]):
             code, out, _ = cli("candidates", "--repo", repo.path)
         self.assertEqual((code, json.loads(out)["pinned"]), (0, ["0.9.9", "0.9.10", "0.9.14"]))
-        versions = {"0.9.9": {**ts.SEED["0.9.9"], "classification": "additive"}, "0.9.10": {**ts.SEED["0.9.10"], "classification": "additive"}, "0.9.14": ts.SEED["0.9.14"]}
+        # Its own classifications: 0.9.14 is stated here, so a change to the seeded
+        # classification of any version cannot move this test's expected floor.
+        versions = {
+            version: {**ts.SEED[version], "classification": classification}
+            for version, classification in (
+                ("0.9.9", "additive"),
+                ("0.9.10", "additive"),
+                ("0.9.14", "not-rollback-safe"),
+            )
+        }
         safety = repo.write("safety.json", rc.dump_json({"versions": versions}))
         code, out, _ = cli("floor", "0.9.10", "--repo", repo.path, "--safety", safety)
         result = json.loads(out)
