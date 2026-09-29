@@ -699,3 +699,71 @@ def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=())
         and not (isinstance(versions.get(version), dict) and versions[version].get("classification") == "additive")
     ]
     return min(flagged, key=vkey) if flagged else None
+
+
+def _canonical(value) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def _rest_of(manifest: dict) -> tuple:
+    """Everything a pin change must leave alone: the top-level keys, and every other entry
+    in any order."""
+    top = {k: v for k, v in manifest.items() if k != "plugins"}
+    others = sorted(_canonical(p) for p in _plugins(manifest) if not _is_ai_tc(p))
+    return _canonical(top), others
+
+
+def _integrity_only(metadata) -> bool:
+    return (
+        isinstance(metadata, dict)
+        and set(metadata) == {"integrity"}
+        and isinstance(metadata["integrity"], str)
+        and INTEGRITY.fullmatch(metadata["integrity"]) is not None
+    )
+
+
+def _restore_shape(entry: dict) -> bool:
+    """{name: ai-tc, source: {npm, PACKAGE, x.y.z, REGISTRY}, description, metadata: {integrity}}."""
+    source = entry.get("source")
+    return (
+        set(entry) == {"name", "source", "description", "metadata"}
+        and entry["name"] == ENTRY_NAME
+        and isinstance(entry["description"], str)
+        and entry["description"].strip() != ""
+        and isinstance(source, dict)
+        and set(source) == {"source", "package", "version", "registry"}
+        and source["source"] == "npm"
+        and source["package"] == PACKAGE
+        and source["registry"] == REGISTRY
+        and entry_version(entry) is not None
+        and _integrity_only(entry["metadata"])
+    )
+
+
+def _without_pin(entry: dict) -> dict:
+    stripped = {k: v for k, v in entry.items() if k != "metadata"}
+    if isinstance(stripped.get("source"), dict):
+        stripped["source"] = {k: v for k, v in stripped["source"].items() if k != "version"}
+    return stripped
+
+
+def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
+    """Which importer mode a manifest change is EXACTLY. 'none' means the ai-tc entry is
+    unchanged; 'human' means any other change to it."""
+    base, head = find_ai_tc_entry(base_manifest), find_ai_tc_entry(head_manifest)
+    if base == head:
+        return "none"
+    if _rest_of(base_manifest) != _rest_of(head_manifest):
+        return "human"
+    if head is None:
+        return "remove"
+    if base is None:
+        return "restore" if _restore_shape(head) else "human"
+    old, new = entry_version(base), entry_version(head)
+    if old is None or new is None or old == new:
+        return "human"
+    if _without_pin(base) != _without_pin(head) or not _integrity_only(head.get("metadata")):
+        return "human"
+    if "metadata" in base and not _integrity_only(base["metadata"]):
+        return "human"
+    return "advance" if vkey(new) > vkey(old) else "rollback"

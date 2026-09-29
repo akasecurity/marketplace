@@ -630,3 +630,95 @@ class TestSafetyProblems(unittest.TestCase):
         for name, doc in cases.items():
             with self.subTest(name):
                 self.assertNotEqual(rc.safety_problems(doc), [])
+
+
+class TestDiffMode(unittest.TestCase):
+    def removed(self):
+        doc = ts.manifest()
+        del doc["plugins"][2]
+        return doc
+
+    def test_identical_is_none(self):
+        self.assertEqual(rc.diff_mode(ts.manifest(), ts.manifest()), "none")
+
+    def test_other_entries_and_top_level_edits_alone_are_none(self):
+        head = ts.manifest()
+        head["plugins"][0]["description"] = "new words"
+        head["metadata"]["version"] = "0.2.0"
+        self.assertEqual(rc.diff_mode(ts.manifest(), head), "none")
+
+    def test_reordered_plugins_are_none(self):
+        head = ts.manifest()
+        head["plugins"].reverse()
+        self.assertEqual(rc.diff_mode(ts.manifest(), head), "none")
+
+    def test_up_with_its_integrity_is_advance(self):
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY)), "advance")
+
+    def test_down_is_rollback(self):
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.13", integrity=ts.OTHER_INTEGRITY)), "rollback")
+
+    def test_a_base_without_metadata_still_advances(self):
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14", integrity=None), ts.manifest("0.9.15")), "advance")
+
+    def test_an_advance_that_also_touches_another_entry_is_human(self):
+        head = ts.manifest("0.9.15")
+        head["plugins"][0]["description"] = "new words"
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), head), "human")
+
+    def test_an_advance_that_changes_a_top_level_key_is_human(self):
+        head = ts.manifest("0.9.15")
+        head["metadata"]["version"] = "0.2.0"
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), head), "human")
+
+    def test_an_advance_that_changes_the_registry_is_human(self):
+        head = ts.manifest("0.9.15")
+        ts.ai_tc(head)["source"]["registry"] = "https://npm.pkg.github.com"
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), head), "human")
+
+    def test_an_advance_that_adds_a_key_is_human(self):
+        head = ts.manifest("0.9.15")
+        ts.ai_tc(head)["hooks"] = "./hooks/extra.json"
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), head), "human")
+
+    def test_a_version_move_without_integrity_is_human(self):
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.15", integrity=None)), "human")
+
+    def test_extra_metadata_is_human(self):
+        head = ts.manifest("0.9.15")
+        ts.ai_tc(head)["metadata"]["note"] = "x"
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), head), "human")
+
+    def test_a_new_integrity_at_the_same_version_is_human(self):
+        self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.14", integrity=ts.OTHER_INTEGRITY)), "human")
+
+    def test_a_description_edit_is_human(self):
+        self.assertEqual(rc.diff_mode(ts.manifest(), ts.manifest(description="Better words.")), "human")
+
+    def test_removing_only_the_entry_is_remove(self):
+        self.assertEqual(rc.diff_mode(ts.manifest(), self.removed()), "remove")
+
+    def test_removing_the_entry_and_editing_another_is_human(self):
+        head = self.removed()
+        head["plugins"][0]["description"] = "new words"
+        self.assertEqual(rc.diff_mode(ts.manifest(), head), "human")
+
+    def test_the_fixed_restore_shape_is_restore(self):
+        self.assertEqual(rc.diff_mode(self.removed(), ts.manifest("0.9.14")), "restore")
+
+    def test_a_restore_without_the_registry_is_human(self):
+        self.assertEqual(rc.diff_mode(self.removed(), ts.manifest("0.9.14", registry=False)), "human")
+
+    def test_a_restore_with_an_extra_key_is_human(self):
+        head = ts.manifest("0.9.14")
+        ts.ai_tc(head)["strict"] = False
+        self.assertEqual(rc.diff_mode(self.removed(), head), "human")
+
+    def test_nothing_before_or_after_is_none(self):
+        self.assertEqual(rc.diff_mode(self.removed(), self.removed()), "none")
+
+    def test_an_ambiguous_head_is_refused(self):
+        head = ts.manifest("0.9.15")
+        head["plugins"].append(copy.deepcopy(head["plugins"][2]))
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.diff_mode(ts.manifest(), head)
