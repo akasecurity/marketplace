@@ -150,3 +150,70 @@ class TestPinnedVersions(unittest.TestCase):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
         with self.assertRaises(rc.InfraError):
             rc.pinned_versions(self.repo.path)
+
+
+class TestHttpHeaders(unittest.TestCase):
+    def test_a_token_goes_only_to_the_github_api(self):
+        self.assertTrue(rc._sends_token_to(f"{rc.AI_TC_API}/compare/a...main"))
+        self.assertFalse(rc._sends_token_to(rc.packument_url()))
+        self.assertFalse(rc._sends_token_to("https://registry.npmjs.org/api.github.com"))
+
+    def test_github_requests_name_the_api_version(self):
+        headers = rc._headers_for(f"{rc.AI_TC_API}/x", {})
+        self.assertEqual(headers["X-GitHub-Api-Version"], "2022-11-28")
+        self.assertEqual(headers["Accept"], "application/vnd.github+json")
+
+    def test_registry_requests_carry_no_authorization(self):
+        headers = rc._headers_for(rc.packument_url(), {"Accept": "application/json"})
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers["Accept"], "application/json")
+
+    def test_no_token_in_the_environment_means_anonymous(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn("Authorization", rc._headers_for(f"{rc.AI_TC_API}/x", {}))
+
+    def test_the_packument_url_escapes_the_scope_slash(self):
+        self.assertEqual(rc.packument_url(), "https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code")
+
+
+class TestNpmCandidates(unittest.TestCase):
+    def fetch(self, versions, latest="0.9.14"):
+        return ts.FakeFetch(
+            {rc.packument_url(): (200, {"versions": versions, "dist-tags": {"latest": latest}})}
+        )
+
+    def test_only_exact_versions_above_everything_pinned_ascending(self):
+        versions = {v: {} for v in ["0.9.9", "0.9.10", "0.9.14", "0.9.15", "0.10.0-rc1", "0.9.16", "0.10.0"]}
+        self.assertEqual(
+            rc.npm_candidates({"0.9.6", "0.9.14"}, fetch=self.fetch(versions)),
+            ["0.9.15", "0.9.16", "0.10.0"],
+        )
+
+    def test_versions_sort_by_number_not_text(self):
+        self.assertEqual(
+            rc.npm_candidates({"0.9.8"}, fetch=self.fetch({"0.9.10": {}, "0.9.9": {}})), ["0.9.9", "0.9.10"]
+        )
+
+    def test_nothing_pinned_yields_every_exact_version(self):
+        self.assertEqual(rc.npm_candidates(set(), fetch=self.fetch({"0.9.6": {}, "0.9.0-rc1": {}})), ["0.9.6"])
+
+    def test_nothing_above_the_pin_is_an_empty_list(self):
+        self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=self.fetch({"0.9.13": {}, "0.9.14": {}})), [])
+
+    def test_a_single_version_string_is_accepted(self):
+        fetch = ts.FakeFetch({rc.packument_url(): (200, {"versions": "0.9.15"})})
+        self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=fetch), ["0.9.15"])
+
+    def test_npm_latest_is_never_consulted(self):
+        self.assertEqual(
+            rc.npm_candidates({"0.9.14"}, fetch=self.fetch({"0.9.15": {}}, latest="9.9.9")), ["0.9.15"]
+        )
+
+    def test_the_registry_is_read_explicitly(self):
+        fetch = self.fetch({"0.9.15": {}})
+        rc.npm_candidates({"0.9.14"}, fetch=fetch)
+        self.assertEqual(fetch.calls, [(rc.packument_url(), {"Accept": "application/json"})])
+
+    def test_a_registry_error_is_infrastructure(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_candidates(set(), fetch=ts.FakeFetch({rc.packument_url(): (503, b"")}))
