@@ -1,0 +1,31 @@
+name: script-tests
+
+# Runs the release-check unit tests on the PR's own code. This is safe on pull_request:
+# the token is read-only and no secret is in scope. It is not a required check (validate
+# is), but a red run here means the module every release workflow runs has regressed.
+
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/script-tests.yml"
+      - ".claude-plugin/marketplace.json"
+      - "rollback-safety.json"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (the pin import-plugin-release.yml uses).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: unit tests (standard library only, no network)
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
