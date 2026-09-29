@@ -975,3 +975,110 @@ class TestAuditRulesets(unittest.TestCase):
     def test_an_unlistable_repository_is_a_problem(self):
         fetch = ts.FakeFetch({f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100": (403, b"")})
         self.assertEqual(rc.audit_rulesets(fetch=fetch), ["could not list the repository's rulesets (HTTP 403)"])
+
+
+def cli(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = rc.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class TestCli(unittest.TestCase):
+    def repo(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.13"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.14"))
+        return repo
+
+    def test_verify_version_prints_the_verified_release(self):
+        with mock.patch.object(rc, "verify_release", return_value=fake_verify("0.9.14")):
+            code, out, _ = cli("verify-version", "0.9.14")
+        self.assertEqual((code, json.loads(out)["git_commit"]), (0, ts.ATTESTED["0.9.14"]))
+
+    def test_a_failed_check_exits_1_and_names_the_check(self):
+        with mock.patch.object(rc, "verify_release", side_effect=rc.ReleaseCheckError("commit-on-main", "behind")):
+            code, out, err = cli("verify-version", "0.9.15")
+        self.assertEqual((code, json.loads(out)["error"]["check"]), (1, "commit-on-main"))
+        self.assertIn("::error::commit-on-main: behind", err)
+
+    def test_no_verdict_exits_2(self):
+        with mock.patch.object(rc, "verify_release", side_effect=rc.InfraError("network", "down")):
+            code, out, _ = cli("verify-version", "0.9.15")
+        self.assertEqual((code, json.loads(out)["error"]["check"]), (2, "network"))
+
+    def test_usage_errors_exit_2(self):
+        self.assertEqual(cli("no-such-command")[0], 2)
+        self.assertEqual(cli("floor")[0], 2)
+
+    def test_candidates(self):
+        repo = self.repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        candidates.assert_called_once_with({"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"pinned": ["0.9.13", "0.9.14"], "candidates": ["0.9.15"]}))
+
+    def test_classify_prints_a_rollback_safety_entry(self):
+        tag = "0035_migration"
+        result = rc.Classification("not-rollback-safe", [tag], {tag: "additive"})
+        with mock.patch.object(rc, "classify_migrations", return_value=result):
+            code, out, err = cli("classify", ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), ts.SEED["0.9.14"])
+        self.assertIn(f"{tag}: additive", err)
+
+    def test_safety_entry(self):
+        repo = self.repo()
+        with mock.patch.object(rc, "safety_entry", return_value=ts.SEED["0.9.14"]) as entry:
+            code, out, _ = cli("safety-entry", "0.9.14", "--repo", repo.path)
+        entry.assert_called_once_with("0.9.14", {"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"version": "0.9.14", "entry": ts.SEED["0.9.14"]}))
+
+    def test_floor_exits_1_when_the_target_crosses_it(self):
+        repo = self.repo()
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        code, out, _ = cli("floor", "0.9.13", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["floor"], result["highest_pinned"]), (1, "0.9.14", "0.9.14"))
+        self.assertEqual(result["error"]["check"], "floor")
+
+    def test_floor_exits_0_when_nothing_is_crossed(self):
+        repo = self.repo()
+        additive = {"0.9.14": {**ts.SEED["0.9.14"], "classification": "additive"}}
+        safety = repo.write("safety.json", rc.dump_json({"versions": additive}))
+        code, out, _ = cli("floor", "0.9.13", "--repo", repo.path, "--safety", safety)
+        self.assertEqual((code, json.loads(out)), (0, {"target": "0.9.13", "highest_pinned": "0.9.14", "floor": None}))
+
+    def test_diff_mode(self):
+        repo = ts.Repo(self)
+        base = repo.write("base.json", rc.dump_json(ts.manifest("0.9.14")))
+        head = repo.write("head.json", rc.dump_json(ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY)))
+        code, out, _ = cli("diff-mode", base, head)
+        self.assertEqual((code, json.loads(out)), (0, {"mode": "advance"}))
+
+    def test_diff_mode_on_an_ambiguous_manifest_exits_1(self):
+        repo = ts.Repo(self)
+        doc = ts.manifest()
+        doc["plugins"].append(copy.deepcopy(doc["plugins"][2]))
+        base = repo.write("base.json", rc.dump_json(ts.manifest()))
+        head = repo.write("head.json", rc.dump_json(doc))
+        self.assertEqual(cli("diff-mode", base, head)[0], 1)
+
+    def test_diff_mode_on_a_duplicate_key_exits_1(self):
+        repo = ts.Repo(self)
+        base = repo.write("base.json", rc.dump_json(ts.manifest()))
+        head = repo.write("head.json", '{"name": "a", "name": "b", "plugins": []}')
+        self.assertEqual(cli("diff-mode", base, head)[0], 1)
+
+    def test_audit_tags_exits_1_with_problems(self):
+        repo = self.repo()
+        frozen = repo.write("frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        repo.tag("stray")
+        code, out, _ = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--no-rulesets")
+        self.assertEqual((code, json.loads(out)["problems"]), (1, ["tag 'stray' exists: no tag other than fleet-v<N> may exist"]))
+
+    def test_snapshot_tags(self):
+        repo = self.repo()
+        code, out, _ = cli("snapshot-tags", "--repo", repo.path)
+        self.assertEqual((code, [r["tag"] for r in json.loads(out)]), (0, ["fleet-v1"]))
