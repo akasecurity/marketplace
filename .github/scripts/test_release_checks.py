@@ -408,3 +408,144 @@ class TestVerifyRelease(unittest.TestCase):
     def test_a_foreign_run_url_is_refused(self):
         stmt = ts.statement("0.9.14", run_url="https://example.com/actions/runs/1")
         self.refused("run-url", audits=[ts.audit_output("0.9.14", stmt)])
+
+
+SQL_GENERATED = (
+    "ALTER TABLE `events` ADD `elapsed_ms` integer GENERATED ALWAYS AS "
+    "(json_extract(attributes, '$.elapsed_ms')) VIRTUAL;"
+)
+SQL_DEFAULTED = "ALTER TABLE `widgets` ADD `approved` integer DEFAULT 0 NOT NULL;"
+SQL_DROP_INDEX = """DROP INDEX IF EXISTS `idx_widgets_key`;--> statement-breakpoint
+CREATE INDEX `idx_widgets_key_created` ON `widgets` (`key`,`created_at`);"""
+SQL_COMMENTED = """CREATE INDEX `idx_events_ended` ON `events` (`ended_at`) WHERE ended_at IS NOT NULL;--> statement-breakpoint
+-- An expression index, written by hand: the generator cannot emit an
+-- expression that contains a comma.
+CREATE INDEX `idx_events_run` ON `events` (`session_id`, json_extract(`attributes`, '$.run_key')) WHERE `kind` = 'call';
+"""
+SQL_NULLABLE = "ALTER TABLE `widgets` ADD `provider_id` text;"
+SQL_REBUILD = """PRAGMA foreign_keys=OFF;--> statement-breakpoint
+CREATE TABLE `__new_widgets` (`id` text PRIMARY KEY NOT NULL, `mode` text NOT NULL);--> statement-breakpoint
+INSERT INTO `__new_widgets`("id", "mode") SELECT "id", "mode" FROM `widgets`;--> statement-breakpoint
+DROP TABLE `widgets`;--> statement-breakpoint
+ALTER TABLE `__new_widgets` RENAME TO `widgets`;--> statement-breakpoint
+PRAGMA foreign_keys=ON;"""
+
+
+class TestMigrationKind(unittest.TestCase):
+    def test_generated_and_nullable_columns_are_additive(self):
+        self.assertEqual(rc.migration_kind(SQL_GENERATED), "additive")
+        self.assertEqual(rc.migration_kind(SQL_NULLABLE), "additive")
+
+    def test_a_defaulted_not_null_column_is_additive(self):
+        self.assertEqual(rc.migration_kind(SQL_DEFAULTED), "additive")
+
+    def test_indexes_and_comments_are_additive(self):
+        self.assertEqual(rc.migration_kind(SQL_COMMENTED), "additive")
+
+    def test_a_new_table_is_additive(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `gadgets` (`id` integer PRIMARY KEY);"), "additive")
+
+    def test_dropping_an_index_is_not(self):
+        self.assertEqual(rc.migration_kind(SQL_DROP_INDEX), "non-additive: a drop (drop index)")
+
+    def test_not_null_without_a_default_is_not(self):
+        self.assertEqual(
+            rc.migration_kind("ALTER TABLE `widgets` ADD `c` text NOT NULL;"),
+            "non-additive: a NOT NULL column without a default",
+        )
+
+    def test_a_table_rebuild_is_not(self):
+        self.assertEqual(rc.migration_kind(SQL_REBUILD), "non-additive: a table rebuild (drizzle's __new_ copy)")
+
+    def test_every_other_change_is_not(self):
+        cases = {
+            "ALTER TABLE `widgets` RENAME COLUMN `a` TO `b`;": "a rename",
+            "ALTER TABLE `widgets` DROP COLUMN `a`;": "a dropped column",
+            "DROP TABLE `widgets`;": "a drop (drop table)",
+            "CREATE VIEW `widgets` AS SELECT 1;": "a view",
+            "CREATE TRIGGER `w` AFTER INSERT ON `widgets` BEGIN SELECT 1; END;": "a trigger",
+            "CREATE UNIQUE INDEX `u` ON `widgets` (`a`);": "a UNIQUE index",
+            "UPDATE `widgets` SET `c` = 1;": "an unrecognised statement",
+        }
+        for sql, reason in cases.items():
+            with self.subTest(sql):
+                self.assertTrue(rc.migration_kind(sql).startswith(f"non-additive: {reason}"), rc.migration_kind(sql))
+
+    def test_an_empty_file_is_not_additive(self):
+        self.assertEqual(rc.migration_kind("-- nothing\n"), "non-additive: no statements")
+
+
+JOURNAL = f"{rc.MIGRATIONS_DIR}/meta/_journal.json"
+FROM, TO = ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"]
+BASE_TAGS = ("0000_initial", "0034_migration")
+
+
+def journal(*tags):
+    return {"version": "7", "dialect": "sqlite", "entries": [{"idx": i, "tag": t} for i, t in enumerate(tags)]}
+
+
+class TestClassifyMigrations(unittest.TestCase):
+    def fetch(self, from_tags, to_tags, sql):
+        routes = {
+            ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
+            ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
+        }
+        for tag, text in sql.items():
+            routes[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
+        return ts.FakeFetch(routes)
+
+    def test_no_new_migration_is_additive(self):
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}))
+        self.assertEqual((result.classification, result.migrations), ("additive", []))
+
+    def test_every_migration_counts_until_downgrades_are_measured(self):
+        tag = "0035_migration"
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE}))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", [tag]))
+        self.assertEqual(result.kinds, {tag: "additive"})
+
+    def test_once_measured_only_non_additive_kinds_count(self):
+        additive, dropping = "0035_migration", "0036_migration"
+        with mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", False):
+            first = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (additive,), {additive: SQL_NULLABLE}))
+            second = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (dropping,), {dropping: SQL_DROP_INDEX}))
+        self.assertEqual((first.classification, second.classification), ("additive", "not-rollback-safe"))
+
+    def test_reads_use_the_raw_media_type(self):
+        fetch = self.fetch(BASE_TAGS, BASE_TAGS, {})
+        rc.classify_migrations(FROM, TO, fetch=fetch)
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in fetch.calls))
+
+    def test_an_unreadable_journal_counts_as_not_rollback_safe(self):
+        fetch = ts.FakeFetch({ts.contents_url(JOURNAL, TO): (200, journal(*BASE_TAGS))})
+        result = rc.classify_migrations(FROM, TO, fetch=fetch)
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+        self.assertIn("cannot be read", result.note)
+
+    def test_an_unreadable_migration_file_is_not_additive(self):
+        tag = "0036_migration"
+        with mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", False):
+            result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {}))
+        self.assertEqual(result.classification, "not-rollback-safe")
+        self.assertIn("cannot be read", result.kinds[tag])
+
+    def test_a_tag_dropped_from_the_journal_is_not_rollback_safe(self):
+        tag = "0035_migration"
+        with mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", False):
+            result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS + (tag,), BASE_TAGS, {}))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", [tag]))
+
+    def test_a_github_error_is_no_verdict(self):
+        fetch = ts.FakeFetch({ts.contents_url(JOURNAL, FROM): (502, b"")})
+        with self.assertRaises(rc.InfraError):
+            rc.classify_migrations(FROM, TO, fetch=fetch)
+
+    def test_only_full_commit_ids_are_accepted(self):
+        fetch = ts.FakeFetch()
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.classify_migrations("a75532b9", TO, fetch=fetch)
+        self.assertEqual(fetch.calls, [])
+
+    def test_a_journal_tag_that_is_not_a_migration_name_is_refused(self):
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + ("../../x",), {}))
