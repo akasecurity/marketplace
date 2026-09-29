@@ -988,3 +988,111 @@ def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fe
     if check_rulesets:
         problems.extend(audit_rulesets(fetch=fetch))
     return problems
+
+
+def _emit(document, code: int) -> int:
+    print(json.dumps(document, indent=2, ensure_ascii=False))
+    return code
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="release_checks.py", description="Release checks for the ai-tc pin.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version")
+    candidates = sub.add_parser("candidates", help="exact npm versions above everything pinned")
+    candidates.add_argument("--repo", default=".")
+    classify = sub.add_parser("classify", help="classify ai-tc's store migrations between two commits")
+    classify.add_argument("from_commit")
+    classify.add_argument("to_commit")
+    entry = sub.add_parser("safety-entry", help="the rollback-safety.json entry for a version")
+    entry.add_argument("version")
+    entry.add_argument("--repo", default=".")
+    floor = sub.add_parser("floor", help="the rollback floor a target would cross")
+    floor.add_argument("target")
+    floor.add_argument("--repo", default=".")
+    floor.add_argument("--safety", default=SAFETY_FILE)
+    audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
+    audit.add_argument("--repo", default=".")
+    audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
+    audit.add_argument("--previous", default=None)
+    audit.add_argument("--no-rulesets", action="store_true")
+    sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
+    mode = sub.add_parser("diff-mode", help="classify a manifest change")
+    mode.add_argument("base")
+    mode.add_argument("head")
+    return parser
+
+
+def _load(path: str):
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    try:
+        return parse_json(text)
+    except ValueError as exc:
+        raise ReleaseCheckError("parse", f"{path} does not parse: {exc}") from exc
+
+
+def _command(args) -> int:
+    if args.command == "verify-version":
+        release = verify_release(args.version)
+        print(f"OK: {PACKAGE}@{release.version} built from {release.git_commit} on ai-tc main", file=sys.stderr)
+        return _emit(dataclasses.asdict(release), 0)
+    if args.command == "candidates":
+        pinned = pinned_versions(args.repo)
+        return _emit({"pinned": sorted(pinned, key=vkey), "candidates": npm_candidates(pinned)}, 0)
+    if args.command == "classify":
+        result = classify_migrations(args.from_commit, args.to_commit)
+        for tag, kind in result.kinds.items():
+            print(f"{tag}: {kind}", file=sys.stderr)
+        if result.note:
+            print(result.note, file=sys.stderr)
+        return _emit(
+            {"classification": result.classification, "from": args.from_commit, "to": args.to_commit, "migrations": result.migrations},
+            0,
+        )
+    if args.command == "safety-entry":
+        return _emit({"version": args.version, "entry": safety_entry(args.version, pinned_versions(args.repo))}, 0)
+    if args.command == "floor":
+        safety = _load(args.safety)
+        pinned = pinned_versions(args.repo)
+        if not pinned:
+            raise ReleaseCheckError("floor", "nothing is pinned, so there is no rollback to judge")
+        highest = max(pinned, key=vkey)
+        floor = rollback_floor(safety, args.target, highest, pinned=pinned)
+        result = {"target": args.target, "highest_pinned": highest, "floor": floor}
+        if floor is None:
+            return _emit(result, 0)
+        detail = f"{args.target} is below {floor}, which is flagged not rollback-safe"
+        print(f"::error::floor: {detail}", file=sys.stderr)
+        result["error"] = {"check": "floor", "detail": detail}
+        return _emit(result, 1)
+    if args.command == "audit-tags":
+        problems = audit_tags(args.repo, args.frozen, previous_path=args.previous, check_rulesets=not args.no_rulesets)
+        for problem in problems:
+            print(f"::error::{problem}", file=sys.stderr)
+        return _emit({"problems": problems}, 1 if problems else 0)
+    if args.command == "snapshot-tags":
+        return _emit(snapshot_tags(args.repo), 0)
+    return _emit({"mode": diff_mode(_load(args.base), _load(args.head))}, 0)
+
+
+def main(argv=None) -> int:
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    try:
+        return _command(args)
+    except InfraError as exc:
+        print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
+        return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 2)
+    except ReleaseCheckError as exc:
+        print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
+        return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 1)
+    except (OSError, ValueError) as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
