@@ -253,3 +253,57 @@ def pinned_versions(repo_dir: str) -> set:
 def tag_pinned_versions(repo_dir: str) -> set:
     """Every exact version some fleet-v tag pins: the only rollback targets."""
     return {v for ref, v in pins_by_ref(repo_dir).items() if ref != "main" and v}
+
+
+Fetch = Callable[[str, dict], tuple]
+
+
+def _sends_token_to(url: str) -> bool:
+    """Only api.github.com ever sees the job's token; the registry is read anonymously."""
+    return urllib.parse.urlsplit(url).hostname == "api.github.com"
+
+
+def _headers_for(url: str, extra: dict) -> dict:
+    headers = {"User-Agent": "akasecurity-marketplace-release-checks", **extra}
+    if _sends_token_to(url):
+        headers.setdefault("Accept", "application/vnd.github+json")
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+        if os.environ.get("GITHUB_TOKEN"):
+            headers["Authorization"] = "Bearer " + os.environ["GITHUB_TOKEN"]
+    return headers
+
+
+def http_fetch(url: str, headers: dict) -> tuple:
+    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError."""
+    request = urllib.request.Request(url, headers=_headers_for(url, headers))
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        raise InfraError("network", f"GET {url} failed: {exc}") from exc
+
+
+def packument_url() -> str:
+    return f"{REGISTRY}/{urllib.parse.quote(PACKAGE, safe='@')}"
+
+
+def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
+    """Exact x.y.z versions on npmjs above everything pinned, ascending. Never npm latest:
+    a dist-tag can name a version published from a branch."""
+    status, body = fetch(packument_url(), {"Accept": "application/json"})
+    if status != 200:
+        raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
+    versions = json.loads(body).get("versions")
+    if isinstance(versions, dict):
+        names = list(versions)
+    elif isinstance(versions, list):
+        names = versions
+    elif isinstance(versions, str):
+        names = [versions]
+    else:
+        raise InfraError("npm", f"{REGISTRY} returned no versions for {PACKAGE}")
+    exact = {v for v in names if isinstance(v, str) and SEMVER.fullmatch(v)}
+    floor = max((vkey(v) for v in pinned), default=None)
+    return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
