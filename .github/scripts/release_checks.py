@@ -353,3 +353,177 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
         return json.loads(audit.stdout)
     except ValueError as exc:
         raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifiedRelease:
+    version: str
+    integrity: str
+    shasum: str
+    git_commit: str
+    run_url: str
+
+
+class _NotIndexedYet(Exception):
+    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
+
+
+def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
+    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read."""
+    url = f"{packument_url()}/{version}"
+    for attempt in range(1, ATTEMPTS + 1):
+        status, body = fetch(url, {"Accept": "application/json"})
+        if status == 200:
+            break
+        if status != 404 and status < 500:
+            raise ReleaseCheckError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
+        if attempt == ATTEMPTS:
+            if status == 404:
+                raise ReleaseCheckError("dist", f"{REGISTRY} does not serve {PACKAGE}@{version}")
+            raise InfraError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
+        sleep(RETRY_SECONDS)
+    doc = json.loads(body)
+    dist = doc.get("dist") if isinstance(doc, dict) else None
+    if not isinstance(dist, dict) or doc.get("version") != version:
+        raise ReleaseCheckError("dist", f"{REGISTRY} returned no dist for {PACKAGE}@{version}")
+    integrity, shasum = dist.get("integrity"), dist.get("shasum")
+    if not isinstance(integrity, str) or not INTEGRITY.fullmatch(integrity):
+        raise ReleaseCheckError("dist", f"integrity {integrity!r} is not one sha512 SRI")
+    if not isinstance(shasum, str) or not SHASUM.fullmatch(shasum):
+        raise ReleaseCheckError("dist", f"shasum {shasum!r} is not 40 hex")
+    return integrity, shasum
+
+
+def provenance_verdict(sig: dict, version: str, integrity: str) -> dict:
+    """The SLSA statement for PACKAGE@version, once it binds the tarball the dist read saw
+    to ai-tc's release workflow, at the version's own tag, on a GitHub-hosted runner.
+
+    A cryptographically valid attestation alone proves only that SOMEONE published with
+    provenance. The repository, workflow and ref binding carries the security."""
+    pipeline = RELEASE_PIPELINE[PACKAGE]
+    want = {
+        "repository": PROV_REPO,
+        "path": pipeline["workflow"],
+        "ref": f"refs/tags/{pipeline['tag_prefix']}{version}",
+    }
+    if sig.get("invalid"):
+        raise ReleaseCheckError("provenance", f"npm reports INVALID signatures or attestations: {sig['invalid']}")
+    entry = next(
+        (v for v in sig.get("verified") or [] if v.get("name") == PACKAGE and v.get("version") == version),
+        None,
+    )
+    if entry is None:
+        raise _NotIndexedYet(
+            f"{PACKAGE}@{version} carries no VERIFIED attestation (npm's missing list, which "
+            f"names packages with no registry signature: {sig.get('missing')})"
+        )
+    bundles = [b for b in entry.get("attestationBundles") or [] if b.get("predicateType") == SLSA]
+    if not bundles:
+        raise ReleaseCheckError("provenance", f"{PACKAGE}@{version} has no {SLSA} attestation")
+    try:
+        statement = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReleaseCheckError("provenance", f"the SLSA bundle is unreadable: {exc}") from exc
+    predicate = statement.get("predicate") or {}
+    got = ((predicate.get("buildDefinition") or {}).get("externalParameters") or {}).get("workflow") or {}
+    builder = str(((predicate.get("runDetails") or {}).get("builder") or {}).get("id", ""))
+    dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
+    attested = {
+        (s.get("digest") or {}).get("sha512", "") for s in statement.get("subject") or [] if isinstance(s, dict)
+    }
+    if dist_hex not in attested:
+        raise ReleaseCheckError(
+            "provenance",
+            f"the attestation covers a different tarball than the dist read ({integrity}); "
+            "the two registry reads disagree about the bytes",
+        )
+    bad = [f"{k}: attested {got.get(k)!r} != required {v!r}" for k, v in want.items() if got.get(k) != v]
+    if "github-hosted" not in builder:
+        bad.append(f"builder {builder!r} is not a github-hosted runner")
+    if bad:
+        if (
+            got.get("repository") == want["repository"]
+            and got.get("path") == want["path"]
+            and str(got.get("ref", "")).startswith("refs/heads/")
+        ):
+            raise ReleaseCheckError(
+                "provenance",
+                f"{PACKAGE}@{version} was published by {want['repository']} :: {want['path']} from "
+                f"{got.get('ref')!r}, not from its tag {want['ref']!r}: an off-tag publish from a "
+                "branch dispatch. An attestation is immutable, so this version can never be "
+                "imported. This is NOT a stolen-token signal.",
+            )
+        raise ReleaseCheckError(
+            "provenance",
+            "the attestation does not bind this tarball to ai-tc's release workflow: "
+            + "; ".join(bad)
+            + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
+            "with provenance from their own repository.",
+        )
+    return statement
+
+
+def attested_commit(statement: dict, version: str) -> str:
+    """The git commit the provenance says the release was built from, for the tag's own URI."""
+    tag_ref = f"refs/tags/{RELEASE_PIPELINE[PACKAGE]['tag_prefix']}{version}"
+    uri = f"git+{PROV_REPO}@{tag_ref}"
+    dependencies = ((statement.get("predicate") or {}).get("buildDefinition") or {}).get("resolvedDependencies") or []
+    commits = [
+        (d.get("digest") or {}).get("gitCommit")
+        for d in dependencies
+        if isinstance(d, dict) and d.get("uri") == uri
+    ]
+    if len(commits) != 1 or not isinstance(commits[0], str) or not SHA40.fullmatch(commits[0]):
+        raise ReleaseCheckError("attested-commit", f"the provenance names no single commit for {uri} (found {commits!r})")
+    return commits[0]
+
+
+def release_run_url(statement: dict) -> str:
+    """The ai-tc release run that built the tarball, for the PR body."""
+    url = (((statement.get("predicate") or {}).get("runDetails") or {}).get("metadata") or {}).get("invocationId", "")
+    if not isinstance(url, str) or not RUN_URL.fullmatch(url):
+        raise ReleaseCheckError("run-url", f"the provenance names no ai-tc Actions run: {url!r}")
+    return url
+
+
+def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
+    """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main. Refuses
+    behind (built on main's tip, never merged), diverged, 404 and every error."""
+    url = f"{AI_TC_API}/compare/{git_commit}...main?per_page=1"
+    status, body = fetch(url, {})
+    if status in (404, 422):
+        raise ReleaseCheckError("commit-on-main", f"GitHub cannot compare {git_commit} with ai-tc main ({status})")
+    if status != 200:
+        raise InfraError("commit-on-main", f"GET {url} answered {status}")
+    result = json.loads(body).get("status")
+    if result not in ("ahead", "identical"):
+        raise ReleaseCheckError(
+            "commit-on-main",
+            f"compare {git_commit}...main is {result!r}: the attested commit is not on ai-tc main",
+        )
+    return result
+
+
+def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_signatures, sleep=time.sleep) -> VerifiedRelease:
+    """Every check a version must pass before any PR pins it, re-derived from npmjs and
+    GitHub. Nothing is taken on trust."""
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z (pre-releases are never pinned)")
+    integrity, shasum = registry_dist(version, fetch=fetch, sleep=sleep)
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            statement = provenance_verdict(audit(PACKAGE, version), version, integrity)
+            break
+        except _NotIndexedYet as exc:
+            if attempt == ATTEMPTS:
+                raise ReleaseCheckError(
+                    "provenance",
+                    f"{exc}. Every release of this package is published by GitHub Actions with "
+                    f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
+                    "release pipeline.",
+                ) from None
+            sleep(RETRY_SECONDS)
+    git_commit = attested_commit(statement, version)
+    run_url = release_run_url(statement)
+    commit_on_ai_tc_main(git_commit, fetch=fetch)
+    return VerifiedRelease(version, integrity, shasum, git_commit, run_url)
