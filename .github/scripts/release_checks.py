@@ -224,10 +224,15 @@ def _read_manifest(repo_dir: str, rev: str):
 
 
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient: an unreadable or unpinned tag pins nothing."""
+    """What a historical tag pins. Lenient about content: a tag whose manifest does not
+    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
+    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
+    dropping that tag's pin would hide a version from the candidate and rollback floors."""
     try:
         doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
+    except InfraError:
+        raise
     except (ReleaseCheckError, ValueError):
         return None
     return entry_version(pins[0]) if len(pins) == 1 else None
@@ -240,7 +245,12 @@ def pins_by_ref(repo_dir: str) -> dict:
     except ValueError as exc:
         raise ReleaseCheckError("manifest", f"main's {MANIFEST} does not parse: {exc}") from exc
     pins = {"main": entry_version(find_ai_tc_entry(main_doc))}
-    for tag in fleet_tags(repo_dir):
+    tags = fleet_tags(repo_dir)
+    if not tags:
+        # fleet-v1.. can never be deleted, so an empty list means a checkout that did not
+        # fetch tags, and main's pin alone would silently stand for the whole history.
+        raise InfraError("git", f"{repo_dir} holds no fleet-v<N> tag (was the checkout fetched with tags?)")
+    for tag in tags:
         pins[tag] = _tag_pin(repo_dir, tag)
     return pins
 
@@ -316,6 +326,20 @@ def _npm(run, args: list, work: str):
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
 
 
+def _require_npm_11(result) -> None:
+    """An npm older than 11 audits without attestations and reports an empty verified set,
+    which would read as a release with no provenance."""
+    match = re.match(r"(\d+)\.", (result.stdout or "").strip()) if result.returncode == 0 else None
+    if match is None:
+        raise InfraError("toolchain", f"could not read npm's version: {(result.stdout or result.stderr or '')[:200]}")
+    if int(match.group(1)) < 11:
+        raise InfraError(
+            "toolchain",
+            f"npm {result.stdout.strip()} is older than 11, whose audit output cannot show attestations "
+            "(NOT a signature result)",
+        )
+
+
 def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, sleep=time.sleep) -> dict:
     """Run `npm audit signatures --json --include-attestations` over a scratch,
     --ignore-scripts install of exactly package@version from npmjs.
@@ -329,6 +353,7 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
         init = _npm(run, ["init", "-y"], work)
         if init.returncode != 0:
             raise InfraError("toolchain", f"npm init failed: {init.stderr[:2000]}")
+        _require_npm_11(_npm(run, ["--version"], work))
         for attempt in range(1, ATTEMPTS + 1):
             install = _npm(
                 run,
@@ -346,13 +371,34 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
             sleep(RETRY_SECONDS)
         # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
         # exit status is not.
-        audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
-    if not audit.stdout.strip():
-        raise InfraError("toolchain", "npm audit signatures printed nothing (NOT a signature result)")
+        for attempt in range(1, ATTEMPTS + 1):
+            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
+            if audit.stdout.strip():
+                break
+            if attempt == ATTEMPTS:
+                raise InfraError(
+                    "toolchain",
+                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
+                )
+            sleep(RETRY_SECONDS)
     try:
-        return json.loads(audit.stdout)
+        report = json.loads(audit.stdout)
     except ValueError as exc:
         raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
+    # A verdict always carries an "invalid" list (and a "verified" list when there is
+    # anything verified). npm prints its own failures ({"error": {...}}) on the same
+    # stream with the same exit status, and those are not a statement about the package.
+    if (
+        not isinstance(report, dict)
+        or "error" in report
+        or not isinstance(report.get("invalid"), list)
+        or not isinstance(report.get("verified", []), list)
+    ):
+        raise InfraError(
+            "toolchain",
+            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {audit.stdout[:500]}",
+        )
+    return report
 
 
 @dataclasses.dataclass(frozen=True)
