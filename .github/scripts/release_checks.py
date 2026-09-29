@@ -527,3 +527,115 @@ def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_s
     run_url = release_run_url(statement)
     commit_on_ai_tc_main(git_commit, fetch=fetch)
     return VerifiedRelease(version, integrity, shasum, git_commit, run_url)
+
+
+@dataclasses.dataclass
+class Classification:
+    classification: str
+    migrations: list
+    kinds: dict = dataclasses.field(default_factory=dict, compare=False)
+    note: str = dataclasses.field(default="", compare=False)
+
+
+def _statements(sql: str) -> list:
+    text = sql.replace("--> statement-breakpoint", ";")
+    lines = [line.split("--", 1)[0] for line in text.splitlines()]
+    return [" ".join(part.split()) for part in " ".join(lines).split(";") if part.strip()]
+
+
+def _non_additive_reason(statement: str) -> str | None:
+    upper = statement.upper()
+    if upper.startswith("PRAGMA "):
+        return None
+    if "__NEW_" in upper:
+        return "a table rebuild (drizzle's __new_ copy)"
+    if re.match(r"CREATE TABLE ", upper) or re.match(r"CREATE INDEX ", upper):
+        return None
+    if re.match(r"CREATE UNIQUE INDEX ", upper):
+        return "a UNIQUE index, a new constraint an older build's writes can violate"
+    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(.*)", upper)
+    if added:
+        column = added.group(1)
+        if "NOT NULL" in column and "DEFAULT" not in column and "GENERATED" not in column:
+            return "a NOT NULL column without a default"
+        return None
+    if re.match(r"ALTER TABLE \S+ RENAME", upper):
+        return "a rename"
+    if re.match(r"ALTER TABLE \S+ DROP", upper):
+        return "a dropped column"
+    if upper.startswith("DROP "):
+        return "a drop (" + " ".join(upper.split()[:2]).lower() + ")"
+    if re.match(r"CREATE (?:TEMP |TEMPORARY )?VIEW ", upper):
+        return "a view, which may stand in for a former table"
+    if re.match(r"CREATE (?:TEMP |TEMPORARY )?TRIGGER ", upper):
+        return "a trigger, which changes what an older build's writes do"
+    return "an unrecognised statement"
+
+
+def migration_kind(sql: str) -> str:
+    """'additive', or 'non-additive: <first reason>', for one migration file."""
+    statements = _statements(sql)
+    if not statements:
+        return "non-additive: no statements"
+    for statement in statements:
+        reason = _non_additive_reason(statement)
+        if reason:
+            return f"non-additive: {reason}"
+    return "additive"
+
+
+def _ai_tc_file(path: str, commit: str, fetch: Fetch) -> str | None:
+    url = f"{AI_TC_API}/contents/{path}?ref={commit}"
+    status, body = fetch(url, {"Accept": "application/vnd.github.raw+json"})
+    if status == 404:
+        return None
+    if status != 200:
+        raise InfraError("classify", f"GET {url} answered {status}")
+    return body.decode("utf-8")
+
+
+def _journal_tags(commit: str, fetch: Fetch):
+    raw = _ai_tc_file(f"{MIGRATIONS_DIR}/meta/_journal.json", commit, fetch)
+    if raw is None:
+        return None
+    entries = json.loads(raw).get("entries")
+    tags = [e.get("tag") for e in entries] if isinstance(entries, list) else None
+    if tags is None or not all(isinstance(t, str) and MIGRATION_TAG.fullmatch(t) for t in tags):
+        raise ReleaseCheckError("classify", f"the migration journal at {commit} has an unexpected shape")
+    return tags
+
+
+def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
+    """Classify the local-store migrations ai-tc added between two attested commits."""
+    for commit in (from_commit, to_commit):
+        if not isinstance(commit, str) or not SHA40.fullmatch(commit):
+            raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
+    before = _journal_tags(from_commit, fetch)
+    after = _journal_tags(to_commit, fetch)
+    if before is None or after is None:
+        unreadable = from_commit if before is None else to_commit
+        return Classification(
+            "not-rollback-safe",
+            [],
+            note=f"the migration journal at {unreadable} cannot be read, so the version counts as not rollback-safe",
+        )
+    added = [t for t in after if t not in before]
+    removed = [t for t in before if t not in after]
+    kinds = {}
+    for tag in added:
+        sql = _ai_tc_file(f"{MIGRATIONS_DIR}/{tag}.sql", to_commit, fetch)
+        kinds[tag] = "non-additive: the migration file cannot be read" if sql is None else migration_kind(sql)
+    for tag in removed:
+        kinds[tag] = "non-additive: removed from the journal (history rewritten)"
+    migrations = added + removed
+    if not migrations:
+        return Classification("additive", [], kinds)
+    if EVERY_MIGRATION_COUNTS:
+        return Classification(
+            "not-rollback-safe",
+            migrations,
+            kinds,
+            note="every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated",
+        )
+    flagged = any(kind != "additive" for kind in kinds.values())
+    return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
