@@ -166,13 +166,30 @@ class Router:
         self.gh.post(self.gh.repo_path(f"issues/{number}/comments"), {"body": text})
 
 
-def route(results: list[Result], *, label: str, job_result: str, router: Router) -> int:
-    """Apply every result. An evaluation job that did not finish is itself a red result. Returns the exit code."""
+def route(results: list[Result] | None, *, label: str, job_result: str, router: Router) -> int:
+    """Apply every result. Returns the exit code.
+
+    An evaluation job that did not finish is itself a red result, and so is one that finished but handed
+    over no results (None: what it handed over could not be read). Every evaluator returns at least one
+    result, so an empty list means the wiring between the job and this step broke, and reading it as
+    "nothing is red" would leave the audit green for good. The detail names no run URL: it is digested to
+    decide whether anything changed, and every run has its own URL, while the comment appends it.
+    """
     finished = job_result == "success"
-    results = (list(results) if finished else []) + [Result(
-        rule=f"{label}-workflow", label=label, title=f"{label}: the evaluation job did not finish", red=not finished,
-        detail=f"The {label} evaluation job ended `{job_result or 'unknown'}` in {router.run_url}; its checks did "
-               "not run, so their issues were left as they were.")]
+    reported = finished and bool(results)
+    if reported:
+        problem = None
+    elif finished:
+        problem = (f"The {label} evaluation job finished but reported no results that could be read, so none of "
+                   "its checks ran and their issues were left as they were.")
+    else:
+        problem = (f"The {label} evaluation job ended `{job_result or 'unknown'}`; its checks did not run, so "
+                   "their issues were left as they were.")
+    results = list(results or []) if reported else []
+    results.append(Result(
+        rule=f"{label}-workflow", label=label, red=problem is not None, detail=problem or "",
+        title=f"{label}: the evaluation job "
+              + ("reported no results" if finished else "did not finish")))
     red = False
     for result in results:
         print(router.apply(result))
@@ -198,7 +215,12 @@ def main(argv: list[str] | None = None) -> int:
                     escalation=config.get("escalation"), owners=owners, now=dt.datetime.now(dt.timezone.utc),
                     run_url=run_url)
     job_result = env.get("JOB_RESULT", "")
-    results = results_from_json(env.get("RESULTS_JSON", "")) if job_result == "success" else []
+    results: list[Result] | None = []
+    if job_result == "success":
+        try:
+            results = results_from_json(env.get("RESULTS_JSON", ""))
+        except (ValueError, TypeError):
+            results = None
     return route(results, label=args.label, job_result=job_result, router=router)
 
 
