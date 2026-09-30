@@ -31,3 +31,10 @@ class TestLiveRelease(unittest.TestCase):
             (release.integrity, release.git_commit, release.run_url),
             (ts.REAL_INTEGRITY_0_9_14, ts.ATTESTED["0.9.14"], ts.RUN_URL),
         )
+
+    def test_every_fleet_pinned_version_still_verifies(self):
+        # The rollback targets: each release a fleet-v tag can pin must pass the same
+        # checks today, now that the signer is read from the certificate.
+        for version, commit in ts.ATTESTED.items():
+            with self.subTest(version):
+                self.assertEqual(rc.verify_release(version).git_commit, commit)
