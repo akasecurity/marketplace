@@ -409,3 +409,225 @@ def make_plan(git: Any, gh: Any, *, repo_dir: str, mode: str, target: str, reimp
     plan.update(planner(ctx))
     plan.update(reimport=ctx.reimport, below_floor=ctx.below_floor, base_sha=main_sha, base_entry=entry_of(doc))
     return plan
+
+
+AUTO_MERGE_ON = ("mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) "
+                 "{ pullRequest { number } } }")
+AUTO_MERGE_OFF = ("mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) "
+                  "{ pullRequest { number } } }")
+AUTO_MERGE_STATE = ("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) "
+                    "{ pullRequest(number: $number) { autoMergeRequest { enabledAt } } } }")
+# The committer GitHub records, and signs as, on a commit it creates itself (login web-flow).
+GITHUB_COMMITTER_EMAIL = "noreply@github.com"
+
+
+def comment(gh: GitHub, number: int, text: str) -> None:
+    gh.post(gh.repo_path(f"issues/{number}/comments"), {"body": text})
+
+
+def read_file(gh: GitHub, path: str, ref: str) -> str | None:
+    try:
+        answer = gh.get(gh.repo_path(f"contents/{path}"), params={"ref": ref})
+    except GitHubError as error:
+        if error.status == 404:
+            return None
+        raise
+    return base64.b64decode(answer["content"]).decode("utf-8")
+
+
+def branch_exists(gh: GitHub, branch: str) -> bool:
+    try:
+        gh.get(gh.repo_path(f"git/ref/heads/{branch}"))
+    except GitHubError as error:
+        if error.status == 404:
+            return False
+        raise
+    return True
+
+
+def create_commit(gh: GitHub, base_sha: str, files: dict[str, str], message: str) -> str:
+    """One commit on base_sha replacing `files`, through the Git Data API.
+
+    No author or committer is sent, so GitHub records the App's bot account as the author and
+    itself (GitHub <noreply@github.com>, login web-flow) as the committer, and signs the commit.
+    That is the shape validate accepts on a bot PR: every commit authored by the bot App, and
+    committed by it or by web-flow with a verified signature. A commit GitHub committed without
+    signing would fail validate, so it gets no branch."""
+    base_tree = gh.get(gh.repo_path(f"git/commits/{base_sha}"))["tree"]["sha"]
+    tree = gh.post(gh.repo_path("git/trees"), {"base_tree": base_tree, "tree": [
+        {"path": path, "mode": "100644", "type": "blob", "content": text} for path, text in sorted(files.items())]})["sha"]
+    if tree == base_tree:
+        raise Refused("the edit leaves main's tree unchanged; there is nothing to commit", red=False)
+    created = gh.post(gh.repo_path("git/commits"), {"message": message, "tree": tree, "parents": [base_sha]})
+    signed = (created.get("verification") or {}).get("verified") is True
+    if (created.get("committer") or {}).get("email") == GITHUB_COMMITTER_EMAIL and not signed:
+        raise Refused(f"GitHub committed {created['sha']} without a verified signature, which validate refuses on a "
+                      "bot PR, so no branch was created; the App's request must carry no author or committer")
+    return created["sha"]
+
+
+def enable_auto_merge(gh: GitHub, pr: dict) -> None:
+    try:
+        gh.graphql(AUTO_MERGE_ON, {"id": pr["node_id"]})
+    except GitHubError as error:
+        raise Refused(f"PR #{pr['number']} is open, but auto-merge could not be enabled, so it stays open for a "
+                      f"person to merge: {error}") from error
+
+
+def supersede_lower(gh: GitHub, plan: dict, number: int) -> list[int]:
+    """Close open forward pin PRs for lower versions. Never a rollback PR; a failure only warns."""
+    closed = []
+    for other in pulls_by(list_pulls(gh, "open"), PIN_BRANCH):
+        other_version = PIN_BRANCH.fullmatch(other["head"]).group(1)
+        if other["number"] == number or not vkey(other_version) < vkey(plan["version"]):
+            continue
+        try:
+            comment(gh, other["number"], f"Superseded by the ai-tc pin advance to `{plan['version']}` (#{number}). "
+                    "This PR moves the same `source.version` line from the same base, so it can now only conflict. "
+                    "The importer never re-imports a lower version on schedule; moving the pin down is a "
+                    "rollback-mode dispatch of import-plugin-release to a version a `fleet-v` tag has pinned.")
+            gh.patch(gh.repo_path(f"pulls/{other['number']}"), {"state": "closed"})
+            closed.append(other["number"])
+        except GitHubError as error:
+            print(f"::warning::could not close superseded PR #{other['number']}: {error}")
+    return closed
+
+
+def hold_forward(gh: GitHub, number: int, kind: str = "rollback") -> list[int]:
+    """Turn auto-merge off on every open forward pin PR while a rollback (or remove) PR is open."""
+    owner, name = gh.repo.split("/", 1)
+    held = []
+    for other in pulls_by(list_pulls(gh, "open"), PIN_BRANCH):
+        try:
+            gh.graphql(AUTO_MERGE_OFF, {"id": other["node_id"]})
+        except GitHubError:
+            state = gh.graphql(AUTO_MERGE_STATE, {"owner": owner, "name": name, "number": other["number"]})
+            if state["repository"]["pullRequest"]["autoMergeRequest"] is not None:
+                raise Refused(f"could not turn off auto-merge on forward pin PR #{other['number']} while {kind} "
+                              f"PR #{number} is open; turn it off by hand")
+        comment(gh, other["number"], f"Auto-merge is off: {kind} PR #{number} is open. If it merges, this PR "
+                "conflicts: close it and dispatch import-plugin-release with this version as `target` and "
+                "`reimport: true` to reopen it on the new `main` (it then needs a fresh approval).")
+        held.append(other["number"])
+    return held
+
+
+def close_other_rollbacks(gh: GitHub, number: int, branch: str) -> list[int]:
+    closed = []
+    for other in pulls_by(list_pulls(gh, "open"), ROLLBACK_BRANCH):
+        if other["number"] == number or other["head"] == branch:
+            continue
+        comment(gh, other["number"], f"Superseded by rollback PR #{number}.")
+        gh.patch(gh.repo_path(f"pulls/{other['number']}"), {"state": "closed"})
+        closed.append(other["number"])
+    return closed
+
+
+def after_forward(gh: GitHub, plan: dict, pr: dict) -> str:
+    closed = supersede_lower(gh, plan, pr["number"])
+    rollbacks = pulls_by(list_pulls(gh, "open"), ROLLBACK_BRANCH)
+    if rollbacks:
+        comment(gh, pr["number"], f"Auto-merge is not enabled: rollback PR #{rollbacks[0]['number']} is open. Once it "
+                "resolves, enable auto-merge here, or close this PR and dispatch the import with `reimport: true`.")
+        return (f"opened #{pr['number']} without auto-merge (rollback PR #{rollbacks[0]['number']} is open); "
+                f"superseded {closed}")
+    enable_auto_merge(gh, pr)
+    return f"opened #{pr['number']} with auto-merge (squash); superseded {closed}"
+
+
+def after_rollback(gh: GitHub, plan: dict, pr: dict) -> str:
+    # Hold the forward pin PRs first: if enabling auto-merge here then fails (red), no approved
+    # forward PR can still auto-merge past the open rollback.
+    held = hold_forward(gh, pr["number"])
+    enable_auto_merge(gh, pr)
+    closed = close_other_rollbacks(gh, pr["number"], plan["branch"])
+    return f"opened rollback #{pr['number']} with auto-merge (squash); auto-merge off on {held}; closed {closed}"
+
+
+ACTIONS: dict[str, dict] = {
+    "forward": {"edit": edit_pin, "after": after_forward},
+    "rollback": {"edit": edit_pin, "after": after_rollback},
+}
+
+
+def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
+    check_plan(plan)
+    actions = ACTIONS[plan["mode"]]
+    main_sha = gh.get(gh.repo_path("git/ref/heads/main"))["object"]["sha"]
+    raw = read_file(gh, MANIFEST, main_sha)
+    if raw is None:
+        raise Refused(f"main has no {MANIFEST}")
+    if entry_of(json.loads(raw)) != plan["base_entry"]:
+        raise Refused("main's ai-tc entry changed after the verify job read it; the next run re-evaluates", red=False)
+    branch = plan["branch"]
+    if branch_exists(gh, branch):
+        if [p for p in list_pulls(gh, "open") if p["head"] == branch]:
+            raise Refused(f"a PR for {branch} is already open", red=False)
+        if plan["mode"] == "forward" and not plan.get("reimport"):
+            raise Refused(f"{branch} already exists with no open PR (another run got there first, or tag-release "
+                          "has not yet deleted a closed PR's branch); a dispatch with reimport: true replaces it",
+                          red=False)
+        gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        print(f"deleted {branch}, which had no open PR, before creating it again")
+    files = {MANIFEST: actions["edit"](raw, plan)}
+    if plan.get("safety_entry"):
+        safety_raw = read_file(gh, SAFETY_FILE, main_sha)
+        if safety_raw is None:
+            raise Refused(f"main has no {SAFETY_FILE}")
+        added = add_safety_entry(safety_raw, plan["version"], plan["safety_entry"])
+        if added is not None:
+            files[SAFETY_FILE] = added
+    commit = create_commit(gh, main_sha, files, plan["title"])
+    try:
+        gh.post(gh.repo_path("git/refs"), {"ref": f"refs/heads/{branch}", "sha": commit})
+    except GitHubError as error:
+        if error.status == 422:
+            raise Refused(f"{branch} was created by another run first", red=False) from error
+        raise
+    pr = gh.post(gh.repo_path("pulls"), {"title": plan["title"], "head": branch, "base": "main",
+                                         "body": pr_body(plan, run_url)})
+    if plan["labels"]:
+        gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})
+    return actions["after"](gh, plan, pr)
+
+
+def write_output(key: str, value: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise Refused(f"the {key} output is not one line")
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as out:
+            print(f"{key}={value}", file=out)
+    else:
+        print(f"{key}={value}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="import-plugin-release: plan (no secrets) or open-pr (bot App)")
+    parser.add_argument("command", choices=["plan", "open-pr"])
+    parser.add_argument("--repo-dir", default=".")
+    args = parser.parse_args(argv)
+    env = os.environ
+    gh = GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"])
+    try:
+        if args.command == "plan":
+            plan = make_plan(Git(args.repo_dir), gh, repo_dir=args.repo_dir, mode=env.get("MODE") or "forward",
+                             target=env.get("TARGET", ""), reimport=env.get("REIMPORT") == "true",
+                             below_floor=env.get("BELOW_FLOOR") == "true", event=env.get("EVENT_NAME", ""),
+                             run_id=env.get("GITHUB_RUN_ID", ""))
+            write_output("proceed", "true")
+            write_output("plan", json.dumps(plan, separators=(",", ":")))
+            print(f"plan: {plan['mode']} {plan['from_version']} -> {plan['version']} on {plan['branch']}")
+        else:
+            run_url = f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}"
+            print(open_pr(gh, json.loads(env["PLAN_JSON"]), run_url))
+    except Refused as refusal:
+        print(f"::{'error' if refusal.red else 'notice'}::{refusal}")
+        if args.command == "plan":
+            write_output("proceed", "false")
+        return 1 if refusal.red else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
