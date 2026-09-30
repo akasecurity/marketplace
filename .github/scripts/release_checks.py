@@ -63,6 +63,9 @@ SAFETY_FILE = "rollback-safety.json"
 FROZEN_TAGS_FILE = ".github/fleet-tags.frozen.json"
 
 SLSA = "https://slsa.dev/provenance/v1"
+# The builder id of a GitHub-hosted runner in a SLSA statement. Matched exactly: a
+# substring would accept any id that merely mentions it.
+GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
 # The attestation the npm registry itself signs at publish time. npm verifies it against
 # the registry's keys, so it verifying shows npm held them.
 PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
@@ -731,8 +734,8 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
         )
     claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
     disagree = [f"{k}: statement {got.get(k)!r} != certificate {v!r}" for k, v in claimed.items() if got.get(k) != v]
-    if "github-hosted" not in builder:
-        disagree.append(f"builder {builder!r} is not a github-hosted runner")
+    if builder != GITHUB_HOSTED_BUILDER:
+        disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
     if disagree:
         raise ReleaseCheckError(
             "provenance",

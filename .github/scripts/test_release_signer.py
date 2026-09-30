@@ -298,6 +298,26 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
                 error = self.refused("provenance", audits=[ts.audit_output(VERSION, stmt)])
                 self.assertIn("disagrees with the certificate", error.detail)
 
+    def test_a_builder_that_only_contains_github_hosted_is_refused(self):
+        # The certificate is fine; the statement's builder id must be GitHub's exactly.
+        for builder in (
+            "https://evil.example/not-github-hosted",
+            "https://github.com/actions/runner/github-hosted-extra",
+            "https://github.com/actions/runner/self-hosted/github-hosted",
+            "github-hosted",
+            "",
+        ):
+            with self.subTest(builder):
+                stmt = ts.statement(VERSION, builder=builder)
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, stmt)])
+                self.assertIn("disagrees with the certificate", error.detail)
+                self.assertIn("builder", error.detail)
+
+    def test_a_statement_with_no_builder_is_refused(self):
+        stmt = ts.statement(VERSION)
+        del stmt["predicate"]["runDetails"]["builder"]
+        self.refused("provenance", audits=[ts.audit_output(VERSION, stmt)])
+
     def test_two_slsa_bundles_are_refused(self):
         out = ts.audit_output(VERSION)
         bundles = out["verified"][0]["attestationBundles"]
