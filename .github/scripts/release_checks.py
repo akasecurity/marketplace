@@ -392,21 +392,29 @@ class _NotIndexedYet(Exception):
 
 
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
-    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read."""
+    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read.
+
+    Only a 404 that outlasts the read-replica lag is a verdict (the registry does not serve
+    this version), and so is a document that is not a dist for this version. Every other
+    answer that is not a 200 (a 429, a 403, a 5xx), and a 200 that is not a JSON object, says
+    nothing about the release: it is retried and then reported as no verdict."""
     url = f"{packument_url()}/{version}"
     for attempt in range(1, ATTEMPTS + 1):
         status, body = fetch(url, {"Accept": "application/json"})
         if status == 200:
             break
-        if status != 404 and status < 500:
-            raise ReleaseCheckError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
         if attempt == ATTEMPTS:
             if status == 404:
                 raise ReleaseCheckError("dist", f"{REGISTRY} does not serve {PACKAGE}@{version}")
             raise InfraError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
         sleep(RETRY_SECONDS)
-    doc = json.loads(body)
-    dist = doc.get("dist") if isinstance(doc, dict) else None
+    try:
+        doc = parse_json(body.decode("utf-8"))
+    except ValueError as exc:
+        raise InfraError("dist", f"{REGISTRY} answered non-JSON for {PACKAGE}@{version}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise InfraError("dist", f"{REGISTRY} did not answer a JSON object for {PACKAGE}@{version}")
+    dist = doc.get("dist")
     if not isinstance(dist, dict) or doc.get("version") != version:
         raise ReleaseCheckError("dist", f"{REGISTRY} returned no dist for {PACKAGE}@{version}")
     integrity, shasum = dist.get("integrity"), dist.get("shasum")
