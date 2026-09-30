@@ -35,15 +35,23 @@ from typing import Callable
 
 # The one plugin this marketplace pins, and what a publish of it must attest to. These
 # are constants of this reviewed file: nothing read from a PR, the registry or an
-# attestation may nominate the workflow that is supposed to vouch for a release.
+# attestation may nominate the workflow that is supposed to vouch for a release. Who
+# signed a release is read from the Sigstore certificate npm verified, never from the
+# statement the publisher wrote.
 PACKAGE = "@akasecurity/ai-tc-claude-code"
 ENTRY_NAME = "ai-tc"
 REGISTRY = "https://registry.npmjs.org"
 PROV_REPO = "https://github.com/akasecurity/ai-tc"
+OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 RELEASE_PIPELINE = {
     PACKAGE: {
         "workflow": ".github/workflows/release-plugin-claude.yml",
         "tag_prefix": "plugin-claude-v",
+        # GitHub's numeric ids of ai-tc and of the account that owns it. A name can be
+        # taken over after a rename, a transfer or a deleted and re-created repository;
+        # an id cannot.
+        "repository_id": "1296880286",
+        "owner_id": "300515195",
     },
 }
 AI_TC_API = "https://api.github.com/repos/akasecurity/ai-tc"
@@ -406,18 +414,226 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
     return integrity, shasum
 
 
-def provenance_verdict(sig: dict, version: str, integrity: str) -> dict:
-    """The SLSA statement for PACKAGE@version, once it binds the tarball the dist read saw
-    to ai-tc's release workflow, at the version's own tag, on a GitHub-hosted runner.
+class _CertError(ValueError):
+    """The signing certificate could not be read as a Fulcio leaf certificate."""
 
-    A cryptographically valid attestation alone proves only that SOMEONE published with
-    provenance. The repository, workflow and ref binding carries the security."""
+
+# What the release checks read from the signing certificate beyond its subject alternative
+# name: the Fulcio v2 extensions, each one DER UTF8String under 1.3.6.1.4.1.57264.1.<arc>,
+# filled by Fulcio from the claims of the GitHub OIDC token, so a workflow cannot choose
+# them. Every other extension is skipped unread (the deprecated raw-string arcs 1-6, 7, 10,
+# 16, 19, 22 and 24, key usage, the SCT list), so a new Fulcio arc cannot break the reader.
+# Arc 23, the deployment environment, is not pinned: the release job names no GitHub
+# environment. Pin it in the commit that adds one.
+FULCIO_ARC = "1.3.6.1.4.1.57264.1."
+SAN_OID = "2.5.29.17"
+SIGNER_FIELDS = {
+    "issuer": ("8", "OIDC issuer"),
+    "build_signer": ("9", "build signer URI"),
+    "runner": ("11", "runner environment"),
+    "repository": ("12", "source repository URI"),
+    "commit": ("13", "source repository digest"),
+    "ref": ("14", "source repository ref"),
+    "repository_id": ("15", "source repository id"),
+    "owner_id": ("17", "source repository owner id"),
+    "build_config": ("18", "build config URI"),
+    "trigger": ("20", "build trigger"),
+    "run_url": ("21", "run invocation URI"),
+}
+
+
+def _field_label(name: str) -> str:
+    if name == "san":
+        return "certificate subject alternative name"
+    arc, what = SIGNER_FIELDS[name]
+    return f"certificate {what} (Fulcio {FULCIO_ARC}{arc})"
+
+
+def _der(buf: bytes, pos: int, end: int) -> tuple:
+    """(tag, value_start, value_end) of the DER element at buf[pos:end]. Only definite,
+    minimal lengths and single-byte tags, and no element may outrun its parent."""
+    if pos + 2 > end:
+        raise _CertError("truncated element")
+    tag, first = buf[pos], buf[pos + 1]
+    pos += 2
+    if tag & 0x1F == 0x1F:
+        raise _CertError("high tag number form")
+    if first < 0x80:
+        size = first
+    elif first == 0x80:
+        raise _CertError("indefinite length")
+    else:
+        count = first & 0x7F
+        if count > 4 or pos + count > end:
+            raise _CertError("length over four bytes or truncated")
+        size = int.from_bytes(buf[pos : pos + count], "big")
+        if buf[pos] == 0 or size < 0x80:
+            raise _CertError("length not minimal")
+        pos += count
+    if pos + size > end:
+        raise _CertError("element overruns its parent")
+    return tag, pos, pos + size
+
+
+def _der_items(buf: bytes, start: int, stop: int) -> list:
+    """The children of the constructed element whose content is buf[start:stop]. They must
+    fill it exactly."""
+    items, pos = [], start
+    while pos < stop:
+        tag, content_start, content_end = _der(buf, pos, stop)
+        items.append((tag, content_start, content_end))
+        pos = content_end
+    return items
+
+
+def _der_oid(raw: bytes) -> str:
+    if not raw or raw[-1] & 0x80:
+        raise _CertError("malformed OID")
+    arcs, value = [], 0
+    for byte in raw:
+        if value == 0 and byte == 0x80:
+            raise _CertError("OID arc not minimal")
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            arcs.append(value)
+            value = 0
+    head = min(arcs[0] // 40, 2)
+    return ".".join(str(arc) for arc in [head, arcs[0] - 40 * head, *arcs[1:]])
+
+
+def _san_uri(der: bytes, start: int, stop: int) -> str:
+    """The one URI a Fulcio leaf's subjectAltName holds."""
+    tag, content_start, content_end = _der(der, start, stop)
+    if tag != 0x30 or content_end != stop:
+        raise _CertError("the subject alternative name is not one SEQUENCE")
+    names = _der_items(der, content_start, content_end)
+    if len(names) != 1 or names[0][0] != 0x86:
+        raise _CertError("the subject alternative name is not exactly one URI")
+    raw = der[names[0][1] : names[0][2]]
+    if not raw or any(byte < 0x21 or byte > 0x7E for byte in raw):
+        raise _CertError("the subject alternative name URI is not printable ASCII")
+    return raw.decode("ascii")
+
+
+def _fulcio_string(der: bytes, start: int, stop: int, oid: str) -> str:
+    tag, content_start, content_end = _der(der, start, stop)
+    if tag != 0x0C or content_end != stop:
+        raise _CertError(f"extension {oid} is not exactly one UTF8String")
+    try:
+        return der[content_start:content_end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _CertError(f"extension {oid} is not UTF-8") from exc
+
+
+def signer_identity(der: bytes) -> dict:
+    """Who a Fulcio leaf certificate (DER) names: {"san": <URI>, "issuer": ..., "commit": ...,
+    one key per SIGNER_FIELDS name}. Reads the standard library only, verifies nothing
+    cryptographic (npm did: the chain to Fulcio's CA, the signed certificate timestamp,
+    Rekor, and the envelope signature made with this leaf's key), and refuses anything it
+    does not expect with _CertError."""
+    tag, start, stop = _der(der, 0, len(der))
+    if tag != 0x30 or stop != len(der):
+        raise _CertError("not exactly one certificate SEQUENCE")
+    parts = _der_items(der, start, stop)
+    if len(parts) != 3 or parts[0][0] != 0x30:
+        raise _CertError("a certificate is a tbsCertificate, an algorithm and a signature")
+    tbs = _der_items(der, parts[0][1], parts[0][2])
+    if not tbs or tbs[-1][0] != 0xA3:
+        raise _CertError("the certificate has no extensions field")
+    wrapper = _der_items(der, tbs[-1][1], tbs[-1][2])
+    if len(wrapper) != 1 or wrapper[0][0] != 0x30:
+        raise _CertError("the extensions field is not one SEQUENCE")
+    wanted = {FULCIO_ARC + arc: name for name, (arc, _) in SIGNER_FIELDS.items()}
+    seen, found = set(), {}
+    for tag, extension_start, extension_end in _der_items(der, wrapper[0][1], wrapper[0][2]):
+        if tag != 0x30:
+            raise _CertError("an extension is not a SEQUENCE")
+        extension = _der_items(der, extension_start, extension_end)
+        if len(extension) not in (2, 3) or extension[0][0] != 0x06 or extension[-1][0] != 0x04:
+            raise _CertError("an extension is not an OID, an optional flag and an OCTET STRING")
+        if len(extension) == 3 and extension[1][0] != 0x01:
+            raise _CertError("an extension's critical flag is not a BOOLEAN")
+        oid = _der_oid(der[extension[0][1] : extension[0][2]])
+        if oid in seen:
+            raise _CertError(f"extension {oid} appears twice")
+        seen.add(oid)
+        value_start, value_end = extension[-1][1], extension[-1][2]
+        if oid == SAN_OID:
+            found["san"] = _san_uri(der, value_start, value_end)
+        elif oid in wanted:
+            found[wanted[oid]] = _fulcio_string(der, value_start, value_end, oid)
+    absent = [name for name in ("san", *SIGNER_FIELDS) if name not in found]
+    if absent:
+        raise _CertError(f"the certificate does not carry {', '.join(_field_label(n) for n in absent)}")
+    return found
+
+
+def _leaf_der(bundle) -> bytes:
+    """The DER of the certificate a sigstore bundle was signed with: verificationMaterial
+    must hold exactly one of `certificate` or `x509CertificateChain` (whose first entry is
+    the leaf, as sigstore reads it). A public key, both, or neither is refused."""
+    material = bundle.get("verificationMaterial") if isinstance(bundle, dict) else None
+    if not isinstance(material, dict):
+        raise _CertError("the bundle has no verification material")
+    present = [key for key in ("certificate", "x509CertificateChain", "publicKey") if key in material]
+    if present == ["certificate"]:
+        holder = material["certificate"]
+    elif present == ["x509CertificateChain"]:
+        chain = material["x509CertificateChain"]
+        certificates = chain.get("certificates") if isinstance(chain, dict) else None
+        holder = certificates[0] if isinstance(certificates, list) and certificates else None
+    else:
+        raise _CertError(f"the verification material holds {present or 'nothing'}, not one signing certificate")
+    raw = holder.get("rawBytes") if isinstance(holder, dict) else None
+    if not isinstance(raw, str):
+        raise _CertError("the signing certificate has no rawBytes")
+    try:
+        return base64.b64decode(raw, validate=True)
+    except ValueError as exc:
+        raise _CertError(f"the signing certificate is not base64: {exc}") from exc
+
+
+def required_signer(version: str) -> dict:
+    """What the signing certificate of PACKAGE@version must say: ai-tc's release workflow,
+    at the version's own tag, pushed by the tag, from ai-tc's own repository, on a
+    GitHub-hosted runner. The commit and the run are bound to the statement instead."""
     pipeline = RELEASE_PIPELINE[PACKAGE]
-    want = {
+    tag_ref = f"refs/tags/{pipeline['tag_prefix']}{version}"
+    workflow = f"{PROV_REPO}/{pipeline['workflow']}@{tag_ref}"
+    return {
+        "san": workflow,
+        "issuer": OIDC_ISSUER,
+        "build_signer": workflow,
+        "runner": "github-hosted",
         "repository": PROV_REPO,
-        "path": pipeline["workflow"],
-        "ref": f"refs/tags/{pipeline['tag_prefix']}{version}",
+        "ref": tag_ref,
+        "repository_id": pipeline["repository_id"],
+        "owner_id": pipeline["owner_id"],
+        "build_config": workflow,
+        "trigger": "push",
     }
+
+
+@dataclasses.dataclass(frozen=True)
+class SignedStatement:
+    """The in-toto statement a provenance bundle carries, with who signed it. `signer` is
+    read from the certificate npm verified; `body` is what the publisher wrote."""
+
+    body: dict
+    signer: dict
+
+
+def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStatement:
+    """The SLSA statement for PACKAGE@version and the certificate that signed it, once the
+    certificate binds the tarball the dist read saw to ai-tc's release workflow, at the
+    version's own tag, pushed by that tag, on a GitHub-hosted runner.
+
+    npm checks the signature and the certificate's chain, but no identity: an attestation
+    that verifies proves only that SOMEONE published with provenance. So who signed is read
+    from the signing certificate (Fulcio fills it from GitHub's token, and the envelope is
+    signed with that certificate's key), never from the statement, which the publisher
+    wrote. The statement must then agree with the certificate."""
+    pipeline = RELEASE_PIPELINE[PACKAGE]
     if sig.get("invalid"):
         raise ReleaseCheckError("provenance", f"npm reports INVALID signatures or attestations: {sig['invalid']}")
     entry = next(
@@ -432,6 +648,16 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> dict:
     bundles = [b for b in entry.get("attestationBundles") or [] if b.get("predicateType") == SLSA]
     if not bundles:
         raise ReleaseCheckError("provenance", f"{PACKAGE}@{version} has no {SLSA} attestation")
+    if len(bundles) > 1:
+        raise ReleaseCheckError(
+            "provenance",
+            f"{PACKAGE}@{version} has {len(bundles)} {SLSA} attestations, not exactly one, so "
+            "there is no single signer to read",
+        )
+    try:
+        signer = signer_identity(_leaf_der(bundles[0].get("bundle")))
+    except _CertError as exc:
+        raise ReleaseCheckError("provenance", f"the SLSA bundle's signing certificate is unreadable: {exc}") from exc
     try:
         statement = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
     except (KeyError, TypeError, ValueError) as exc:
@@ -443,43 +669,57 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> dict:
     attested = {
         (s.get("digest") or {}).get("sha512", "") for s in statement.get("subject") or [] if isinstance(s, dict)
     }
+    bad = [
+        f"{_field_label(name)}: attested {signer[name]!r} != required {value!r}"
+        for name, value in required_signer(version).items()
+        if signer[name] != value
+    ]
+    if bad:
+        if (
+            signer["repository"] == PROV_REPO
+            and signer["san"].startswith(f"{PROV_REPO}/{pipeline['workflow']}@refs/heads/")
+            and signer["ref"].startswith("refs/heads/")
+        ):
+            raise ReleaseCheckError(
+                "provenance",
+                f"{PACKAGE}@{version} was published by {PROV_REPO} :: {pipeline['workflow']} from "
+                f"{signer['ref']!r}, not from its tag refs/tags/{pipeline['tag_prefix']}{version}: an "
+                "off-tag publish from a branch dispatch. An attestation is immutable, so this "
+                "version can never be imported. This is NOT a stolen-token signal.",
+            )
+        raise ReleaseCheckError(
+            "provenance",
+            "the signing certificate does not bind this tarball to ai-tc's release workflow: "
+            + "; ".join(bad)
+            + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
+            "with provenance from their own repository.",
+        )
     if dist_hex not in attested:
         raise ReleaseCheckError(
             "provenance",
             f"the attestation covers a different tarball than the dist read ({integrity}); "
             "the two registry reads disagree about the bytes",
         )
-    bad = [f"{k}: attested {got.get(k)!r} != required {v!r}" for k, v in want.items() if got.get(k) != v]
+    claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
+    disagree = [f"{k}: statement {got.get(k)!r} != certificate {v!r}" for k, v in claimed.items() if got.get(k) != v]
     if "github-hosted" not in builder:
-        bad.append(f"builder {builder!r} is not a github-hosted runner")
-    if bad:
-        if (
-            got.get("repository") == want["repository"]
-            and got.get("path") == want["path"]
-            and str(got.get("ref", "")).startswith("refs/heads/")
-        ):
-            raise ReleaseCheckError(
-                "provenance",
-                f"{PACKAGE}@{version} was published by {want['repository']} :: {want['path']} from "
-                f"{got.get('ref')!r}, not from its tag {want['ref']!r}: an off-tag publish from a "
-                "branch dispatch. An attestation is immutable, so this version can never be "
-                "imported. This is NOT a stolen-token signal.",
-            )
+        disagree.append(f"builder {builder!r} is not a github-hosted runner")
+    if disagree:
         raise ReleaseCheckError(
             "provenance",
-            "the attestation does not bind this tarball to ai-tc's release workflow: "
-            + "; ".join(bad)
-            + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
-            "with provenance from their own repository.",
+            "the signed statement disagrees with the certificate that signed it: "
+            + "; ".join(disagree)
+            + ". A statement that contradicts its own signer is forged.",
         )
-    return statement
+    return SignedStatement(statement, signer)
 
 
-def attested_commit(statement: dict, version: str) -> str:
-    """The git commit the provenance says the release was built from, for the tag's own URI."""
+def attested_commit(statement: SignedStatement, version: str) -> str:
+    """The git commit the release was built from: the signing certificate's source
+    repository digest, which the statement's own commit for the tag's URI must equal."""
     tag_ref = f"refs/tags/{RELEASE_PIPELINE[PACKAGE]['tag_prefix']}{version}"
     uri = f"git+{PROV_REPO}@{tag_ref}"
-    dependencies = ((statement.get("predicate") or {}).get("buildDefinition") or {}).get("resolvedDependencies") or []
+    dependencies = ((statement.body.get("predicate") or {}).get("buildDefinition") or {}).get("resolvedDependencies") or []
     commits = [
         (d.get("digest") or {}).get("gitCommit")
         for d in dependencies
@@ -487,14 +727,26 @@ def attested_commit(statement: dict, version: str) -> str:
     ]
     if len(commits) != 1 or not isinstance(commits[0], str) or not SHA40.fullmatch(commits[0]):
         raise ReleaseCheckError("attested-commit", f"the provenance names no single commit for {uri} (found {commits!r})")
-    return commits[0]
+    if commits[0] != statement.signer["commit"]:
+        raise ReleaseCheckError(
+            "attested-commit",
+            f"the statement builds {uri} at {commits[0]} but the signing certificate names "
+            f"{statement.signer['commit']} as the commit the workflow ran at",
+        )
+    return statement.signer["commit"]
 
 
-def release_run_url(statement: dict) -> str:
-    """The ai-tc release run that built the tarball, for the PR body."""
-    url = (((statement.get("predicate") or {}).get("runDetails") or {}).get("metadata") or {}).get("invocationId", "")
-    if not isinstance(url, str) or not RUN_URL.fullmatch(url):
-        raise ReleaseCheckError("run-url", f"the provenance names no ai-tc Actions run: {url!r}")
+def release_run_url(statement: SignedStatement) -> str:
+    """The ai-tc release run that built the tarball, for the PR body: the signing
+    certificate's run invocation URI, which the statement's own must equal."""
+    url = statement.signer["run_url"]
+    if not RUN_URL.fullmatch(url):
+        raise ReleaseCheckError("run-url", f"the signing certificate names no ai-tc Actions run: {url!r}")
+    claimed = (((statement.body.get("predicate") or {}).get("runDetails") or {}).get("metadata") or {}).get("invocationId")
+    if claimed != url:
+        raise ReleaseCheckError(
+            "run-url", f"the statement names the run {claimed!r} but the signing certificate names {url!r}"
+        )
     return url
 
 
@@ -518,7 +770,9 @@ def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
 
 def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_signatures, sleep=time.sleep) -> VerifiedRelease:
     """Every check a version must pass before any PR pins it, re-derived from npmjs and
-    GitHub. Nothing is taken on trust."""
+    GitHub. Nothing the publisher wrote is taken on trust. What is trusted is npm's
+    cryptography (the registry signature and the sigstore bundle, including the signing
+    certificate it verified) and GitHub's answer about ai-tc main."""
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z (pre-releases are never pinned)")
     integrity, shasum = registry_dist(version, fetch=fetch, sleep=sleep)

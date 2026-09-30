@@ -420,22 +420,33 @@ class TestVerifyRelease(unittest.TestCase):
         self.refused("provenance", audits=[ts.audit_output("0.9.14", invalid=[{"code": "EINTEGRITYSIGNATURE"}])])
 
     def test_an_off_tag_branch_publish_is_refused_without_crying_theft(self):
-        stmt = ts.statement("0.9.14", ref="refs/heads/release/0.9.x")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        # The certificate and the statement both say the workflow ran from a branch.
+        ref = "refs/heads/release/0.9.x"
+        uri = f"{rc.PROV_REPO}/{ts.WORKFLOW}@{ref}"
+        stmt = ts.statement("0.9.14", ref=ref)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("NOT a stolen-token signal", error.detail)
 
     def test_another_repository_is_refused(self):
-        stmt = ts.statement("0.9.14", repository="https://github.com/someone/ai-tc")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", repository=other)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("anyone can publish with provenance", error.detail)
 
     def test_another_workflow_is_refused(self):
-        stmt = ts.statement("0.9.14", path=".github/workflows/other.yml")
-        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        path = ".github/workflows/other.yml"
+        uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", path=path)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri)
+        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
 
     def test_a_self_hosted_builder_is_refused(self):
         stmt = ts.statement("0.9.14", builder="https://github.com/actions/runner/self-hosted")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        cert = ts.signing_cert("0.9.14", runner="self-hosted")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("github-hosted", error.detail)
 
     def test_an_attestation_for_different_bytes_is_refused(self):
