@@ -25,6 +25,7 @@ from issue_router import CODEOWNERS_FILE, Result, parse_codeowners, results_to_j
 from tag_release import merged_pull
 
 LABEL = "main-audit"
+SUMMARY_RULE = "main-audit"
 ZERO = re.compile(r"0{40}")
 NOT_A_PUSHER = {"web-flow"}
 
@@ -59,8 +60,15 @@ def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None])
 
 
 def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float], None] = time.sleep) -> list[Result]:
+    """One red result per offending commit or rewrite of main, then one green summary of the push.
+
+    The summary is always the last result, so the list is never empty. It is green and auto_close is off, so
+    the router files nothing and closes nothing for it (the red ones wait for a person); it records the number
+    of commits the push added and the number of red results.
+    """
+    commits = added_commits(git, before, after)
     results = []
-    for sha in added_commits(git, before, after):
+    for sha in commits:
         problem = audit_commit(gh, git, sha, sleep)
         if problem:
             results.append(Result(
@@ -69,6 +77,19 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
                 auto_close=False,
                 detail=problem + "\n\nIf this was a break-glass merge, record the incident and who merged it "
                                  "here; a person closes this issue once it is explained."))
+    if not commits and before and not ZERO.fullmatch(before) and before != after:
+        results.append(Result(
+            rule=f"main-audit-rewrite-{after[:12]}", label=LABEL,
+            title=f"main-audit: main moved from {before[:12]} to {after[:12]} without adding a commit", red=True,
+            auto_close=False,
+            detail=f"main moved from `{before}` to `{after}` and the push added no commit, so history was "
+                   "rewritten or reset.\n\nRecord who did it and why here; a person closes this issue once it "
+                   "is explained."))
+    flagged = sum(1 for item in results if item.red)
+    results.append(Result(
+        rule=SUMMARY_RULE, label=LABEL, title="main-audit: the commits a push added to main", red=False,
+        auto_close=False,
+        detail=f"{len(commits)} commit(s) added by this push, {flagged} flagged."))
     return results
 
 
@@ -79,9 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ
     results = audit(Git(args.repo_dir), GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]),
                     env.get("BEFORE", ""), env["AFTER"])
-    for item in results:
+    flagged = [item for item in results if item.red]
+    for item in flagged:
         print(f"::error::{item.detail.splitlines()[0]}")
-    print(f"{len(results)} commit(s) in this push reached main without a code-owner-approved PR")
+    print(f"{len(flagged)} finding(s) in this push to main without a code-owner-approved PR")
     write_output("results", results_to_json(results))
     return 0
 
