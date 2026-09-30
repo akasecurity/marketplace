@@ -41,19 +41,30 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
+      # The baseline is the snapshot the last green run of this file on main kept. A run on any other
+      # branch never supplies it, because a branch can carry its own edited copy of this file. Only a
+      # snapshot that is listed and expired (they last 90 days) skips the comparison, with a notice;
+      # every other failure fails the step, so a hiccup cannot read as "nothing moved".
       - name: fetch the snapshot the last green run kept
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           mkdir -p previous
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --status success --limit 1 \
-            --json databaseId --jq '.[0].databaseId // empty')
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --branch main --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
           if [ -z "$run_id" ]; then
-            echo "::notice::no earlier green tag-audit run; comparing against the frozen list only"
-          elif ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous; then
-            echo "::notice::run $run_id kept no snapshot (expired); comparing against the frozen list only"
+            echo "::notice::no earlier green tag-audit run on main; comparing against the frozen list only"
+            exit 0
           fi
+          kept=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" --jq \
+            '[.artifacts[] | select(.name == "fleet-tags-snapshot")]
+             | if length == 0 then "missing" elif (map(.expired) | all) then "expired" else "ready" end')
+          case "$kept" in
+            ready) gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous ;;
+            expired) echo "::notice::run $run_id kept a snapshot that has expired; comparing against the frozen list only" ;;
+            *) echo "::error::run $run_id is the last green run but lists no fleet-tags-snapshot artifact"; exit 1 ;;
+          esac
       - name: audit
         id: check
         env:
@@ -62,7 +73,8 @@ jobs:
         run: >-
           python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json
           --previous previous/fleet-tags.snapshot.json --snapshot snapshot/fleet-tags.snapshot.json --results
-      # Kept only from a green audit, so a moved tag stays red until a person explains it.
+      # Kept only from a green audit, so a moved tag stays red until a person explains it. It lasts 90
+      # days: after that long without a green run of the file on main, the next run has no baseline.
       # 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a == v7.0.1 (verified with git ls-remote).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.check.outputs.red == 'false'
