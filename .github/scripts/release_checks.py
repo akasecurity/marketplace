@@ -63,6 +63,9 @@ SAFETY_FILE = "rollback-safety.json"
 FROZEN_TAGS_FILE = ".github/fleet-tags.frozen.json"
 
 SLSA = "https://slsa.dev/provenance/v1"
+# The attestation the npm registry itself signs at publish time. npm verifies it against
+# the registry's keys, so it verifying shows npm held them.
+PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
 # The bot App's login, "<app-slug>[bot]". None until the App exists. While it is None, no
@@ -636,14 +639,32 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     pipeline = RELEASE_PIPELINE[PACKAGE]
     if sig.get("invalid"):
         raise ReleaseCheckError("provenance", f"npm reports INVALID signatures or attestations: {sig['invalid']}")
+    # npm fills `missing` (no registry signature) and `verified` (a verified attestation)
+    # independently, so one package can be in both.
+    missing = sig.get("missing")
+    if not isinstance(missing, list) or not all(isinstance(item, dict) for item in missing):
+        raise InfraError(
+            "toolchain", f"npm audit signatures printed no list of missing signatures (NOT a signature result): {missing!r}"
+        )
+    if any(item.get("name") == PACKAGE and item.get("version") == version for item in missing):
+        raise ReleaseCheckError(
+            "signature",
+            f"npm reports no registry signature for {PACKAGE}@{version}: the registry's own "
+            "signature over this tarball is missing, so the attestation alone cannot be relied on",
+        )
     entry = next(
         (v for v in sig.get("verified") or [] if v.get("name") == PACKAGE and v.get("version") == version),
         None,
     )
     if entry is None:
-        raise _NotIndexedYet(
-            f"{PACKAGE}@{version} carries no VERIFIED attestation (npm's missing list, which "
-            f"names packages with no registry signature: {sig.get('missing')})"
+        raise _NotIndexedYet(f"{PACKAGE}@{version} carries no VERIFIED attestation in npm's report")
+    if not any(b.get("predicateType") == PUBLISH for b in entry.get("attestationBundles") or []):
+        # Absent from `missing` means something only if npm held the registry's keys, and
+        # the registry's own publish attestation verifying is what shows it did.
+        raise ReleaseCheckError(
+            "signature",
+            f"{PACKAGE}@{version} has no verified registry publish attestation, so nothing shows "
+            "that npm checked the registry's signature",
         )
     bundles = [b for b in entry.get("attestationBundles") or [] if b.get("predicateType") == SLSA]
     if not bundles:

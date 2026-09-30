@@ -413,7 +413,7 @@ class TestVerifyRelease(unittest.TestCase):
     def test_no_attestation_after_five_tries_is_refused(self):
         sleeps = []
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", verified=False)], sleeps=sleeps)
-        self.assertIn("no registry signature", error.detail)
+        self.assertIn("no VERIFIED attestation", error.detail)
         self.assertEqual(sleeps, [20, 20, 20, 20])
 
     def test_npm_reporting_invalid_is_refused(self):
