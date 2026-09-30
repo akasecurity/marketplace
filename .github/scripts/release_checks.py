@@ -413,7 +413,7 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
         sleep(RETRY_SECONDS)
     try:
         doc = parse_json(body.decode("utf-8"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("dist", f"{REGISTRY} answered non-JSON for {PACKAGE}@{version}: {exc}") from exc
     if not isinstance(doc, dict):
         raise InfraError("dist", f"{REGISTRY} did not answer a JSON object for {PACKAGE}@{version}")
@@ -728,7 +728,7 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
         statement = parse_json(base64.b64decode(payload, validate=True).decode("utf-8"))
         if not isinstance(statement, dict):
             raise ValueError("the statement is not a JSON object")
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
     subjects = statement.get("subject")
     attested = {

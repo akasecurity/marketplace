@@ -98,6 +98,9 @@ class TestRegistryDist(ts.VerifyMixin, unittest.TestCase):
             with self.subTest(body):
                 self.no_verdict("dist", routes=self.routes_answering((200, body)))
 
+    def test_a_dist_body_nested_too_deep_to_parse_is_no_verdict(self):
+        self.no_verdict("dist", routes=self.routes_answering((200, b"[" * 200000)))
+
     def test_a_dist_body_that_is_not_an_object_is_no_verdict(self):
         for body in (b"[]", b'"text"', b"null", b"7"):
             with self.subTest(body):
@@ -219,6 +222,7 @@ class TestMalformedReports(ts.VerifyMixin, unittest.TestCase):
             "invalid UTF-8": b"\xff\xfe",
             "a duplicate key": b'{"subject": [], "subject": []}',
             "NaN": b'{"subject": NaN}',
+            "nesting too deep to parse": b"[" * 200000,
         }.items():
             with self.subTest(name):
                 error = self.refused("provenance", audits=[with_payload(self.report(), payload)])
