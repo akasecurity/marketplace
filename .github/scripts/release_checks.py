@@ -303,15 +303,15 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     status, body = fetch(packument_url(), {"Accept": "application/json"})
     if status != 200:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
-    versions = json.loads(body).get("versions")
-    if isinstance(versions, dict):
-        names = list(versions)
-    elif isinstance(versions, list):
-        names = versions
-    elif isinstance(versions, str):
-        names = [versions]
-    else:
-        raise InfraError("npm", f"{REGISTRY} returned no versions for {PACKAGE}")
-    exact = {v for v in names if isinstance(v, str) and SEMVER.fullmatch(v)}
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except ValueError as exc:
+        raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
+    versions = document.get("versions") if isinstance(document, dict) else None
+    if not isinstance(versions, dict):
+        # The packument keys "versions" by version. A list or a bare string is what
+        # `npm view ... versions --json` prints, not what the registry serves.
+        raise InfraError("npm", f"{REGISTRY} returned no versions object for {PACKAGE}")
+    exact = {v for v in versions if SEMVER.fullmatch(v)}
     floor = max((vkey(v) for v in pinned), default=None)
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
