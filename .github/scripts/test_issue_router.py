@@ -182,6 +182,11 @@ class TestNoResults(RouterCase):
         self.assertEqual(self.gh.called("POST", R("issues")), [])
         self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
 
+    def test_an_explicit_empty_list_leaves_an_open_per_rule_issue_as_it_is(self):
+        self.issues.append(existing())
+        self.assertEqual(self.route([]), 0)
+        self.assertEqual(self.gh.writes(), [])
+
     def test_a_finished_job_with_a_result_is_green_when_the_result_is(self):
         self.assertEqual(self.route([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)]), 0)
         self.assertEqual(self.gh.writes(), [])
