@@ -836,6 +836,41 @@ class TestClassifyMigrations(unittest.TestCase):
             rc.classify_migrations("a75532b9", TO, fetch=fetch)
         self.assertEqual(fetch.calls, [])
 
+    def test_a_malformed_journal_is_a_verdict_not_a_crash(self):
+        # The journal at an attested commit never changes, so a retry cannot help: refuse it.
+        cases = {
+            "not JSON": b"not json",
+            "a list, not an object": b"[]",
+            "null": b"null",
+            "entries that is not a list": b'{"entries": "0000_initial"}',
+            "an entry that is not an object": b'{"entries": [1]}',
+            "an entry whose tag is not a string": b'{"entries": [{"tag": 5}]}',
+            "a duplicated key": b'{"entries": [], "entries": []}',
+            "nested too deep to parse": b"[" * 100000 + b"]" * 100000,
+            "not UTF-8": b"\xff\xfe{}",
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(JOURNAL, commit): (200, answer)})
+                    with self.assertRaises(rc.ReleaseCheckError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+                    self.assertIn(commit, caught.exception.detail)
+
+    def test_a_migration_file_that_is_not_utf8_is_a_verdict_not_a_crash(self):
+        tag = "0035_migration"
+        fetch = self.fetch(
+            BASE_TAGS,
+            BASE_TAGS + (tag,),
+            {},
+            routes={ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO): (200, b"CREATE TABLE \xff\xfe;")},
+        )
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.classify_migrations(FROM, TO, fetch=fetch)
+        self.assertEqual(caught.exception.check, "classify")
+        self.assertIn(f"{tag}.sql", caught.exception.detail)
+
     def test_a_journal_tag_that_is_not_a_migration_name_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + ("../../x",), {}))

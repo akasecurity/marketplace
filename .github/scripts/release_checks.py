@@ -1025,15 +1025,23 @@ def _ai_tc_file(path: str, commit: str, fetch: Fetch) -> str | None:
         return None
     if status != 200:
         raise InfraError("classify", f"GET {url} answered {status}")
-    return body.decode("utf-8")
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The file at an attested commit never changes, so this is a verdict, not an outage.
+        raise ReleaseCheckError("classify", f"{path} at {commit} is not UTF-8: {exc}") from exc
 
 
 def _journal_tags(commit: str, fetch: Fetch):
     raw = _ai_tc_file(f"{MIGRATIONS_DIR}/meta/_journal.json", commit, fetch)
     if raw is None:
         return None
-    entries = json.loads(raw).get("entries")
-    tags = [e.get("tag") for e in entries] if isinstance(entries, list) else None
+    try:
+        document = parse_json(raw)
+    except (ValueError, RecursionError) as exc:
+        raise ReleaseCheckError("classify", f"the migration journal at {commit} does not parse: {exc}") from exc
+    entries = document.get("entries") if isinstance(document, dict) else None
+    tags = [e.get("tag") if isinstance(e, dict) else None for e in entries] if isinstance(entries, list) else None
     if tags is None or not all(isinstance(t, str) and MIGRATION_TAG.fullmatch(t) for t in tags):
         raise ReleaseCheckError("classify", f"the migration journal at {commit} has an unexpected shape")
     return tags
