@@ -426,7 +426,7 @@ class TestVerifyRelease(unittest.TestCase):
         stmt = ts.statement("0.9.14", ref=ref)
         cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
-        self.assertIn("NOT a stolen-token signal", error.detail)
+        self.assertIn("not a stolen npm credential", error.detail)
 
     def test_another_repository_is_refused(self):
         other = "https://github.com/someone/ai-tc"
