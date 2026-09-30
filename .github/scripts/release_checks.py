@@ -347,9 +347,9 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
     --ignore-scripts install of exactly package@version from npmjs.
 
     npm does the cryptography (the registry signature and the sigstore bundle); the
-    caller judges what the attestation binds. Needs npm 11 (Node 24): an older npm
-    returns an EMPTY verified set, which reads as "no attestation" and would refuse a
-    good release."""
+    caller judges what the attestation binds. Needs an npm that honours
+    --include-attestations (11.12 or later). An older one prints no `verified` list at all,
+    which provenance_verdict reports as a toolchain failure, not as a missing attestation."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
@@ -680,7 +680,16 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
             f"npm reports no registry signature for {PACKAGE}@{version}: the registry's own "
             "signature over this tarball is missing, so the attestation alone cannot be relied on",
         )
-    verified = sig.get("verified", [])
+    if "verified" not in sig:
+        # npm prints `verified` whenever it honours --include-attestations, even when it
+        # verified nothing. No list at all means an npm that ignored the flag (before 11.12):
+        # a statement about npm, not about the release.
+        raise InfraError(
+            "toolchain",
+            "npm audit signatures printed no `verified` list (NOT a signature result): npm lists "
+            "verified attestations only when it honours --include-attestations, which needs npm 11.12 or later",
+        )
+    verified = sig["verified"]
     if not isinstance(verified, list) or not all(isinstance(item, dict) for item in verified):
         raise InfraError("toolchain", f"npm audit signatures printed a verified list that is not a list of objects (NOT a signature result): {verified!r:.200}")
     entries = [v for v in verified if v.get("name") == PACKAGE and v.get("version") == version]
