@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -36,6 +37,31 @@ class TestJsonHelpers(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError) as caught:
             rc.load_round_trip(compact)
         self.assertEqual(caught.exception.check, "round-trip")
+
+
+class TestErrorClasses(unittest.TestCase):
+    def test_no_verdict_is_never_caught_as_a_verdict(self):
+        self.assertFalse(issubclass(rc.InfraError, rc.ReleaseCheckError))
+        self.assertFalse(issubclass(rc.ReleaseCheckError, rc.InfraError))
+
+    def test_both_carry_the_check_and_the_detail(self):
+        for cls in (rc.ReleaseCheckError, rc.InfraError):
+            with self.subTest(cls=cls.__name__):
+                error = cls("npm", "the registry is down")
+                self.assertEqual(error.check, "npm")
+                self.assertEqual(error.detail, "the registry is down")
+                self.assertEqual(str(error), "npm: the registry is down")
+
+    def test_a_handler_written_for_a_verdict_lets_an_outage_through(self):
+        # _tag_pin is lenient about what a tag's manifest says, so every verdict-shaped
+        # failure pins nothing. A failed read is no verdict and must not be dropped with them.
+        with mock.patch.object(rc, "_read_manifest", side_effect=rc.InfraError("git", "show failed")):
+            with self.assertRaises(rc.InfraError):
+                rc._tag_pin("unused", "fleet-v1")
+        for verdict in (rc.ReleaseCheckError("manifest", "no plugins list"), ValueError("does not parse")):
+            with self.subTest(verdict=repr(verdict)):
+                with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
+                    self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
 
 
 class TestSelectEntry(unittest.TestCase):
@@ -252,9 +278,30 @@ class TestNpmCandidates(unittest.TestCase):
     def test_nothing_above_the_pin_is_an_empty_list(self):
         self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=self.fetch({"0.9.13": {}, "0.9.14": {}})), [])
 
-    def test_a_single_version_string_is_accepted(self):
-        fetch = ts.FakeFetch({rc.packument_url(): (200, {"versions": "0.9.15"})})
-        self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=fetch), ["0.9.15"])
+    def test_a_registry_document_that_is_not_a_versions_object_is_no_verdict(self):
+        # The registry's packument always holds "versions" as an object keyed by version.
+        # The list and string shapes belong to `npm view ... versions --json`, which this
+        # module never reads, so they are a wrong answer and not a second accepted format.
+        not_json = "answered non-JSON"
+        no_object = "no versions object"
+        for label, body, expected in (
+            ("an array", b"[]", no_object),
+            ("a string", b'"0.9.15"', no_object),
+            ("null", b"null", no_object),
+            ("no versions key", {"dist-tags": {"latest": "0.9.14"}}, no_object),
+            ("a null versions", {"versions": None}, no_object),
+            ("a versions list", {"versions": ["0.9.15"]}, no_object),
+            ("a versions string", {"versions": "0.9.15"}, no_object),
+            ("text that is not JSON", b"not json", not_json),
+            ("bytes that are not UTF-8", b"\xff", not_json),
+            ("a duplicated key", b'{"versions": {"0.9.15": {}}, "versions": {"0.9.16": {}}}', not_json),
+        ):
+            with self.subTest(label):
+                fetch = ts.FakeFetch({rc.packument_url(): (200, body)})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(expected, caught.exception.detail)
 
     def test_npm_latest_is_never_consulted(self):
         self.assertEqual(
@@ -526,29 +573,40 @@ class TestVerifyRelease(unittest.TestCase):
     def test_no_attestation_after_five_tries_is_refused(self):
         sleeps = []
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", verified=False)], sleeps=sleeps)
-        self.assertIn("no registry signature", error.detail)
+        self.assertIn("no VERIFIED attestation", error.detail)
         self.assertEqual(sleeps, [20, 20, 20, 20])
 
     def test_npm_reporting_invalid_is_refused(self):
         self.refused("provenance", audits=[ts.audit_output("0.9.14", invalid=[{"code": "EINTEGRITYSIGNATURE"}])])
 
     def test_an_off_tag_branch_publish_is_refused_without_crying_theft(self):
-        stmt = ts.statement("0.9.14", ref="refs/heads/release/0.9.x")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
-        self.assertIn("NOT a stolen-token signal", error.detail)
+        # The certificate and the statement both say the workflow ran from a branch.
+        ref = "refs/heads/release/0.9.x"
+        uri = f"{rc.PROV_REPO}/{ts.WORKFLOW}@{ref}"
+        stmt = ts.statement("0.9.14", ref=ref)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+        self.assertIn("not a stolen npm credential", error.detail)
 
     def test_another_repository_is_refused(self):
-        stmt = ts.statement("0.9.14", repository="https://github.com/someone/ai-tc")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", repository=other)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("anyone can publish with provenance", error.detail)
 
     def test_another_workflow_is_refused(self):
-        stmt = ts.statement("0.9.14", path=".github/workflows/other.yml")
-        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        path = ".github/workflows/other.yml"
+        uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", path=path)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri)
+        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
 
     def test_a_self_hosted_builder_is_refused(self):
         stmt = ts.statement("0.9.14", builder="https://github.com/actions/runner/self-hosted")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        cert = ts.signing_cert("0.9.14", runner="self-hosted")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("github-hosted", error.detail)
 
     def test_an_attestation_for_different_bytes_is_refused(self):
@@ -613,6 +671,37 @@ class TestMigrationKind(unittest.TestCase):
             "non-additive: a NOT NULL column without a default",
         )
 
+    def test_not_null_is_read_after_the_column_name_and_as_words(self):
+        no_default = "non-additive: a NOT NULL column without a default"
+        cases = {
+            "a name that ends in default": "ALTER TABLE `widgets` ADD `is_default` integer NOT NULL;",
+            "a quoted name that holds the word": "ALTER TABLE `widgets` ADD `x default` integer NOT NULL;",
+            "a double-quoted name that holds the word": 'ALTER TABLE `widgets` ADD "x default" integer NOT NULL;',
+            "a bracketed name that holds the word": "ALTER TABLE `widgets` ADD [x default] integer NOT NULL;",
+            "an unquoted name, COLUMN spelled out": "ALTER TABLE widgets ADD COLUMN x integer NOT NULL;",
+            "an unquoted name with a dollar before the word": "ALTER TABLE widgets ADD x$default integer NOT NULL;",
+            "the word in a string of a check": "ALTER TABLE `widgets` ADD `x` text NOT NULL CHECK (`x` <> 'DEFAULT');",
+            "the word as a quoted name in the definition": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES `default`(`id`);",
+            "a longer word that starts with it": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES defaults(id);",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), no_default)
+
+    def test_a_default_or_a_generated_expression_after_the_name_still_allows_not_null(self):
+        cases = [
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL DEFAULT 0;",
+            "ALTER TABLE `widgets` ADD `x default` integer DEFAULT 0 NOT NULL;",
+            "ALTER TABLE `widgets` ADD `x` text NOT NULL DEFAULT 'a';",
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL GENERATED ALWAYS AS (1) VIRTUAL;",
+            "ALTER TABLE `widgets` ADD `x` text;",
+            # The words are in a quoted name, not in the column's constraints.
+            "ALTER TABLE `widgets` ADD `x` integer REFERENCES `not null`(`id`);",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), "additive")
+
     def test_a_table_rebuild_is_not(self):
         self.assertEqual(rc.migration_kind(SQL_REBUILD), "non-additive: a table rebuild (drizzle's __new_ copy)")
 
@@ -633,6 +722,95 @@ class TestMigrationKind(unittest.TestCase):
     def test_an_empty_file_is_not_additive(self):
         self.assertEqual(rc.migration_kind("-- nothing\n"), "non-additive: no statements")
 
+    def test_dashes_inside_a_string_do_not_hide_the_rest_of_the_line(self):
+        sql = "CREATE TABLE `t` (`a` text DEFAULT '--');DROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_an_apostrophe_in_a_block_comment_does_not_open_a_string(self):
+        # A lexer that misses /* */ reads the apostrophe as the start of a string that
+        # runs to the next quote and blanks the DROP in between.
+        sql = "/* don't */ DROP TABLE `users`; CREATE TABLE `a` (`b` text DEFAULT 'x');"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_a_statement_breakpoint_ends_a_statement_with_no_semicolon(self):
+        sql = "CREATE TABLE `a` (`x` integer)\n--> statement-breakpoint\nDROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_ai_tc_splits_on_the_breakpoint_wherever_it_stands_so_the_rest_of_the_line_counts(self):
+        # ai-tc runs the text after each "-->\s*statement-breakpoint" as its own chunk, even
+        # when it follows a statement on the same line or sits inside a comment.
+        drop = "non-additive: a drop (drop table)"
+        cases = {
+            "after a statement on the same line": "CREATE TABLE `a` (`x` integer);--> statement-breakpoint DROP TABLE `users`;",
+            "inside a line comment": "CREATE TABLE `a` (`x` integer); -- why --> statement-breakpoint DROP TABLE `users`;",
+            "with a newline between the words": "CREATE TABLE `a` (`x` integer)-->\nstatement-breakpoint DROP TABLE `users`;",
+            "with no space at all": "CREATE TABLE `a` (`x` integer)-->statement-breakpoint DROP TABLE `users`;",
+            # JavaScript's \s counts U+FEFF as white space and Python's does not.
+            "split by a byte-order mark": f"CREATE TABLE `a` (`x` integer);-->{chr(0xFEFF)}statement-breakpoint DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), drop)
+
+    def test_a_breakpoint_inside_a_comment_cannot_hide_the_statement_after_it(self):
+        # The chunk before the breakpoint ends inside a block comment, which is refused.
+        sql = "CREATE TABLE `a` (`x` integer); /* --> statement-breakpoint DROP TABLE `users`; -- */"
+        self.assertTrue(rc.migration_kind(sql).startswith("non-additive"), rc.migration_kind(sql))
+
+    def test_a_semicolon_inside_a_string_does_not_end_the_statement(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT ';DROP TABLE x');"), "additive")
+
+    def test_a_doubled_quote_is_an_escape_not_the_end_of_the_literal(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'it''s; DROP TABLE x');"), "additive")
+        self.assertEqual(rc.migration_kind('CREATE TABLE "t""x;y" ("a" text);'), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t``x;y` (`a` text);"), "additive")
+
+    def test_quoted_names_keep_their_words_so_a_rebuild_is_still_seen(self):
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE `__new_widgets` (`id` text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE [__new_widgets] (id text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+
+    def test_words_inside_a_string_or_a_comment_decide_nothing(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'DROP TABLE __new_x');"), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text); /* DROP TABLE `users`; */ -- DROP TABLE `x`;"), "additive")
+
+    def test_only_the_foreign_keys_pragma_is_additive(self):
+        pragma = "non-additive: a PRAGMA other than foreign_keys=ON/OFF"
+        cases = {
+            "PRAGMA foreign_keys=OFF;": "additive",
+            "PRAGMA foreign_keys=ON;": "additive",
+            "pragma foreign_keys = off;": "additive",
+            "PRAGMA foreign_keys  =  On ;": "additive",
+            "PRAGMA user_version=9;": pragma,
+            "PRAGMA writable_schema=1;": pragma,
+            "PRAGMA journal_mode=DELETE;": pragma,
+            "PRAGMA foreign_keys;": pragma,
+            "PRAGMA foreign_keys=1;": pragma,
+            "PRAGMA main.foreign_keys=OFF;": pragma,
+            "PRAGMA foreign_keys=OFF AND 1;": pragma,
+        }
+        for sql, kind in cases.items():
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), kind)
+
+    def test_a_quote_or_comment_that_never_closes_is_not_additive(self):
+        unterminated = "non-additive: an unterminated quoted string or comment"
+        cases = {
+            "string": "CREATE TABLE `t` (`a` text DEFAULT 'x);",
+            "backtick name": "CREATE TABLE `t (`a` text);",
+            "double-quoted name": 'CREATE TABLE "t (a text);',
+            "bracketed name": "CREATE TABLE [t (a text);",
+            "block comment": "CREATE TABLE `t` (`a` text); /* DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), unterminated)
+
 
 JOURNAL = f"{rc.MIGRATIONS_DIR}/meta/_journal.json"
 FROM, TO = ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"]
@@ -643,15 +821,40 @@ def journal(*tags):
     return {"version": "7", "dialect": "sqlite", "entries": [{"idx": i, "tag": t} for i, t in enumerate(tags)]}
 
 
+def blob(tag, variant=""):
+    """A stable fake git blob sha for one migration file."""
+    return hashlib.sha1(f"{tag}{variant}".encode()).hexdigest()
+
+
+def directory(tags, edited=()):
+    """What the Contents API answers for the migrations directory: the meta folder, then
+    one file per tag, each with its git blob sha. A tag in `edited` has a different one."""
+    files = [
+        {
+            "name": f"{tag}.sql",
+            "path": f"{rc.MIGRATIONS_DIR}/{tag}.sql",
+            "sha": blob(tag, "edited" if tag in edited else ""),
+            "type": "file",
+        }
+        for tag in tags
+    ]
+    return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
+
+
 class TestClassifyMigrations(unittest.TestCase):
-    def fetch(self, from_tags, to_tags, sql):
-        routes = {
+    def fetch(self, from_tags, to_tags, sql, *, edited=(), routes=None):
+        """Journals, listings and added files for a pair of releases. `edited` tags carry a
+        different blob sha at TO; `routes` replaces any of the answers."""
+        answers = {
             ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
             ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, FROM): (200, directory(from_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(to_tags, edited)),
         }
         for tag, text in sql.items():
-            routes[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
-        return ts.FakeFetch(routes)
+            answers[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
+        answers.update(routes or {})
+        return ts.FakeFetch(answers)
 
     def test_no_new_migration_is_additive(self):
         result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}))
@@ -670,10 +873,17 @@ class TestClassifyMigrations(unittest.TestCase):
             second = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (dropping,), {dropping: SQL_DROP_INDEX}))
         self.assertEqual((first.classification, second.classification), ("additive", "not-rollback-safe"))
 
-    def test_reads_use_the_raw_media_type(self):
-        fetch = self.fetch(BASE_TAGS, BASE_TAGS, {})
+    def test_file_reads_use_the_raw_media_type_and_listings_use_json(self):
+        tag = "0035_migration"
+        fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE})
         rc.classify_migrations(FROM, TO, fetch=fetch)
-        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in fetch.calls))
+        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(f"/contents/{rc.MIGRATIONS_DIR}")]
+        files = [(url, h) for url, h in fetch.calls if (url, h) not in listings]
+        # One listing per attested commit, however many migrations the journals hold.
+        self.assertEqual(sorted(url for url, _ in listings), sorted([ts.contents_url(rc.MIGRATIONS_DIR, c) for c in (FROM, TO)]))
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github+json" for _, h in listings))
+        self.assertEqual(len(files), 3)  # the two journals and the one added file
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in files))
 
     def test_an_unreadable_journal_counts_as_not_rollback_safe(self):
         fetch = ts.FakeFetch({ts.contents_url(JOURNAL, TO): (200, journal(*BASE_TAGS))})
@@ -687,6 +897,86 @@ class TestClassifyMigrations(unittest.TestCase):
             result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {}))
         self.assertEqual(result.classification, "not-rollback-safe")
         self.assertIn("cannot be read", result.kinds[tag])
+
+    def test_a_migration_edited_in_place_is_not_rollback_safe(self):
+        # A store that already applied the tag never re-runs an edit, so a fresh store and
+        # an old one diverge: the release is not safe to roll back across, whatever the edit.
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, edited=("0000_initial",)))
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", ["0000_initial"]))
+                self.assertTrue(result.kinds["0000_initial"].startswith("non-additive: modified in place"), result.kinds)
+                self.assertNotIn("0034_migration", result.kinds)
+
+    def test_an_edited_migration_is_listed_after_the_added_and_removed_ones(self):
+        added, removed = "0035_migration", "0033_migration"
+        result = rc.classify_migrations(
+            FROM,
+            TO,
+            fetch=self.fetch(BASE_TAGS + (removed,), BASE_TAGS + (added,), {added: SQL_NULLABLE}, edited=("0000_initial",)),
+        )
+        self.assertEqual(result.migrations, [added, removed, "0000_initial"])
+        self.assertEqual(result.kinds[added], "additive")
+
+    def test_a_shipped_migration_the_listing_does_not_hold_is_not_additive(self):
+        # The journal names it but the directory has no such file (or the directory cannot
+        # be listed at all): unreadable, which counts as not rollback-safe. Not an outage.
+        without = lambda tags: (200, [e for e in directory(tags) if e["name"] != "0000_initial.sql"])
+        cases = {
+            "missing at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): without(BASE_TAGS)}, ["0000_initial"]),
+            "missing at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): without(BASE_TAGS)}, ["0000_initial"]),
+            "no directory at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+            "no directory at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+        }
+        for name, (routes, unreadable) in cases.items():
+            for counts in (True, False):
+                with self.subTest(name, every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                    result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+                    self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", unreadable))
+                    for tag in unreadable:
+                        self.assertEqual(result.kinds[tag], "non-additive: the migration file cannot be read")
+
+    def test_a_listing_error_is_no_verdict(self):
+        for commit in (FROM, TO):
+            for status in (403, 500, 502):
+                with self.subTest(commit=commit[:8], status=status):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): (status, b"")})
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+
+    def test_a_truncated_listing_is_no_verdict(self):
+        # The Contents API lists at most 1000 entries of a directory and does not say it stopped.
+        crowd = [{"name": f"x{i}.txt", "path": f"{rc.MIGRATIONS_DIR}/x{i}.txt", "sha": blob(f"x{i}"), "type": "file"} for i in range(1000)]
+        for size, raises in ((1000, True), (999, False)):
+            with self.subTest(entries=size):
+                routes = {ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(BASE_TAGS) + crowd[: size - len(directory(BASE_TAGS))])}
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes)
+                if raises:
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                else:
+                    self.assertEqual(rc.classify_migrations(FROM, TO, fetch=fetch).classification, "additive")
+
+    def test_a_listing_that_is_not_a_directory_listing_is_no_verdict(self):
+        good = directory(BASE_TAGS)
+        with_sha = lambda value: [dict(e, sha=value) if e["name"] == "0034_migration.sql" else e for e in good]
+        cases = {
+            "not JSON": (200, b"not json"),
+            "a single file, not a directory": (200, {"name": "0000_initial.sql", "type": "file", "sha": blob("x")}),
+            "null": (200, b"null"),
+            "an entry that is not an object": (200, [*good, "0035_migration.sql"]),
+            "a sha that is not 40 hex": (200, with_sha("not-a-sha")),
+            "a sha that is not a string": (200, with_sha(7)),
+            "an entry without a sha": (200, [{k: v for k, v in e.items() if k != "sha"} if e["name"] == "0034_migration.sql" else e for e in good]),
+            "a duplicated key": (200, b'[{"name": "a", "name": "b"}]'),
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): answer})
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
 
     def test_a_tag_dropped_from_the_journal_is_not_rollback_safe(self):
         tag = "0035_migration"
@@ -704,6 +994,41 @@ class TestClassifyMigrations(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.classify_migrations("a75532b9", TO, fetch=fetch)
         self.assertEqual(fetch.calls, [])
+
+    def test_a_malformed_journal_is_a_verdict_not_a_crash(self):
+        # The journal at an attested commit never changes, so a retry cannot help: refuse it.
+        cases = {
+            "not JSON": b"not json",
+            "a list, not an object": b"[]",
+            "null": b"null",
+            "entries that is not a list": b'{"entries": "0000_initial"}',
+            "an entry that is not an object": b'{"entries": [1]}',
+            "an entry whose tag is not a string": b'{"entries": [{"tag": 5}]}',
+            "a duplicated key": b'{"entries": [], "entries": []}',
+            "nested too deep to parse": b"[" * 100000 + b"]" * 100000,
+            "not UTF-8": b"\xff\xfe{}",
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(JOURNAL, commit): (200, answer)})
+                    with self.assertRaises(rc.ReleaseCheckError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+                    self.assertIn(commit, caught.exception.detail)
+
+    def test_a_migration_file_that_is_not_utf8_is_a_verdict_not_a_crash(self):
+        tag = "0035_migration"
+        fetch = self.fetch(
+            BASE_TAGS,
+            BASE_TAGS + (tag,),
+            {},
+            routes={ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO): (200, b"CREATE TABLE \xff\xfe;")},
+        )
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.classify_migrations(FROM, TO, fetch=fetch)
+        self.assertEqual(caught.exception.check, "classify")
+        self.assertIn(f"{tag}.sql", caught.exception.detail)
 
     def test_a_journal_tag_that_is_not_a_migration_name_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
@@ -770,10 +1095,57 @@ class TestRollbackFloor(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
 
+    def test_only_a_well_formed_additive_entry_is_trusted(self):
+        # A version is safe to roll back across only on an entry that safety_problems accepts
+        # and that says "additive". One malformed entry flags its own version; it does not
+        # refuse the whole file, which would block every rollback (the incident path).
+        good = dict(ts.SEED["0.9.14"], classification="additive", migrations=[])
+        malformed = {
+            "only the classification": {"classification": "additive"},
+            "an extra key": {**good, "note": 1},
+            "keys out of order": {key: good[key] for key in ("from", "classification", "to", "migrations")},
+            "a commit that is not 40 hex": {**good, "from": "abc"},
+            "a migration that is not a tag": {**good, "migrations": ["../x"]},
+            "migrations that is not a list": {**good, "migrations": "0035_migration"},
+        }
+        for name, entry in malformed.items():
+            with self.subTest(name):
+                self.assertNotEqual(rc.safety_problems({"versions": {"0.9.14": entry}}), [])
+                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.safety_problems({"versions": {"0.9.14": good}}), [])
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14"))
+
+    def test_a_malformed_entry_flags_only_its_own_version(self):
+        versions = {"0.9.13": dict(ts.SEED["0.9.13"]), "0.9.14": {"classification": "additive"}}
+        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13"))
+        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14"), "0.9.14")
+
 
 class TestSafetyProblems(unittest.TestCase):
     def test_the_seed_is_well_formed(self):
         self.assertEqual(rc.safety_problems({"versions": ts.SEED}), [])
+
+    def test_each_problem_names_its_version_and_field(self):
+        good = dict(ts.SEED["0.9.14"])
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good}}),
+            ["rollback-safety.json '0.9': not an exact x.y.z"],
+        )
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9.14": {**good, "classification": "safe", "from": "abc"}}}),
+            [
+                "rollback-safety.json '0.9.14': classification must be additive or not-rollback-safe",
+                "rollback-safety.json '0.9.14': from must be a 40-hex commit id",
+            ],
+        )
+        # Every entry is read, not just the first one with a problem.
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good, "0.9.14": good, "0.9.15": {}}}),
+            [
+                "rollback-safety.json '0.9': not an exact x.y.z",
+                f"rollback-safety.json '0.9.15': keys must be exactly {rc.SAFETY_KEYS}, in that order",
+            ],
+        )
 
     def test_each_malformation_is_named(self):
         good = dict(ts.SEED["0.9.14"])
