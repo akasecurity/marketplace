@@ -233,7 +233,10 @@ def _read_manifest(repo_dir: str, rev: str):
 
 
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient: an unreadable or unpinned tag pins nothing."""
+    """What a historical tag pins. Lenient about content: a tag whose manifest does not
+    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
+    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
+    dropping that tag's pin would hide a version from the candidate and rollback floors."""
     try:
         doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
