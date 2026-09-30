@@ -52,7 +52,8 @@ Don't "fix" it by copying entries across.
 records that version's npm integrity in the entry's free-form `metadata.integrity` (Claude Code
 does not read it; fleet checks compare installed bytes against it). Claude Code honours the pin on
 install and in its plugin auto-update pass, so a new `@akasecurity/ai-tc-claude-code` publish
-reaches nobody through this marketplace until an approved pull request moves the pin. That is the
+reaches nobody through this marketplace until a code-owner-approved pull request moves the pin (an
+org owner's break-glass merge aside, which `main-audit` reports). That is the
 point: the pin is the audit trail, and it is what stops a fleet from advancing because a publish
 happened. It holds for `main` and for `fleet-v2` onward; `fleet-v1` predates it — its ai-tc entry
 names only the package — so a marketplace registered at `fleet-v1` (or any pre-pin commit) with
@@ -85,9 +86,10 @@ other tag name:
 - **Never move, delete or re-sign an existing `fleet-v<N>` tag.** `tag-audit` treats a tag that no
   longer resolves to its recorded object as a supply-chain event, not a typo;
   `.github/fleet-tags.frozen.json` records the tags that existed when it was switched on.
-- Managed fleets either follow `main`, which only an approved pull request can move, or register
-  this marketplace at a `fleet-v<N>` tag, which never moves; a fleet on a tag moves only when its
-  own configuration names a later one. A tag is also the only way to hold a fleet on one release,
+- Managed fleets either follow `main`, which moves only through a code-owner-approved pull request
+  (an org owner's break-glass merge aside, which `main-audit` reports), or register this
+  marketplace at a `fleet-v<N>` tag, which never moves; a fleet on a tag moves only when its own
+  configuration names a later one. A tag is also the only way to hold a fleet on one release,
   since a marketplace ref cannot be a raw commit.
 - **Checking a version by hand, registry-explicit.** The importer and `validate` run these checks
   as code. To repeat them, confirm the version on the **public** registry with the scope mapping
@@ -126,8 +128,9 @@ may use.
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
   no secret: it takes the highest exact npm version above every version `main` or a `fleet-v` tag
   has pinned that passes the release checks, never npm `latest` on trust. Its `open-pr` job creates
-  the bot branch (never force-pushing: an existing branch means another run got there), opens the
-  PR and enables auto-merge. A version a code owner rejected (its PR closed unmerged), or one a
+  the bot branch with a create-only ref, never a force-push (a branch with an open PR is skipped; one
+  with no open PR is skipped on a plain forward run, and deleted and created again only by a
+  `reimport` or rollback dispatch), opens the PR and enables auto-merge. A version a code owner rejected (its PR closed unmerged), or one a
   rollback moved away from, comes back only through a dispatch with `reimport: true`.
   `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
   open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
@@ -151,6 +154,8 @@ may use.
 
 Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners.
 
-**Adding an npm-pinned plugin means adding its release workflow path and tag prefix to the release
-pipeline in `.github/scripts/release_checks.py` in the same commit** — the importer and `validate`
-refuse a pinned package with no declared release workflow to bind its provenance to.
+**The release path covers one plugin.** `release_checks.py` names one package and one release
+pipeline, and the importer, `validate`, `tag-release` and `staleness` act only on the entry that
+pins it; `validate` checks every other entry only for parsing and unique names. Pinning another
+plugin to an npm version gets none of these checks, and adding it to `RELEASE_PIPELINE` alone
+changes nothing: pin one only together with the script changes that cover it.
