@@ -589,6 +589,25 @@ class TestMigrationKind(unittest.TestCase):
         self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'DROP TABLE __new_x');"), "additive")
         self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text); /* DROP TABLE `users`; */ -- DROP TABLE `x`;"), "additive")
 
+    def test_only_the_foreign_keys_pragma_is_additive(self):
+        pragma = "non-additive: a PRAGMA other than foreign_keys=ON/OFF"
+        cases = {
+            "PRAGMA foreign_keys=OFF;": "additive",
+            "PRAGMA foreign_keys=ON;": "additive",
+            "pragma foreign_keys = off;": "additive",
+            "PRAGMA foreign_keys  =  On ;": "additive",
+            "PRAGMA user_version=9;": pragma,
+            "PRAGMA writable_schema=1;": pragma,
+            "PRAGMA journal_mode=DELETE;": pragma,
+            "PRAGMA foreign_keys;": pragma,
+            "PRAGMA foreign_keys=1;": pragma,
+            "PRAGMA main.foreign_keys=OFF;": pragma,
+            "PRAGMA foreign_keys=OFF AND 1;": pragma,
+        }
+        for sql, kind in cases.items():
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), kind)
+
     def test_a_quote_or_comment_that_never_closes_is_not_additive(self):
         unterminated = "non-additive: an unterminated quoted string or comment"
         cases = {

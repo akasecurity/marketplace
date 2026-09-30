@@ -971,7 +971,11 @@ def _statements(sql: str) -> list:
 def _non_additive_reason(statement: str) -> str | None:
     upper = statement.upper()
     if upper.startswith("PRAGMA "):
-        return None
+        # The two drizzle writes around a table rebuild, and nothing else: any other
+        # pragma changes how the store behaves (journal mode, schema writes, user_version).
+        if re.fullmatch(r"PRAGMA FOREIGN_KEYS\s*=\s*(?:ON|OFF)", upper):
+            return None
+        return "a PRAGMA other than foreign_keys=ON/OFF"
     if "__NEW_" in upper:
         return "a table rebuild (drizzle's __new_ copy)"
     if re.match(r"CREATE TABLE ", upper) or re.match(r"CREATE INDEX ", upper):
