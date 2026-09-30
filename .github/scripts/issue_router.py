@@ -1,0 +1,206 @@
+"""Opens, updates and closes the marketplace's alert issues.
+
+staleness, tag-audit and main-audit evaluate their rules in a job that cannot
+write issues, and hand the results to a job that can do nothing else. Each
+rule has one issue, found by its label and a hidden rule marker; it is
+assigned to the release approvers in .github/release-approvers.json and
+mentions the code owners in .github/CODEOWNERS. A red rule comments only when
+its detail changes, or once a day; after 48 hours the escalation owner is
+assigned; a rule that clears closes its issue (main-audit's issues are closed
+by a person). GitHub mails a failed scheduled run only to whoever last edited
+its cron line, which is why red goes to an issue.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+
+from ghapi import GitHub
+
+APPROVERS_FILE = ".github/release-approvers.json"
+CODEOWNERS_FILE = ".github/CODEOWNERS"
+COMMENT_EVERY = dt.timedelta(hours=24)
+ESCALATE_AFTER = dt.timedelta(hours=48)
+
+
+@dataclass
+class Result:
+    """One rule's outcome. red None means not evaluated this run: its issue is left as it is."""
+
+    rule: str
+    label: str
+    title: str
+    red: bool | None
+    detail: str = ""
+    kind: str = "alert"  # "alert" fails the run while red; "notice" never does
+    extra_labels: list[str] = field(default_factory=list)
+    auto_close: bool = True
+
+
+def results_to_json(results: list[Result]) -> str:
+    return json.dumps([asdict(result) for result in results], separators=(",", ":"))
+
+
+def results_from_json(text: str) -> list[Result]:
+    return [Result(**item) for item in json.loads(text or "[]")]
+
+
+def parse_codeowners(text: str) -> list[str]:
+    """The owners of `*`; as in CODEOWNERS, the last matching line wins."""
+    owners: list[str] = []
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        pattern, *handles = line.split()
+        if pattern == "*":
+            owners = [handle[1:] for handle in handles if handle.startswith("@")]
+    return owners
+
+
+def marker(name: str, value: str) -> str:
+    return f"<!-- {name}:{value} -->"
+
+
+def read_marker(body: str | None, name: str) -> str | None:
+    match = re.search(rf"<!-- {re.escape(name)}:(.*?) -->", body or "")
+    return match.group(1) if match else None
+
+
+def set_marker(body: str, name: str, value: str) -> str:
+    if read_marker(body, name) is None:
+        return marker(name, value) + "\n" + body
+    return re.sub(rf"<!-- {re.escape(name)}:.*? -->", lambda _: marker(name, value), body, count=1)
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def when(text: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def stamp(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Router:
+    def __init__(self, gh, *, approvers: list[str], escalation: str | None, owners: list[str],
+                 now: dt.datetime, run_url: str) -> None:
+        self.gh = gh
+        self.approvers = approvers
+        self.escalation = escalation
+        self.owners = owners
+        self.now = now
+        self.run_url = run_url
+
+    def find(self, result: Result) -> dict | None:
+        for issue in self.gh.paginate(self.gh.repo_path("issues"), {"state": "open", "labels": result.label}):
+            if "pull_request" not in issue and read_marker(issue.get("body"), "rule") == result.rule:
+                return issue
+        return None
+
+    def apply(self, result: Result) -> str:
+        if result.red is None:
+            return f"{result.rule}: not evaluated this run; its issue is left as it is"
+        issue = self.find(result)
+        if result.red:
+            return self._open(result) if issue is None else self._update(result, issue)
+        if issue is not None and result.auto_close:
+            self._comment(issue["number"], f"Cleared at {stamp(self.now)} ({self.run_url}).")
+            self.gh.patch(self.gh.repo_path(f"issues/{issue['number']}"), {"state": "closed", "state_reason": "completed"})
+            return f"{result.rule}: cleared; closed #{issue['number']}"
+        return f"{result.rule}: clear"
+
+    def _open(self, result: Result) -> str:
+        cc = " ".join(f"@{owner}" for owner in self.owners)
+        closing = ("It closes by itself when the rule clears." if result.auto_close
+                   else "A person closes it once it is explained.")
+        body = "\n".join([marker("rule", result.rule), marker("state", digest(result.detail)),
+                          marker("last-comment", stamp(self.now)), "", result.detail, "", "---",
+                          f"Filed by {self.run_url}. cc {cc}",
+                          "Assigned to the release approvers; after 48 hours the escalation owner is assigned too. "
+                          + closing])
+        issue = self.gh.post(self.gh.repo_path("issues"), {"title": result.title, "body": body,
+                                                           "labels": [result.label, *result.extra_labels],
+                                                           "assignees": self.approvers})
+        return f"{result.rule}: opened #{issue['number']}"
+
+    def _update(self, result: Result, issue: dict) -> str:
+        number, body = issue["number"], issue.get("body") or ""
+        new_body, actions = body, []
+        state, last = digest(result.detail), read_marker(body, "last-comment")
+        if state != read_marker(body, "state") or last is None or self.now - when(last) >= COMMENT_EVERY:
+            self._comment(number, f"{result.detail}\n\n({self.run_url})")
+            new_body = set_marker(set_marker(new_body, "state", state), "last-comment", stamp(self.now))
+            actions.append("commented")
+        present = {label.get("name") for label in issue.get("labels", [])}
+        missing = [label for label in [result.label, *result.extra_labels] if label not in present]
+        if missing:
+            self.gh.post(self.gh.repo_path(f"issues/{number}/labels"), {"labels": missing})
+            actions.append("labelled")
+        if self.now - when(issue["created_at"]) >= ESCALATE_AFTER:
+            assigned = {assignee.get("login") for assignee in issue.get("assignees", [])}
+            if self.escalation and self.escalation not in assigned:
+                self.gh.post(self.gh.repo_path(f"issues/{number}/assignees"), {"assignees": [self.escalation]})
+                self._comment(number, f"Open for more than 48 hours: assigning @{self.escalation}, the escalation "
+                                      f"owner in {APPROVERS_FILE}.")
+                actions.append("escalated")
+            elif not self.escalation and read_marker(new_body, "escalation-unset") is None:
+                self._comment(number, f"Open for more than 48 hours, and {APPROVERS_FILE} names no escalation "
+                                      "owner, so nobody further is assigned.")
+                new_body = set_marker(new_body, "escalation-unset", "1")
+                actions.append("escalation owner unset")
+        if new_body != body:
+            self.gh.patch(self.gh.repo_path(f"issues/{number}"), {"body": new_body})
+        return f"{result.rule}: #{number} " + (", ".join(actions) or "unchanged")
+
+    def _comment(self, number: int, text: str) -> None:
+        self.gh.post(self.gh.repo_path(f"issues/{number}/comments"), {"body": text})
+
+
+def route(results: list[Result], *, label: str, job_result: str, router: Router) -> int:
+    """Apply every result. An evaluation job that did not finish is itself a red result. Returns the exit code."""
+    finished = job_result == "success"
+    results = (list(results) if finished else []) + [Result(
+        rule=f"{label}-workflow", label=label, title=f"{label}: the evaluation job did not finish", red=not finished,
+        detail=f"The {label} evaluation job ended `{job_result or 'unknown'}` in {router.run_url}; its checks did "
+               "not run, so their issues were left as they were.")]
+    red = False
+    for result in results:
+        print(router.apply(result))
+        if result.red and result.kind == "alert":
+            red = True
+            first = result.detail.splitlines()[0] if result.detail else result.rule
+            print(f"::error title={result.title}::{first}")
+    return 1 if red else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Open, update or close one workflow's alert issues")
+    parser.add_argument("command", choices=["apply"])
+    parser.add_argument("--label", required=True, choices=["staleness", "tag-audit", "main-audit"])
+    args = parser.parse_args(argv)
+    env = os.environ
+    run_url = f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}"
+    with open(APPROVERS_FILE, encoding="utf-8") as handle:
+        config = json.load(handle)
+    with open(CODEOWNERS_FILE, encoding="utf-8") as handle:
+        owners = parse_codeowners(handle.read())
+    router = Router(GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]), approvers=config["approvers"],
+                    escalation=config.get("escalation"), owners=owners, now=dt.datetime.now(dt.timezone.utc),
+                    run_url=run_url)
+    job_result = env.get("JOB_RESULT", "")
+    results = results_from_json(env.get("RESULTS_JSON", "")) if job_result == "success" else []
+    return route(results, label=args.label, job_result=job_result, router=router)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
