@@ -148,3 +148,81 @@ class TestEveryPrRules(unittest.TestCase):
         base[rc.MANIFEST] = "{"
         report = run(pull(**HUMAN), base, files(ts.manifest()), ["README.md"])
         failed_with(self, report, "does not parse at the base")
+
+
+def human_report(head_doc, *, base_doc=None, changed=(rc.MANIFEST,), head_safety=None):
+    report = vp.Report()
+    entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
+    head = copy.deepcopy(ts.SEED) if head_safety is None else head_safety
+    vp.human_rules(entries, copy.deepcopy(ts.SEED), head, sorted(changed), report)
+    return report
+
+
+class TestHumanRules(unittest.TestCase):
+    def test_an_ai_tc_description_edit_passes_with_a_note(self):
+        report = human_report(ts.manifest(description="Clearer words."))
+        self.assertEqual(report.failures, [])
+        self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
+        self.assertTrue(any("change all four files" in n for n in report.notes))
+
+    def test_a_perfect_advance_by_a_human_fails(self):
+        report = human_report(ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY))
+        failed_with(self, report, "a human PR may change only the ai-tc entry's description")
+
+    def test_a_registry_edit_fails(self):
+        head = ts.manifest()
+        ts.ai_tc(head)["source"]["registry"] = "https://registry.npmjs.org/"
+        failed_with(self, human_report(head), "a human PR may change only")
+
+    def test_adding_hooks_fails(self):
+        head = ts.manifest()
+        ts.ai_tc(head)["hooks"] = "./hooks/extra.json"
+        failed_with(self, human_report(head), "a human PR may change only")
+
+    def test_removing_the_entry_fails(self):
+        head = ts.manifest()
+        del head["plugins"][2]
+        failed_with(self, human_report(head), "a human PR may change only")
+
+    def test_an_edit_to_another_entry_passes(self):
+        head = ts.manifest()
+        head["plugins"][1]["description"] = "New words."
+        self.assertEqual(human_report(head).failures, [])
+
+    def test_a_human_edit_of_the_safety_file_is_called_out(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety["0.9.14"]["classification"] = "additive"
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertIn(
+            "HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
+            "the approving code owner owns this classification",
+            report.notes,
+        )
+
+    def test_removing_a_safety_entry_is_called_out(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        del head_safety["0.9.9"]
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertTrue(any("0.9.9: not-rollback-safe -> removed" in n for n in report.notes))
+
+    def test_deleting_the_safety_file_fails(self):
+        report = vp.Report()
+        entries = vp.every_pr_rules(ts.manifest(), ts.manifest(), report)
+        vp.human_rules(entries, copy.deepcopy(ts.SEED), None, [rc.SAFETY_FILE], report)
+        failed_with(self, report, "rollback-safety.json must stay")
+
+    def test_touching_automation_is_called_out(self):
+        report = human_report(ts.manifest(), changed=(".github/workflows/validate.yml",))
+        self.assertTrue(any(".github/workflows/validate.yml" in n for n in report.notes))
+
+    def test_a_malformed_safety_file_is_reported(self):
+        report = vp.Report()
+        text = '{"versions": {"0.9.14": {"classification": "safe"}}}'
+        self.assertIsNone(vp.safety_versions(text, report, label="the PR head"))
+        failed_with(self, report, "at the PR head: rollback-safety.json '0.9.14'")
+
+    def test_the_bot_hint_explains_an_unconfigured_identity(self):
+        self.assertIn("release_checks.BOT_LOGIN is None", vp.bot_hint(pull(), None))
+        self.assertIn("is not the marketplace bot App", vp.bot_hint(pull(author="dependabot[bot]"), BOT))
+        self.assertEqual(vp.bot_hint(pull(**HUMAN), BOT), "")
