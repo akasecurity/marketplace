@@ -1,0 +1,94 @@
+name: tag-audit
+
+# Daily, on every tag push or deletion, and on demand: detect a fleet-v tag that
+# moved or vanished, a tag that should not exist, a break in the tag ledger, or a
+# ruleset that was edited or disabled (AGENTS.md, "The workflows"). Detection, not
+# prevention: the rulesets prevent. tag-release runs the same checks before it
+# creates a tag. A tag pushed at an old commit that has no copy of this file starts
+# no run; the daily run and staleness's hourly ref check still see it. Red goes to
+# one issue, filed by the only job here that may write issues.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  push:
+    tags: ["**"]
+  delete:
+  workflow_dispatch:
+
+concurrency:
+  group: tag-audit
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      results: ${{ steps.check.outputs.results }}
+      red: ${{ steps.check.outputs.red }}
+    steps:
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: fetch the snapshot the last green run kept
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p previous
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$run_id" ]; then
+            echo "::notice::no earlier green tag-audit run; comparing against the frozen list only"
+          elif ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous; then
+            echo "::notice::run $run_id kept no snapshot (expired); comparing against the frozen list only"
+          fi
+      - name: audit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json
+          --previous previous/fleet-tags.snapshot.json --snapshot snapshot/fleet-tags.snapshot.json --results
+      # Kept only from a green audit, so a moved tag stays red until a person explains it.
+      # 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a == v7.0.1 (verified with git ls-remote).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.check.outputs.red == 'false'
+        with:
+          name: fleet-tags-snapshot
+          path: snapshot/fleet-tags.snapshot.json
+          retention-days: 90
+          if-no-files-found: error
+
+  file-issues:
+    name: file-issues
+    needs: audit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: open, update or close the tag-audit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS_JSON: ${{ needs.audit.outputs.results }}
+          JOB_RESULT: ${{ needs.audit.result }}
+        run: python3 .github/scripts/issue_router.py apply --label tag-audit
