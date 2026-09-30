@@ -226,3 +226,222 @@ class TestHumanRules(unittest.TestCase):
         self.assertIn("release_checks.BOT_LOGIN is None", vp.bot_hint(pull(), None))
         self.assertIn("is not the marketplace bot App", vp.bot_hint(pull(author="dependabot[bot]"), BOT))
         self.assertEqual(vp.bot_hint(pull(**HUMAN), BOT), "")
+
+
+def bot_report(head_doc, *, base_doc=None, pr=None, changed=None, head_safety=None, tip=None, pins=None, verify_fn=verify):
+    report = vp.Report()
+    entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
+    vp.bot_rules(
+        pr or pull(),
+        entries,
+        dict(ts.PINS) if pins is None else pins,
+        copy.deepcopy(ts.SEED),
+        copy.deepcopy(ts.SEED) if head_safety is None else head_safety,
+        copy.deepcopy(ts.SEED) if tip is None else tip,
+        sorted(changed if changed is not None else [rc.MANIFEST]),
+        report,
+        bot_login=BOT,
+        verify=verify_fn,
+        classify=classify,
+    )
+    return report
+
+
+FORWARD_SAFETY = {**ts.SEED, NEXT: NEXT_ENTRY}
+ADDITIVE_TIP = {v: {**e, "classification": "additive"} for v, e in ts.SEED.items()}
+
+
+class TestBotRules(unittest.TestCase):
+    def advance(self, **overrides):
+        kwargs = dict(changed=[rc.MANIFEST, rc.SAFETY_FILE], head_safety=copy.deepcopy(FORWARD_SAFETY))
+        kwargs.update(overrides)
+        return bot_report(ts.manifest(NEXT), **kwargs)
+
+    def test_a_forward_pin_passes_and_reports_what_it_verified(self):
+        report = self.advance()
+        self.assertEqual(report.failures, [])
+        for row in (
+            ("Mode", "ADVANCE (bot PR)"),
+            ("Pin", "`0.9.14` -> `0.9.15`"),
+            ("Integrity", f"`{ts.INTEGRITY}`"),
+            ("Attested commit", f"`{'f' * 40}`"),
+            ("On ai-tc main", "yes"),
+            ("Release run", ts.RUN_URL),
+            ("Store migration", "not-rollback-safe (0036_migration)"),
+        ):
+            self.assertIn(row, report.rows)
+
+    def test_the_wrong_head_ref_fails(self):
+        failed_with(self, self.advance(pr=pull(head_ref="bot/pin-ai-tc-0.9.16")), "is not the advance branch")
+
+    def test_a_fork_fails(self):
+        failed_with(self, self.advance(pr=pull(head_repo="someone/marketplace")), "head repository must be akasecurity/marketplace")
+
+    def test_a_pr_opened_by_anyone_else_fails(self):
+        report = self.advance(pr=pull(author="venuverse", author_type="User"))
+        failed_with(self, report, f"the PR is opened by venuverse (User), not by the bot App {BOT}")
+
+    def test_a_head_ref_outside_bot_fails(self):
+        failed_with(self, self.advance(pr=pull(head_ref=f"pin-ai-tc-{NEXT}")), "is not under refs/heads/bot/")
+
+    def test_a_commit_by_anyone_else_fails(self):
+        commits = (
+            {"sha": "e" * 40, "author": BOT, "committer": "web-flow", "verified": True},
+            {"sha": "d" * 40, "author": "venuverse", "committer": "venuverse", "verified": False},
+        )
+        report = self.advance(pr=pull(commits=commits))
+        failed_with(self, report, f"commit dddddddddddd is authored by venuverse, not by {BOT}")
+        failed_with(self, report, f"commit dddddddddddd is committed by venuverse: a bot commit's committer is {BOT}")
+        self.assertFalse(any("eeeeeeeeeeee" in f for f in report.failures), report.failures)
+
+    def test_a_commit_the_app_pushed_itself_passes_unsigned(self):
+        commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": False},)
+        self.assertEqual(self.advance(pr=pull(commits=commits)).failures, [])
+
+    def test_a_web_flow_commit_needs_a_verified_signature(self):
+        for verified in (False, None):
+            commits = ({"sha": "e" * 40, "author": BOT, "committer": "web-flow", "verified": verified},)
+            failed_with(self, self.advance(pr=pull(commits=commits)), "commit eeeeeeeeeeee is committed by web-flow without a verified signature")
+
+    def test_a_signed_web_edit_by_a_person_fails(self):
+        commits = ({"sha": "e" * 40, "author": "venuverse", "committer": "web-flow", "verified": True},)
+        report = self.advance(pr=pull(commits=commits))
+        failed_with(self, report, f"commit eeeeeeeeeeee is authored by venuverse, not by {BOT}")
+        self.assertEqual(len(report.failures), 1, report.failures)
+
+    def test_no_commits_fails(self):
+        failed_with(self, self.advance(pr=pull(commits=())), "lists no commits")
+
+    def test_an_extra_file_fails(self):
+        failed_with(self, self.advance(changed=[rc.MANIFEST, rc.SAFETY_FILE, "README.md"]), "it also changes: README.md")
+
+    def test_an_integrity_npm_does_not_serve_fails(self):
+        report = bot_report(
+            ts.manifest(NEXT, integrity=ts.OTHER_INTEGRITY),
+            changed=[rc.MANIFEST, rc.SAFETY_FILE],
+            head_safety=copy.deepcopy(FORWARD_SAFETY),
+        )
+        failed_with(self, report, "is not the integrity npmjs serves for 0.9.15")
+
+    def test_a_release_that_fails_verification_fails(self):
+        report = bot_report(ts.manifest("0.9.16"), pr=pull(head_ref="bot/pin-ai-tc-0.9.16"))
+        failed_with(self, report, "0.9.16 fails the release checks (dist)")
+
+    def test_a_missing_safety_entry_fails(self):
+        failed_with(self, self.advance(head_safety=copy.deepcopy(ts.SEED)), "must gain exactly one entry, for 0.9.15")
+
+    def test_a_wrong_safety_entry_fails(self):
+        wrong = copy.deepcopy(FORWARD_SAFETY)
+        wrong[NEXT]["classification"] = "additive"
+        failed_with(self, self.advance(head_safety=wrong), "but validate computes")
+
+    def test_a_forward_pin_may_not_rewrite_older_entries(self):
+        rewritten = copy.deepcopy(FORWARD_SAFETY)
+        rewritten["0.9.14"]["classification"] = "additive"
+        failed_with(self, self.advance(head_safety=rewritten), "must gain exactly one entry, for 0.9.15, and change nothing else")
+
+    def test_a_reimport_of_a_recorded_version_leaves_the_file_alone_and_says_so(self):
+        report = bot_report(
+            ts.manifest("0.9.14"),
+            base_doc=ts.manifest("0.9.13"),
+            pr=pull(head_ref="bot/pin-ai-tc-0.9.14"),
+            pins={**ts.PINS, "main": "0.9.13"},
+        )
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any(n.startswith("RE-IMPORT: 0.9.14") for n in report.notes))
+        self.assertIn(("Store migration", "not-rollback-safe (recorded)"), report.rows)
+
+    def test_a_reimport_that_rewrites_its_recorded_entry_fails(self):
+        rewritten = copy.deepcopy(ts.SEED)
+        rewritten["0.9.14"]["classification"] = "additive"
+        report = bot_report(
+            ts.manifest("0.9.14"),
+            base_doc=ts.manifest("0.9.13"),
+            pr=pull(head_ref="bot/pin-ai-tc-0.9.14"),
+            pins={**ts.PINS, "main": "0.9.13"},
+            changed=[rc.MANIFEST, rc.SAFETY_FILE],
+            head_safety=rewritten,
+        )
+        failed_with(self, report, "already records 0.9.14")
+
+    def rollback(self, target="0.9.13", **overrides):
+        kwargs = dict(pr=pull(head_ref=f"bot/rollback-ai-tc-0.9.14-to-{target}"), tip=copy.deepcopy(ADDITIVE_TIP))
+        kwargs.update(overrides)
+        return bot_report(ts.manifest(target), **kwargs)
+
+    def test_a_rollback_above_the_floor_passes(self):
+        report = self.rollback()
+        self.assertEqual(report.failures, [])
+        self.assertIn(("Mode", "ROLLBACK (bot PR)"), report.rows)
+        self.assertIn(("Rollback floor", "none crossed"), report.rows)
+        self.assertTrue(any(n.startswith("OLDER THAN 0.9.14: if 0.9.13") for n in report.notes), report.notes)
+
+    def test_a_rollback_below_the_floor_fails(self):
+        failed_with(self, self.rollback(tip=copy.deepcopy(ts.SEED)), "BELOW THE ROLLBACK FLOOR: 0.9.13 is below 0.9.14")
+        # 0.9.14 is pinned (main, fleet-v8) but main's file has no entry for it: flagged, not safe.
+        unrecorded = {v: e for v, e in ADDITIVE_TIP.items() if v != "0.9.14"}
+        failed_with(self, self.rollback(tip=unrecorded), "BELOW THE ROLLBACK FLOOR: 0.9.13 is below 0.9.14")
+
+    def test_the_floor_comes_from_main_not_from_the_pr(self):
+        report = self.rollback(
+            tip=copy.deepcopy(ts.SEED), head_safety=copy.deepcopy(ADDITIVE_TIP), changed=[rc.MANIFEST, rc.SAFETY_FILE]
+        )
+        failed_with(self, report, "BELOW THE ROLLBACK FLOOR")
+        failed_with(self, report, "a bot rollback PR may change only .claude-plugin/marketplace.json")
+
+    def test_a_rollback_to_a_version_no_tag_pinned_fails(self):
+        failed_with(self, self.rollback("0.9.11"), "not a version any fleet-v tag has pinned")
+
+    def test_a_rollback_without_a_readable_floor_fails(self):
+        report = vp.Report()
+        entries = vp.every_pr_rules(ts.manifest(), ts.manifest("0.9.13"), report)
+        vp.bot_rules(
+            pull(head_ref="bot/rollback-ai-tc-0.9.14-to-0.9.13"),
+            entries,
+            dict(ts.PINS),
+            copy.deepcopy(ts.SEED),
+            copy.deepcopy(ts.SEED),
+            None,
+            [rc.MANIFEST],
+            report,
+            bot_login=BOT,
+            verify=verify,
+            classify=classify,
+        )
+        failed_with(self, report, "no rollback floor can be read")
+
+    def removed(self):
+        doc = ts.manifest()
+        del doc["plugins"][2]
+        return doc
+
+    def test_a_removal_on_its_branch_passes_without_verifying_anything(self):
+        def never(version):
+            raise AssertionError("a removal verifies no version")
+
+        report = bot_report(self.removed(), pr=pull(head_ref="bot/remove-ai-tc-36123456789"), verify_fn=never)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any(n.startswith("REMOVE") for n in report.notes))
+
+    def test_a_removal_on_another_branch_fails(self):
+        failed_with(self, bot_report(self.removed(), pr=pull(head_ref="bot/remove-ai-tc-x")), "is not the remove branch")
+
+    def test_a_restore_passes(self):
+        report = bot_report(ts.manifest("0.9.14"), base_doc=self.removed(), pr=pull(head_ref="bot/restore-ai-tc-0.9.14"))
+        self.assertEqual(report.failures, [])
+        self.assertIn(("Mode", "RESTORE (bot PR)"), report.rows)
+
+    def test_a_restore_below_the_floor_fails(self):
+        report = bot_report(ts.manifest("0.9.13"), base_doc=self.removed(), pr=pull(head_ref="bot/restore-ai-tc-0.9.13"))
+        failed_with(self, report, "BELOW THE ROLLBACK FLOOR: restoring 0.9.13 crosses 0.9.14")
+
+    def test_a_bot_pr_with_a_human_shaped_diff_fails(self):
+        report = bot_report(ts.manifest(description="Bot words."), pr=pull(head_ref="bot/pin-ai-tc-0.9.14"))
+        failed_with(self, report, "must be exactly one importer mode's shape")
+
+    def test_an_outage_is_no_verdict(self):
+        def down(version):
+            raise rc.InfraError("network", "down")
+
+        with self.assertRaises(rc.InfraError):
+            self.advance(verify_fn=down)

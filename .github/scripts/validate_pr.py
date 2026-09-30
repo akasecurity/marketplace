@@ -208,3 +208,163 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
     touched = [p for p in changed if p.startswith(".github/")]
     if touched:
         report.note("touches automation or ownership, review the diff line by line: " + ", ".join(touched))
+
+
+REF_PATTERNS = {
+    "advance": "bot/pin-ai-tc-{head}",
+    "rollback": "bot/rollback-ai-tc-{base}-to-{head}",
+    "restore": "bot/restore-ai-tc-{head}",
+}
+REMOVE_REF = re.compile(r"bot/remove-ai-tc-[0-9]+")
+# The bot-branches ruleset lets only the bot App create, update or delete these refs.
+BOT_REF_PREFIX = "bot/"
+# GitHub's own committer login. A commit the App creates through the Git Data API with no
+# author or committer carries the App as author, web-flow as committer, and GitHub's signature.
+WEB_FLOW = "web-flow"
+
+
+def commit_problems(commit: dict, bot_login: str) -> list:
+    """Why one PR commit is not the bot App's, or [].
+
+    A login is only GitHub's match of the commit's email, which anyone can write into a
+    commit, so no name is trusted alone: these checks sit beside the PR the App opened and
+    the bot/ ref only the App may push, and web-flow counts only with a verified signature."""
+    sha = str(commit.get("sha"))[:12]
+    author, committer = commit.get("author"), commit.get("committer")
+    problems = []
+    if author != bot_login:
+        problems.append(f"commit {sha} is authored by {author}, not by {bot_login}")
+    if committer == WEB_FLOW:
+        if commit.get("verified") is not True:
+            problems.append(f"commit {sha} is committed by {WEB_FLOW} without a verified signature")
+    elif committer != bot_login:
+        problems.append(
+            f"commit {sha} is committed by {committer}: a bot commit's committer is {bot_login}, "
+            f"or {WEB_FLOW} with a verified signature"
+        )
+    return problems
+
+
+def _floor_crossed(target, highest, tip_safety, report: Report, what: str, *, pinned=()) -> None:
+    if tip_safety is None:
+        report.fail(f"main's {rc.SAFETY_FILE} is missing or malformed, so no rollback floor can be read; refusing")
+        return
+    floor = rc.rollback_floor({"versions": tip_safety}, target, highest, pinned=pinned)
+    report.row("Rollback floor", _code(floor) if floor else "none crossed")
+    if floor:
+        report.fail(
+            f"BELOW THE ROLLBACK FLOOR: {what} {floor}, which main's {rc.SAFETY_FILE} flags "
+            "not rollback-safe. Only an org owner's break-glass merge lands this PR."
+        )
+
+
+def _advance_rules(head_v, pinned, highest, base_safety, head_safety, report: Report, *, verify, classify) -> None:
+    if highest is not None and rc.vkey(head_v) <= rc.vkey(highest):
+        report.note(
+            f"RE-IMPORT: {head_v} is not above {highest}, the highest version ever pinned. Only a "
+            "manual import dispatch with reimport: true opens this PR."
+        )
+    base_safety = base_safety or {}
+    if head_safety is None:
+        report.fail(f"{rc.SAFETY_FILE} is missing or malformed at the PR head")
+        return
+    if head_v in base_safety:
+        if head_safety != base_safety:
+            report.fail(f"{rc.SAFETY_FILE} already records {head_v}; a forward PR for it must leave the file unchanged")
+        report.row("Store migration", f"{base_safety[head_v]['classification']} (recorded)")
+        return
+    added = sorted(set(head_safety) - set(base_safety), key=rc.vkey)
+    unchanged = all(head_safety.get(v) == e for v, e in base_safety.items())
+    if added != [head_v] or not unchanged:
+        report.fail(
+            f"{rc.SAFETY_FILE} must gain exactly one entry, for {head_v}, and change nothing else "
+            f"(added: {', '.join(added) or 'none'})"
+        )
+        return
+    try:
+        expected = rc.safety_entry(head_v, pinned, verify=verify, classify=classify)
+    except rc.InfraError:
+        raise
+    except rc.ReleaseCheckError as exc:
+        report.fail(f"could not compute {head_v}'s store-migration entry ({exc.check}): {exc.detail}")
+        return
+    if head_safety[head_v] != expected:
+        report.fail(
+            f"{rc.SAFETY_FILE} {head_v} is {json.dumps(head_safety[head_v])}, but validate computes {json.dumps(expected)}"
+        )
+    report.row("Store migration", f"{expected['classification']} ({', '.join(expected['migrations']) or 'none'})")
+
+
+def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safety, changed, report: Report, *, bot_login, verify, classify) -> None:
+    """A bot PR passes only as exactly one importer mode, from the bot, verified end to end."""
+    base_entry, head_entry, mode = entries
+    base_v, head_v = rc.entry_version(base_entry), rc.entry_version(head_entry)
+    report.row("Mode", f"{MODE_LABEL.get(mode, mode.upper())} (bot PR)")
+    report.row("Pin", f"{_code(base_v or 'absent')} -> {_code(head_v or 'absent')}")
+    if pr.author != bot_login or pr.author_type != "Bot":
+        report.fail(f"the PR is opened by {pr.author} ({pr.author_type}), not by the bot App {bot_login}")
+    if pr.head_repo != pr.base_repo:
+        report.fail(f"a bot PR's head repository must be {pr.base_repo}, not {pr.head_repo or 'a deleted fork'}")
+    if not pr.head_ref.startswith(BOT_REF_PREFIX):
+        report.fail(
+            f"head ref {_code(pr.head_ref)} is not under refs/heads/{BOT_REF_PREFIX}, the only branches "
+            "the bot-branches ruleset lets the bot App, and no one else, push"
+        )
+    if not pr.commits:
+        report.fail("the PR lists no commits")
+    for commit in pr.commits:
+        for problem in commit_problems(commit, bot_login):
+            report.fail(problem)
+    report.note("Who pushed each commit is enforced by the bot-branches ruleset; the API exposes no pusher.")
+    if mode not in MODE_LABEL:
+        report.fail(f"a bot PR must be exactly one importer mode's shape (advance, rollback, remove or restore); this diff is {mode!r}")
+        return
+    if mode == "remove":
+        ref_ok = REMOVE_REF.fullmatch(pr.head_ref) is not None
+    else:
+        ref_ok = pr.head_ref == REF_PATTERNS[mode].format(base=base_v, head=head_v)
+    if not ref_ok:
+        report.fail(f"head ref {_code(pr.head_ref)} is not the {mode} branch for this diff")
+    allowed = {rc.MANIFEST, rc.SAFETY_FILE} if mode == "advance" else {rc.MANIFEST}
+    extra = sorted(set(changed) - allowed)
+    if extra:
+        report.fail(f"a bot {mode} PR may change only {', '.join(sorted(allowed))}; it also changes: {', '.join(extra)}")
+    if mode == "remove":
+        report.note("REMOVE: this marketplace stops serving ai-tc until a restore merges")
+        return
+    try:
+        release = verify(head_v)
+    except rc.InfraError:
+        raise
+    except rc.ReleaseCheckError as exc:
+        report.fail(f"{head_v} fails the release checks ({exc.check}): {exc.detail}")
+        return
+    report.row("Integrity", _code(release.integrity))
+    report.row("Attested commit", _code(release.git_commit))
+    report.row("On ai-tc main", "yes")
+    report.row("Release run", release.run_url)
+    recorded = (head_entry.get("metadata") or {}).get("integrity")
+    if recorded != release.integrity:
+        report.fail(f"metadata.integrity {_code(recorded)} is not the integrity npmjs serves for {head_v} ({release.integrity})")
+    pinned = {v for v in pins.values() if v}
+    highest = max(pinned, key=rc.vkey) if pinned else None
+    if mode in ("rollback", "restore") and rc.vkey(head_v) < rc.vkey("0.9.14"):
+        report.note(
+            f"OLDER THAN 0.9.14: if {head_v} cannot open a store a newer build migrated, it reports only a "
+            "generic 'could not open the store' error, whose advice to move the store aside would set aside "
+            "a store that is only newer. Tell developers not to follow that advice."
+        )
+    if mode == "advance":
+        _advance_rules(head_v, pinned, highest, base_safety, head_safety, report, verify=verify, classify=classify)
+    elif mode == "rollback":
+        tag_pinned = {v for ref, v in pins.items() if ref != "main" and v}
+        if head_v not in tag_pinned:
+            report.fail(f"rollback target {head_v} is not a version any fleet-v tag has pinned")
+        if highest is None:
+            report.fail("nothing is pinned, so a rollback has nothing to roll back from")
+        else:
+            _floor_crossed(head_v, highest, tip_safety, report, f"{head_v} is below", pinned=pinned)
+    else:
+        report.note("RESTORE: the ai-tc entry returns in the fixed npm shape")
+        if highest is not None and rc.vkey(head_v) < rc.vkey(highest):
+            _floor_crossed(head_v, highest, tip_safety, report, f"restoring {head_v} crosses", pinned=pinned)
