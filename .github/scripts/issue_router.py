@@ -173,10 +173,12 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
     over no output (None: it was absent, blank or could not be read), because reading that as "nothing is
     red" would leave the audit green for good if the wiring between the job and this step broke. An
     explicit empty list is different: it is the evaluator saying that nothing is red, so it is a clear
-    result for every label and closes an earlier alert. It says nothing about which evaluator sends it: an
-    evaluator that always appends a clear result of its own never sends one. The detail names no
-    run URL: it is digested to decide whether anything changed, and every run has its own URL, while the
-    comment appends it.
+    result for every label. The one issue it closes is the label's own "<label>-workflow" issue, opened
+    when an earlier run's job did not finish or handed over nothing; it leaves every per-rule issue as it
+    is, because only a clear result for that rule closes that rule's issue. It says nothing about which
+    evaluator sends it: an evaluator that always appends a clear result of its own never sends one. The
+    detail names no run URL: it is digested to decide whether anything changed, and every run has its own
+    URL, while the comment appends it.
     """
     finished = job_result == "success"
     reported = finished and results is not None
