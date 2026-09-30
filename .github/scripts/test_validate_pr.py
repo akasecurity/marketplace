@@ -445,3 +445,79 @@ class TestBotRules(unittest.TestCase):
 
         with self.assertRaises(rc.InfraError):
             self.advance(verify_fn=down)
+
+
+class TestEvaluate(unittest.TestCase):
+    def forward(self, pr, **kwargs):
+        head = files(ts.manifest(NEXT), safety=FORWARD_SAFETY)
+        return run(pr, files(ts.manifest()), head, [rc.MANIFEST, rc.SAFETY_FILE], **kwargs)
+
+    def test_a_bot_forward_pin_passes_end_to_end(self):
+        report = self.forward(pull())
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+
+    def test_without_a_configured_bot_the_same_pr_is_a_refused_human_pr(self):
+        failed_with(self, self.forward(pull(), bot_login=None), "release_checks.BOT_LOGIN is None")
+
+    def test_the_bot_login_on_a_user_account_is_not_the_bot(self):
+        failed_with(self, self.forward(pull(author_type="User")), "a human PR may change only")
+
+    def test_a_malformed_head_safety_file_fails_any_pr(self):
+        head = files(ts.manifest())
+        head[rc.SAFETY_FILE] = '{"versions": []}'
+        failed_with(self, run(pull(**HUMAN), files(ts.manifest()), head, ["README.md"]), "at the PR head")
+
+    def test_an_unparseable_main_safety_file_refuses_a_rollback(self):
+        report = run(
+            pull(head_ref="bot/rollback-ai-tc-0.9.14-to-0.9.13"),
+            files(ts.manifest()),
+            files(ts.manifest("0.9.13")),
+            [rc.MANIFEST],
+            tip_text="{",
+        )
+        failed_with(self, report, "no rollback floor can be read")
+
+    def test_rules_stop_at_an_ambiguous_entry(self):
+        head_doc = ts.manifest()
+        head_doc["plugins"].append(copy.deepcopy(head_doc["plugins"][2]))
+        report = run(pull(**HUMAN), files(ts.manifest()), files(head_doc), [rc.MANIFEST])
+        self.assertEqual((report.rows, report.exit_code), ([], 1))
+
+
+class TestSummary(unittest.TestCase):
+    def test_a_pass_names_the_verdict_the_rows_and_the_run_to_confirm(self):
+        report = vp.Report()
+        report.row("Mode", "ADVANCE (bot PR)")
+        text = vp.render_summary(report, 7)
+        self.assertTrue(text.startswith("## validate: PR #7: PASS\n"))
+        self.assertIn("confirm it is that workflow", text)
+        self.assertIn("| Mode | ADVANCE (bot PR) |", text)
+        self.assertTrue(text.endswith("\n"))
+
+    def test_failures_notes_and_no_verdict_have_sections(self):
+        report = vp.Report(infra="network: down")
+        report.fail("one")
+        report.note("two")
+        text = vp.render_summary(report, 7)
+        self.assertIn("## validate: PR #7: NO VERDICT", text)
+        for section in ("### No verdict\n\n- network: down", "### Failures\n\n- one", "### Notes\n\n- two"):
+            self.assertIn(section, text)
+
+    def test_a_cell_cannot_break_the_table_and_no_line_can_start_a_command(self):
+        report = vp.Report()
+        report.row("Mode", "a|b")
+        report.fail("first\n::error::injected")
+        text = vp.render_summary(report, 7)
+        self.assertIn("| Mode | a/b |", text)
+        self.assertIn("- first ::error::injected", text)
+        self.assertFalse(any(line.startswith("::") for line in text.splitlines()))
+
+    def test_code_spans_cannot_be_escaped(self):
+        self.assertEqual(vp._code("x`y\nz"), "`x'y z`")
+
+    def test_exit_codes(self):
+        self.assertEqual(vp.Report().exit_code, 0)
+        failing = vp.Report()
+        failing.fail("x")
+        self.assertEqual(failing.exit_code, 1)
+        self.assertEqual(vp.Report(infra="x").exit_code, 2)

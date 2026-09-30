@@ -368,3 +368,68 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
         report.note("RESTORE: the ai-tc entry returns in the fixed npm shape")
         if highest is not None and rc.vkey(head_v) < rc.vkey(highest):
             _floor_crossed(head_v, highest, tip_safety, report, f"restoring {head_v} crosses", pinned=pinned)
+
+
+def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins, tip_safety_text, *, bot_login, verify, classify) -> Report:
+    """Every rule validate applies to one PR.
+
+    The base files come from the PR's merge base. The tip safety text is main's
+    rollback-safety.json, which alone decides the floor."""
+    report = Report()
+    head_docs = parse_manifests(head_files, report, label="the PR head")
+    for path in (rc.MANIFEST, rc.SAFETY_FILE):
+        text = head_files.get(path)
+        try:
+            written = rc.dump_json(rc.parse_json(text)) if text is not None else text
+        except ValueError:
+            continue  # a parse failure is reported on its own
+        if written != text:
+            report.fail(
+                f"{path} at the PR head is not in the one writer's format (json.dumps with indent=2, "
+                "ensure_ascii=False and one trailing newline); the importer refuses to rewrite such a file"
+            )
+    base_docs = parse_manifests(base_files, Report(), label="the base")
+    if rc.MANIFEST not in base_docs:
+        report.fail(f"{rc.MANIFEST} does not parse at the base, so nothing can be compared")
+    if rc.MANIFEST not in head_docs or rc.MANIFEST not in base_docs:
+        return report
+    entries = every_pr_rules(base_docs[rc.MANIFEST], head_docs[rc.MANIFEST], report)
+    base_safety = safety_versions(base_files.get(rc.SAFETY_FILE), Report(), label="the base")
+    head_safety = safety_versions(head_files.get(rc.SAFETY_FILE), report, label="the PR head")
+    tip_safety = safety_versions(tip_safety_text, Report(), label="main")
+    if entries is None:
+        return report
+    if bot_login is not None and pr.author == bot_login and pr.author_type == "Bot":
+        bot_rules(pr, entries, pins, base_safety, head_safety, tip_safety, changed, report, bot_login=bot_login, verify=verify, classify=classify)
+    else:
+        human_rules(entries, base_safety, head_safety, changed, report, bot_hint=bot_hint(pr, bot_login))
+    return report
+
+
+def _line(text) -> str:
+    return " ".join(str(text).split())
+
+
+def _cell(text) -> str:
+    return _line(text).replace("|", "/")
+
+
+def render_summary(report: Report, number) -> str:
+    verdict = "NO VERDICT" if report.infra else ("FAIL" if report.failures else "PASS")
+    lines = [
+        f"## validate: PR #{number}: {verdict}",
+        "",
+        "validate.yml from the base branch, run on pull_request_target. Before trusting a green "
+        "result, open this check run and confirm it is that workflow: any GitHub Actions job "
+        "named validate satisfies the required check.",
+        "",
+    ]
+    if report.rows:
+        lines += ["| Check | Value |", "| --- | --- |"]
+        lines += [f"| {_cell(key)} | {_cell(value)} |" for key, value in report.rows]
+        lines.append("")
+    sections = (("No verdict", [report.infra] if report.infra else []), ("Failures", report.failures), ("Notes", report.notes))
+    for title, items in sections:
+        if items:
+            lines += [f"### {title}", ""] + [f"- {_line(item)}" for item in items] + [""]
+    return "\n".join(lines)
