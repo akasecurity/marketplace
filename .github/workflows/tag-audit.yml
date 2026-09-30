@@ -42,9 +42,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # The baseline is the snapshot the last green run of this file on main kept. A run on any other
-      # branch never supplies it, because a branch can carry its own edited copy of this file. Only a
-      # snapshot that is listed and expired (they last 90 days) skips the comparison, with a notice;
-      # every other failure fails the step, so a hiccup cannot read as "nothing moved".
+      # branch never supplies it, because a branch can carry its own edited copy of this file. The
+      # branch name alone is not enough: a pull request from a fork's own main also reports main, so
+      # only a run started by the schedule, by hand or by a deletion counts; a pull request never
+      # does. Only a snapshot that is listed and expired (they last 90 days) skips the comparison,
+      # with a notice; every other failure fails the step, so a hiccup cannot read as "nothing moved".
       - name: fetch the snapshot the last green run kept
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,7 +54,9 @@ jobs:
           set -eu
           mkdir -p previous
           run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --branch main --status success \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            --limit 100 --json databaseId,event --jq \
+            '[.[] | select(.event == "schedule" or .event == "workflow_dispatch" or .event == "delete")]
+             | .[0].databaseId // empty')
           if [ -z "$run_id" ]; then
             echo "::notice::no earlier green tag-audit run on main; comparing against the frozen list only"
             exit 0
