@@ -80,6 +80,10 @@ class ImporterWorkflow(WorkflowCase):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
 
+RUN_77 = '[{"databaseId": 77, "event": "schedule"}]'
+READY = '{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}'
+
+
 class TagAuditWorkflow(WorkflowCase):
     name = "tag-audit.yml"
 
@@ -120,8 +124,12 @@ class TagAuditWorkflow(WorkflowCase):
     def test_the_baseline_comes_only_from_a_green_run_on_main(self):
         fetch = self.step("name: fetch the snapshot the last green run kept")
         listing = re.search(r"(?s)gh run list.*?--jq", fetch).group(0)
-        for flag in ("--workflow tag-audit.yml", "--branch main", "--status success", "--limit 1"):
+        for flag in ("--workflow tag-audit.yml", "--branch main", "--status success", "--limit 100",
+                     "--json databaseId,event"):
             self.assertIn(flag, listing)
+        # A fork's pull request from its own main also reports the branch main, so the event decides.
+        self.assertIn('.event == "schedule" or .event == "workflow_dispatch" or .event == "delete"', fetch)
+        self.assertNotIn("pull_request", fetch)
 
     def test_a_failed_download_is_not_read_as_an_expired_snapshot(self):
         fetch = self.step("name: fetch the snapshot the last green run kept")
@@ -181,32 +189,59 @@ class TagAuditWorkflow(WorkflowCase):
             return done, calls
 
     def test_the_fetch_step_downloads_the_last_green_runs_snapshot(self):
-        done, calls = self.run_fetch(runs='[{"databaseId": 77}]',
+        done, calls = self.run_fetch(runs=RUN_77,
                                      artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(calls[-1], "run download 77 --repo akasecurity/marketplace --name fleet-tags-snapshot --dir previous")
+
+    def test_the_fetch_step_never_takes_a_pull_request_run_as_the_baseline(self):
+        # A fork's pull request from its own main lists as a green run on the branch main; only the
+        # older scheduled run may supply the baseline.
+        runs = ('[{"databaseId": 99, "event": "pull_request"}, {"databaseId": 88, "event": "pull_request_target"},'
+                ' {"databaseId": 77, "event": "schedule"}]')
+        done, calls = self.run_fetch(runs=runs, artifacts=READY)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(calls[-1], "run download 77 --repo akasecurity/marketplace --name fleet-tags-snapshot --dir previous")
+        self.assertFalse([call for call in calls if " 99 " in f" {call} " or " 88 " in f" {call} "])
+
+    def test_the_fetch_step_with_only_pull_request_runs_has_no_baseline(self):
+        done, calls = self.run_fetch(runs='[{"databaseId": 99, "event": "pull_request"}]', artifacts=READY)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
+        # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
+        self.assertTrue(calls[0].startswith("run list "))
+        self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
+
+    def test_the_fetch_step_takes_a_manual_or_deletion_run_as_the_baseline(self):
+        for event in ("workflow_dispatch", "delete"):
+            with self.subTest(event):
+                done, calls = self.run_fetch(runs='[{"databaseId": 55, "event": "%s"}]' % event, artifacts=READY)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertTrue(calls[-1].startswith("run download 55 "))
 
     def test_the_fetch_step_with_no_earlier_green_run_compares_against_the_frozen_list_only(self):
         done, calls = self.run_fetch()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
-        self.assertEqual(len(calls), 1)
+        # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
+        self.assertTrue(calls[0].startswith("run list "))
+        self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
 
     def test_the_fetch_step_takes_the_notice_path_only_for_an_expired_snapshot(self):
-        done, calls = self.run_fetch(runs='[{"databaseId": 77}]',
+        done, calls = self.run_fetch(runs=RUN_77,
                                      artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::run 77 kept a snapshot that has expired", done.stdout)
         self.assertFalse([call for call in calls if call.startswith("run download")])
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
-        listed = dict(runs='[{"databaseId": 77}]',
+        listed = dict(runs=RUN_77,
                       artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}')
         cases = {
-            "the run listing fails": dict(runs='[{"databaseId": 77}]', list_fails=True),
+            "the run listing fails": dict(runs=RUN_77, list_fails=True),
             "the artifact listing fails": dict(listed, api_fails=True),
-            "the green run lists no snapshot": dict(runs='[{"databaseId": 77}]', artifacts='{"artifacts": []}'),
-            "another artifact only": dict(runs='[{"databaseId": 77}]',
+            "the green run lists no snapshot": dict(runs=RUN_77, artifacts='{"artifacts": []}'),
+            "another artifact only": dict(runs=RUN_77,
                                           artifacts='{"artifacts": [{"name": "other", "expired": false}]}'),
             "the download fails": dict(listed, download_fails=True),
         }
