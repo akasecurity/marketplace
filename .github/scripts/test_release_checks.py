@@ -225,9 +225,30 @@ class TestNpmCandidates(unittest.TestCase):
     def test_nothing_above_the_pin_is_an_empty_list(self):
         self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=self.fetch({"0.9.13": {}, "0.9.14": {}})), [])
 
-    def test_a_single_version_string_is_accepted(self):
-        fetch = ts.FakeFetch({rc.packument_url(): (200, {"versions": "0.9.15"})})
-        self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=fetch), ["0.9.15"])
+    def test_a_registry_document_that_is_not_a_versions_object_is_no_verdict(self):
+        # The registry's packument always holds "versions" as an object keyed by version.
+        # The list and string shapes belong to `npm view ... versions --json`, which this
+        # module never reads, so they are a wrong answer and not a second accepted format.
+        not_json = "answered non-JSON"
+        no_object = "no versions object"
+        for label, body, expected in (
+            ("an array", b"[]", no_object),
+            ("a string", b'"0.9.15"', no_object),
+            ("null", b"null", no_object),
+            ("no versions key", {"dist-tags": {"latest": "0.9.14"}}, no_object),
+            ("a null versions", {"versions": None}, no_object),
+            ("a versions list", {"versions": ["0.9.15"]}, no_object),
+            ("a versions string", {"versions": "0.9.15"}, no_object),
+            ("text that is not JSON", b"not json", not_json),
+            ("bytes that are not UTF-8", b"\xff", not_json),
+            ("a duplicated key", b'{"versions": {"0.9.15": {}}, "versions": {"0.9.16": {}}}', not_json),
+        ):
+            with self.subTest(label):
+                fetch = ts.FakeFetch({rc.packument_url(): (200, body)})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(expected, caught.exception.detail)
 
     def test_npm_latest_is_never_consulted(self):
         self.assertEqual(
