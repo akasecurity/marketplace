@@ -951,8 +951,71 @@ def _journal_tags(commit: str, fetch: Fetch):
     return tags
 
 
+# The Contents API lists at most this many entries of a directory, and does not say it stopped.
+CONTENTS_LISTING_CAP = 1000
+EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
+UNREADABLE_FILE = "non-additive: the migration file cannot be read"
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there. One request however many files it holds.
+    The raw media type the file reads use returns bytes with no sha, so this asks for the
+    JSON listing instead."""
+    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+    status, body = fetch(url, {"Accept": "application/vnd.github+json"})
+    if status == 404:
+        return None
+    if status != 200:
+        raise InfraError("classify", f"GET {url} answered {status}")
+    try:
+        listing = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("classify", f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(listing, list) or not all(isinstance(entry, dict) for entry in listing):
+        raise InfraError("classify", f"GET {url} did not answer a directory listing")
+    if len(listing) >= CONTENTS_LISTING_CAP:
+        raise InfraError(
+            "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
+        )
+    return {
+        entry["name"][: -len(".sql")]: entry.get("sha")
+        for entry in listing
+        if entry.get("type") == "file" and isinstance(entry.get("name"), str) and entry["name"].endswith(".sql")
+    }
+
+
+def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{tag: kind} for each migration that both journals name and whose file is not the same
+    blob at the two commits, or cannot be compared. ai-tc's store migrator records an
+    applied migration by its tag and never re-runs it, so an edit changes what a fresh store
+    gets but not what an existing one has: the two diverge, and no rollback across the
+    release is safe. A file that cannot be found counts the same way, as it does for an added
+    migration. A listing that fails or is malformed is no verdict."""
+    if not tags:
+        return {}
+    listings = [_migration_blobs(commit, fetch) for commit in (from_commit, to_commit)]
+    kinds = {}
+    for tag in tags:
+        shas = []
+        for blobs in listings:
+            if blobs is None or tag not in blobs:
+                shas.append(None)
+                continue
+            sha = blobs[tag]
+            if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+                raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {tag}.sql")
+            shas.append(sha)
+        if None in shas:
+            kinds[tag] = UNREADABLE_FILE
+        elif shas[0] != shas[1]:
+            kinds[tag] = EDITED_IN_PLACE
+    return kinds
+
+
 def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
-    """Classify the local-store migrations ai-tc added between two attested commits."""
+    """Classify the local-store migrations ai-tc added, removed from the journal or edited
+    in place between two attested commits."""
     for commit in (from_commit, to_commit):
         if not isinstance(commit, str) or not SHA40.fullmatch(commit):
             raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
@@ -970,10 +1033,12 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
     kinds = {}
     for tag in added:
         sql = _ai_tc_file(f"{MIGRATIONS_DIR}/{tag}.sql", to_commit, fetch)
-        kinds[tag] = "non-additive: the migration file cannot be read" if sql is None else migration_kind(sql)
+        kinds[tag] = UNREADABLE_FILE if sql is None else migration_kind(sql)
     for tag in removed:
         kinds[tag] = "non-additive: removed from the journal (history rewritten)"
-    migrations = added + removed
+    edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
+    kinds.update(edited)
+    migrations = added + removed + list(edited)
     if not migrations:
         return Classification("additive", [], kinds)
     if EVERY_MIGRATION_COUNTS:

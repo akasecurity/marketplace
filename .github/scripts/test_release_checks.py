@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -541,15 +542,40 @@ def journal(*tags):
     return {"version": "7", "dialect": "sqlite", "entries": [{"idx": i, "tag": t} for i, t in enumerate(tags)]}
 
 
+def blob(tag, variant=""):
+    """A stable fake git blob sha for one migration file."""
+    return hashlib.sha1(f"{tag}{variant}".encode()).hexdigest()
+
+
+def directory(tags, edited=()):
+    """What the Contents API answers for the migrations directory: the meta folder, then
+    one file per tag, each with its git blob sha. A tag in `edited` has a different one."""
+    files = [
+        {
+            "name": f"{tag}.sql",
+            "path": f"{rc.MIGRATIONS_DIR}/{tag}.sql",
+            "sha": blob(tag, "edited" if tag in edited else ""),
+            "type": "file",
+        }
+        for tag in tags
+    ]
+    return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
+
+
 class TestClassifyMigrations(unittest.TestCase):
-    def fetch(self, from_tags, to_tags, sql):
-        routes = {
+    def fetch(self, from_tags, to_tags, sql, *, edited=(), routes=None):
+        """Journals, listings and added files for a pair of releases. `edited` tags carry a
+        different blob sha at TO; `routes` replaces any of the answers."""
+        answers = {
             ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
             ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, FROM): (200, directory(from_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(to_tags, edited)),
         }
         for tag, text in sql.items():
-            routes[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
-        return ts.FakeFetch(routes)
+            answers[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
+        answers.update(routes or {})
+        return ts.FakeFetch(answers)
 
     def test_no_new_migration_is_additive(self):
         result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}))
@@ -568,10 +594,17 @@ class TestClassifyMigrations(unittest.TestCase):
             second = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (dropping,), {dropping: SQL_DROP_INDEX}))
         self.assertEqual((first.classification, second.classification), ("additive", "not-rollback-safe"))
 
-    def test_reads_use_the_raw_media_type(self):
-        fetch = self.fetch(BASE_TAGS, BASE_TAGS, {})
+    def test_file_reads_use_the_raw_media_type_and_listings_use_json(self):
+        tag = "0035_migration"
+        fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE})
         rc.classify_migrations(FROM, TO, fetch=fetch)
-        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in fetch.calls))
+        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(f"/contents/{rc.MIGRATIONS_DIR}")]
+        files = [(url, h) for url, h in fetch.calls if (url, h) not in listings]
+        # One listing per attested commit, however many migrations the journals hold.
+        self.assertEqual(sorted(url for url, _ in listings), sorted([ts.contents_url(rc.MIGRATIONS_DIR, c) for c in (FROM, TO)]))
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github+json" for _, h in listings))
+        self.assertEqual(len(files), 3)  # the two journals and the one added file
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in files))
 
     def test_an_unreadable_journal_counts_as_not_rollback_safe(self):
         fetch = ts.FakeFetch({ts.contents_url(JOURNAL, TO): (200, journal(*BASE_TAGS))})
@@ -585,6 +618,86 @@ class TestClassifyMigrations(unittest.TestCase):
             result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {}))
         self.assertEqual(result.classification, "not-rollback-safe")
         self.assertIn("cannot be read", result.kinds[tag])
+
+    def test_a_migration_edited_in_place_is_not_rollback_safe(self):
+        # A store that already applied the tag never re-runs an edit, so a fresh store and
+        # an old one diverge: the release is not safe to roll back across, whatever the edit.
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, edited=("0000_initial",)))
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", ["0000_initial"]))
+                self.assertTrue(result.kinds["0000_initial"].startswith("non-additive: modified in place"), result.kinds)
+                self.assertNotIn("0034_migration", result.kinds)
+
+    def test_an_edited_migration_is_listed_after_the_added_and_removed_ones(self):
+        added, removed = "0035_migration", "0033_migration"
+        result = rc.classify_migrations(
+            FROM,
+            TO,
+            fetch=self.fetch(BASE_TAGS + (removed,), BASE_TAGS + (added,), {added: SQL_NULLABLE}, edited=("0000_initial",)),
+        )
+        self.assertEqual(result.migrations, [added, removed, "0000_initial"])
+        self.assertEqual(result.kinds[added], "additive")
+
+    def test_a_shipped_migration_the_listing_does_not_hold_is_not_additive(self):
+        # The journal names it but the directory has no such file (or the directory cannot
+        # be listed at all): unreadable, which counts as not rollback-safe. Not an outage.
+        without = lambda tags: (200, [e for e in directory(tags) if e["name"] != "0000_initial.sql"])
+        cases = {
+            "missing at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): without(BASE_TAGS)}, ["0000_initial"]),
+            "missing at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): without(BASE_TAGS)}, ["0000_initial"]),
+            "no directory at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+            "no directory at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+        }
+        for name, (routes, unreadable) in cases.items():
+            for counts in (True, False):
+                with self.subTest(name, every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                    result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+                    self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", unreadable))
+                    for tag in unreadable:
+                        self.assertEqual(result.kinds[tag], "non-additive: the migration file cannot be read")
+
+    def test_a_listing_error_is_no_verdict(self):
+        for commit in (FROM, TO):
+            for status in (403, 500, 502):
+                with self.subTest(commit=commit[:8], status=status):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): (status, b"")})
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+
+    def test_a_truncated_listing_is_no_verdict(self):
+        # The Contents API lists at most 1000 entries of a directory and does not say it stopped.
+        crowd = [{"name": f"x{i}.txt", "path": f"{rc.MIGRATIONS_DIR}/x{i}.txt", "sha": blob(f"x{i}"), "type": "file"} for i in range(1000)]
+        for size, raises in ((1000, True), (999, False)):
+            with self.subTest(entries=size):
+                routes = {ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(BASE_TAGS) + crowd[: size - len(directory(BASE_TAGS))])}
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes)
+                if raises:
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                else:
+                    self.assertEqual(rc.classify_migrations(FROM, TO, fetch=fetch).classification, "additive")
+
+    def test_a_listing_that_is_not_a_directory_listing_is_no_verdict(self):
+        good = directory(BASE_TAGS)
+        with_sha = lambda value: [dict(e, sha=value) if e["name"] == "0034_migration.sql" else e for e in good]
+        cases = {
+            "not JSON": (200, b"not json"),
+            "a single file, not a directory": (200, {"name": "0000_initial.sql", "type": "file", "sha": blob("x")}),
+            "null": (200, b"null"),
+            "an entry that is not an object": (200, [*good, "0035_migration.sql"]),
+            "a sha that is not 40 hex": (200, with_sha("not-a-sha")),
+            "a sha that is not a string": (200, with_sha(7)),
+            "an entry without a sha": (200, [{k: v for k, v in e.items() if k != "sha"} if e["name"] == "0034_migration.sql" else e for e in good]),
+            "a duplicated key": (200, b'[{"name": "a", "name": "b"}]'),
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): answer})
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
 
     def test_a_tag_dropped_from_the_journal_is_not_rollback_safe(self):
         tag = "0035_migration"
