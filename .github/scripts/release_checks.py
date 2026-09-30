@@ -1151,28 +1151,30 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
 SAFETY_KEYS = ["classification", "from", "to", "migrations"]
 
 
+def _entry_problems(version, entry) -> list:
+    """What is wrong with one rollback-safety.json entry (empty = well formed)."""
+    where = f"{SAFETY_FILE} {version!r}"
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        return [f"{where}: not an exact x.y.z"]
+    if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
+        return [f"{where}: keys must be exactly {SAFETY_KEYS}, in that order"]
+    problems = []
+    if entry["classification"] not in ("additive", "not-rollback-safe"):
+        problems.append(f"{where}: classification must be additive or not-rollback-safe")
+    for key in ("from", "to"):
+        if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
+            problems.append(f"{where}: {key} must be a 40-hex commit id")
+    migrations = entry["migrations"]
+    if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
+        problems.append(f"{where}: migrations must be a list of migration tags")
+    return problems
+
+
 def safety_problems(doc) -> list:
     """What is wrong with a rollback-safety.json document (empty = well formed)."""
     if not isinstance(doc, dict) or list(doc) != ["versions"] or not isinstance(doc["versions"], dict):
         return [f'{SAFETY_FILE} must be exactly {{"versions": {{...}}}}']
-    problems = []
-    for version, entry in doc["versions"].items():
-        where = f"{SAFETY_FILE} {version!r}"
-        if not SEMVER.fullmatch(version):
-            problems.append(f"{where}: not an exact x.y.z")
-            continue
-        if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
-            problems.append(f"{where}: keys must be exactly {SAFETY_KEYS}, in that order")
-            continue
-        if entry["classification"] not in ("additive", "not-rollback-safe"):
-            problems.append(f"{where}: classification must be additive or not-rollback-safe")
-        for key in ("from", "to"):
-            if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
-                problems.append(f"{where}: {key} must be a 40-hex commit id")
-        migrations = entry["migrations"]
-        if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
-            problems.append(f"{where}: migrations must be a list of migration tags")
-    return problems
+    return [problem for version, entry in doc["versions"].items() for problem in _entry_problems(version, entry)]
 
 
 def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=classify_migrations) -> dict:
@@ -1189,9 +1191,12 @@ def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=c
 
 def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
     """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
-    or None. Anything but an explicit "additive" entry counts as flagged, and so does a
-    version in `pinned` with no entry at all: a pin that reached main without a computed
-    entry (a break-glass merge, a restore, a hand-run import) is no evidence of safety."""
+    or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
+    so does a version in `pinned` with no entry at all: a pin that reached main without a
+    computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
+    safety. An entry is judged on its own: one malformed entry flags its own version and
+    does not stop the others being read, because refusing the file would block every
+    rollback."""
     versions = safety.get("versions") if isinstance(safety, dict) else None
     if not isinstance(versions, dict):
         raise ReleaseCheckError("safety", f'{SAFETY_FILE} must be {{"versions": {{...}}}}')
@@ -1203,7 +1208,11 @@ def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=())
         if isinstance(version, str)
         and SEMVER.fullmatch(version)
         and low < vkey(version) <= high
-        and not (isinstance(versions.get(version), dict) and versions[version].get("classification") == "additive")
+        and not (
+            version in versions
+            and not _entry_problems(version, versions[version])
+            and versions[version]["classification"] == "additive"
+        )
     ]
     return min(flagged, key=vkey) if flagged else None
 

@@ -936,10 +936,57 @@ class TestRollbackFloor(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
 
+    def test_only_a_well_formed_additive_entry_is_trusted(self):
+        # A version is safe to roll back across only on an entry that safety_problems accepts
+        # and that says "additive". One malformed entry flags its own version; it does not
+        # refuse the whole file, which would block every rollback (the incident path).
+        good = dict(ts.SEED["0.9.14"], classification="additive", migrations=[])
+        malformed = {
+            "only the classification": {"classification": "additive"},
+            "an extra key": {**good, "note": 1},
+            "keys out of order": {key: good[key] for key in ("from", "classification", "to", "migrations")},
+            "a commit that is not 40 hex": {**good, "from": "abc"},
+            "a migration that is not a tag": {**good, "migrations": ["../x"]},
+            "migrations that is not a list": {**good, "migrations": "0035_migration"},
+        }
+        for name, entry in malformed.items():
+            with self.subTest(name):
+                self.assertNotEqual(rc.safety_problems({"versions": {"0.9.14": entry}}), [])
+                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.safety_problems({"versions": {"0.9.14": good}}), [])
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14"))
+
+    def test_a_malformed_entry_flags_only_its_own_version(self):
+        versions = {"0.9.13": dict(ts.SEED["0.9.13"]), "0.9.14": {"classification": "additive"}}
+        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13"))
+        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14"), "0.9.14")
+
 
 class TestSafetyProblems(unittest.TestCase):
     def test_the_seed_is_well_formed(self):
         self.assertEqual(rc.safety_problems({"versions": ts.SEED}), [])
+
+    def test_each_problem_names_its_version_and_field(self):
+        good = dict(ts.SEED["0.9.14"])
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good}}),
+            ["rollback-safety.json '0.9': not an exact x.y.z"],
+        )
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9.14": {**good, "classification": "safe", "from": "abc"}}}),
+            [
+                "rollback-safety.json '0.9.14': classification must be additive or not-rollback-safe",
+                "rollback-safety.json '0.9.14': from must be a 40-hex commit id",
+            ],
+        )
+        # Every entry is read, not just the first one with a problem.
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good, "0.9.14": good, "0.9.15": {}}}),
+            [
+                "rollback-safety.json '0.9': not an exact x.y.z",
+                f"rollback-safety.json '0.9.15': keys must be exactly {rc.SAFETY_KEYS}, in that order",
+            ],
+        )
 
     def test_each_malformation_is_named(self):
         good = dict(ts.SEED["0.9.14"])
