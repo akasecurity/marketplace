@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The marketplace's one release-verification module (standard library only).
 
-Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin, runs
-THIS file from main's copy. validate.yml imports it through validate_pr.py; the
-importer, tag-release, staleness and tag-audit run it as a CLI.
+Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin,
+imports THIS file from main's copy: validate through validate_pr.py, and the importer,
+tag-release, staleness and tag-audit directly. The command line below is for a person,
+and for a copy run outside this repository.
 
 It has no third-party dependency on purpose. Nothing is installed before it runs, so
 nothing outside this reviewed file can change a verdict.
@@ -81,8 +82,10 @@ ATTEMPTS = 5
 RETRY_SECONDS = 20
 
 
-class ReleaseCheckError(Exception):
-    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+class _CheckFailure(Exception):
+    """What every release-check failure carries: the check's name and a detail. It exists
+    to share the constructor. Nothing catches it: a handler names ReleaseCheckError or
+    InfraError, whichever it means."""
 
     def __init__(self, check: str, detail: str) -> None:
         super().__init__(f"{check}: {detail}")
@@ -90,8 +93,14 @@ class ReleaseCheckError(Exception):
         self.detail = detail
 
 
-class InfraError(ReleaseCheckError):
-    """No verdict: the network, npm, git or an API failed (CLI exit 2). Still a refusal."""
+class ReleaseCheckError(_CheckFailure):
+    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+
+
+class InfraError(_CheckFailure):
+    """No verdict: the network, npm, git or an API failed (CLI exit 2). Deliberately NOT a
+    ReleaseCheckError: a handler written for a verdict never catches an outage, so an
+    unhandled one stops the run instead of reading as a refusal."""
 
 
 def _reject_duplicates(pairs):
@@ -224,7 +233,10 @@ def _read_manifest(repo_dir: str, rev: str):
 
 
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient: an unreadable or unpinned tag pins nothing."""
+    """What a historical tag pins. Lenient about content: a tag whose manifest does not
+    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
+    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
+    dropping that tag's pin would hide a version from the candidate and rollback floors."""
     try:
         doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
@@ -295,16 +307,16 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     status, body = fetch(packument_url(), {"Accept": "application/json"})
     if status != 200:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
-    versions = json.loads(body).get("versions")
-    if isinstance(versions, dict):
-        names = list(versions)
-    elif isinstance(versions, list):
-        names = versions
-    elif isinstance(versions, str):
-        names = [versions]
-    else:
-        raise InfraError("npm", f"{REGISTRY} returned no versions for {PACKAGE}")
-    exact = {v for v in names if isinstance(v, str) and SEMVER.fullmatch(v)}
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except ValueError as exc:
+        raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
+    versions = document.get("versions") if isinstance(document, dict) else None
+    if not isinstance(versions, dict):
+        # The packument keys "versions" by version. A list or a bare string is what
+        # `npm view ... versions --json` prints, not what the registry serves.
+        raise InfraError("npm", f"{REGISTRY} returned no versions object for {PACKAGE}")
+    exact = {v for v in versions if SEMVER.fullmatch(v)}
     floor = max((vkey(v) for v in pinned), default=None)
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
 
