@@ -1,0 +1,62 @@
+name: main-audit
+
+# On every push to main: red unless every commit the push added is the merge
+# commit of a PR with an approving review from a code owner, on the PR's final
+# head, by someone other than its last pusher (AGENTS.md, "The workflows").
+# Detective only: the main ruleset prevents, and this records a bypass. It runs
+# from the pushed commit's own copy, so a bypass push could change it in the
+# same push. Each offending commit gets its own issue, which a person closes.
+# No concurrency group: a group drops pending runs, and a dropped run would be
+# an unaudited push.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      results: ${{ steps.audit.outputs.results }}
+    steps:
+      # The pushed commit, with full history so the push's first commit has its parent.
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: audit the commits this push added
+        id: audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: python3 .github/scripts/main_audit.py --repo-dir .
+
+  file-issues:
+    name: file-issues
+    needs: audit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: open an issue for each commit that reached main unapproved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS_JSON: ${{ needs.audit.outputs.results }}
+          JOB_RESULT: ${{ needs.audit.result }}
+        run: python3 .github/scripts/issue_router.py apply --label main-audit
