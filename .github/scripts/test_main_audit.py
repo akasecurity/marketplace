@@ -1,5 +1,9 @@
 """Tests for main_audit.py: every commit a push adds must be a code-owner-approved PR merge."""
+import contextlib
+import io
+import os
 import unittest
+from unittest import mock
 
 import issue_router as rt
 import main_audit as ma
@@ -86,6 +90,30 @@ class TestMainAudit(unittest.TestCase):
     def test_an_approver_who_is_not_a_code_owner_does_not_count(self):
         reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}}]
         self.assertEqual(len(self.audit(github(reviews=reviews))), 1)
+
+    def run_main(self, gh):
+        env = {"AFTER": "s1", "BEFORE": "p", "GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
+        out = io.StringIO()
+        real_audit = ma.audit
+        with mock.patch.dict(os.environ, env), mock.patch.object(ma, "Git", lambda path: repo()), \
+                mock.patch.object(ma, "GitHub", lambda token, repository: gh), \
+                mock.patch.object(ma, "write_output", lambda key, value: None), \
+                mock.patch.object(ma, "audit", lambda *args: real_audit(*args, sleep=lambda seconds: None)), \
+                contextlib.redirect_stdout(out):
+            code = ma.main(["--repo-dir", "."])
+        return code, out.getvalue()
+
+    def test_a_clean_push_prints_the_summary_line_the_wiring_check_greps_for(self):
+        code, out = self.run_main(github())
+        self.assertEqual(code, 0)
+        self.assertIn("0 commit(s) in this push reached main without a code-owner-approved PR", out)
+        self.assertNotIn("::error::", out)
+
+    def test_a_flagged_push_counts_the_red_commits_in_the_summary_line(self):
+        code, out = self.run_main(github(pulls=[]))
+        self.assertEqual(code, 0)
+        self.assertIn("1 commit(s) in this push reached main without a code-owner-approved PR", out)
+        self.assertIn("::error::", out)
 
     def test_the_commits_a_push_added(self):
         self.assertEqual(ma.added_commits(repo(), "0" * 40, "s2"), ["s2"])

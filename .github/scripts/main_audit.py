@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     flagged = [item for item in results if item.red]
     for item in flagged:
         print(f"::error::{item.detail.splitlines()[0]}")
-    print(f"{len(flagged)} finding(s) in this push to main without a code-owner-approved PR")
+    print(f"{len(flagged)} commit(s) in this push reached main without a code-owner-approved PR")
     write_output("results", results_to_json(results))
     return 0
 
