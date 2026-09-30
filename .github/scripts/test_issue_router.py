@@ -224,7 +224,7 @@ class TestMain(unittest.TestCase):
     def test_a_success_with_an_explicit_empty_list_is_clear(self):
         self.assertEqual(self.run_main(job_result="success", results_json="[]"), (0, []))
 
-    def test_main_audit_empty_list_for_a_clean_push_is_clear(self):
+    def test_main_audit_explicit_empty_list_is_clear(self):
         self.assertEqual(self.run_main(job_result="success", results_json="[]", label="main-audit"), (0, []))
 
     def test_main_audit_with_no_output_is_red(self):

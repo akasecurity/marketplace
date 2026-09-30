@@ -172,8 +172,9 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
     An evaluation job that did not finish is itself a red result, and so is one that finished but handed
     over no output (None: it was absent, blank or could not be read), because reading that as "nothing is
     red" would leave the audit green for good if the wiring between the job and this step broke. An
-    explicit empty list is different: it is the evaluator saying that nothing is red (a clean push is
-    exactly that for main-audit), so it is a clear result and closes an earlier alert. The detail names no
+    explicit empty list is different: it is the evaluator saying that nothing is red, so it is a clear
+    result for every label and closes an earlier alert. It says nothing about which evaluator sends it: an
+    evaluator that always appends a clear result of its own never sends one. The detail names no
     run URL: it is digested to decide whether anything changed, and every run has its own URL, while the
     comment appends it.
     """
