@@ -8,8 +8,9 @@ Each rule is its own result, filed as its own issue by issue_router.py:
   (ii)  a bot PR has been open for more than 24 hours;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
         than an hour old, changed the ai-tc version and carries no fleet-v tag;
-  (iv)  a tag other than fleet-v<N> exists, or a ref other than refs/heads/main
-        answers to the name main.
+  (iv)  a tag other than fleet-v<N> (N a positive integer without a leading
+        zero) exists, or a ref other than refs/heads/main answers to the name
+        main.
 Also: the ai-tc entry missing from main (red until a restore merges), the
 "rolled back, awaiting fix-forward" notice while the latest fleet-v tag is a
 rollback (rule (i) stays live then, so a fix-forward the importer fails to pin
@@ -134,12 +135,12 @@ def rule_iii(git: Git, frozen: list[dict], now: dt.datetime) -> Result:
 
 def rule_iv(refs: list[str]) -> Result:
     names = [ref for ref in refs if not ref.endswith("^{}")]
-    stray = [ref for ref in names if ref.startswith("refs/tags/") and not re.fullmatch(r"refs/tags/fleet-v[0-9]+", ref)]
+    stray = [ref for ref in names if ref.startswith("refs/tags/") and not release_checks.FLEET_TAG.fullmatch(ref[len("refs/tags/"):])]
     found = sorted(set(stray + [ref for ref in names if ref in SHADOWS]))
     return result("staleness-iv", bool(found),
                   "Refs that must not exist:\n" + "\n".join(f"- `{ref}`" for ref in found)
                   + "\n\nSome Claude Code versions follow a tag named `main` instead of the branch. Deleting a "
-                  "tag takes an org owner (tags-locked forbids it to everyone else): follow the runbook's "
+                  "tag takes an org owner (a tag ruleset forbids it to everyone else): follow the runbook's "
                   "stray-tag step.")
 
 
