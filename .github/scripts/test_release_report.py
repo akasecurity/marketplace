@@ -176,6 +176,26 @@ class TestMalformedReports(ts.VerifyMixin, unittest.TestCase):
         del out["verified"][0]["attestationBundles"]
         self.no_verdict("toolchain", audits=[out])
 
+    def test_a_report_without_a_verified_list_is_toolchain_not_a_missing_attestation(self):
+        # npm prints `verified` whenever it honours --include-attestations (npm 11.12 and
+        # later). An older npm prints none, and that says nothing about the release.
+        for name, out in {
+            "no verified key": {"invalid": [], "missing": []},
+            "the key dropped from a full report": {k: v for k, v in ts.audit_output(VERSION).items() if k != "verified"},
+        }.items():
+            with self.subTest(name):
+                sleeps = []
+                error = self.no_verdict("toolchain", audits=[out], sleeps=sleeps)
+                self.assertIn("include-attestations", error.detail)
+                self.assertIn("11.12", error.detail)
+                self.assertEqual(sleeps, [], "a report npm cannot have meant is not waited out")
+
+    def test_an_empty_verified_list_is_still_a_missing_attestation(self):
+        sleeps = []
+        error = self.refused("provenance", audits=[ts.audit_output(VERSION, verified=False)], sleeps=sleeps)
+        self.assertIn("no VERIFIED attestation", error.detail)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
     def test_two_verified_entries_for_the_package_are_toolchain(self):
         out = self.report()
         out["verified"].append(copy.deepcopy(out["verified"][0]))
