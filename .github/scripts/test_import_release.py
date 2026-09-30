@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import types
 import unittest
@@ -365,6 +366,195 @@ class TestModes(PlanCase):
             with self.subTest(mode=mode), self.assertRaisesRegex(ir.Refused, "not available") as caught:
                 self.plan(mode=mode, event="workflow_dispatch")
             self.assertTrue(caught.exception.red)
+
+
+MAIN = "d" * 40
+TREE = "e" * 40
+
+
+class OpenPrCase(unittest.TestCase):
+    def setUp(self):
+        self.pulls: list[dict] = []
+        self.main_manifest = manifest("0.9.14", INTEGRITY["0.9.14"])
+        self.gh = FakeGitHub({
+            ("GET", R("git/ref/heads/main")): {"object": {"sha": MAIN}},
+            ("GET", R(f"contents/{MANIFEST}")): lambda body, params: contents(self.main_manifest),
+            ("GET", R(f"contents/{SAFETY_FILE}")): contents(safety({"0.9.14": safety_entry("0.9.14", "0.9.13")})),
+            ("GET", R("pulls")): pulls_route(self.pulls),
+            ("GET", R(f"git/commits/{MAIN}")): {"tree": {"sha": TREE}},
+            ("POST", R("git/trees")): {"sha": "f" * 40},
+            # What GitHub answers an App's commit sent with no author or committer.
+            ("POST", R("git/commits")): {"sha": "c" * 40, "committer": {"name": "GitHub", "email": "noreply@github.com"},
+                                         "verification": {"verified": True, "reason": "valid"}},
+            ("POST", R("git/refs")): {"ref": "created"},
+            ("POST", R("pulls")): {"number": 12, "node_id": "PR_12"},
+            ("POST", R("issues/12/comments")): {"id": 1},
+            ("GRAPHQL", "enablePullRequestAutoMerge"): {"enablePullRequestAutoMerge": {"pullRequest": {"number": 12}}},
+        })
+
+    def route_branch(self, branch: str, exists: bool = False) -> None:
+        self.gh.routes[("GET", R(f"git/ref/heads/{branch}"))] = {"ref": f"refs/heads/{branch}"} if exists else not_found()
+
+    def open(self, plan: dict) -> str:
+        return ir.open_pr(self.gh, plan, "https://github.com/akasecurity/marketplace/actions/runs/7")
+
+
+class TestOpenPrForward(OpenPrCase):
+    def test_writes_both_files_creates_the_branch_opens_the_pr_and_enables_auto_merge(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        entry = safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",))
+        self.assertEqual(self.open(forward_plan(safety_entry=entry)), "opened #12 with auto-merge (squash); superseded []")
+        tree = self.gh.called("POST", R("git/trees"))[0][2]
+        self.assertEqual(tree["base_tree"], TREE)
+        files = {item["path"]: item["content"] for item in tree["tree"]}
+        self.assertEqual(ts.ai_tc(json.loads(files[MANIFEST]))["source"]["version"], "0.9.15")
+        self.assertEqual(json.loads(files[SAFETY_FILE])["versions"]["0.9.15"], entry)
+        self.assertTrue(all(item["mode"] == "100644" and item["type"] == "blob" for item in tree["tree"]))
+        # No author or committer key: GitHub then commits as web-flow and signs, which validate accepts.
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2],
+                         {"message": "feat: advance the ai-tc pin to 0.9.15", "tree": "f" * 40, "parents": [MAIN]})
+        self.assertEqual(self.gh.called("POST", R("git/refs"))[0][2],
+                         {"ref": "refs/heads/bot/pin-ai-tc-0.9.15", "sha": "c" * 40})
+        opened = self.gh.called("POST", R("pulls"))[0][2]
+        self.assertEqual((opened["head"], opened["base"], opened["title"]),
+                         ("bot/pin-ai-tc-0.9.15", "main", "feat: advance the ai-tc pin to 0.9.15"))
+        self.assertIn("**Approver checklist:**", opened["body"])
+        self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
+        self.assertEqual(self.gh.called("POST", R("issues/12/labels")), [])
+
+    def test_a_commit_github_committed_but_did_not_sign_gets_no_branch(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.gh.routes[("POST", R("git/commits"))] = {
+            "sha": "c" * 40, "committer": {"name": "GitHub", "email": "noreply@github.com"},
+            "verification": {"verified": False, "reason": "unsigned"}}
+        with self.assertRaisesRegex(ir.Refused, "without a verified signature, which validate refuses") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
+        self.assertEqual(self.gh.called("POST", R("git/refs")), [])
+        self.assertEqual(self.gh.called("POST", R("pulls")), [])
+
+    def test_supersedes_lower_forward_prs_only(self):
+        self.route_branch("bot/pin-ai-tc-0.9.16")
+        self.pulls += [pull(8, "bot/pin-ai-tc-0.9.15"), pull(9, "bot/pin-ai-tc-0.9.17")]
+        self.gh.routes[("POST", R("issues/8/comments"))] = {"id": 2}
+        self.gh.routes[("PATCH", R("pulls/8"))] = {"state": "closed"}
+        self.assertTrue(self.open(forward_plan("0.9.16", "0.9.14")).endswith("superseded [8]"))
+        self.assertIn("rollback-mode dispatch", self.gh.called("POST", R("issues/8/comments"))[0][2]["body"])
+        self.assertEqual(self.gh.called("PATCH", R("pulls/8"))[0][2], {"state": "closed"})
+        self.assertEqual(self.gh.called("PATCH", R("pulls/9")), [])
+
+    def test_no_auto_merge_while_a_rollback_pr_is_open(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
+        self.assertIn("without auto-merge (rollback PR #5 is open)", self.open(forward_plan()))
+        self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge"), [])
+        self.assertIn("rollback PR #5", self.gh.called("POST", R("issues/12/comments"))[0][2]["body"])
+        self.assertEqual(self.gh.called("PATCH", R("pulls/5")), [])
+
+    def test_an_existing_branch_with_an_open_pr_is_a_green_skip_with_no_writes(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15"))
+        with self.assertRaisesRegex(ir.Refused, "already open") as caught:
+            self.open(forward_plan())
+        self.assertFalse(caught.exception.red)
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_an_existing_branch_without_a_pr_is_skipped_unless_reimport(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        with self.assertRaisesRegex(ir.Refused, "already exists") as caught:
+            self.open(forward_plan())
+        self.assertFalse(caught.exception.red)
+        self.assertEqual(self.gh.writes(), [])
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        self.open(forward_plan(reimport=True))
+        order = [f"{call[0]} {call[1]}" for call in self.gh.writes()]
+        self.assertLess(order.index(f"DELETE {R('git/refs/heads/bot/pin-ai-tc-0.9.15')}"), order.index(f"POST {R('git/refs')}"))
+
+    def test_a_moved_entry_on_main_is_a_green_skip_with_no_writes(self):
+        self.main_manifest = manifest("0.9.15", INTEGRITY["0.9.15"])
+        with self.assertRaisesRegex(ir.Refused, "changed after the verify job") as caught:
+            self.open(forward_plan("0.9.16", "0.9.14"))
+        self.assertFalse(caught.exception.red)
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_losing_the_race_for_the_branch_is_a_green_skip(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.gh.routes[("POST", R("git/refs"))] = GitHubError(422, "POST", "git/refs", "Reference already exists")
+        with self.assertRaisesRegex(ir.Refused, "created by another run first") as caught:
+            self.open(forward_plan())
+        self.assertFalse(caught.exception.red)
+        self.assertEqual(self.gh.called("POST", R("pulls")), [])
+
+    def test_a_failed_auto_merge_is_red_and_leaves_the_pr_open(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.gh.routes[("GRAPHQL", "enablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "not allowed")
+        with self.assertRaisesRegex(ir.Refused, "stays open for a person to merge") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
+        self.assertEqual(len(self.gh.called("POST", R("pulls"))), 1)
+        self.assertEqual(self.gh.called("PATCH", R("pulls/12")), [])
+
+    def test_a_malformed_plan_is_refused_before_any_call(self):
+        with self.assertRaises(ir.Refused):
+            self.open(forward_plan(integrity="sha512-short"))
+        self.assertEqual(self.gh.calls, [])
+
+
+class TestOpenPrRollback(OpenPrCase):
+    def test_labels_enables_auto_merge_holds_forward_prs_and_closes_other_rollbacks(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.pulls += [pull(8, "bot/pin-ai-tc-0.9.15"), pull(9, "bot/rollback-ai-tc-0.9.14-to-0.9.12")]
+        for number in (8, 9):
+            self.gh.routes[("POST", R(f"issues/{number}/comments"))] = {"id": number}
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = {"disablePullRequestAutoMerge": {"pullRequest": {"number": 8}}}
+        self.gh.routes[("PATCH", R("pulls/9"))] = {"state": "closed"}
+        self.assertEqual(self.open(rollback_plan()),
+                         "opened rollback #12 with auto-merge (squash); auto-merge off on [8]; closed [9]")
+        self.assertEqual(self.gh.called("POST", R("issues/12/labels"))[0][2], {"labels": ["rollback"]})
+        self.assertEqual(self.gh.called("GRAPHQL", "disablePullRequestAutoMerge")[0][2], {"id": "PR_8"})
+        self.assertEqual([call[1] for call in self.gh.calls if call[0] == "GRAPHQL"],
+                         ["disablePullRequestAutoMerge", "enablePullRequestAutoMerge"])
+        self.assertIn("rollback PR #12", self.gh.called("POST", R("issues/8/comments"))[0][2]["body"])
+        self.assertEqual(self.gh.called("PATCH", R("pulls/8")), [])
+        self.assertEqual([item["path"] for item in self.gh.called("POST", R("git/trees"))[0][2]["tree"]], [MANIFEST])
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"],
+                         "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13")
+
+    def test_a_stale_rollback_branch_without_a_pr_is_replaced(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13", exists=True)
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13"))] = None
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.open(rollback_plan())
+        self.assertEqual(len(self.gh.called("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13"))), 1)
+
+    def test_an_auto_merge_that_cannot_be_turned_off_is_red(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.pulls.append(pull(8, "bot/pin-ai-tc-0.9.15"))
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "forbidden")
+        self.gh.routes[("GRAPHQL", "repository")] = {"repository": {"pullRequest": {"autoMergeRequest": {"enabledAt": "2026-09-29T00:00:00Z"}}}}
+        with self.assertRaisesRegex(ir.Refused, "turn it off by hand") as caught:
+            self.open(rollback_plan())
+        self.assertTrue(caught.exception.red)
+
+
+class TestMain(unittest.TestCase):
+    def test_a_green_refusal_exits_zero_and_reports_no_proceed(self):
+        env = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule"}
+        with mock.patch.dict(ir.os.environ, env, clear=True), \
+                mock.patch.object(ir, "make_plan", side_effect=ir.Refused("nothing new", red=False)), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(ir.main(["plan"]), 0)
+        self.assertIn("::notice::nothing new", out.getvalue())
+        self.assertIn("proceed=false", out.getvalue())
+
+    def test_a_red_refusal_exits_one(self):
+        env = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan(integrity="bad")),
+               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+        with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(ir.main(["open-pr"]), 1)
+        self.assertIn("::error::", out.getvalue())
 
 
 if __name__ == "__main__":
