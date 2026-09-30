@@ -81,8 +81,10 @@ ATTEMPTS = 5
 RETRY_SECONDS = 20
 
 
-class ReleaseCheckError(Exception):
-    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+class _CheckFailure(Exception):
+    """What every release-check failure carries: the check's name and a detail. It exists
+    to share the constructor. Nothing catches it: a handler names ReleaseCheckError or
+    InfraError, whichever it means."""
 
     def __init__(self, check: str, detail: str) -> None:
         super().__init__(f"{check}: {detail}")
@@ -90,8 +92,14 @@ class ReleaseCheckError(Exception):
         self.detail = detail
 
 
-class InfraError(ReleaseCheckError):
-    """No verdict: the network, npm, git or an API failed (CLI exit 2). Still a refusal."""
+class ReleaseCheckError(_CheckFailure):
+    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+
+
+class InfraError(_CheckFailure):
+    """No verdict: the network, npm, git or an API failed (CLI exit 2). Deliberately NOT a
+    ReleaseCheckError: a handler written for a verdict never catches an outage, so an
+    unhandled one stops the run instead of reading as a refusal."""
 
 
 def _reject_duplicates(pairs):
