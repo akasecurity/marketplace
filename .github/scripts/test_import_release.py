@@ -178,5 +178,194 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("claude plugin marketplace add akasecurity/marketplace#bot/rollback-ai-tc-0.9.14-to-0.9.13", body)
 
 
+PLAN_KEYS = {"mode", "version", "from_version", "integrity", "shasum", "git_commit", "run_url", "branch", "title",
+             "labels", "classification", "migrations", "safety_entry", "refused", "highest_pinned", "floor",
+             "crossed", "target_tag", "reimport", "below_floor", "base_sha", "base_entry"}
+TAGS = [fleet_tag(6, "c6"), fleet_tag(7, "c7"), fleet_tag(8, "c8")]
+
+
+def repo(main_version: str | None = "0.9.14", entries: dict | None = None) -> FakeGit:
+    """main ("m") after fleet-v6/7/8 (0.9.12, 0.9.13, 0.9.14), with main's rollback-safety.json."""
+    if entries is None:
+        entries = {"0.9.13": safety_entry("0.9.13", "0.9.12", "additive", ()), "0.9.14": safety_entry("0.9.14", "0.9.13")}
+    files = {("c6", MANIFEST): manifest("0.9.12"), ("c7", MANIFEST): manifest("0.9.13"),
+             ("c8", MANIFEST): manifest("0.9.14"),
+             ("m", MANIFEST): manifest(main_version, INTEGRITY.get(main_version), entry=main_version is not None),
+             ("m", SAFETY_FILE): safety(entries)}
+    return FakeGit(chain=["c6", "c7", "c8", "m"], files=files, tags=TAGS)
+
+
+class PlanCase(unittest.TestCase):
+    def setUp(self):
+        self.pinned = {"0.9.12", "0.9.13", "0.9.14"}
+        # What release_checks.pins_by_ref reads from main and the tags in repo() (fleet-v6/7/8).
+        self.pins = {"main": "0.9.14", "fleet-v6": "0.9.12", "fleet-v7": "0.9.13", "fleet-v8": "0.9.14"}
+        self.candidates: list[str] = []
+        self.bad: dict[str, tuple[str, str]] = {}
+        self.floor = None
+        self.pulls: list[dict] = []
+        self.gh = FakeGitHub({("GET", R("pulls")): pulls_route(self.pulls)})
+        classification = types.SimpleNamespace(classification="additive", migrations=["0036_add_column"])
+        stubs = {"pinned_versions": lambda repo_dir: set(self.pinned),
+                 "pins_by_ref": lambda repo_dir: dict(self.pins),
+                 "npm_candidates": lambda pinned: list(self.candidates),
+                 "verify_release": self.fake_verify,
+                 "classify_migrations": lambda start, end: classification,
+                 "rollback_floor": lambda table, target, highest, pinned=(): self.floor}
+        self.stubs = {}
+        for name, function in stubs.items():
+            patcher = mock.patch.object(release_checks, name, side_effect=function)
+            self.stubs[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_verify(self, version):
+        if version in self.bad:
+            raise release_checks.ReleaseCheckError(*self.bad[version])
+        return verified(version)
+
+    def plan(self, git=None, **inputs):
+        args = dict(repo_dir="/fake/marketplace", mode="forward", target="", reimport=False, below_floor=False,
+                    event="schedule", run_id="42")
+        args.update(inputs)
+        return ir.make_plan(git or repo(), self.gh, **args)
+
+
+class TestPlanForward(PlanCase):
+    def test_the_schedule_takes_the_highest_candidate_that_passes(self):
+        self.candidates = ["0.9.15", "0.9.16"]
+        self.bad = {"0.9.16": ("provenance", "ref refs/heads/release is not the version's tag")}
+        plan = self.plan()
+        self.assertEqual((plan["mode"], plan["version"], plan["from_version"]), ("forward", "0.9.15", "0.9.14"))
+        self.assertEqual((plan["branch"], plan["title"]), ("bot/pin-ai-tc-0.9.15", "feat: advance the ai-tc pin to 0.9.15"))
+        self.assertEqual(plan["integrity"], INTEGRITY["0.9.15"])
+        self.assertEqual(plan["refused"], [{"version": "0.9.16", "reason": "provenance: ref refs/heads/release is not the version's tag"}])
+        self.assertEqual(plan["safety_entry"], {"classification": "additive", "from": ATTESTED["0.9.14"],
+                                                "to": ATTESTED["0.9.15"], "migrations": ["0036_add_column"]})
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+        self.assertEqual((plan["base_sha"], plan["base_entry"]), ("m", entry_json("0.9.14", INTEGRITY["0.9.14"])))
+        self.assertEqual(set(plan), PLAN_KEYS)
+        ir.check_plan(plan)
+
+    def test_nothing_new_on_npm_is_a_green_skip(self):
+        with self.assertRaisesRegex(ir.Refused, "no exact release above 0.9.14") as caught:
+            self.plan()
+        self.assertFalse(caught.exception.red)
+
+    def test_every_candidate_refused_is_a_green_skip_that_names_them(self):
+        self.candidates = ["0.9.15"]
+        self.bad = {"0.9.15": ("commit-on-main", "behind")}
+        with self.assertRaisesRegex(ir.Refused, r"refused: 0\.9\.15") as caught:
+            self.plan()
+        self.assertFalse(caught.exception.red)
+
+    def test_the_schedule_opens_nothing_while_a_rollback_pr_is_open(self):
+        self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
+        self.candidates = ["0.9.15"]
+        with self.assertRaisesRegex(ir.Refused, "rollback PR #5 is open") as caught:
+            self.plan()
+        self.assertFalse(caught.exception.red)
+        self.stubs["npm_candidates"].assert_not_called()
+
+    def test_an_open_pr_for_the_version_is_a_green_skip(self):
+        self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15"))
+        self.candidates = ["0.9.15"]
+        with self.assertRaisesRegex(ir.Refused, "PR #6 for 0.9.15 is already open") as caught:
+            self.plan()
+        self.assertFalse(caught.exception.red)
+
+    def test_a_rejected_version_stays_rejected_until_reimport(self):
+        self.pulls.append(pull(7, "bot/pin-ai-tc-0.9.15", state="closed"))
+        self.candidates = ["0.9.15"]
+        with self.assertRaisesRegex(ir.Refused, "closed unmerged") as scheduled:
+            self.plan()
+        self.assertFalse(scheduled.exception.red)
+        with self.assertRaisesRegex(ir.Refused, "closed unmerged") as dispatched:
+            self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(dispatched.exception.red)
+        plan = self.plan(event="workflow_dispatch", target="0.9.15", reimport=True)
+        self.assertEqual((plan["version"], plan["reimport"]), ("0.9.15", True))
+
+    def test_a_version_a_rollback_moved_away_from_needs_reimport(self):
+        self.pinned = {"0.9.13", "0.9.14", "0.9.15"}  # a fleet-v tag pinned 0.9.15; main was rolled back to 0.9.14
+        entries = {"0.9.14": safety_entry("0.9.14", "0.9.13"),
+                   "0.9.15": safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",))}
+        with self.assertRaisesRegex(ir.Refused, "reimport: true") as caught:
+            self.plan(repo(entries=entries), event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(caught.exception.red)
+        plan = self.plan(repo(entries=entries), event="workflow_dispatch", target="0.9.15", reimport=True)
+        self.assertIsNone(plan["safety_entry"])
+        self.assertEqual((plan["classification"], plan["migrations"]), ("additive", ["0036_add_column"]))
+        self.stubs["classify_migrations"].assert_not_called()
+        # A fix-forward after that rollback: its entry is computed from 0.9.15, the highest version
+        # pinned below it, exactly as validate recomputes it, not from main's 0.9.14.
+        self.candidates = ["0.9.16"]
+        plan = self.plan(repo(entries=entries))
+        self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.15"])
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.15"], ATTESTED["0.9.16"])
+
+    def test_a_dispatched_target_that_fails_verification_is_red(self):
+        self.bad = {"0.9.15": ("commit-on-main", "behind")}
+        with self.assertRaisesRegex(ir.Refused, "0.9.15 fails the release checks: commit-on-main: behind") as caught:
+            self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(caught.exception.red)
+
+    def test_a_forward_target_must_be_above_the_pin_and_reimport_needs_a_target(self):
+        with self.assertRaisesRegex(ir.Refused, "rollback-mode dispatch"):
+            self.plan(event="workflow_dispatch", target="0.9.13")
+        with self.assertRaisesRegex(ir.Refused, "needs an explicit target"):
+            self.plan(event="workflow_dispatch", reimport=True)
+
+    def test_no_entry_on_main_skips_the_schedule(self):
+        with self.assertRaisesRegex(ir.Refused, "no ai-tc entry") as caught:
+            self.plan(repo(main_version=None, entries={}))
+        self.assertFalse(caught.exception.red)
+
+
+class TestPlanRollback(PlanCase):
+    def test_a_tag_name_resolves_to_its_version(self):
+        plan = self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
+        self.assertEqual((plan["mode"], plan["version"], plan["from_version"]), ("rollback", "0.9.13", "0.9.14"))
+        self.assertEqual(plan["branch"], "bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.assertEqual(plan["title"], "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13")
+        self.assertEqual(plan["labels"], ["rollback"])
+        self.assertEqual((plan["target_tag"], plan["crossed"], plan["classification"]),
+                         ("fleet-v7", ["0.9.14"], "not-rollback-safe"))
+        self.assertIsNone(plan["floor"])
+        self.assertEqual(self.stubs["rollback_floor"].call_args.args[1:], ("0.9.13", "0.9.14"))
+        self.assertEqual(set(plan), PLAN_KEYS)
+        ir.check_plan(plan)
+
+    def test_below_the_floor_is_refused_unless_below_floor_is_set(self):
+        self.floor = "0.9.14"
+        with self.assertRaisesRegex(ir.Refused, "below the rollback floor") as caught:
+            self.plan(mode="rollback", target="0.9.13", event="workflow_dispatch")
+        self.assertTrue(caught.exception.red)
+        plan = self.plan(mode="rollback", target="0.9.13", event="workflow_dispatch", below_floor=True)
+        self.assertEqual((plan["floor"], plan["below_floor"]), ("0.9.14", True))
+
+    def test_the_target_must_be_tag_pinned_and_below_main(self):
+        for target, message in (("0.9.11", "not a version any fleet-v tag has pinned"),
+                                ("0.9.14", "not below main's pin"),
+                                ("fleet-v9", "there is no tag fleet-v9"),
+                                ("latest", "neither an exact x.y.z nor fleet-v<N>"),
+                                ("", "needs a target")):
+            with self.subTest(target=target), self.assertRaisesRegex(ir.Refused, message):
+                self.plan(mode="rollback", target=target, event="workflow_dispatch")
+
+    def test_an_open_rollback_pr_for_the_same_move_is_a_green_skip(self):
+        self.pulls.append(pull(9, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
+        with self.assertRaisesRegex(ir.Refused, "#9") as caught:
+            self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
+        self.assertFalse(caught.exception.red)
+
+
+class TestModes(PlanCase):
+    def test_remove_and_restore_are_not_built(self):
+        for mode in ("remove", "restore"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ir.Refused, "not available") as caught:
+                self.plan(mode=mode, event="workflow_dispatch")
+            self.assertTrue(caught.exception.red)
+
+
 if __name__ == "__main__":
     unittest.main()

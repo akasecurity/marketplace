@@ -234,3 +234,178 @@ def pr_body(plan: dict, run_url: str) -> str:
         "tag-release then creates the next `fleet-v<N>` tag at the squash commit.",
     ]
     return "\n".join(lines) + "\n"
+
+
+@dataclass
+class Context:
+    """What a planner reads: the checkout, the API (read-only in the verify job) and the dispatch inputs."""
+
+    git: Any
+    gh: Any
+    repo_dir: str
+    event: str
+    target: str
+    reimport: bool
+    below_floor: bool
+    run_id: str
+    doc: dict
+    current: str | None
+    safety: dict
+    pulls_open: list
+
+
+def verify(version: str) -> Any:
+    try:
+        return release_checks.verify_release(version)
+    except release_checks.ReleaseCheckError as error:
+        raise Refused(f"{version} fails the release checks: {describe(error)}") from error
+
+
+def facts(release: Any) -> dict:
+    return {"version": release.version, "integrity": release.integrity, "shasum": release.shasum,
+            "git_commit": release.git_commit, "run_url": release.run_url}
+
+
+def plan_forward(ctx: Context) -> dict:
+    scheduled = ctx.event == "schedule"
+    if ctx.current is None:
+        raise Refused("main has no ai-tc entry: nothing is imported until a restore merges", red=not scheduled)
+    rollbacks = pulls_by(ctx.pulls_open, ROLLBACK_BRANCH)
+    if scheduled and rollbacks:
+        raise Refused(f"rollback PR #{rollbacks[0]['number']} is open: the scheduled import opens nothing "
+                      "until it merges or closes", red=False)
+    pinned = set(release_checks.pinned_versions(ctx.repo_dir))
+    highest = max(pinned, key=vkey)
+    refused: list[dict] = []
+    if ctx.target:
+        if not SEMVER.fullmatch(ctx.target):
+            raise Refused(f"target {ctx.target!r} is not an exact x.y.z")
+        if not vkey(ctx.target) > vkey(ctx.current):
+            raise Refused(f"{ctx.target} is not above main's pin {ctx.current}; moving the pin down is a "
+                          "rollback-mode dispatch")
+        if not ctx.reimport and not vkey(ctx.target) > vkey(highest):
+            raise Refused(f"{ctx.target} is not above {highest}, the highest version main or a fleet-v tag has "
+                          "pinned; re-promoting a version a rollback moved away from takes reimport: true")
+        release = verify(ctx.target)
+    else:
+        if ctx.reimport:
+            raise Refused("reimport: true needs an explicit target version")
+        release = None
+        for candidate in reversed(release_checks.npm_candidates(pinned)):
+            try:
+                release = release_checks.verify_release(candidate)
+                break
+            except release_checks.ReleaseCheckError as error:
+                refused.append({"version": candidate, "reason": describe(error)})
+                print(f"::warning::npm has {candidate}, which the importer refuses: {describe(error)}")
+        if release is None:
+            if refused:
+                raise Refused(f"no npm release above {highest} passes the release checks "
+                              f"(refused: {', '.join(item['version'] for item in refused)})", red=False)
+            raise Refused(f"npm has no exact release above {highest}", red=False)
+    version = release.version
+    branch = f"bot/pin-ai-tc-{version}"
+    same = [p for p in ctx.pulls_open if p["head"] == branch]
+    if same:
+        raise Refused(f"PR #{same[0]['number']} for {version} is already open", red=False)
+    if not ctx.reimport:
+        closed = [p for p in list_pulls(ctx.gh, "closed") if p["head"] == branch and not p["merged"]]
+        if closed:
+            raise Refused(f"a bot PR for {version} (#{closed[0]['number']}) was closed unmerged; that rejection "
+                          "stands until a dispatch with reimport: true", red=not scheduled)
+    known = ctx.safety.get("versions", {})
+    if version in known:
+        classification = known[version].get("classification", "unknown")
+        migrations, safety_entry = list(known[version].get("migrations", [])), None
+    else:
+        # The same computation validate repeats (release_checks.safety_entry): the migrations since
+        # the highest version main or a fleet-v tag has pinned below this one, which after a
+        # rollback is the release rolled back from, not main's pin. The candidate is not re-verified.
+        try:
+            safety_entry = release_checks.safety_entry(
+                version, pinned,
+                verify=lambda v: release if v == version else release_checks.verify_release(v),
+                classify=release_checks.classify_migrations)
+        except release_checks.ReleaseCheckError as error:
+            raise Refused(f"could not compute {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
+        classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
+    return {**facts(release), "branch": branch, "title": f"feat: advance the ai-tc pin to {version}",
+            "labels": [], "classification": classification, "migrations": migrations,
+            "safety_entry": safety_entry, "refused": refused, "highest_pinned": highest}
+
+
+def plan_rollback(ctx: Context) -> dict:
+    if ctx.current is None:
+        raise Refused("main has no ai-tc entry to roll back; re-adding it is a restore-mode dispatch")
+    if not ctx.target:
+        raise Refused("a rollback needs a target: an exact x.y.z or fleet-v<N>")
+    pins = tag_pins(ctx.repo_dir)
+    target_tag = None
+    if FLEET_TAG.fullmatch(ctx.target):
+        if ctx.target not in pins:
+            raise Refused(f"there is no tag {ctx.target}")
+        target_tag, version = ctx.target, pins[ctx.target]
+        if version is None:
+            raise Refused(f"{ctx.target} pins no exact ai-tc version, so it cannot be a rollback target")
+    elif SEMVER.fullmatch(ctx.target):
+        version = ctx.target
+    else:
+        raise Refused(f"target {ctx.target!r} is neither an exact x.y.z nor fleet-v<N>")
+    if version not in {pinned for pinned in pins.values() if pinned}:
+        raise Refused(f"{version} is not a version any fleet-v tag has pinned; a rollback target must be one")
+    if not vkey(version) < vkey(ctx.current):
+        raise Refused(f"{version} is not below main's pin {ctx.current}, so this is not a rollback")
+    pinned = release_checks.pinned_versions(ctx.repo_dir)
+    highest = max(pinned, key=vkey)
+    # pinned=: a pinned version with no rollback-safety entry counts as flagged, exactly as
+    # validate (bot_rules) and the `floor` CLI compute it, so this refusal and validate's agree.
+    floor = release_checks.rollback_floor(ctx.safety, version, highest, pinned=pinned)
+    if floor is not None and not ctx.below_floor:
+        raise Refused(f"{version} is below the rollback floor: {floor} is flagged not-rollback-safe in main's "
+                      f"{SAFETY_FILE}, so a Mac's store may already be ahead of {version}'s build. below_floor: true "
+                      "opens the PR anyway, but validate fails it and only an org owner's break-glass merge lands it")
+    release = verify(version)
+    branch = f"bot/rollback-ai-tc-{ctx.current}-to-{version}"
+    same = [p for p in ctx.pulls_open if p["head"] == branch]
+    if same:
+        raise Refused(f"rollback PR #{same[0]['number']} for {ctx.current} -> {version} is already open", red=False)
+    known = ctx.safety.get("versions", {})
+    crossed = sorted((v for v, entry in known.items()
+                      if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(ctx.current)
+                      and entry.get("classification") == "not-rollback-safe"), key=vkey)
+    return {**facts(release), "branch": branch,
+            "title": f"fix: roll the ai-tc pin back from {ctx.current} to {version}", "labels": ["rollback"],
+            "classification": "not-rollback-safe" if crossed else "additive", "migrations": [],
+            "highest_pinned": highest, "floor": floor, "crossed": crossed, "target_tag": target_tag}
+
+
+PLANNERS: dict[str, Callable[[Context], dict]] = {"forward": plan_forward, "rollback": plan_rollback}
+
+
+def make_plan(git: Any, gh: Any, *, repo_dir: str, mode: str, target: str, reimport: bool, below_floor: bool,
+              event: str, run_id: str) -> dict:
+    if mode not in ("forward", "rollback", "remove", "restore"):
+        raise Refused(f"unknown mode {mode!r}")
+    planner = PLANNERS.get(mode)
+    if planner is None:
+        raise Refused(f"{mode} mode is not available: remove and restore are built only once removal is "
+                      "qualified as an emergency stop")
+    main_sha = git.rev_parse("main")
+    raw = git.show(main_sha, MANIFEST)
+    if raw is None:
+        raise Refused(f"main has no {MANIFEST}")
+    safety_raw = git.show(main_sha, SAFETY_FILE)
+    if safety_raw is None:
+        raise Refused(f"main has no {SAFETY_FILE}")
+    doc = json.loads(raw)
+    ctx = Context(git=git, gh=gh, repo_dir=repo_dir, event=event, target=target.strip(),
+                  reimport=reimport and mode == "forward", below_floor=below_floor and mode != "forward",
+                  run_id=run_id, doc=doc, current=pinned_version(doc), safety=json.loads(safety_raw),
+                  pulls_open=list_pulls(gh, "open"))
+    plan = {"mode": mode, "version": None, "from_version": ctx.current, "integrity": None, "shasum": None,
+            "git_commit": None, "run_url": None, "branch": None, "title": None, "labels": [],
+            "classification": None, "migrations": [], "safety_entry": None, "refused": [],
+            "highest_pinned": None, "floor": None, "crossed": [], "target_tag": None}
+    plan.update(planner(ctx))
+    plan.update(reimport=ctx.reimport, below_floor=ctx.below_floor, base_sha=main_sha, base_entry=entry_of(doc))
+    return plan
