@@ -1,0 +1,187 @@
+"""tag-release: cut fleet-v<N> at every first-parent commit on main whose ai-tc version changed.
+
+A sweep, not a per-push tag: each run walks main's first-parent history from
+the last fleet-v tag's commit to the tip, oldest first, and tags every commit
+whose ai-tc version (or the entry's absence) differs from its parent's and
+that carries no fleet-v tag yet. GitHub keeps one pending run per concurrency
+group and drops the rest, so a dropped run loses nothing: the next one tags
+what it missed, in commit order. Each tag is annotated, and its message
+records the version, integrity, PR, approver and store-migration class, plus
+rollback-from, drill and approver-note when they apply. The run also deletes
+the bot's own branches whose PRs are closed, since only the bot may delete
+bot/** branches.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Callable
+
+from ghapi import GitHub, GitHubError
+from gitrepo import Git
+from import_release import Refused, entry_of, list_pulls
+from issue_router import CODEOWNERS_FILE, parse_codeowners
+from release_checks import MANIFEST, SAFETY_FILE, SEMVER, vkey
+
+ABSENT = "entry removed"
+ASSOCIATION_ATTEMPTS = 3
+ASSOCIATION_WAIT = 20.0
+
+
+def version_at(git: Git, sha: str | None) -> str:
+    """The ai-tc version main pinned at `sha`, or ABSENT when the entry (or the commit) is missing."""
+    if sha is None:
+        return ABSENT
+    raw = git.show(sha, MANIFEST)
+    if raw is None:
+        return ABSENT
+    entry = entry_of(json.loads(raw))
+    if entry is None:
+        return ABSENT
+    version = entry["source"].get("version")
+    return version if isinstance(version, str) and version else "unpinned"
+
+
+def integrity_at(git: Git, sha: str) -> str:
+    raw = git.show(sha, MANIFEST)
+    entry = entry_of(json.loads(raw)) if raw else None
+    metadata = entry.get("metadata") if entry is not None else None
+    return metadata.get("integrity", "none") if isinstance(metadata, dict) else "none"
+
+
+def pending(git: Git) -> list[str]:
+    tags = git.fleet_tags()
+    if not tags:
+        raise Refused("no fleet-v tag exists to sweep from")
+    tagged = {tag["commit"] for tag in tags}
+    return [sha for sha in git.first_parent_after(tags[-1]["commit"], "main")
+            if sha not in tagged and version_at(git, sha) != version_at(git, git.first_parent(sha))]
+
+
+def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
+    if not SEMVER.fullmatch(version):
+        return "none"
+    raw = git.show(sha, SAFETY_FILE)
+    known = json.loads(raw).get("versions", {}) if raw else {}
+    if SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
+        crossed = [entry for v, entry in known.items()
+                   if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(previous)]
+        return ("not-rollback-safe" if any(entry.get("classification") == "not-rollback-safe" for entry in crossed)
+                else "additive")
+    entry = known.get(version)
+    return entry.get("classification", "unknown") if isinstance(entry, dict) else "unknown"
+
+
+def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep) -> dict | None:
+    """The PR whose merge commit is `sha`, or None. The association can lag a merge by seconds, so an
+    empty answer is asked again before it stands."""
+    for attempt in range(ASSOCIATION_ATTEMPTS):
+        pulls = gh.get(gh.repo_path(f"commits/{sha}/pulls"))
+        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")]
+        if merged:
+            return merged[0]
+        if attempt < ASSOCIATION_ATTEMPTS - 1:
+            sleep(ASSOCIATION_WAIT)
+    return None
+
+
+def pr_facts(gh: GitHub, sha: str, owners: list[str], sleep: Callable[[float], None] = time.sleep) -> dict:
+    pull = merged_pull(gh, sha, sleep)
+    if pull is None:
+        return {"pr": "none", "approver": "none", "note": "no pull request merged this commit", "drill": False}
+    number = pull["number"]
+    full = gh.get(gh.repo_path(f"pulls/{number}"))
+    head = full["head"]["sha"]
+    approvals = [review for review in gh.paginate(gh.repo_path(f"pulls/{number}/reviews"))
+                 if review.get("state") == "APPROVED" and review.get("commit_id") == head
+                 and (review.get("user") or {}).get("login") in owners]
+    drill = any(label.get("name") == "drill" for label in full.get("labels", []))
+    if approvals:
+        return {"pr": str(number), "approver": approvals[-1]["user"]["login"], "note": None, "drill": drill}
+    merger = (full.get("merged_by") or {}).get("login") or "unknown"
+    return {"pr": str(number), "approver": "none", "note": f"ruleset bypass by {merger}", "drill": drill}
+
+
+def message(n: int, version: str, previous: str, integrity: str, facts: dict, migration: str) -> str:
+    lines = [f"fleet-v{n}: ai-tc {version}", "", f"version: {version}", f"integrity: {integrity}",
+             f"pr: {facts['pr']}", f"approver: {facts['approver']}", f"store-migration: {migration}"]
+    if SEMVER.fullmatch(version) and SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
+        lines.append(f"rollback-from: {previous}")
+    if facts["drill"]:
+        lines.append("drill: true")
+    if facts["note"]:
+        lines.append(f"approver-note: {facts['note']}")
+    return "\n".join(lines) + "\n"
+
+
+def tag_exists(gh: GitHub, name: str) -> bool:
+    try:
+        gh.get(gh.repo_path(f"git/ref/tags/{name}"))
+    except GitHubError as error:
+        if error.status == 404:
+            return False
+        raise
+    return True
+
+
+def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+    todo = pending(git)
+    number = git.fleet_tags()[-1]["n"]
+    created = []
+    for sha in todo:
+        number += 1
+        name = f"fleet-v{number}"
+        if tag_exists(gh, name):
+            raise Refused(f"{name} already exists on GitHub but not in this checkout; re-run the sweep")
+        parent = git.first_parent(sha)
+        version, previous = version_at(git, sha), version_at(git, parent)
+        owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
+        text = message(number, version, previous, integrity_at(git, sha), pr_facts(gh, sha, owners, sleep),
+                       store_migration(git, sha, version, previous))
+        tag_object = gh.post(gh.repo_path("git/tags"),
+                             {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
+        gh.post(gh.repo_path("git/refs"), {"ref": f"refs/tags/{name}", "sha": tag_object})
+        created.append(f"{name} -> {sha} (ai-tc {version})")
+        print(f"created {created[-1]}")
+    return created
+
+
+def cleanup_branches(gh: GitHub) -> list[str]:
+    """Delete bot/** branches whose PRs are all closed; keep any with an open PR or with no PR at all."""
+    open_heads = {p["head"] for p in list_pulls(gh, "open")}
+    closed_heads = {p["head"] for p in list_pulls(gh, "closed")}
+    deleted = []
+    for ref in gh.get(gh.repo_path("git/matching-refs/heads/bot/")):
+        branch = ref["ref"][len("refs/heads/"):]
+        if branch in open_heads or branch not in closed_heads:
+            continue
+        gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        deleted.append(branch)
+    return deleted
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="tag-release: tag main's untagged pin changes; clean up bot branches")
+    parser.add_argument("command", choices=["sweep", "cleanup-branches"])
+    parser.add_argument("--repo-dir", default=".")
+    args = parser.parse_args(argv)
+    gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
+    try:
+        if args.command == "sweep":
+            created = sweep(Git(args.repo_dir), gh)
+            print(f"tagged {len(created)} commit(s)" if created
+                  else "nothing to tag: every pin change on main has its fleet-v tag")
+        else:
+            deleted = cleanup_branches(gh)
+            print("deleted " + (", ".join(deleted) if deleted else "no branch"))
+    except Refused as refusal:
+        print(f"::error::{refusal}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
