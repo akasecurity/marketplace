@@ -1,0 +1,79 @@
+"""Structural guards on the workflow files: what may hold secrets, and what runs where.
+
+The files are read as text (the stdlib has no YAML parser). These pin the
+security-relevant shape; they do not replace reading a workflow in review.
+"""
+import os
+import re
+import unittest
+
+WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
+
+
+def read(name: str) -> str:
+    with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def header(text: str) -> str:
+    return text.split("\njobs:\n", 1)[0]
+
+
+def jobs(text: str) -> dict[str, str]:
+    """Each job's block, keyed by job id (the two-space-indented keys under `jobs:`)."""
+    parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):[ \t]*$", text.split("\njobs:\n", 1)[1])
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
+
+
+class WorkflowCase(unittest.TestCase):
+    name = ""
+
+    def setUp(self):
+        self.text = read(self.name)
+        self.head = header(self.text)
+        self.jobs = jobs(self.text)
+
+    def assert_common_shape(self):
+        self.assertIn("\npermissions: {}\n", self.head)
+        self.assertEqual(self.text.count("persist-credentials: false"), self.text.count("uses: actions/checkout@"))
+        self.assertNotIn("secrets.GITHUB_TOKEN", self.text)
+        self.assertNotIn("--force", self.text)
+        for job, block in self.jobs.items():
+            self.assertIn("    permissions:\n", block, f"job {job} declares its permissions")
+
+
+class ImporterWorkflow(WorkflowCase):
+    name = "import-plugin-release.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_triggers_are_the_schedule_and_a_dispatch_only(self):
+        self.assertIn('    - cron: "*/15 * * * *"', self.head)
+        self.assertIn("  workflow_dispatch:", self.head)
+        self.assertNotIn("repository_dispatch", self.text)
+
+    def test_dispatch_inputs_match_the_contract(self):
+        self.assertRegex(self.head, r"(?s)\n      mode:\n.*?type: choice\n\s+options: \[forward, rollback, remove, restore\]\n\s+default: forward\n")
+        self.assertRegex(self.head, r"(?s)\n      target:\n.*?type: string\n")
+        self.assertRegex(self.head, r"(?s)\n      reimport:\n.*?type: boolean\n")
+        self.assertRegex(self.head, r"(?s)\n      below_floor:\n.*?type: boolean\n")
+
+    def test_each_mode_queues_in_its_own_concurrency_group(self):
+        self.assertIn("  group: ${{ github.event_name == 'schedule' && 'import-forward' || "
+                      "format('import-{0}', inputs.mode) }}\n", self.head)
+        self.assertIn("  cancel-in-progress: false\n", self.head)
+
+    def test_verify_holds_no_secret_and_only_open_pr_enters_the_environment(self):
+        self.assertEqual(list(self.jobs), ["verify", "open-pr"])
+        self.assertNotIn("secrets.", self.jobs["verify"])
+        self.assertNotIn("environment:", self.jobs["verify"])
+        self.assertIn("    environment: marketplace-bot\n", self.jobs["open-pr"])
+        self.assertIn("    if: needs.verify.outputs.proceed == 'true'\n", self.jobs["open-pr"])
+
+    def test_the_workflow_token_never_writes(self):
+        self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
+
+
+if __name__ == "__main__":
+    unittest.main()
