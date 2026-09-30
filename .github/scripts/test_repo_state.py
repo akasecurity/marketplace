@@ -41,3 +41,32 @@ class TestCommittedManifest(unittest.TestCase):
         for rel in (".agents/plugins/marketplace.json", "plugins.json"):
             with self.subTest(rel):
                 rc.parse_json(read(rel))
+
+
+def journal_numbers(entry):
+    return [tag.split("_", 1)[0] for tag in entry["migrations"]]
+
+
+class TestCommittedRollbackSafety(unittest.TestCase):
+    def setUp(self):
+        self.raw = read(rc.SAFETY_FILE)
+        self.doc = rc.parse_json(self.raw)
+
+    def test_well_formed_and_written_by_the_one_writer(self):
+        self.assertEqual(rc.safety_problems(self.doc), [])
+        self.assertEqual(rc.dump_json(self.doc), self.raw)
+
+    def test_the_seed_is_what_the_classifier_computed(self):
+        # A reviewed reclassification of a seeded version updates SEED in the same PR.
+        for version, want in ts.SEED.items():
+            with self.subTest(version):
+                got = self.doc["versions"][version]
+                self.assertEqual(
+                    (got["classification"], got["from"], got["to"], journal_numbers(got)),
+                    (want["classification"], want["from"], want["to"], journal_numbers(want)),
+                )
+
+    def test_every_seeded_release_with_a_migration_is_flagged(self):
+        flagged = {v for v, e in self.doc["versions"].items() if e["classification"] == "not-rollback-safe"}
+        self.assertTrue({"0.9.9", "0.9.10", "0.9.12", "0.9.14"} <= flagged)
+        self.assertEqual(self.doc["versions"]["0.9.13"]["classification"], "additive")

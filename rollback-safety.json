@@ -1,0 +1,52 @@
+{
+  "versions": {
+    "0.9.9": {
+      "classification": "not-rollback-safe",
+      "from": "94cc75d98b26a0e998929e49e56dc6790c19e222",
+      "to": "2ff9a50d899d3820a3718f9e086dc281d4fa1d86",
+      "migrations": [
+        "0022_audit_inspection_ms"
+      ]
+    },
+    "0.9.10": {
+      "classification": "not-rollback-safe",
+      "from": "2ff9a50d899d3820a3718f9e086dc281d4fa1d86",
+      "to": "ec81a843b0eb500000eff4cf3d29863b481ad01f",
+      "migrations": [
+        "0023_secret_vault_user_authorized",
+        "0024_finding_resolution_key_created_index",
+        "0025_audit_capture_attribute_columns",
+        "0026_audit_llm_call_usage_columns",
+        "0027_audit_llm_usage_index",
+        "0028_activity_session_probe_indexes"
+      ]
+    },
+    "0.9.12": {
+      "classification": "not-rollback-safe",
+      "from": "ec81a843b0eb500000eff4cf3d29863b481ad01f",
+      "to": "1d69b0e82602a64da4bc8aee0c48916774e65f15",
+      "migrations": [
+        "0029_audit_capture_rollup_index",
+        "0030_audit_content_expiry",
+        "0031_audit_capture_by_time_index",
+        "0032_audit_capture_by_id_index",
+        "0033_audit_capture_location_index",
+        "0034_findings_read_indexes"
+      ]
+    },
+    "0.9.13": {
+      "classification": "additive",
+      "from": "1d69b0e82602a64da4bc8aee0c48916774e65f15",
+      "to": "1cef4ad151acee9a6d6df745060378b75a744262",
+      "migrations": []
+    },
+    "0.9.14": {
+      "classification": "not-rollback-safe",
+      "from": "1cef4ad151acee9a6d6df745060378b75a744262",
+      "to": "a75532b98a70546d3825cbc237769aefe4dcc074",
+      "migrations": [
+        "0035_share_destination_provider_id"
+      ]
+    }
+  }
+}
