@@ -170,13 +170,15 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
     """Apply every result. Returns the exit code.
 
     An evaluation job that did not finish is itself a red result, and so is one that finished but handed
-    over no results (None: what it handed over could not be read). Every evaluator returns at least one
-    result, so an empty list means the wiring between the job and this step broke, and reading it as
-    "nothing is red" would leave the audit green for good. The detail names no run URL: it is digested to
-    decide whether anything changed, and every run has its own URL, while the comment appends it.
+    over no output (None: it was absent, blank or could not be read), because reading that as "nothing is
+    red" would leave the audit green for good if the wiring between the job and this step broke. An
+    explicit empty list is different: it is the evaluator saying that nothing is red (a clean push is
+    exactly that for main-audit), so it is a clear result and closes an earlier alert. The detail names no
+    run URL: it is digested to decide whether anything changed, and every run has its own URL, while the
+    comment appends it.
     """
     finished = job_result == "success"
-    reported = finished and bool(results)
+    reported = finished and results is not None
     if reported:
         problem = None
     elif finished:
@@ -217,8 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     job_result = env.get("JOB_RESULT", "")
     results: list[Result] | None = []
     if job_result == "success":
+        raw = env.get("RESULTS_JSON", "")
         try:
-            results = results_from_json(env.get("RESULTS_JSON", ""))
+            # Blank output is no output; only a parsed list, even an empty one, is a result.
+            results = results_from_json(raw) if raw.strip() else None
         except (ValueError, TypeError):
             results = None
     return route(results, label=args.label, job_result=job_result, router=router)
