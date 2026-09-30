@@ -53,5 +53,58 @@ class TestRegistrySignature(ts.VerifyMixin, unittest.TestCase):
         self.assertNotIn("registry signature", error.detail)
 
 
+class TestRegistryDist(ts.VerifyMixin, unittest.TestCase):
+    def routes_answering(self, *answers):
+        routes = ts.release_routes(VERSION)
+        routes[ts.dist_url(VERSION)] = list(answers)
+        return routes
+
+    def good_answer(self):
+        return ts.release_routes(VERSION)[ts.dist_url(VERSION)]
+
+    def test_a_rate_limited_dist_read_is_retried_then_no_verdict(self):
+        sleeps = []
+        error = self.no_verdict("dist", routes=self.routes_answering((429, b"slow down")), sleeps=sleeps)
+        self.assertIn("429", error.detail)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_late_success_after_throttling_is_used(self):
+        sleeps = []
+        routes = self.routes_answering((429, b""), (429, b""), self.good_answer())
+        release, _ = self.verify(routes=routes, sleeps=sleeps)
+        self.assertEqual(release.integrity, ts.INTEGRITY)
+        self.assertEqual(sleeps, [20, 20])
+
+    def test_a_forbidden_dist_read_is_no_verdict(self):
+        self.no_verdict("dist", routes=self.routes_answering((403, b"forbidden")))
+
+    def test_every_unexpected_status_is_retried_and_ends_as_no_verdict(self):
+        for status in (400, 401, 403, 408, 429, 500, 502, 503):
+            with self.subTest(status):
+                sleeps = []
+                self.no_verdict("dist", routes=self.routes_answering((status, b"")), sleeps=sleeps)
+                self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_version_npm_never_serves_is_still_a_verdict(self):
+        sleeps = []
+        self.refused("dist", routes=self.routes_answering((404, b'"version not found"')), sleeps=sleeps)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_non_json_dist_body_is_no_verdict(self):
+        for body in (b"<html>bad gateway</html>", b"", b"\xff\xfe", b'{"version": "0.9.14", "version": "0.9.14"}'):
+            with self.subTest(body):
+                self.no_verdict("dist", routes=self.routes_answering((200, body)))
+
+    def test_a_dist_body_that_is_not_an_object_is_no_verdict(self):
+        for body in (b"[]", b'"text"', b"null", b"7"):
+            with self.subTest(body):
+                self.no_verdict("dist", routes=self.routes_answering((200, body)))
+
+    def test_a_dist_document_without_a_dist_or_for_another_version_is_still_a_verdict(self):
+        for doc in ({"version": VERSION}, {"version": "0.9.13", "dist": {}}, {"dist": {}}):
+            with self.subTest(doc):
+                self.refused("dist", routes=self.routes_answering((200, doc)))
+
+
 if __name__ == "__main__":
     unittest.main()
