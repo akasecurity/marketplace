@@ -1,7 +1,7 @@
 """Live checks of release_checks.py against npmjs and the GitHub API.
 
 Not collected by the unit-test pattern (test_*.py), so CI never needs the network. Run
-them by hand before merging any change to the release checks, with npm 11 on PATH:
+them by hand before merging any change to the release checks, with npm 11.12 or later on PATH:
 
     python3 -m unittest discover -s .github/scripts -p 'live_*.py' -v
 """
@@ -31,3 +31,10 @@ class TestLiveRelease(unittest.TestCase):
             (release.integrity, release.git_commit, release.run_url),
             (ts.REAL_INTEGRITY_0_9_14, ts.ATTESTED["0.9.14"], ts.RUN_URL),
         )
+
+    def test_every_fleet_pinned_version_still_verifies(self):
+        # The rollback targets: each release a fleet-v tag can pin must pass the same
+        # checks today, now that the signer is read from the certificate.
+        for version, commit in ts.ATTESTED.items():
+            with self.subTest(version):
+                self.assertEqual(rc.verify_release(version).git_commit, commit)
