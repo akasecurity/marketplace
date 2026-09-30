@@ -40,86 +40,117 @@ Don't "fix" it by copying entries across.
 4. Renames do not propagate on their own. After a rename, check `akasecurity/.github`
    (`profile/README.md`), `akasecurity/homebrew-tap` (README + formula), and `akasecurity/ai-tc-docs`
    (`overrides/home.html`) for the old name.
+5. The `ai-tc` entry is the exception for its package and its name: `validate` fails a human change
+   to either, so such a change is a rare, fleet-wide act an org owner merges under break-glass,
+   together with the matching release-pipeline change in `.github/scripts/release_checks.py`. Its
+   `description` changes like any other plugin's, through a reviewed pull request.
 
 ## ai-tc is pinned; `fleet-v<N>` tags
 
 `.claude-plugin/marketplace.json` pins the `ai-tc` entry's npm source to an **exact** version
-(`source.version`). Claude Code honours it on install and in its plugin auto-update pass, so a
-new `@akasecurity/ai-tc-claude-code` publish reaches nobody through this marketplace until a
-commit here moves the pin. That is the point: the pin is the audit trail, and it is what stops a
-fleet from advancing because a publish happened. It holds for `main` and for `fleet-v2` onward;
-`fleet-v1` predates it — its ai-tc entry names only the package — so a marketplace registered at
-`fleet-v1` (or any pre-pin commit) with auto-update on installs npm `latest` on every pass. The
-tag stays (never move a tag), but it is not a rollback target for the plugin version: a rollback
-is a new tag pinning the lower version. Only this file carries it —
+(`source.version`) on the public registry (`source.registry`, `https://registry.npmjs.org`), and
+records that version's npm integrity in the entry's free-form `metadata.integrity` (Claude Code
+does not read it; fleet checks compare installed bytes against it). Claude Code honours the pin on
+install and in its plugin auto-update pass, so a new `@akasecurity/ai-tc-claude-code` publish
+reaches nobody through this marketplace until an approved pull request moves the pin. That is the
+point: the pin is the audit trail, and it is what stops a fleet from advancing because a publish
+happened. It holds for `main` and for `fleet-v2` onward; `fleet-v1` predates it — its ai-tc entry
+names only the package — so a marketplace registered at `fleet-v1` (or any pre-pin commit) with
+auto-update on installs npm `latest` on every pass. Only this file carries the pin —
 `.agents/plugins/marketplace.json` does not list ai-tc, and `plugins.json` has no source/version
-field — so "change all four" does not apply to a version bump.
+field — so "change all four" does not apply to a version change.
 
-Managed fleets register this marketplace at a **signed, annotated `fleet-v<N>` tag** rather than
-`main`, and record out-of-band the commit each tag must resolve to plus the pinned version's
-registry integrity. Their checks re-derive that chain from the live world (tag → commit, manifest
-at that commit → version, registry → integrity), so:
+**How the pin moves: only through the release bot's pull requests** (see "The workflows").
 
-- **Never move, delete or re-sign an existing `fleet-v<N>` tag.** A tag that no longer resolves
-  to its recorded commit is treated as a supply-chain event on the fleet side, not a typo.
-- **A plugin release is a two-commit affair:** (1) here, bump `source.version` in one commit
-  and cut `fleet-v<N+1>` at that commit — `git tag -s fleet-v<N+1> -m '<why>'`,
-  `git push origin fleet-v<N+1>`; (2) the fleet configuration then advances its recorded
-  commit, its template's `ref`, and its integrity record for the new version together. Do the
-  marketplace half first: until the fleet side advances, its devices keep installing from the
-  old tag, which still names the old (pinned) version.
-- **Pre-flight before the tag, registry-explicit.** The tag is permanent, so confirm the version
-  on the **public** registry with the scope mapping pinned — a scoped `.npmrc` in your cwd can
-  silently route `@akasecurity` to another registry that serves different bytes for the same
-  version:
+- **A release** is a `bot/pin-ai-tc-<v>` PR that `import-plugin-release` opens after verifying the
+  npm release: an exact `x.y.z`, the registry's dist, SLSA provenance bound to ai-tc's release
+  workflow at the version's own tag, and the attested commit on ai-tc's `main`. It changes the
+  version and `metadata.integrity`, and adds the version's entry to `rollback-safety.json`. One code
+  owner approves it after running the candidate in one real session (the PR's checklist), and
+  auto-merge squash-merges it once `validate` is green.
+- **A rollback** is a rollback-mode dispatch of the same workflow, with a version or a `fleet-v<N>`
+  name. Its `bot/rollback-ai-tc-<from>-to-<v>` PR moves only the pin, down to a version a `fleet-v`
+  tag has pinned and not below the rollback floor that `rollback-safety.json` records; one code
+  owner approves it. Never reset `main` backwards, and never restore a whole manifest from a tag:
+  that would undo the other entries' edits.
+- **Nobody edits the ai-tc entry by hand.** `validate` fails any human change to it other than its
+  `description` (see "Adding or renaming a plugin", step 5).
+
+**`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
+annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
+and store-migration class, and for a rollback the version it rolled back from. Rulesets let only
+the release bot create a `fleet-v` tag and nobody at all move or delete one, and refuse every
+other tag name:
+
+- **Never move, delete or re-sign an existing `fleet-v<N>` tag.** `tag-audit` treats a tag that no
+  longer resolves to its recorded object as a supply-chain event, not a typo;
+  `.github/fleet-tags.frozen.json` records the tags that existed when it was switched on.
+- Managed fleets either follow `main`, which only an approved pull request can move, or register
+  this marketplace at a `fleet-v<N>` tag, which never moves; a fleet on a tag moves only when its
+  own configuration names a later one. A tag is also the only way to hold a fleet on one release,
+  since a marketplace ref cannot be a raw commit.
+- **Checking a version by hand, registry-explicit.** The importer and `validate` run these checks
+  as code. To repeat them, confirm the version on the **public** registry with the scope mapping
+  pinned — a scoped `.npmrc` in your cwd can silently route `@akasecurity` to another registry that
+  serves different bytes for the same version:
   `npm view @akasecurity/ai-tc-claude-code@<v> dist --@akasecurity:registry=https://registry.npmjs.org`
   (or `curl -s https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code | jq '.versions["<v>"].dist'`).
-  Managed fleets also require the publish to carry provenance from ai-tc's release workflow;
-  `npm audit signatures` in a scratch dir that installs exactly `<v>` shows it. A version that
-  fails either check must not be pinned.
-- The pin bump and the tag are separate acts on purpose. A pin commit that no tag points at is
-  visible to `main` installers only; a fleet only moves when its own configuration moves to the
-  new tag.
+  `npm audit signatures` in a scratch dir that installs exactly `<v>` shows its provenance.
 
 `preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
 
 ## Workflow
 
-No CI. Small commits straight to `main`, but validate JSON before pushing:
+Every change reaches `main` through a pull request. `.github/CODEOWNERS` names the code owners of
+every file, and the `main` ruleset requires one of them to approve (someone other than the PR's
+last pusher) and the `validate` check to pass, so a code owner's own PR needs the other code
+owner. Merges are squash merges. Before pushing, validate the JSON and run the scripts' tests:
 
 ```bash
 for f in plugins.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
   jq empty "$f" && echo "ok $f"
 done
+python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 ```
 
 A malformed manifest breaks `/plugin marketplace add` for every user at once.
 
-## The one workflow: import-plugin-release
+## The workflows
 
-"No CI" above still describes how changes land: nothing in this repo tests, gates, or
-auto-merges anything. The one workflow, `.github/workflows/import-plugin-release.yml`, is a
-release robot, not a test gate. When ai-tc's release workflow announces a publish
-(`repository_dispatch`, event type `plugin-release`) — or a maintainer runs it by hand with a
-package and version — it re-derives the "Pre-flight before the tag" checklist above as code,
-against the live registry and trusting nothing from the payload: a registry-explicit dist read,
-and the provenance binding to ai-tc's own release workflow at that version's tag. If everything
-holds, it opens a `bot/pin-<entry>-<version>` PR moving that entry's `source.version`; a version
-that is already pinned, lower than the pin, or not an exact `x.y.z` logs why and opens nothing.
-Its only output is a PR: the human merge and the signed `fleet-v<N+1>` tag remain the promotion,
-exactly as "ai-tc is pinned" describes.
+`validate`, `import-plugin-release` and `tag-release` are the release path; `staleness`,
+`tag-audit` and `main-audit` watch it. Their logic lives in `.github/scripts/` (stdlib Python, with
+tests beside it), so the workflow files stay thin. Only `import-plugin-release`'s `open-pr` job and
+`tag-release` act as the release bot, through the `marketplace-bot` environment, which only `main`
+may use.
 
-**Which entry it advances comes from the payload's package**, matched against `source.package` —
-not from the plugin's name, and not from a package this workflow assumes. ai-tc publishes more
-plugins than this marketplace carries, so the doorbell rings here for releases with no pin to
-advance: a package no entry pins is a **green no-op**. The one refusal is a package this
-marketplace *does* pin that `RELEASE_PIPELINE` (in the workflow) does not describe — there would
-be no declared release workflow to bind its provenance to, and guessing is how a tarball gets
-attributed to the wrong pipeline. **Adding an npm-pinned plugin therefore means adding its
-release workflow path and tag prefix to `RELEASE_PIPELINE` in the same commit**, or its first
-dispatch fails.
+- **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
+  no secret: it takes the highest exact npm version above every version `main` or a `fleet-v` tag
+  has pinned that passes the release checks, never npm `latest` on trust. Its `open-pr` job creates
+  the bot branch (never force-pushing: an existing branch means another run got there), opens the
+  PR and enables auto-merge. A version a code owner rejected (its PR closed unmerged), or one a
+  rollback moved away from, comes back only through a dispatch with `reimport: true`.
+  `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
+  open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
+  rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it.
+  While a rollback PR is open, the scheduled import opens nothing.
+- **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
+  its script, reading the PR's files as data. An approver confirms the check run is `validate.yml`'s
+  run from `main`, and trusts its summary over the PR body.
+- **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
+  comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
+  ai-tc version changed and has no `fleet-v` tag yet, and deletes the bot's branches whose PRs are
+  closed.
+- **`staleness`** (hourly) files an issue when a passing release sits unpinned for 24 hours, npm has
+  a version the importer refuses, a bot PR is open for 24 hours, a pin change is untagged for an
+  hour, a stray tag or a second ref named `main` exists, or the ai-tc entry is gone; it posts a
+  "rolled back, awaiting fix-forward" notice while the latest tag is a rollback.
+- **`tag-audit`** (daily and on tag pushes) checks the `fleet-v` ledger against the frozen list, the
+  last green run and `main`'s history, and that the rulesets are active as configured.
+- **`main-audit`** (every push to `main`) opens an issue for any commit that reached `main` without
+  a code-owner-approved PR.
 
-That mapping is workflow-controlled on purpose and must never be read from the payload: the
-payload says *which* package was published, and `RELEASE_PIPELINE` says what a publish of it has
-to prove. Taking the workflow path from the dispatch would let whoever sends it nominate the
-workflow that is supposed to vouch for it.
+Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners.
+
+**Adding an npm-pinned plugin means adding its release workflow path and tag prefix to the release
+pipeline in `.github/scripts/release_checks.py` in the same commit** — the importer and `validate`
+refuse a pinned package with no declared release workflow to bind its provenance to.
