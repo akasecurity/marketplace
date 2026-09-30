@@ -1,6 +1,9 @@
 """Tests for issue_router.py: one issue per rule, quiet unless something changes, escalation, closing."""
 import datetime as dt
 import io
+import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -123,6 +126,102 @@ class TestRoute(RouterCase):
             self.assertEqual(rt.route([red()], label="staleness", job_result="failure", router=self.router()), 1)
         opened = [call[2] for call in self.gh.called("POST", R("issues"))]
         self.assertEqual([item["title"] for item in opened], ["staleness: the evaluation job did not finish"])
+
+
+class TestFailedJobStaysQuiet(RouterCase):
+    def test_a_job_that_keeps_failing_comments_once_however_many_runs_report_it(self):
+        def run(number):
+            router = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None,
+                               owners=["Vaishnav-OM"], now=NOW, run_url=f"https://github.com/{REPO}/actions/runs/{number}")
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                return rt.route([], label="staleness", job_result="failure", router=router)
+
+        self.assertEqual(run(1), 1)
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertIn("actions/runs/1", opened["body"])
+        self.issues.append({"number": 40, "body": opened["body"], "created_at": "2026-10-01T10:00:00Z",
+                            "labels": [{"name": "staleness"}], "assignees": []})
+        del self.gh.calls[:]
+        self.assertEqual(run(2), 1)
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_the_run_url_is_not_part_of_the_digested_detail(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="staleness", job_result="failure", router=self.router())
+        detail = rt.read_marker(self.gh.called("POST", R("issues"))[0][2]["body"], "state")
+        self.assertEqual(detail, rt.digest(
+            "The staleness evaluation job ended `failure`; its checks did not run, so their issues were left as "
+            "they were."))
+
+
+class TestNoResults(RouterCase):
+    def route(self, results, job_result="success"):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            return rt.route(results, label="staleness", job_result=job_result, router=self.router())
+
+    def test_a_finished_job_that_reported_nothing_is_red(self):
+        self.assertEqual(self.route([]), 1)
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(opened["title"], "staleness: the evaluation job reported no results")
+        self.assertEqual(rt.read_marker(opened["body"], "rule"), "staleness-workflow")
+
+    def test_a_finished_job_whose_results_could_not_be_read_is_red(self):
+        self.assertEqual(self.route(None), 1)
+        self.assertEqual(len(self.gh.called("POST", R("issues"))), 1)
+
+    def test_a_finished_job_with_a_result_is_green_when_the_result_is(self):
+        self.assertEqual(self.route([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)]), 0)
+        self.assertEqual(self.gh.writes(), [])
+
+
+class TestMain(unittest.TestCase):
+    """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
+
+    def run_main(self, *, job_result, results_json=None, label="staleness"):
+        gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+        env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "9",
+               "JOB_RESULT": job_result}
+        if results_json is not None:
+            env["RESULTS_JSON"] = results_json
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, ".github"))
+            with open(os.path.join(root, ".github", "release-approvers.json"), "w", encoding="utf-8") as handle:
+                json.dump({"approvers": ["Vaishnav-OM"], "escalation": None}, handle)
+            with open(os.path.join(root, ".github", "CODEOWNERS"), "w", encoding="utf-8") as handle:
+                handle.write("* @Vaishnav-OM\n")
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(rt, "GitHub", return_value=gh), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO):
+                    code = rt.main(["apply", "--label", label])
+            finally:
+                os.chdir(cwd)
+        return code, [call[2]["title"] for call in gh.called("POST", R("issues"))]
+
+    def test_a_success_with_no_results_output_is_red(self):
+        self.assertEqual(self.run_main(job_result="success"),
+                         (1, ["staleness: the evaluation job reported no results"]))
+
+    def test_a_success_with_an_empty_list_is_red(self):
+        self.assertEqual(self.run_main(job_result="success", results_json="[]")[0], 1)
+
+    def test_a_success_with_unparsable_results_files_an_issue_instead_of_crashing(self):
+        self.assertEqual(self.run_main(job_result="success", results_json="{not json"),
+                         (1, ["staleness: the evaluation job reported no results"]))
+        self.assertEqual(self.run_main(job_result="success", results_json='[{"unknown": 1}]')[0], 1)
+
+    def test_a_success_with_a_clear_result_is_green(self):
+        clear = rt.results_to_json([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)])
+        self.assertEqual(self.run_main(job_result="success", results_json=clear), (0, []))
+
+    def test_a_red_result_is_filed_and_fails_the_run(self):
+        code, titles = self.run_main(job_result="success", results_json=rt.results_to_json([red()]))
+        self.assertEqual((code, titles), (1, ["staleness: an unpinned release"]))
+
+    def test_a_job_that_did_not_finish_is_red(self):
+        self.assertEqual(self.run_main(job_result="cancelled", results_json="[]"),
+                         (1, ["staleness: the evaluation job did not finish"]))
 
 
 class TestHelpers(unittest.TestCase):
