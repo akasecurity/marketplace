@@ -59,6 +59,13 @@ class TestPending(unittest.TestCase):
         self.assertEqual(tr.pending(history()), ["b", "c", "d"])
 
     def test_a_commit_that_already_carries_a_tag_is_skipped(self):
+        # A lower-numbered tag on a later commit: the walk still starts after the highest tag (fleet-v8),
+        # and the commit that carries a tag is passed over.
+        git = history()
+        git.tags = [fleet_tag(7, "c"), fleet_tag(8, "t8")]
+        self.assertEqual(tr.pending(git), ["b", "d"])
+
+    def test_numbering_resumes_after_the_highest_tag(self):
         git = history()
         git.tags.append(fleet_tag(9, "b"))
         self.assertEqual(tr.pending(git), ["c", "d"])
@@ -110,6 +117,57 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
 
 
+class TestStoreMigration(unittest.TestCase):
+    def classify(self, version: str, previous: str, table: dict) -> str:
+        git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): safety(table)})
+        return tr.store_migration(git, "x", version, previous)
+
+    def test_a_rollback_across_a_not_rollback_safe_release_records_it(self):
+        table = {"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": safety_entry("0.9.15", "0.9.14", "additive", ())}
+        self.assertEqual(self.classify("0.9.13", "0.9.15", table), "not-rollback-safe")
+
+    def test_a_rollback_whose_only_flagged_release_is_the_one_rolled_back_from_records_it(self):
+        table = {"0.9.14": safety_entry("0.9.14", "0.9.13")}
+        self.assertEqual(self.classify("0.9.13", "0.9.14", table), "not-rollback-safe")
+
+    def test_one_flagged_release_among_additive_ones_is_enough(self):
+        table = {"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": safety_entry("0.9.15", "0.9.14", "additive", ()),
+                 "0.9.16": safety_entry("0.9.16", "0.9.15", "additive", ())}
+        self.assertEqual(self.classify("0.9.13", "0.9.16", table), "not-rollback-safe")
+
+    def test_a_flagged_target_or_a_flagged_release_above_the_previous_pin_does_not_count(self):
+        table = {"0.9.13": safety_entry("0.9.13", "0.9.12"), "0.9.15": safety_entry("0.9.15", "0.9.14"),
+                 "0.9.14": safety_entry("0.9.14", "0.9.13", "additive", ())}
+        self.assertEqual(self.classify("0.9.13", "0.9.14", table), "additive")
+
+    def test_a_forward_release_records_its_own_classification(self):
+        table = {"0.9.15": safety_entry("0.9.15", "0.9.14")}
+        self.assertEqual(self.classify("0.9.15", "0.9.14", table), "not-rollback-safe")
+
+
+class TestApprover(unittest.TestCase):
+    def test_the_last_owner_approval_on_the_final_head_is_named(self):
+        gh = FakeGitHub({
+            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z"}],
+            ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
+            ("GET", R("pulls/13/reviews")): [
+                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}]})
+        facts = tr.pr_facts(gh, "b", ["Vaishnav-OM", "venuverse"], sleep=lambda seconds: None)
+        self.assertEqual(facts["approver"], "Vaishnav-OM")
+
+    def test_owners_are_read_from_the_merged_commits_parent(self):
+        git = history(chain=("t8", "b"))
+        git.files[("b", ".github/CODEOWNERS")] = "* @Vaishnav-OM @venuverse @added-by-the-merge\n"
+        gh = sweep_github()
+        gh.routes[("GET", R("pulls/13/reviews"))] = [
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "added-by-the-merge"}}]
+        tr.sweep(git, gh, sleep=lambda seconds: None)
+        message = gh.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertIn("approver: none\n", message)
+        self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
+
+
 class TestCleanup(unittest.TestCase):
     def test_only_the_bots_branches_with_a_closed_pr_are_deleted(self):
         pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True), pull(21, "bot/pin-ai-tc-0.9.16"),
@@ -120,6 +178,13 @@ class TestCleanup(unittest.TestCase):
                          ("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15")): None,
                          ("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13")): None})
         self.assertEqual(tr.cleanup_branches(gh), ["bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.14-to-0.9.13"])
+
+    def test_a_reimport_reusing_a_closed_prs_branch_name_keeps_the_branch(self):
+        pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True), pull(30, "bot/pin-ai-tc-0.9.15")]
+        gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
+                         ("GET", R("git/matching-refs/heads/bot/")): [{"ref": "refs/heads/bot/pin-ai-tc-0.9.15"}]})
+        self.assertEqual(tr.cleanup_branches(gh), [])
+        self.assertEqual(gh.writes(), [])
 
 
 if __name__ == "__main__":
