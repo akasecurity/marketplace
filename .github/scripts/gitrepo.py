@@ -33,9 +33,13 @@ class Git:
         return self.run("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").strip()
 
     def show(self, rev: str, path: str) -> str | None:
-        """The file at `path` in commit `rev`, or None when that commit has no such file."""
+        """The file at `path` in commit `rev`, or None when that commit's tree has no entry there.
+
+        Absence is decided from the tree (`ls-tree`), not from a failed read: a tree entry whose
+        blob (or a parent tree) cannot be read is a damaged checkout, and raises GitError rather
+        than passing for a missing file."""
         commit = self.rev_parse(rev)
-        if self._run("cat-file", "-e", f"{commit}:{path}", check=False).returncode != 0:
+        if not self.run("ls-tree", commit, "--", path).strip():
             return None
         return self.run("show", f"{commit}:{path}")
 

@@ -10,8 +10,10 @@ name: import-plugin-release
 #
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
 # marketplace-bot environment, whose deployment policy admits only main, and acts
-# as the bot App: a create-only bot branch (an existing branch means another run
-# got there, so the run skips; never a force-push), the PR, and auto-merge
+# as the bot App: a bot branch made with a create-only ref, never force-pushed (an
+# existing branch with an open PR is skipped; one with no open PR is skipped on a
+# plain forward run, and deleted and created again only by a reimport or rollback
+# dispatch), the PR, and auto-merge
 # (squash). Acting as the App, not with the workflow's own token, is what lets
 # validate start on the PR and lets the merge start tag-release: events the
 # workflow token causes start no pull_request_target or push runs.
