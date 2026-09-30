@@ -132,3 +132,79 @@ def every_pr_rules(base_doc: dict, head_doc: dict, report: Report):
         report.fail(f"{exc.check}: {exc.detail}")
         return None
     return base_entry, head_entry, mode
+
+
+def _without(entry: dict, *keys: str) -> dict:
+    return {k: v for k, v in entry.items() if k not in keys}
+
+
+def safety_versions(text, report: Report, *, label: str):
+    """The versions map of a rollback-safety.json text, or None (absent or malformed)."""
+    if text is None:
+        return None
+    try:
+        doc = rc.parse_json(text)
+    except ValueError as exc:
+        report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {exc}")
+        return None
+    problems = rc.safety_problems(doc)
+    for problem in problems:
+        report.fail(f"at {label}: {problem}")
+    return None if problems else doc["versions"]
+
+
+def bot_hint(pr: PullRequest, bot_login) -> str:
+    if pr.author_type != "Bot":
+        return ""
+    if bot_login is None:
+        return (
+            " This PR's author is a bot, but no bot identity is configured "
+            "(release_checks.BOT_LOGIN is None), so it is judged as a human PR."
+        )
+    return f" Its author {pr.author} is not the marketplace bot App ({bot_login})."
+
+
+def _safety_edit_notes(base, head, changed, report: Report) -> None:
+    if rc.SAFETY_FILE not in changed:
+        return
+    if head is None:
+        report.fail(f"{rc.SAFETY_FILE} must stay, and stay well formed: without it no rollback floor can be read")
+        return
+    base = base or {}
+    for version in sorted(set(base) | set(head), key=rc.vkey):
+        before, after = base.get(version), head.get(version)
+        if before == after:
+            continue
+        old = before["classification"] if before else "absent"
+        new = after["classification"] if after else "removed"
+        report.note(
+            f"HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
+            "the approving code owner owns this classification"
+        )
+
+
+def human_rules(entries, base_safety, head_safety, changed, report: Report, *, bot_hint: str = "") -> None:
+    """A human PR may change the ai-tc entry's description and nothing else of it."""
+    base_entry, head_entry, mode = entries
+    if mode == "none":
+        report.row("Mode", "HUMAN PR, ai-tc entry unchanged")
+    elif (
+        mode == "human"
+        and base_entry is not None
+        and head_entry is not None
+        and _without(base_entry, "description") == _without(head_entry, "description")
+    ):
+        report.row("Mode", "HUMAN PR, ai-tc description edit")
+        report.note("ai-tc description changed: change all four files (AGENTS.md, 'Four files, one set of facts')")
+    else:
+        report.row("Mode", f"HUMAN PR, refused ({mode})")
+        report.fail(
+            "a human PR may change only the ai-tc entry's description: not its name, source, "
+            "version, metadata or any other key, and it may not remove or add the entry. The pin "
+            "moves only through the importer's bot PRs; a package or name change is an org "
+            "owner's break-glass merge." + bot_hint
+        )
+    _safety_edit_notes(base_safety, head_safety, changed, report)
+    touched = [p for p in changed if p.startswith(".github/")]
+    if touched:
+        report.note("touches automation or ownership, review the diff line by line: " + ", ".join(touched))
