@@ -512,6 +512,37 @@ class TestMigrationKind(unittest.TestCase):
             "non-additive: a NOT NULL column without a default",
         )
 
+    def test_not_null_is_read_after_the_column_name_and_as_words(self):
+        no_default = "non-additive: a NOT NULL column without a default"
+        cases = {
+            "a name that ends in default": "ALTER TABLE `widgets` ADD `is_default` integer NOT NULL;",
+            "a quoted name that holds the word": "ALTER TABLE `widgets` ADD `x default` integer NOT NULL;",
+            "a double-quoted name that holds the word": 'ALTER TABLE `widgets` ADD "x default" integer NOT NULL;',
+            "a bracketed name that holds the word": "ALTER TABLE `widgets` ADD [x default] integer NOT NULL;",
+            "an unquoted name, COLUMN spelled out": "ALTER TABLE widgets ADD COLUMN x integer NOT NULL;",
+            "an unquoted name with a dollar before the word": "ALTER TABLE widgets ADD x$default integer NOT NULL;",
+            "the word in a string of a check": "ALTER TABLE `widgets` ADD `x` text NOT NULL CHECK (`x` <> 'DEFAULT');",
+            "the word as a quoted name in the definition": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES `default`(`id`);",
+            "a longer word that starts with it": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES defaults(id);",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), no_default)
+
+    def test_a_default_or_a_generated_expression_after_the_name_still_allows_not_null(self):
+        cases = [
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL DEFAULT 0;",
+            "ALTER TABLE `widgets` ADD `x default` integer DEFAULT 0 NOT NULL;",
+            "ALTER TABLE `widgets` ADD `x` text NOT NULL DEFAULT 'a';",
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL GENERATED ALWAYS AS (1) VIRTUAL;",
+            "ALTER TABLE `widgets` ADD `x` text;",
+            # The words are in a quoted name, not in the column's constraints.
+            "ALTER TABLE `widgets` ADD `x` integer REFERENCES `not null`(`id`);",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), "additive")
+
     def test_a_table_rebuild_is_not(self):
         self.assertEqual(rc.migration_kind(SQL_REBUILD), "non-additive: a table rebuild (drizzle's __new_ copy)")
 
