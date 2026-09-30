@@ -478,11 +478,25 @@ class TestOpenPrForward(OpenPrCase):
         self.assertEqual(self.gh.writes(), [])
 
     def test_losing_the_race_for_the_branch_is_a_green_skip(self):
-        self.route_branch("bot/pin-ai-tc-0.9.15")
+        answers = [not_found(), {"ref": "refs/heads/bot/pin-ai-tc-0.9.15"}]
+
+        def branch(body, params):
+            return answers.pop(0)
+
+        self.gh.routes[("GET", R("git/ref/heads/bot/pin-ai-tc-0.9.15"))] = branch
         self.gh.routes[("POST", R("git/refs"))] = GitHubError(422, "POST", "git/refs", "Reference already exists")
         with self.assertRaisesRegex(ir.Refused, "created by another run first") as caught:
             self.open(forward_plan())
         self.assertFalse(caught.exception.red)
+        self.assertEqual(self.gh.called("POST", R("pulls")), [])
+
+    def test_a_rejected_ref_with_the_branch_still_absent_is_red_with_the_reason(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.gh.routes[("POST", R("git/refs"))] = GitHubError(
+            422, "POST", "git/refs", '{"message": "Repository rule violations found"}')
+        with self.assertRaisesRegex(ir.Refused, "does not exist: .*Repository rule violations") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
         self.assertEqual(self.gh.called("POST", R("pulls")), [])
 
     def test_a_failed_auto_merge_is_red_and_leaves_the_pr_open(self):

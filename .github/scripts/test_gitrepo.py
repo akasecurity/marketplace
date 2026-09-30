@@ -58,6 +58,25 @@ class TestGit(Scratch):
         with self.assertRaises(GitError):
             self.git.show("0" * 40, "dir/m.json")
 
+    def test_a_committed_file_whose_object_is_missing_raises_instead_of_reading_as_absent(self):
+        sha = self.commit("dir/m.json", "{}\n")
+        blob = self.sh("rev-parse", f"{sha}:dir/m.json")
+        loose = os.path.join(self.dir, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+        with self.assertRaises(GitError):
+            self.git.show(sha, "dir/m.json")
+        self.assertIsNone(self.git.show(sha, "dir/absent.json"))
+
+    def test_a_path_under_a_missing_tree_object_raises(self):
+        sha = self.commit("dir/m.json", "{}\n")
+        tree = self.sh("rev-parse", f"{sha}:dir")
+        loose = os.path.join(self.dir, ".git", "objects", tree[:2], tree[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+        with self.assertRaises(GitError):
+            self.git.show(sha, "dir/m.json")
+
     def test_first_parent_history_skips_the_merged_side_branch(self):
         base = self.commit("a.txt", "base\n")
         self.sh("switch", "-q", "-c", "side")

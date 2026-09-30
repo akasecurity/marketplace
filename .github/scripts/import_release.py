@@ -5,8 +5,10 @@ fleet-v tag ledger from the checkout, picks the version, verifies it with
 release_checks, and prints one JSON plan. `open-pr` runs in the
 marketplace-bot environment with the bot App's installation credential: it
 re-reads main through the API, writes the bot commit through the Git Data API
-(no local push and no persisted credential), creates the branch create-only
-(an existing branch means another run got there), opens the PR and enables
+(no local push and no persisted credential), creates the branch with a create-only
+ref, never a force-push (an existing branch with an open PR is skipped; one with no
+open PR is skipped on a plain forward run, and deleted and created again only by a
+reimport or rollback dispatch), opens the PR and enables
 auto-merge. AGENTS.md ("ai-tc is pinned", "The workflows") describes the flow.
 """
 from __future__ import annotations
@@ -581,9 +583,12 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
     try:
         gh.post(gh.repo_path("git/refs"), {"ref": f"refs/heads/{branch}", "sha": commit})
     except GitHubError as error:
-        if error.status == 422:
+        if error.status != 422:
+            raise
+        # A 422 is also what a ref rule answers, so only a branch that now exists proves a lost race.
+        if branch_exists(gh, branch):
             raise Refused(f"{branch} was created by another run first", red=False) from error
-        raise
+        raise Refused(f"GitHub refused to create {branch}, and it does not exist: {error.body[:500]}") from error
     pr = gh.post(gh.repo_path("pulls"), {"title": plan["title"], "head": branch, "base": "main",
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
