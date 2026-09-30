@@ -435,10 +435,11 @@ class _CertError(ValueError):
 # What the release checks read from the signing certificate beyond its subject alternative
 # name: the Fulcio v2 extensions, each one DER UTF8String under 1.3.6.1.4.1.57264.1.<arc>,
 # filled by Fulcio from the claims of the GitHub OIDC token, so a workflow cannot choose
-# them. Every other extension is skipped unread (the deprecated raw-string arcs 1-6, 7, 10,
-# 16, 19, 22 and 24, key usage, the SCT list), so a new Fulcio arc cannot break the reader.
-# Arc 23, the deployment environment, is not pinned: the release job names no GitHub
-# environment. Pin it in the commit that adds one.
+# them. Every other extension is skipped unread: the deprecated raw-string arcs 1 to 6, the
+# v2 arcs the checks do not use (7, 10, 16, 19, 22, 24), key usage and the SCT list. So a
+# new Fulcio arc cannot break the reader. Arc 23, the deployment environment, is not
+# pinned because the release job names no GitHub environment: pin it in the commit that
+# adds one.
 FULCIO_ARC = "1.3.6.1.4.1.57264.1."
 SAN_OID = "2.5.29.17"
 SIGNER_FIELDS = {
