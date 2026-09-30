@@ -38,6 +38,31 @@ class TestJsonHelpers(unittest.TestCase):
         self.assertEqual(caught.exception.check, "round-trip")
 
 
+class TestErrorClasses(unittest.TestCase):
+    def test_no_verdict_is_never_caught_as_a_verdict(self):
+        self.assertFalse(issubclass(rc.InfraError, rc.ReleaseCheckError))
+        self.assertFalse(issubclass(rc.ReleaseCheckError, rc.InfraError))
+
+    def test_both_carry_the_check_and_the_detail(self):
+        for cls in (rc.ReleaseCheckError, rc.InfraError):
+            with self.subTest(cls=cls.__name__):
+                error = cls("npm", "the registry is down")
+                self.assertEqual(error.check, "npm")
+                self.assertEqual(error.detail, "the registry is down")
+                self.assertEqual(str(error), "npm: the registry is down")
+
+    def test_a_handler_written_for_a_verdict_lets_an_outage_through(self):
+        # _tag_pin is lenient about what a tag's manifest says, so every verdict-shaped
+        # failure pins nothing. A failed read is no verdict and must not be dropped with them.
+        with mock.patch.object(rc, "_read_manifest", side_effect=rc.InfraError("git", "show failed")):
+            with self.assertRaises(rc.InfraError):
+                rc._tag_pin("unused", "fleet-v1")
+        for verdict in (rc.ReleaseCheckError("manifest", "no plugins list"), ValueError("does not parse")):
+            with self.subTest(verdict=repr(verdict)):
+                with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
+                    self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
+
+
 class TestSelectEntry(unittest.TestCase):
     def test_selects_the_one_ai_tc_entry(self):
         doc = ts.manifest()
