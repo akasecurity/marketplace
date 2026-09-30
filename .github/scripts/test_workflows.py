@@ -75,5 +75,32 @@ class ImporterWorkflow(WorkflowCase):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
 
+class TagAuditWorkflow(WorkflowCase):
+    name = "tag-audit.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_triggers(self):
+        self.assertIn('    - cron: "23 5 * * *"', self.head)
+        self.assertIn('    tags: ["**"]', self.head)
+        self.assertIn("\n  delete:\n", self.head)
+        self.assertIn("\n  workflow_dispatch:\n", self.head)
+        self.assertIn("  group: tag-audit\n", self.head)
+
+    def test_no_secret_and_no_environment(self):
+        self.assertNotIn("secrets.", self.text)
+        self.assertNotIn("environment:", self.text)
+
+    def test_only_file_issues_can_write_issues(self):
+        self.assertEqual(list(self.jobs), ["audit", "file-issues"])
+        self.assertNotIn("issues: write", self.jobs["audit"])
+        self.assertIn("      issues: write\n", self.jobs["file-issues"])
+        self.assertIn("    if: always()\n", self.jobs["file-issues"])
+
+    def test_the_snapshot_is_kept_only_from_a_green_audit(self):
+        self.assertIn("if: steps.check.outputs.red == 'false'", self.jobs["audit"])
+
+
 if __name__ == "__main__":
     unittest.main()
