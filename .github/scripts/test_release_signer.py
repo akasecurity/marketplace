@@ -298,6 +298,69 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
                 error = self.refused("provenance", audits=[ts.audit_output(VERSION, stmt)])
                 self.assertIn("disagrees with the certificate", error.detail)
 
+    def branch_cert(self, branch="refs/heads/main", **overrides):
+        """A certificate for ai-tc's release workflow dispatched on a branch, as an older copy
+        of the workflow could be."""
+        uri = f"{AI_TC}/{ts.WORKFLOW}@{branch}"
+        fields = {"san": uri, "build_signer": uri, "build_config": uri, "ref": branch, "trigger": "workflow_dispatch"}
+        fields.update(overrides)
+        return ts.signing_cert(VERSION, **fields)
+
+    def test_off_tag_text_names_only_a_ref_difference(self):
+        ref = "refs/heads/main"
+        audits = [ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=self.branch_cert(ref))]
+        error = self.refused("provenance", audits=audits)
+        self.assertIn(ref, error.detail)
+        self.assertIn(f"refs/tags/plugin-claude-v{VERSION}", error.detail)
+        self.assertIn("not a stolen npm credential", error.detail)
+        self.assertIn("only from a tag push", error.detail)
+        self.assertIn("maintainers", error.detail)
+        self.assertNotIn("anyone can publish", error.detail)
+
+    def test_an_off_tag_publish_that_is_also_something_else_is_not_excused(self):
+        ref = "refs/heads/main"
+        cases = {
+            "a self-hosted runner": {"runner": "self-hosted"},
+            "another issuer": {"issuer": "https://example.com"},
+            "another repository id": {"repository_id": "1"},
+            "another owner id": {"owner_id": "2"},
+            "another source repository": {"repository": OTHER},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                cert = self.branch_cert(ref, **overrides)
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=cert)])
+                self.assertNotIn("stolen", error.detail)
+                self.assertIn("anyone can publish with provenance", error.detail)
+
+    def test_an_off_tag_publish_whose_certificate_is_not_consistent_is_not_excused(self):
+        ref = "refs/heads/main"
+        audits_for = lambda cert: [ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=cert)]
+        for name, cert in {
+            "a subject alternative name on another branch": self.branch_cert(ref, san=f"{AI_TC}/{ts.WORKFLOW}@refs/heads/other"),
+            "a build signer on another workflow": self.branch_cert(ref, build_signer=f"{AI_TC}/.github/workflows/x.yml@{ref}"),
+            "a source ref that is a tag": self.branch_cert(ref, ref=f"refs/tags/plugin-claude-v{VERSION}"),
+        }.items():
+            with self.subTest(name):
+                error = self.refused("provenance", audits=audits_for(cert))
+                self.assertNotIn("stolen", error.detail)
+
+    def test_an_off_tag_publish_the_statement_contradicts_is_not_excused(self):
+        # The certificate says branch; the statement still claims the tag.
+        error = self.refused("provenance", audits=[ts.audit_output(VERSION, cert=self.branch_cert())])
+        self.assertNotIn("stolen", error.detail)
+
+    def test_a_tag_that_is_not_the_versions_is_not_called_off_tag(self):
+        for name, overrides in {
+            "another versions tag": {"ref": "refs/tags/plugin-claude-v0.9.13", "san": workflow_uri("0.9.13")},
+            "a dispatch on the tag": {"trigger": "workflow_dispatch"},
+        }.items():
+            with self.subTest(name):
+                cert = ts.signing_cert(VERSION, **overrides)
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, cert=cert)])
+                self.assertNotIn("stolen", error.detail)
+                self.assertNotIn("branch", error.detail)
+
     def test_a_builder_that_only_contains_github_hosted_is_refused(self):
         # The certificate is fine; the statement's builder id must be GitHub's exactly.
         for builder in (

@@ -456,6 +456,11 @@ SIGNER_FIELDS = {
 }
 
 
+# The required fields a workflow run on a branch instead of the version's tag changes: the
+# ones that carry the ref, and how the run was triggered.
+REF_FIELDS = frozenset({"san", "build_signer", "build_config", "ref", "trigger"})
+
+
 def _field_label(name: str) -> str:
     if name == "san":
         return "certificate subject alternative name"
@@ -701,28 +706,39 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     attested = {
         (s.get("digest") or {}).get("sha512", "") for s in statement.get("subject") or [] if isinstance(s, dict)
     }
-    bad = [
-        f"{_field_label(name)}: attested {signer[name]!r} != required {value!r}"
-        for name, value in required_signer(version).items()
-        if signer[name] != value
-    ]
-    if bad:
+    wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}
+    claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
+    disagree = [f"{k}: statement {got.get(k)!r} != certificate {v!r}" for k, v in claimed.items() if got.get(k) != v]
+    if builder != GITHUB_HOSTED_BUILDER:
+        disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
+    if wrong:
+        # The fields that carry the ref are the only ones a workflow dispatched on a branch
+        # changes, so only a difference confined to them, in a certificate that is otherwise
+        # consistent and that the statement agrees with, is said to be an off-tag publish.
+        branch = signer["ref"]
+        at_branch = f"{PROV_REPO}/{pipeline['workflow']}@{branch}"
         if (
-            signer["repository"] == PROV_REPO
-            and signer["san"].startswith(f"{PROV_REPO}/{pipeline['workflow']}@refs/heads/")
-            and signer["ref"].startswith("refs/heads/")
+            set(wrong) <= REF_FIELDS
+            and branch.startswith("refs/heads/")
+            and all(signer[name] == at_branch for name in ("san", "build_signer", "build_config"))
+            and not disagree
         ):
             raise ReleaseCheckError(
                 "provenance",
-                f"{PACKAGE}@{version} was published by {PROV_REPO} :: {pipeline['workflow']} from "
-                f"{signer['ref']!r}, not from its tag refs/tags/{pipeline['tag_prefix']}{version}: an "
-                "off-tag publish from a branch dispatch. An attestation is immutable, so this "
-                "version can never be imported. This is NOT a stolen-token signal.",
+                f"{PACKAGE}@{version} was signed by {PROV_REPO} :: {pipeline['workflow']} at the branch "
+                f"{branch!r}, not at its tag {required_signer(version)['ref']!r}. ai-tc's release "
+                "workflow publishes only from a tag push, so an older copy of it was dispatched on a "
+                "branch. An attestation is immutable, so this version can never be imported. This is "
+                "not a stolen npm credential: the signing certificate names ai-tc's own workflow. "
+                "Tell ai-tc's maintainers.",
             )
         raise ReleaseCheckError(
             "provenance",
             "the signing certificate does not bind this tarball to ai-tc's release workflow: "
-            + "; ".join(bad)
+            + "; ".join(
+                f"{_field_label(name)}: attested {signer[name]!r} != required {value!r}"
+                for name, value in wrong.items()
+            )
             + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
             "with provenance from their own repository.",
         )
@@ -732,10 +748,6 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
             f"the attestation covers a different tarball than the dist read ({integrity}); "
             "the two registry reads disagree about the bytes",
         )
-    claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
-    disagree = [f"{k}: statement {got.get(k)!r} != certificate {v!r}" for k, v in claimed.items() if got.get(k) != v]
-    if builder != GITHUB_HOSTED_BUILDER:
-        disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
     if disagree:
         raise ReleaseCheckError(
             "provenance",
