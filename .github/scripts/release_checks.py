@@ -982,10 +982,12 @@ def _non_additive_reason(statement: str) -> str | None:
         return None
     if re.match(r"CREATE UNIQUE INDEX ", upper):
         return "a UNIQUE index, a new constraint an older build's writes can violate"
-    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(.*)", upper)
+    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
     if added:
-        column = added.group(1)
-        if "NOT NULL" in column and "DEFAULT" not in column and "GENERATED" not in column:
+        # Only the words after the column's name count, and only as words: the name itself
+        # (`is_default`, `x default`) and any quoted name further on are not keywords.
+        definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
+        if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
             return "a NOT NULL column without a default"
         return None
     if re.match(r"ALTER TABLE \S+ RENAME", upper):
