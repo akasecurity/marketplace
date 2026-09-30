@@ -1,0 +1,78 @@
+name: staleness
+
+# Hourly checks that the release chain has not stalled (AGENTS.md, "The
+# workflows"): a passing release left unpinned for a day, a version the importer
+# refuses, a bot PR open for a day, a pin change left untagged for an hour, a
+# stray tag or a second ref named main, the ai-tc entry gone from main, and the
+# "rolled back, awaiting fix-forward" notice. Each rule is its own issue, filed
+# by the only job here that may write issues: GitHub mails a failed scheduled run
+# only to whoever last edited its cron line. A manual run with drill set files a
+# test issue through the same path, and the next run without it closes the issue.
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      drill:
+        description: "File a test issue through the same path (the next run without drill closes it)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: staleness
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  evaluate:
+    name: evaluate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      results: ${{ steps.evaluate.outputs.results }}
+    steps:
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      # npm 11 (node 24) for the release checks' `npm audit signatures`.
+      # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: evaluate the rules
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DRILL: ${{ inputs.drill && 'true' || 'false' }}
+          ACTOR: ${{ github.actor }}
+        run: python3 .github/scripts/staleness.py --repo-dir . --frozen .github/fleet-tags.frozen.json
+
+  file-issues:
+    name: file-issues
+    needs: evaluate
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: open, update or close the staleness issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS_JSON: ${{ needs.evaluate.outputs.results }}
+          JOB_RESULT: ${{ needs.evaluate.result }}
+        run: python3 .github/scripts/issue_router.py apply --label staleness
