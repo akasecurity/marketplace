@@ -120,11 +120,15 @@ class TestOtherRules(StalenessCase):
 
     def test_rule_iv_names_stray_tags_and_other_refs_named_main(self):
         refs = ("refs/heads/main", "refs/heads/feature/main", "refs/pull/12/head", "refs/tags/fleet-v8",
-                "refs/tags/fleet-v8^{}", "refs/tags/x4-probe", "refs/tags/main", "refs/tags/main^{}")
+                "refs/tags/fleet-v8^{}", "refs/tags/x4-probe", "refs/tags/main", "refs/tags/main^{}",
+                "refs/tags/fleet-v0", "refs/tags/fleet-v08")
         rule = self.rules(refs=refs)["staleness-iv"]
         self.assertTrue(rule.red)
         self.assertIn("`refs/tags/main`", rule.detail)
         self.assertIn("`refs/tags/x4-probe`", rule.detail)
+        self.assertIn("`refs/tags/fleet-v0`", rule.detail)
+        self.assertIn("`refs/tags/fleet-v08`", rule.detail)
+        self.assertNotIn("`refs/tags/fleet-v8`", rule.detail)
         self.assertNotIn("feature/main", rule.detail)
         self.assertNotIn("refs/pull", rule.detail)
         self.assertFalse(self.rules()["staleness-iv"].red)
