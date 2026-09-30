@@ -160,7 +160,7 @@ class TestNoResults(RouterCase):
             return rt.route(results, label="staleness", job_result=job_result, router=self.router())
 
     def test_a_finished_job_that_reported_nothing_is_red(self):
-        self.assertEqual(self.route([]), 1)
+        self.assertEqual(self.route(None), 1)
         opened = self.gh.called("POST", R("issues"))[0][2]
         self.assertEqual(opened["title"], "staleness: the evaluation job reported no results")
         self.assertEqual(rt.read_marker(opened["body"], "rule"), "staleness-workflow")
@@ -168,6 +168,19 @@ class TestNoResults(RouterCase):
     def test_a_finished_job_whose_results_could_not_be_read_is_red(self):
         self.assertEqual(self.route(None), 1)
         self.assertEqual(len(self.gh.called("POST", R("issues"))), 1)
+
+    def test_a_finished_job_that_reported_an_explicit_empty_list_is_clear(self):
+        self.assertEqual(self.route([]), 0)
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_an_explicit_empty_list_closes_an_earlier_no_results_alert(self):
+        self.issues.append({"number": 40, "labels": [{"name": "staleness"}], "assignees": [],
+                            "created_at": "2026-10-01T10:00:00Z",
+                            "body": "\n".join([rt.marker("rule", "staleness-workflow"),
+                                               rt.marker("state", rt.digest("x")), "", "x"])})
+        self.assertEqual(self.route([]), 0)
+        self.assertEqual(self.gh.called("POST", R("issues")), [])
+        self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
 
     def test_a_finished_job_with_a_result_is_green_when_the_result_is(self):
         self.assertEqual(self.route([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)]), 0)
@@ -203,8 +216,20 @@ class TestMain(unittest.TestCase):
         self.assertEqual(self.run_main(job_result="success"),
                          (1, ["staleness: the evaluation job reported no results"]))
 
-    def test_a_success_with_an_empty_list_is_red(self):
-        self.assertEqual(self.run_main(job_result="success", results_json="[]")[0], 1)
+    def test_a_success_with_an_empty_string_is_red(self):
+        self.assertEqual(self.run_main(job_result="success", results_json=""),
+                         (1, ["staleness: the evaluation job reported no results"]))
+        self.assertEqual(self.run_main(job_result="success", results_json="  \n")[0], 1)
+
+    def test_a_success_with_an_explicit_empty_list_is_clear(self):
+        self.assertEqual(self.run_main(job_result="success", results_json="[]"), (0, []))
+
+    def test_main_audit_empty_list_for_a_clean_push_is_clear(self):
+        self.assertEqual(self.run_main(job_result="success", results_json="[]", label="main-audit"), (0, []))
+
+    def test_main_audit_with_no_output_is_red(self):
+        self.assertEqual(self.run_main(job_result="success", label="main-audit"),
+                         (1, ["main-audit: the evaluation job reported no results"]))
 
     def test_a_success_with_unparsable_results_files_an_issue_instead_of_crashing(self):
         self.assertEqual(self.run_main(job_result="success", results_json="{not json"),
