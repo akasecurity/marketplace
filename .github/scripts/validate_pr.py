@@ -433,3 +433,112 @@ def render_summary(report: Report, number) -> str:
         if items:
             lines += [f"### {title}", ""] + [f"- {_line(item)}" for item in items] + [""]
     return "\n".join(lines)
+
+
+def _run_git(repo: str, *args: str) -> str:
+    result = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise rc.InfraError("git", f"git {' '.join(args)} failed: {result.stderr.strip()[:300]}")
+    return result.stdout
+
+
+def read_at(repo: str, rev: str, path: str):
+    """A file's text at a commit, as data; None when the commit does not have it."""
+    probe = subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{rev}:{path}"], capture_output=True)
+    if probe.returncode != 0:
+        return None
+    shown = subprocess.run(["git", "-C", repo, "show", f"{rev}:{path}"], capture_output=True)
+    if shown.returncode != 0:
+        raise rc.InfraError("git", f"git show {rev}:{path} failed")
+    try:
+        return shown.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise rc.ReleaseCheckError("utf-8", f"{path} at {rev[:12]} is not UTF-8") from exc
+
+
+def changed_files(repo: str, start: str, end: str) -> list:
+    """The paths the PR's own diff touches, with both sides of a rename listed."""
+    out = _run_git(repo, "diff", "--no-renames", "--name-only", "-z", start, end)
+    return sorted(path for path in out.split(chr(0)) if path)
+
+
+# GitHub lists at most this many commits of a pull request, however many pages are asked for.
+COMMIT_LISTING_CAP = 250
+
+
+def pr_commits(base_repo: str, number: int, *, fetch) -> list:
+    """Each PR commit's author and committer logins (None where GitHub matched no account to
+    the commit's email) and whether GitHub verified its signature. A listing that reaches
+    GitHub's cap may be truncated, so it is no verdict rather than a partial answer."""
+    commits = []
+    for page in (1, 2, 3):
+        url = f"https://api.github.com/repos/{base_repo}/pulls/{number}/commits?per_page=100&page={page}"
+        status, body = fetch(url, {})
+        if status != 200:
+            raise rc.InfraError("api", f"GET {url} answered {status}")
+        batch = json.loads(body)
+        commits += [
+            {
+                "sha": c.get("sha"),
+                "author": (c.get("author") or {}).get("login"),
+                "committer": (c.get("committer") or {}).get("login"),
+                "verified": ((c.get("commit") or {}).get("verification") or {}).get("verified") is True,
+            }
+            for c in batch
+        ]
+        if len(batch) < 100:
+            break
+    if len(commits) >= COMMIT_LISTING_CAP:
+        raise rc.InfraError("api", f"PR #{number} lists {len(commits)} commits, GitHub's listing cap, so the list may be incomplete")
+    return commits
+
+
+def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -> int:
+    env = os.environ if env is None else env
+    fetch = fetch or rc.http_fetch
+    verify = verify or functools.lru_cache(maxsize=None)(rc.verify_release)
+    classify = classify or rc.classify_migrations
+    number = env.get("PR_NUMBER", "?")
+    try:
+        head_sha, base_repo = env.get("HEAD_SHA", ""), env.get("BASE_REPO", "")
+        if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
+            raise rc.InfraError("input", "HEAD_SHA, BASE_REPO and PR_NUMBER must be a 40-hex sha, owner/name and a number")
+        start = _run_git(repo, "merge-base", "HEAD", head_sha).strip()
+        base = {path: read_at(repo, start, path) for path in WATCHED}
+        head = {path: read_at(repo, head_sha, path) for path in WATCHED}
+        pr = PullRequest(
+            int(number),
+            env.get("AUTHOR_LOGIN", ""),
+            env.get("AUTHOR_TYPE", ""),
+            env.get("HEAD_REPO", ""),
+            base_repo,
+            env.get("HEAD_REF", ""),
+            tuple(pr_commits(base_repo, int(number), fetch=fetch)),
+        )
+        report = evaluate(
+            pr,
+            base,
+            head,
+            changed_files(repo, start, head_sha),
+            rc.pins_by_ref(repo),
+            read_at(repo, rc.main_ref(repo), rc.SAFETY_FILE),
+            bot_login=rc.BOT_LOGIN,
+            verify=verify,
+            classify=classify,
+        )
+    except rc.InfraError as exc:
+        report = Report(infra=f"{exc.check}: {exc.detail}")
+    except rc.ReleaseCheckError as exc:
+        report = Report()
+        report.fail(f"{exc.check}: {exc.detail}")
+    text = render_summary(report, number)
+    print(text)
+    summary_path = env.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+    return report.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

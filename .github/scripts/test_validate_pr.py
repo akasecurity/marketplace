@@ -521,3 +521,129 @@ class TestSummary(unittest.TestCase):
         failing.fail("x")
         self.assertEqual(failing.exit_code, 1)
         self.assertEqual(vp.Report(infra="x").exit_code, 2)
+
+
+class TestMain(unittest.TestCase):
+    def setUp(self):
+        self.repo = ts.Repo(self)
+        base = files(ts.manifest())
+        self.repo.commit(ts.manifest(), files={k: v for k, v in base.items() if k != rc.MANIFEST})
+        self.repo.tag("fleet-v1")  # pins_by_ref refuses a checkout with no fleet-v tag
+        self.summary = os.path.join(ts.Repo(self).path, "summary.md")
+
+    def pr_commit(self, doc=None, extra=None):
+        ts.git(self.repo.path, "checkout", "-q", "-b", "pr")
+        head = self.repo.commit(doc, files=extra or {})
+        ts.git(self.repo.path, "checkout", "-q", "main")
+        return head
+
+    def env(self, head, **overrides):
+        values = dict(
+            HEAD_SHA=head,
+            PR_NUMBER="7",
+            BASE_REPO="akasecurity/marketplace",
+            HEAD_REPO="akasecurity/marketplace",
+            HEAD_REF="docs/words",
+            AUTHOR_LOGIN="venuverse",
+            AUTHOR_TYPE="User",
+            GITHUB_STEP_SUMMARY=self.summary,
+        )
+        values.update(overrides)
+        return values
+
+    COMMITS_URL = "https://api.github.com/repos/akasecurity/marketplace/pulls/7/commits?per_page=100&page=1"
+
+    def commits(self, head, login="venuverse", *, committer=None, verified=False):
+        """GET pulls/7/commits, shaped like the API's answer: one commit."""
+        item = {
+            "sha": head,
+            "author": {"login": login},
+            "committer": {"login": committer or login},
+            "commit": {"verification": {"verified": verified, "reason": "valid" if verified else "unsigned"}},
+        }
+        return ts.FakeFetch({self.COMMITS_URL: (200, [item])})
+
+    def main(self, head, fetch, **env):
+        with mock.patch("sys.stdout"):
+            return vp.main(repo=self.repo.path, env=self.env(head, **env), fetch=fetch, verify=verify, classify=classify)
+
+    def summary_text(self):
+        with open(self.summary, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_harmless_human_pr_passes_and_writes_the_summary(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.assertEqual(self.main(head, self.commits(head)), 0)
+        self.assertIn("## validate: PR #7: PASS", self.summary_text())
+
+    def test_a_human_pin_edit_fails(self):
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head = self.pr_commit(doc)
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn("a human PR may change only", self.summary_text())
+
+    def test_a_bot_forward_pin_passes(self):
+        head = self.pr_commit(ts.manifest(NEXT), {rc.SAFETY_FILE: rc.dump_json({"versions": FORWARD_SAFETY})})
+        fetch = self.commits(head, BOT, committer="web-flow", verified=True)
+        with mock.patch.object(rc, "BOT_LOGIN", BOT):
+            code = self.main(head, fetch, AUTHOR_LOGIN=BOT, AUTHOR_TYPE="Bot", HEAD_REF=f"bot/pin-ai-tc-{NEXT}")
+        self.assertEqual(code, 0, self.summary_text())
+
+    def test_pr_commits_reads_both_logins_and_the_signature_verdict(self):
+        api = [
+            {
+                "sha": "e" * 40,
+                "author": {"login": BOT},
+                "committer": {"login": "web-flow"},
+                "commit": {"verification": {"verified": True, "reason": "valid"}},
+            },
+            # No account matched the emails: GitHub answers null for both.
+            {"sha": "d" * 40, "author": None, "committer": None, "commit": {"verification": {"verified": False, "reason": "unsigned"}}},
+        ]
+        fetch = ts.FakeFetch({self.COMMITS_URL: (200, api)})
+        self.assertEqual(
+            vp.pr_commits("akasecurity/marketplace", 7, fetch=fetch),
+            [
+                {"sha": "e" * 40, "author": BOT, "committer": "web-flow", "verified": True},
+                {"sha": "d" * 40, "author": None, "committer": None, "verified": False},
+            ],
+        )
+
+    def test_pr_commits_refuses_a_listing_that_reaches_githubs_cap(self):
+        # GitHub lists at most 250 commits of a PR, so 100 + 100 + 50 may be a truncated listing.
+        def page(n, count):
+            item = lambda i: {"sha": f"{i:040x}", "author": {"login": "x"}, "committer": {"login": "x"}, "commit": {}}
+            return (200, [item(n * 1000 + i) for i in range(count)])
+
+        base = "https://api.github.com/repos/akasecurity/marketplace/pulls/7/commits?per_page=100&page="
+        fetch = ts.FakeFetch({base + "1": page(1, 100), base + "2": page(2, 100), base + "3": page(3, 50)})
+        with self.assertRaises(rc.InfraError) as caught:
+            vp.pr_commits("akasecurity/marketplace", 7, fetch=fetch)
+        self.assertIn("250", str(caught.exception.detail))
+
+    def test_changed_files_are_the_pr_diff_from_the_merge_base(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.repo.commit(files={"llms.txt": "moved on main\n"})
+        start = ts.git(self.repo.path, "merge-base", "HEAD", head).strip()
+        self.assertEqual(vp.changed_files(self.repo.path, start, head), ["README.md"])
+
+    def test_a_non_hex_head_is_no_verdict(self):
+        self.assertEqual(self.main("main", ts.FakeFetch()), 2)
+        self.assertIn("NO VERDICT", self.summary_text())
+
+    def test_an_unlistable_pr_is_no_verdict(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.assertEqual(self.main(head, ts.FakeFetch()), 2)
+
+    def test_a_manifest_that_is_not_utf8_fails(self):
+        ts.git(self.repo.path, "checkout", "-q", "-b", "pr")
+        with open(os.path.join(self.repo.path, rc.MANIFEST), "wb") as handle:
+            handle.write(bytes([255, 254]))
+        head = self.repo.commit()
+        ts.git(self.repo.path, "checkout", "-q", "main")
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn("is not UTF-8", self.summary_text())
+
+    def test_read_at_returns_none_for_an_absent_file(self):
+        self.assertIsNone(vp.read_at(self.repo.path, "HEAD", "no/such/file.json"))
