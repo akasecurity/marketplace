@@ -83,6 +83,11 @@ class FakeGit:
     def commits_between(self, before: str, after: str) -> list[str]:
         return self.first_parent_after(before, after)
 
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        if ancestor not in self.chain:
+            return None
+        return descendant in self.chain and self.chain.index(ancestor) <= self.chain.index(descendant)
+
     def commit_time(self, sha: str) -> int:
         return self.times[sha]
 

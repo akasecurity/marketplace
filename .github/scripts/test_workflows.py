@@ -303,6 +303,11 @@ class MainAuditWorkflow(WorkflowCase):
         self.assertIn("  push:\n    branches: [main]\n", self.head)
         self.assertNotIn("concurrency:", self.text)
 
+    def test_the_audit_sees_full_history_and_the_pushed_range(self):
+        self.assertIn("          fetch-depth: 0\n", self.jobs["audit"])
+        self.assertIn("          BEFORE: ${{ github.event.before }}\n", self.jobs["audit"])
+        self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["audit"])
+
     def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
         self.assertNotIn("secrets.", self.text)
         self.assertNotIn("environment:", self.text)

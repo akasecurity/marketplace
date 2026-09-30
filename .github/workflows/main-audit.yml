@@ -5,7 +5,9 @@ name: main-audit
 # head, by someone other than its last pusher (AGENTS.md, "The workflows").
 # Detective only: the main ruleset prevents, and this records a bypass. It runs
 # from the pushed commit's own copy, so a bypass push could change it in the
-# same push. Each offending commit gets its own issue, which a person closes.
+# same push. Each offending commit, each push that rewrote main and each push
+# the audit could not finish gets its own issue, which only a person closes; if
+# the job itself dies (a timeout), the shared workflow issue stays open too.
 # No concurrency group: a group drops pending runs, and a dropped run would be
 # an unaudited push.
 

@@ -6,8 +6,9 @@ rule has one issue, found by its label and a hidden rule marker; it is
 assigned to the release approvers in .github/release-approvers.json and
 mentions the code owners in .github/CODEOWNERS. A red rule comments only when
 its detail changes, or once a day; after 48 hours the escalation owner is
-assigned; a rule that clears closes its issue (main-audit's issues are closed
-by a person). GitHub mails a failed scheduled run only to whoever last edited
+assigned; a rule that clears closes its issue, unless its result says
+otherwise (main-audit's per-push results never do: the next run audits only its
+own push, so a person closes them). GitHub mails a failed scheduled run only to whoever last edited
 its cron line, which is why red goes to an issue.
 """
 from __future__ import annotations
@@ -27,6 +28,7 @@ APPROVERS_FILE = ".github/release-approvers.json"
 CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
 ESCALATE_AFTER = dt.timedelta(hours=48)
+PER_PUSH_LABELS = {"main-audit"}
 
 
 @dataclass
@@ -173,12 +175,12 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
     over no output (None: it was absent, blank or could not be read), because reading that as "nothing is
     red" would leave the audit green for good if the wiring between the job and this step broke. An
     explicit empty list is different: it is the evaluator saying that nothing is red, so it is a clear
-    result for every label. The one issue it closes is the label's own "<label>-workflow" issue, opened
-    when an earlier run's job did not finish or handed over nothing; it leaves every per-rule issue as it
-    is, because only a clear result for that rule closes that rule's issue. It says nothing about which
-    evaluator sends it: an evaluator that always appends a clear result of its own never sends one. The
-    detail names no run URL: it is digested to decide whether anything changed, and every run has its own
-    URL, while the comment appends it.
+    result for every label. The one issue it can close is the label's own "<label>-workflow" issue, opened
+    when an earlier run's job did not finish or handed over nothing (main-audit's is left for a person, see
+    PER_PUSH_LABELS); it leaves every per-rule issue as it is, because only a clear result for that rule
+    closes that rule's issue. It says nothing about which evaluator sends it: an evaluator that always
+    appends a clear result of its own never sends one. The detail names no run URL: it is digested to decide
+    whether anything changed, and every run has its own URL, while the comment appends it.
     """
     finished = job_result == "success"
     reported = finished and results is not None
@@ -191,8 +193,11 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
         problem = (f"The {label} evaluation job ended `{job_result or 'unknown'}`; its checks did not run, so "
                    "their issues were left as they were.")
     results = list(results or []) if reported else []
+    # main-audit checks one push per run, so a later clean run says nothing about the push whose job did
+    # not finish: its workflow issue stays open for a person. The other rules re-check all state every run.
     results.append(Result(
         rule=f"{label}-workflow", label=label, red=problem is not None, detail=problem or "",
+        auto_close=label not in PER_PUSH_LABELS,
         title=f"{label}: the evaluation job "
               + ("reported no results" if finished else "did not finish")))
     red = False

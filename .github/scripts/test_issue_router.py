@@ -192,6 +192,42 @@ class TestNoResults(RouterCase):
         self.assertEqual(self.gh.writes(), [])
 
 
+class TestWorkflowIssueLifetime(RouterCase):
+    """The issue for an evaluation job that did not finish closes only where the next run re-checks everything."""
+
+    def open_workflow_issue(self, label):
+        self.issues = [{"number": 40, "body": rt.marker("rule", f"{label}-workflow"), "created_at": "2026-10-01T10:00:00Z",
+                        "labels": [{"name": label}], "assignees": []}]
+
+    def clean_run(self, label):
+        green = rt.Result(rule=label, label=label, title="t", red=False, auto_close=False)
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = rt.route([green], label=label, job_result="success", router=self.router())
+        return code, out.getvalue()
+
+    def test_a_state_based_rule_closes_it_when_the_next_run_is_clean(self):
+        self.open_workflow_issue("staleness")
+        code, out = self.clean_run("staleness")
+        self.assertEqual(code, 0)
+        self.assertIn("staleness-workflow: cleared; closed #40", out)
+        self.assertEqual(len(self.gh.called("PATCH", R("issues/40"))), 1)
+
+    def test_main_audit_leaves_it_for_a_person_because_a_run_audits_only_its_own_push(self):
+        self.open_workflow_issue("main-audit")
+        code, out = self.clean_run("main-audit")
+        self.assertEqual(code, 0)
+        self.assertIn("main-audit-workflow: clear", out)
+        self.assertNotIn("closed", out)
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_main_audit_files_it_saying_a_person_closes_it(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="main-audit", job_result="failure", router=self.router())
+        body = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.assertIn("A person closes it once it is explained.", body)
+        self.assertNotIn("closes by itself", body)
+
+
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 

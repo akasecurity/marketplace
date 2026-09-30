@@ -70,6 +70,17 @@ class Git:
         """Every commit `after` reaches and `before` does not, oldest first."""
         return [line for line in self.run("rev-list", "--reverse", f"{before}..{after}").splitlines() if line]
 
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        """Whether `ancestor` is reachable from `descendant`; None when `ancestor` is not a commit this
+        checkout has (a force-pushed-over tip that no other ref keeps is never fetched)."""
+        if self._run("cat-file", "-e", f"{ancestor}^{{commit}}", check=False).returncode != 0:
+            return None
+        proc = self._run("merge-base", "--is-ancestor", ancestor, descendant, check=False)
+        if proc.returncode not in (0, 1):
+            raise GitError(f"git merge-base --is-ancestor {ancestor} {descendant} failed: "
+                           f"{proc.stderr.decode('utf-8', 'replace').strip()}")
+        return proc.returncode == 0
+
     def commit_time(self, sha: str) -> int:
         return int(self.run("show", "-s", "--format=%ct", sha).strip())
 
