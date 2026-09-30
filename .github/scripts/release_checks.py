@@ -883,10 +883,89 @@ class Classification:
     note: str = dataclasses.field(default="", compare=False)
 
 
+# ai-tc runs a migration as the chunks left by splitting its text on this pattern, wherever
+# it stands: after a statement on the same line, inside a comment, across a line break (see
+# splitStatements in its migrations module). The split is on the raw text, before any quote
+# or comment is read, so it is made first here too. JavaScript's \s is not Python's: it
+# counts U+FEFF and leaves out a few control characters, so its set is spelled out.
+_JS_WHITESPACE = "".join(
+    map(
+        chr,
+        (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B))
+        + (0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF),
+    )
+)
+STATEMENT_BREAKPOINT = re.compile("-->[" + re.escape(_JS_WHITESPACE) + "]*statement-breakpoint")
+
+
+class _Unterminated(ValueError):
+    """A quoted string or name, or a block comment, that never closes."""
+
+
+def _closing_quote(text: str, start: int) -> int:
+    """The index of the quote that closes the one at `start`. A doubled quote inside reads
+    as a close and a re-open, which comes to the same thing, so it needs no case of its own."""
+    stop = text.find(text[start], start + 1)
+    if stop < 0:
+        raise _Unterminated(f"a {text[start]} at {start} is never closed")
+    return stop
+
+
+def _chunk_statements(chunk: str) -> list:
+    """The statements of one chunk, read left to right the way SQLite reads them.
+
+    A single-quoted string becomes '' (what it says decides nothing, and a ';' or '--' in it
+    ends nothing). A quoted name ("..." `...` [...]) is kept whole, so a __new_ table is
+    still seen. A -- comment runs to the end of the line and a /* */ comment to its close;
+    both are dropped. A ';' outside all of those ends a statement."""
+    statements: list = []
+    parts: list = []
+
+    def end() -> None:
+        statement = " ".join("".join(parts).split())
+        if statement:
+            statements.append(statement)
+        parts.clear()
+
+    i, size = 0, len(chunk)
+    while i < size:
+        char = chunk[i]
+        if char == "'":
+            i = _closing_quote(chunk, i) + 1
+            parts.append("''")
+        elif char in '"`':
+            stop = _closing_quote(chunk, i) + 1
+            parts.append(chunk[i:stop])
+            i = stop
+        elif char == "[":
+            stop = chunk.find("]", i + 1) + 1
+            if stop == 0:
+                raise _Unterminated(f"a [ at {i} is never closed")
+            parts.append(chunk[i:stop])
+            i = stop
+        elif chunk.startswith("--", i):
+            stop = chunk.find("\n", i)
+            i = size if stop < 0 else stop
+            parts.append(" ")
+        elif chunk.startswith("/*", i):
+            stop = chunk.find("*/", i + 2)
+            if stop < 0:
+                raise _Unterminated(f"a /* at {i} is never closed")
+            i = stop + 2
+            parts.append(" ")
+        elif char == ";":
+            end()
+            i += 1
+        else:
+            parts.append(char)
+            i += 1
+    end()
+    return statements
+
+
 def _statements(sql: str) -> list:
-    text = sql.replace("--> statement-breakpoint", ";")
-    lines = [line.split("--", 1)[0] for line in text.splitlines()]
-    return [" ".join(part.split()) for part in " ".join(lines).split(";") if part.strip()]
+    """Every statement ai-tc would run for one migration file. Raises _Unterminated."""
+    return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
 
 
 def _non_additive_reason(statement: str) -> str | None:
@@ -920,7 +999,10 @@ def _non_additive_reason(statement: str) -> str | None:
 
 def migration_kind(sql: str) -> str:
     """'additive', or 'non-additive: <first reason>', for one migration file."""
-    statements = _statements(sql)
+    try:
+        statements = _statements(sql)
+    except _Unterminated:
+        return "non-additive: an unterminated quoted string or comment"
     if not statements:
         return "non-additive: no statements"
     for statement in statements:

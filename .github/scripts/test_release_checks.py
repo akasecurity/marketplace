@@ -532,6 +532,76 @@ class TestMigrationKind(unittest.TestCase):
     def test_an_empty_file_is_not_additive(self):
         self.assertEqual(rc.migration_kind("-- nothing\n"), "non-additive: no statements")
 
+    def test_dashes_inside_a_string_do_not_hide_the_rest_of_the_line(self):
+        sql = "CREATE TABLE `t` (`a` text DEFAULT '--');DROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_an_apostrophe_in_a_block_comment_does_not_open_a_string(self):
+        # A lexer that misses /* */ reads the apostrophe as the start of a string that
+        # runs to the next quote and blanks the DROP in between.
+        sql = "/* don't */ DROP TABLE `users`; CREATE TABLE `a` (`b` text DEFAULT 'x');"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_a_statement_breakpoint_ends_a_statement_with_no_semicolon(self):
+        sql = "CREATE TABLE `a` (`x` integer)\n--> statement-breakpoint\nDROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_ai_tc_splits_on_the_breakpoint_wherever_it_stands_so_the_rest_of_the_line_counts(self):
+        # ai-tc runs the text after each "-->\s*statement-breakpoint" as its own chunk, even
+        # when it follows a statement on the same line or sits inside a comment.
+        drop = "non-additive: a drop (drop table)"
+        cases = {
+            "after a statement on the same line": "CREATE TABLE `a` (`x` integer);--> statement-breakpoint DROP TABLE `users`;",
+            "inside a line comment": "CREATE TABLE `a` (`x` integer); -- why --> statement-breakpoint DROP TABLE `users`;",
+            "with a newline between the words": "CREATE TABLE `a` (`x` integer)-->\nstatement-breakpoint DROP TABLE `users`;",
+            "with no space at all": "CREATE TABLE `a` (`x` integer)-->statement-breakpoint DROP TABLE `users`;",
+            # JavaScript's \s counts U+FEFF as white space and Python's does not.
+            "split by a byte-order mark": f"CREATE TABLE `a` (`x` integer);-->{chr(0xFEFF)}statement-breakpoint DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), drop)
+
+    def test_a_breakpoint_inside_a_comment_cannot_hide_the_statement_after_it(self):
+        # The chunk before the breakpoint ends inside a block comment, which is refused.
+        sql = "CREATE TABLE `a` (`x` integer); /* --> statement-breakpoint DROP TABLE `users`; -- */"
+        self.assertTrue(rc.migration_kind(sql).startswith("non-additive"), rc.migration_kind(sql))
+
+    def test_a_semicolon_inside_a_string_does_not_end_the_statement(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT ';DROP TABLE x');"), "additive")
+
+    def test_a_doubled_quote_is_an_escape_not_the_end_of_the_literal(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'it''s; DROP TABLE x');"), "additive")
+        self.assertEqual(rc.migration_kind('CREATE TABLE "t""x;y" ("a" text);'), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t``x;y` (`a` text);"), "additive")
+
+    def test_quoted_names_keep_their_words_so_a_rebuild_is_still_seen(self):
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE `__new_widgets` (`id` text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE [__new_widgets] (id text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+
+    def test_words_inside_a_string_or_a_comment_decide_nothing(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'DROP TABLE __new_x');"), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text); /* DROP TABLE `users`; */ -- DROP TABLE `x`;"), "additive")
+
+    def test_a_quote_or_comment_that_never_closes_is_not_additive(self):
+        unterminated = "non-additive: an unterminated quoted string or comment"
+        cases = {
+            "string": "CREATE TABLE `t` (`a` text DEFAULT 'x);",
+            "backtick name": "CREATE TABLE `t (`a` text);",
+            "double-quoted name": 'CREATE TABLE "t (a text);',
+            "bracketed name": "CREATE TABLE [t (a text);",
+            "block comment": "CREATE TABLE `t` (`a` text); /* DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), unterminated)
+
 
 JOURNAL = f"{rc.MIGRATIONS_DIR}/meta/_journal.json"
 FROM, TO = ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"]
