@@ -3,10 +3,12 @@ name: tag-audit
 # Daily, on every tag push or deletion, and on demand: detect a fleet-v tag that
 # moved or vanished, a tag that should not exist, a break in the tag ledger, or a
 # ruleset that was edited or disabled (AGENTS.md, "The workflows"). Detection, not
-# prevention: the rulesets prevent. tag-release runs the same checks before it
-# creates a tag. A tag pushed at an old commit that has no copy of this file starts
-# no run; the daily run and staleness's hourly ref check still see it. Red goes to
-# one issue, filed by the only job here that may write issues.
+# prevention: the rulesets prevent. tag-release runs this workflow's ledger and
+# ruleset checks before it creates a tag (not its comparison with the last green
+# run's snapshot of the tag objects); only this workflow makes that comparison. A
+# tag pushed at an old commit that has no copy of this file starts no run; the
+# daily run and staleness's hourly ref check still see it. Red goes to one issue,
+# filed by the only job here that may write issues.
 
 on:
   schedule:

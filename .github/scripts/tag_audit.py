@@ -1,4 +1,5 @@
-"""tag-audit's checks; tag-release runs the same checks before it creates anything.
+"""tag-audit's checks. tag-release runs tag-audit's ledger and ruleset checks before it creates anything (not its
+comparison with the last green run's snapshot of the tag objects); only tag-audit's own run makes that comparison.
 
 Detection, not prevention: the rulesets prevent, and this notices an edit to
 one of them, a moved or deleted fleet-v tag, or a tag that should not exist.
