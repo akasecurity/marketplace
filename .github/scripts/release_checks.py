@@ -633,6 +633,16 @@ def required_signer(version: str) -> dict:
     }
 
 
+def _field(doc, *keys):
+    """doc[keys[0]][keys[1]]...; None when any step is absent or passes through something
+    that is not an object. A statement is the publisher's JSON, so no level can be assumed."""
+    for key in keys:
+        if not isinstance(doc, dict):
+            return None
+        doc = doc.get(key)
+    return doc
+
+
 @dataclasses.dataclass(frozen=True)
 class SignedStatement:
     """The in-toto statement a provenance bundle carries, with who signed it. `signer` is
@@ -653,6 +663,8 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     signed with that certificate's key), never from the statement, which the publisher
     wrote. The statement must then agree with the certificate."""
     pipeline = RELEASE_PIPELINE[PACKAGE]
+    if not isinstance(sig, dict):
+        raise InfraError("toolchain", f"npm audit signatures did not print a report object (NOT a signature result): {sig!r:.200}")
     if sig.get("invalid"):
         raise ReleaseCheckError("provenance", f"npm reports INVALID signatures or attestations: {sig['invalid']}")
     # npm fills `missing` (no registry signature) and `verified` (a verified attestation)
@@ -668,13 +680,18 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
             f"npm reports no registry signature for {PACKAGE}@{version}: the registry's own "
             "signature over this tarball is missing, so the attestation alone cannot be relied on",
         )
-    entry = next(
-        (v for v in sig.get("verified") or [] if v.get("name") == PACKAGE and v.get("version") == version),
-        None,
-    )
-    if entry is None:
+    verified = sig.get("verified", [])
+    if not isinstance(verified, list) or not all(isinstance(item, dict) for item in verified):
+        raise InfraError("toolchain", f"npm audit signatures printed a verified list that is not a list of objects (NOT a signature result): {verified!r:.200}")
+    entries = [v for v in verified if v.get("name") == PACKAGE and v.get("version") == version]
+    if len(entries) > 1:
+        raise InfraError("toolchain", f"npm audit signatures lists {PACKAGE}@{version} as verified {len(entries)} times (NOT a signature result)")
+    if not entries:
         raise _NotIndexedYet(f"{PACKAGE}@{version} carries no VERIFIED attestation in npm's report")
-    if not any(b.get("predicateType") == PUBLISH for b in entry.get("attestationBundles") or []):
+    attestations = entries[0].get("attestationBundles")
+    if not isinstance(attestations, list) or not all(isinstance(item, dict) for item in attestations):
+        raise InfraError("toolchain", f"npm audit signatures printed attestation bundles that are not a list of objects (NOT a signature result): {attestations!r:.200}")
+    if not any(b.get("predicateType") == PUBLISH for b in attestations):
         # Absent from `missing` means something only if npm held the registry's keys, and
         # the registry's own publish attestation verifying is what shows it did.
         raise ReleaseCheckError(
@@ -682,7 +699,7 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
             f"{PACKAGE}@{version} has no verified registry publish attestation, so nothing shows "
             "that npm checked the registry's signature",
         )
-    bundles = [b for b in entry.get("attestationBundles") or [] if b.get("predicateType") == SLSA]
+    bundles = [b for b in attestations if b.get("predicateType") == SLSA]
     if not bundles:
         raise ReleaseCheckError("provenance", f"{PACKAGE}@{version} has no {SLSA} attestation")
     if len(bundles) > 1:
@@ -695,20 +712,29 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
         signer = signer_identity(_leaf_der(bundles[0].get("bundle")))
     except _CertError as exc:
         raise ReleaseCheckError("provenance", f"the SLSA bundle's signing certificate is unreadable: {exc}") from exc
+    payload = _field(bundles[0], "bundle", "dsseEnvelope", "payload")
     try:
-        statement = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ReleaseCheckError("provenance", f"the SLSA bundle is unreadable: {exc}") from exc
-    predicate = statement.get("predicate") or {}
-    got = ((predicate.get("buildDefinition") or {}).get("externalParameters") or {}).get("workflow") or {}
-    builder = str(((predicate.get("runDetails") or {}).get("builder") or {}).get("id", ""))
-    dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
+        if not isinstance(payload, str):
+            raise ValueError("the envelope has no payload")
+        statement = parse_json(base64.b64decode(payload, validate=True).decode("utf-8"))
+        if not isinstance(statement, dict):
+            raise ValueError("the statement is not a JSON object")
+    except ValueError as exc:
+        raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
+    subjects = statement.get("subject")
     attested = {
-        (s.get("digest") or {}).get("sha512", "") for s in statement.get("subject") or [] if isinstance(s, dict)
+        _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
     }
+    dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
     wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}
+    workflow = ("predicate", "buildDefinition", "externalParameters", "workflow")
     claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
-    disagree = [f"{k}: statement {got.get(k)!r} != certificate {v!r}" for k, v in claimed.items() if got.get(k) != v]
+    disagree = [
+        f"{k}: statement {_field(statement, *workflow, k)!r} != certificate {v!r}"
+        for k, v in claimed.items()
+        if _field(statement, *workflow, k) != v
+    ]
+    builder = _field(statement, "predicate", "runDetails", "builder", "id")
     if builder != GITHUB_HOSTED_BUILDER:
         disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
     if wrong:
@@ -763,11 +789,11 @@ def attested_commit(statement: SignedStatement, version: str) -> str:
     repository digest, which the statement's own commit for the tag's URI must equal."""
     tag_ref = f"refs/tags/{RELEASE_PIPELINE[PACKAGE]['tag_prefix']}{version}"
     uri = f"git+{PROV_REPO}@{tag_ref}"
-    dependencies = ((statement.body.get("predicate") or {}).get("buildDefinition") or {}).get("resolvedDependencies") or []
+    dependencies = _field(statement.body, "predicate", "buildDefinition", "resolvedDependencies")
     commits = [
-        (d.get("digest") or {}).get("gitCommit")
-        for d in dependencies
-        if isinstance(d, dict) and d.get("uri") == uri
+        _field(dependency, "digest", "gitCommit")
+        for dependency in (dependencies if isinstance(dependencies, list) else [])
+        if isinstance(dependency, dict) and dependency.get("uri") == uri
     ]
     if len(commits) != 1 or not isinstance(commits[0], str) or not SHA40.fullmatch(commits[0]):
         raise ReleaseCheckError("attested-commit", f"the provenance names no single commit for {uri} (found {commits!r})")
@@ -786,7 +812,7 @@ def release_run_url(statement: SignedStatement) -> str:
     url = statement.signer["run_url"]
     if not RUN_URL.fullmatch(url):
         raise ReleaseCheckError("run-url", f"the signing certificate names no ai-tc Actions run: {url!r}")
-    claimed = (((statement.body.get("predicate") or {}).get("runDetails") or {}).get("metadata") or {}).get("invocationId")
+    claimed = _field(statement.body, "predicate", "runDetails", "metadata", "invocationId")
     if claimed != url:
         raise ReleaseCheckError(
             "run-url", f"the statement names the run {claimed!r} but the signing certificate names {url!r}"
