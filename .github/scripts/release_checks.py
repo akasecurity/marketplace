@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The marketplace's one release-verification module (standard library only).
 
-Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin, runs
-THIS file from main's copy. validate.yml imports it through validate_pr.py; the
-importer, tag-release, staleness and tag-audit run it as a CLI.
+Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin,
+imports THIS file from main's copy: validate through validate_pr.py, and the importer,
+tag-release, staleness and tag-audit directly. The command line below is for a person,
+and for a copy run outside this repository.
 
 It has no third-party dependency on purpose. Nothing is installed before it runs, so
 nothing outside this reviewed file can change a verdict.
