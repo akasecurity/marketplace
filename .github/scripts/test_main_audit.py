@@ -2,12 +2,16 @@
 import contextlib
 import io
 import os
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
 import issue_router as rt
 import main_audit as ma
 from fakes import BOT, CODEOWNERS, REPO, FakeGit, FakeGitHub
+from ghapi import GitHubError
+from gitrepo import Git
 
 
 def R(suffix):
@@ -58,7 +62,75 @@ class TestMainAudit(unittest.TestCase):
     def test_a_push_that_adds_no_commit_but_moves_main_is_red(self):
         results = [item for item in ma.audit(repo(), github(), "s2", "s1", sleep=lambda seconds: None) if item.red]
         self.assertEqual([(item.rule, item.auto_close) for item in results], [("main-audit-rewrite-s1", False)])
+        self.assertIn("not an ancestor", results[0].detail)
         self.assertIn("rewritten or reset", results[0].detail)
+
+    def test_an_old_tip_the_checkout_does_not_have_is_red_and_the_new_tip_is_still_audited(self):
+        # The ordinary shape of a reset: the old tip lived only on main, so it was never fetched.
+        results = ma.audit(repo(), github(pulls=[]), "gone", "s1", sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
+                         [("main-audit-rewrite-s1", True, False), ("main-audit-s1", True, False),
+                          ("main-audit", False, False)])
+        self.assertIn("not in the checkout", results[0].detail)
+
+    def test_a_failure_part_way_keeps_what_was_found_and_is_recorded_against_the_push(self):
+        git = FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
+        gh = FakeGitHub({("GET", R("commits/s1/pulls")): [],
+                         ("GET", R("commits/s2/pulls")): GitHubError(502, "GET", "commits/s2/pulls", "bad gateway\nretry")})
+        results = ma.audit(git, gh, "p", "s2", sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
+                         [("main-audit-s1", True, False), ("main-audit-unaudited-s2", True, False),
+                          ("main-audit", False, False)])
+        self.assertIn("GitHubError", results[1].detail)
+        self.assertIn("bad gateway retry", results[1].detail)
+        self.assertIn("a person closes this issue", results[1].detail)
+
+    def test_a_git_failure_is_recorded_against_the_push_instead_of_failing_the_job(self):
+        class Broken(FakeGit):
+            def is_ancestor(self, ancestor, descendant):
+                raise ma.GitError("git merge-base failed")
+
+        results = ma.audit(Broken(chain=["p", "s1"]), github(), "p", "s1", sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
+                         [("main-audit-unaudited-s1", True, False), ("main-audit", False, False)])
+
+    def test_only_the_tip_waits_for_the_pull_request_association(self):
+        waits = []
+        git = FakeGit(chain=["p", "s1", "s2"], files={})
+        gh = FakeGitHub({("GET", R("commits/s1/pulls")): [], ("GET", R("commits/s2/pulls")): []})
+        results = ma.audit(git, gh, "p", "s2", sleep=waits.append)
+        self.assertEqual(len([item for item in results if item.red]), 2)
+        self.assertEqual(len(waits), 2)  # the tip's two waits between three asks; s1 asks without waiting
+        self.assertEqual(len(gh.called("GET", R("commits/s1/pulls"))), 3)
+
+    def test_a_reset_in_a_real_repository_is_red_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as root:
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+            def sh(*args):
+                return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            sh("init", "-q", "-b", "main")
+            for name in ("a", "b", "c"):
+                with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
+                    handle.write(name)
+                sh("add", name)
+                sh("commit", "-q", "-m", name)
+            old_tip, first = sh("rev-parse", "HEAD"), sh("rev-parse", "HEAD~2")
+            sh("reset", "-q", "--hard", first)
+            sh("reflog", "expire", "--expire=now", "--all")
+            sh("gc", "-q", "--prune=now")
+            git = Git(root)
+            self.assertIsNone(git.is_ancestor(old_tip, first))
+            self.assertTrue(git.is_ancestor(first, first))
+            gh = FakeGitHub({("GET", R(f"commits/{first}/pulls")): []})
+            results = ma.audit(git, gh, old_tip, first, sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red) for item in results],
+                         [(f"main-audit-rewrite-{first[:12]}", True), (f"main-audit-{first[:12]}", True),
+                          ("main-audit", False)])
 
     def test_the_owners_are_read_at_the_commits_parent_not_the_commit_itself(self):
         # The PR's own tree makes its approver an owner; the parent's tree does not.
@@ -103,7 +175,7 @@ class TestMainAudit(unittest.TestCase):
             code = ma.main(["--repo-dir", "."])
         return code, out.getvalue()
 
-    def test_a_clean_push_prints_the_summary_line_the_wiring_check_greps_for(self):
+    def test_a_clean_push_prints_a_zero_count_summary_line(self):
         code, out = self.run_main(github())
         self.assertEqual(code, 0)
         self.assertIn("0 commit(s) in this push reached main without a code-owner-approved PR", out)
@@ -114,6 +186,20 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("1 commit(s) in this push reached main without a code-owner-approved PR", out)
         self.assertIn("::error::", out)
+
+    def test_a_rewrite_is_not_counted_as_a_commit_in_the_summary_line(self):
+        env = {"AFTER": "s1", "BEFORE": "gone", "GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
+        out = io.StringIO()
+        real_audit = ma.audit
+        with mock.patch.dict(os.environ, env), mock.patch.object(ma, "Git", lambda path: repo()), \
+                mock.patch.object(ma, "GitHub", lambda token, repository: github()), \
+                mock.patch.object(ma, "write_output", lambda key, value: None), \
+                mock.patch.object(ma, "audit", lambda *args: real_audit(*args, sleep=lambda seconds: None)), \
+                contextlib.redirect_stdout(out):
+            code = ma.main(["--repo-dir", "."])
+        self.assertEqual(code, 0)
+        self.assertIn("0 commit(s) in this push reached main without a code-owner-approved PR", out.getvalue())
+        self.assertIn("1 other problem(s) with this push", out.getvalue())
 
     def test_the_commits_a_push_added(self):
         self.assertEqual(ma.added_commits(repo(), "0" * 40, "s2"), ["s2"])
