@@ -293,5 +293,24 @@ class StalenessWorkflow(WorkflowCase):
         self.assertIn("    if: always()\n", self.jobs["file-issues"])
 
 
+class MainAuditWorkflow(WorkflowCase):
+    name = "main-audit.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_every_push_to_main_is_audited_and_none_is_dropped(self):
+        self.assertIn("  push:\n    branches: [main]\n", self.head)
+        self.assertNotIn("concurrency:", self.text)
+
+    def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
+        self.assertNotIn("secrets.", self.text)
+        self.assertNotIn("environment:", self.text)
+        self.assertEqual(list(self.jobs), ["audit", "file-issues"])
+        self.assertNotIn("issues: write", self.jobs["audit"])
+        self.assertIn("      issues: write\n", self.jobs["file-issues"])
+        self.assertIn("    if: always()\n", self.jobs["file-issues"])
+
+
 if __name__ == "__main__":
     unittest.main()
