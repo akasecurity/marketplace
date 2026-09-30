@@ -252,5 +252,26 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertNotIn("expired", done.stdout)
 
 
+class TagReleaseWorkflow(WorkflowCase):
+    name = "tag-release.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_triggers_and_serialization(self):
+        self.assertIn("  push:\n    branches: [main]\n", self.head)
+        self.assertIn("\n  workflow_dispatch:\n", self.head)
+        self.assertIn("  group: tag-release\n", self.head)
+        self.assertIn("  cancel-in-progress: false\n", self.head)
+
+    def test_one_job_in_the_bot_environment_audits_before_it_mints(self):
+        self.assertEqual(list(self.jobs), ["tag"])
+        job = self.jobs["tag"]
+        self.assertIn("    environment: marketplace-bot\n", job)
+        self.assertLess(job.index("tag_audit.py check"), job.index("actions/create-github-app-token@"))
+        self.assertLess(job.index("actions/create-github-app-token@"), job.index("tag_release.py sweep"))
+        self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
+
+
 if __name__ == "__main__":
     unittest.main()
