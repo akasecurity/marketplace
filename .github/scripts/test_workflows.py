@@ -273,5 +273,25 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
 
+class StalenessWorkflow(WorkflowCase):
+    name = "staleness.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_hourly_with_a_drill_input(self):
+        self.assertIn('    - cron: "7 * * * *"', self.head)
+        self.assertRegex(self.head, r"(?s)\n      drill:\n.*?type: boolean\n")
+        self.assertIn("  group: staleness\n", self.head)
+
+    def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
+        self.assertNotIn("secrets.", self.text)
+        self.assertNotIn("environment:", self.text)
+        self.assertEqual(list(self.jobs), ["evaluate", "file-issues"])
+        self.assertNotIn("issues: write", self.jobs["evaluate"])
+        self.assertIn("      issues: write\n", self.jobs["file-issues"])
+        self.assertIn("    if: always()\n", self.jobs["file-issues"])
+
+
 if __name__ == "__main__":
     unittest.main()
