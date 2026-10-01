@@ -214,10 +214,13 @@ class Router:
             actions.append("labelled")
         if self.now - when(issue["created_at"]) >= ESCALATE_AFTER:
             assigned = {assignee.get("login") for assignee in issue.get("assignees", [])}
-            if self.escalation and self.escalation not in assigned:
+            # Once per owner: the marker outlives the assignment, so an owner who takes themselves off the
+            # issue is not assigned again, with another comment, on every run.
+            if self.escalation and self.escalation not in assigned and read_marker(new_body, "escalated") != self.escalation:
                 self.gh.post(self.gh.repo_path(f"issues/{number}/assignees"), {"assignees": [self.escalation]})
                 self._comment(number, f"Open for more than 48 hours: assigning @{self.escalation}, the escalation "
                                       f"owner in {APPROVERS_FILE}.")
+                new_body = set_marker(new_body, "escalated", self.escalation)
                 actions.append("escalated")
             elif not self.escalation and read_marker(new_body, "escalation-unset") is None:
                 self._comment(number, f"Open for more than 48 hours, and {APPROVERS_FILE} names no escalation "
