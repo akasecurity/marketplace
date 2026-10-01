@@ -8,11 +8,14 @@ from import_release import Refused
 from release_checks import MANIFEST, SAFETY_FILE
 
 
+NOW = 1_790_000_000
+
+
 def R(suffix):
     return f"repos/{REPO}/{suffix}"
 
 
-def history(chain=("t8", "a", "b", "c", "d")) -> FakeGit:
+def history(chain=("t8", "a", "b", "c", "d"), times=None) -> FakeGit:
     """main after fleet-v8 ("t8", 0.9.14): a description-only merge ("a"), a release to 0.9.15 ("b"),
     a rollback to 0.9.14 ("c"), and the entry's removal ("d")."""
     older = {"0.9.14": safety_entry("0.9.14", "0.9.13")}
@@ -27,7 +30,7 @@ def history(chain=("t8", "a", "b", "c", "d")) -> FakeGit:
         files[(sha, MANIFEST)] = text
         files[(sha, SAFETY_FILE)] = safety(table)
         files[(sha, ".github/CODEOWNERS")] = CODEOWNERS
-    return FakeGit(chain=list(chain), files=files, tags=[fleet_tag(7, "t7"), fleet_tag(8, "t8")])
+    return FakeGit(chain=list(chain), files=files, tags=[fleet_tag(7, "t7"), fleet_tag(8, "t8")], times=times)
 
 
 def sweep_github() -> FakeGitHub:
@@ -94,7 +97,8 @@ class TestSweep(unittest.TestCase):
     def test_contiguous_annotated_tags_with_the_contract_message(self):
         gh = sweep_github()
         waits = []
-        self.assertEqual(tr.sweep(history(), gh, sleep=waits.append),
+        # "d" has no PR; it is old enough to be tagged as a push without one.
+        self.assertEqual(tr.sweep(history(times={"d": NOW - 7200}), gh, sleep=waits.append, now=lambda: NOW),
                          ["fleet-v9 -> b (ai-tc 0.9.15)", "fleet-v10 -> c (ai-tc 0.9.14)",
                           "fleet-v11 -> d (ai-tc entry removed)"])
         self.assertEqual(len(gh.called("GET", R("commits/d/pulls"))), 3)  # an empty association is asked again
@@ -114,6 +118,33 @@ class TestSweep(unittest.TestCase):
                          [{"ref": "refs/tags/fleet-v9", "sha": "object-fleet-v9"},
                           {"ref": "refs/tags/fleet-v10", "sha": "object-fleet-v10"},
                           {"ref": "refs/tags/fleet-v11", "sha": "object-fleet-v11"}])
+
+    def test_a_young_commit_with_no_linked_pr_is_left_untagged_and_stops_the_sweep(self):
+        gh = sweep_github()
+        git = history(chain=("t8", "b", "d"), times={"d": NOW - 600})
+        with self.assertRaisesRegex(Refused, "links no merged pull request"):
+            tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        tags = [call[2] for call in gh.called("POST", R("git/tags"))]
+        self.assertEqual([(t["tag"], t["object"]) for t in tags], [("fleet-v9", "b")])  # nothing at or after "d"
+        self.assertEqual(len(gh.called("POST", R("git/refs"))), 1)
+
+    def test_an_unlinked_commit_over_an_hour_old_is_tagged_as_a_push_without_a_pr(self):
+        for age in (tr.UNLINKED_GRACE, 7200):
+            with self.subTest(age=age):
+                gh = sweep_github()
+                git = history(chain=("t8", "b", "d"), times={"d": NOW - age})
+                self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
+                                 ["fleet-v9 -> b (ai-tc 0.9.15)", "fleet-v10 -> d (ai-tc entry removed)"])
+                message = gh.called("POST", R("git/tags"))[1][2]["message"]
+                self.assertIn("pr: none\napprover: none\n", message)
+                self.assertIn("approver-note: no pull request merged this commit\n", message)
+
+    def test_a_young_commit_is_tagged_when_a_merged_pr_is_linked(self):
+        # Only a commit with no linked PR waits: the age of one that has a PR is never consulted.
+        gh = sweep_github()
+        git = history(chain=("t8", "b"), times={"b": NOW - 60})
+        self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
+                         ["fleet-v9 -> b (ai-tc 0.9.15)"])
 
     def test_a_next_tag_that_already_exists_on_github_stops_the_sweep(self):
         gh = sweep_github()
