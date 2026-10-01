@@ -228,14 +228,16 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(vp.bot_hint(pull(**HUMAN), BOT), "")
 
 
-def bot_report(head_doc, *, base_doc=None, pr=None, changed=None, head_safety=None, tip=None, pins=None, verify_fn=verify):
+def bot_report(
+    head_doc, *, base_doc=None, pr=None, changed=None, base_safety=None, head_safety=None, tip=None, pins=None, verify_fn=verify
+):
     report = vp.Report()
     entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
     vp.bot_rules(
         pr or pull(),
         entries,
         dict(ts.PINS) if pins is None else pins,
-        copy.deepcopy(ts.SEED),
+        copy.deepcopy(ts.SEED) if base_safety is None else base_safety,
         copy.deepcopy(ts.SEED) if head_safety is None else head_safety,
         copy.deepcopy(ts.SEED) if tip is None else tip,
         sorted(changed if changed is not None else [rc.MANIFEST]),
@@ -349,7 +351,8 @@ class TestBotRules(unittest.TestCase):
         )
         self.assertEqual(report.failures, [])
         self.assertTrue(any(n.startswith("RE-IMPORT: 0.9.14") for n in report.notes))
-        self.assertIn(("Store migration", "not-rollback-safe (recorded)"), report.rows)
+        # The recorded class is stronger than the computed one, so it stands.
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes additive)"), report.rows)
 
     def test_a_reimport_that_rewrites_its_recorded_entry_fails(self):
         rewritten = copy.deepcopy(ts.SEED)
@@ -363,6 +366,66 @@ class TestBotRules(unittest.TestCase):
             head_safety=rewritten,
         )
         failed_with(self, report, "already records 0.9.14")
+
+    def recorded_forward(self, entry, **overrides):
+        """A forward PR for NEXT, which the base already records as `entry`; the file is left alone."""
+        recorded = {**ts.SEED, NEXT: entry}
+        kwargs = dict(base_safety=copy.deepcopy(recorded), head_safety=copy.deepcopy(recorded))
+        kwargs.update(overrides)
+        return bot_report(ts.manifest(NEXT), **kwargs)
+
+    def test_a_recorded_entry_weaker_than_the_computed_one_fails(self):
+        # validate computes not-rollback-safe for 0.9.15, so an entry that says additive was typed, not computed.
+        entry = {"classification": "additive", "from": ts.ATTESTED["0.9.14"], "to": ATTESTED[NEXT], "migrations": []}
+        report = self.recorded_forward(entry)
+        failed_with(self, report, "records 0.9.15 as additive, but validate computes not-rollback-safe (0036_migration)")
+        failed_with(self, report, "a code owner corrects the entry in a reviewed PR")
+
+    def test_a_recorded_entry_for_another_commit_fails(self):
+        entry = {**NEXT_ENTRY, "to": "2" * 40}
+        failed_with(self, self.recorded_forward(entry), f"records 0.9.15 up to commit `{'2' * 40}`, but 0.9.15's attested commit is `{'f' * 40}`")
+
+    def test_a_recorded_entry_that_matches_the_computation_passes(self):
+        report = self.recorded_forward(NEXT_ENTRY)
+        self.assertEqual(report.failures, [])
+        self.assertFalse(any(n.startswith("rollback-safety.json records") for n in report.notes), report.notes)
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes not-rollback-safe)"), report.rows)
+
+    def test_a_recorded_entry_stronger_than_the_computed_one_passes(self):
+        # Fail-safe: validate computes additive for 0.9.13, and the recorded not-rollback-safe stands.
+        report = bot_report(
+            ts.manifest("0.9.13"),
+            base_doc=ts.manifest("0.9.12"),
+            pr=pull(head_ref="bot/pin-ai-tc-0.9.13"),
+            pins={**ts.PINS, "main": "0.9.12"},
+            base_safety={**ts.SEED, "0.9.13": {**ts.SEED["0.9.13"], "classification": "not-rollback-safe"}},
+            head_safety={**ts.SEED, "0.9.13": {**ts.SEED["0.9.13"], "classification": "not-rollback-safe"}},
+        )
+        self.assertEqual(report.failures, [])
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes additive)"), report.rows)
+
+    def test_a_different_starting_commit_is_only_a_note(self):
+        entry = {**NEXT_ENTRY, "from": ts.ATTESTED["0.9.13"]}
+        report = self.recorded_forward(entry)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any("records 0.9.15 from commit" in n and "only the commit it runs up to" in n for n in report.notes), report.notes)
+
+    def test_an_outage_recomputing_a_recorded_entry_is_no_verdict(self):
+        def down_below(version):
+            if version == "0.9.14":
+                raise rc.InfraError("network", "down")
+            return verify(version)
+
+        with self.assertRaises(rc.InfraError):
+            self.recorded_forward(NEXT_ENTRY, verify_fn=down_below)
+
+    def test_a_release_that_cannot_be_recomputed_fails(self):
+        def gone_below(version):
+            if version == "0.9.14":
+                raise rc.ReleaseCheckError("dist", "npmjs does not serve 0.9.14")
+            return verify(version)
+
+        failed_with(self, self.recorded_forward(NEXT_ENTRY, verify_fn=gone_below), "could not compute 0.9.15's store-migration entry (dist)")
 
     def rollback(self, target="0.9.13", **overrides):
         kwargs = dict(pr=pull(head_ref=f"bot/rollback-ai-tc-0.9.14-to-{target}"), tip=copy.deepcopy(ADDITIVE_TIP))
