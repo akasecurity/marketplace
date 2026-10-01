@@ -466,6 +466,17 @@ class TestNpmAuditSignatures(unittest.TestCase):
         self.assertEqual(release.version, "0.9.14")
         self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
 
+    def test_the_default_audit_takes_the_judge_verify_release_hands_it(self):
+        # Every other test passes its own `audit`, so none of them reaches the function verify_release
+        # uses when it is given none. Its keyword-only defaults (the npm runner and the wait) are
+        # swapped for fakes, which leaves the call from verify_release to the real function as it is.
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+        with mock.patch.dict(rc.npm_audit_signatures.__kwdefaults__, {"run": run, "sleep": sleeps.append}):
+            release = rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), sleep=sleeps.append)
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
     def test_verify_release_refuses_a_release_that_is_never_indexed_after_one_install(self):
         run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False)))]), []
 
