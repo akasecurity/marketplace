@@ -77,11 +77,13 @@ def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
 
 
 def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep) -> dict | None:
-    """The PR whose merge commit is `sha`, or None. The association can lag a merge by seconds, so an
+    """The PR into main whose merge commit is `sha`, or None. A PR merged into another branch whose merge
+    commit later reached main is not main's merge. The association can lag a merge by seconds, so an
     empty answer is asked again before it stands."""
     for attempt in range(ASSOCIATION_ATTEMPTS):
         pulls = gh.get(gh.repo_path(f"commits/{sha}/pulls"))
-        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")]
+        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")
+                  and (p.get("base") or {}).get("ref") == "main"]
         if merged:
             return merged[0]
         if attempt < ASSOCIATION_ATTEMPTS - 1:
