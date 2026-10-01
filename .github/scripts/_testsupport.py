@@ -517,19 +517,28 @@ class Repo:
             git(self.path, "tag", "-a", name, "-m", message or name, rev)
 
 
+def scripted_audit(testcase, version, reports, sleep):
+    """An `audit` for verify_release that serves the scripted reports in order (the last one
+    repeats) through the production retry loop, so the waits and the number of audits are the
+    real ones. It stands in for npm_audit_signatures below the judge: nothing here installs
+    anything or checks a report's shape, so a malformed report reaches the judge as it is."""
+    queue = list(reports)
+
+    def audit(package, v, judge):
+        testcase.assertEqual((package, v), (rc.PACKAGE, version))
+        return rc._audit_until_judged(lambda: queue.pop(0) if len(queue) > 1 else queue[0], judge, sleep)
+
+    return audit
+
+
 class VerifyMixin:
     """verify() and its outcomes for a TestCase that drives release_checks.verify_release
     with a fake registry, a fake GitHub and a scripted npm audit."""
 
     def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
         fetch = FakeFetch(routes if routes is not None else release_routes(version))
-        queue = list(audits if audits is not None else [audit_output(version)])
-
-        def audit(package, v):
-            self.assertEqual((package, v), (rc.PACKAGE, version))
-            return queue.pop(0) if len(queue) > 1 else queue[0]
-
         recorded = sleeps if sleeps is not None else []
+        audit = scripted_audit(self, version, audits if audits is not None else [audit_output(version)], recorded.append)
         return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
 
     def refused(self, check, **kwargs):

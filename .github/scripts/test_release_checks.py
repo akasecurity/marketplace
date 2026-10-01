@@ -329,9 +329,10 @@ class TestNpmCandidates(unittest.TestCase):
 class FakeRun:
     """Stands in for subprocess.run, answering by npm sub-command."""
 
-    def __init__(self, *, install=(0,), audit=(1, "{}"), npm_version="11.19.0", hang=None):
+    def __init__(self, *, install=(0,), audit=(1, "{}"), audits=None, npm_version="11.19.0", hang=None):
         self.install = list(install)
         self.audit = audit
+        self.audits = None if audits is None else list(audits)  # (code, stdout) per audit; the last repeats
         self.npm_version = npm_version
         self.hang = hang
         self.calls = []
@@ -349,8 +350,14 @@ class FakeRun:
         if args[:2] == ["npm", "install"]:
             code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
             return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
-        code, out = self.audit
+        if self.audits is not None:
+            code, out = self.audits.pop(0) if len(self.audits) > 1 else self.audits[0]
+        else:
+            code, out = self.audit
         return subprocess.CompletedProcess(args, code, out, "")
+
+    def count(self, command):
+        return sum(1 for args, _ in self.calls if args[1] == command)
 
 
 class TestNpmAuditSignatures(unittest.TestCase):
@@ -366,10 +373,110 @@ class TestNpmAuditSignatures(unittest.TestCase):
         self.assertEqual(len(cwds), 1)
         self.assertNotEqual(cwds.pop(), os.getcwd())
 
-    def test_the_audit_asks_for_attestations(self):
+    def test_the_audit_asks_for_attestations_and_a_fresh_read_of_the_registry(self):
         run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
         rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
-        self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+        self.assertEqual(
+            run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations", "--prefer-online"]
+        )
+
+    def test_the_audit_is_the_part_that_is_repeated(self):
+        # Registry lag is waited out by auditing again, not by installing again: one scratch
+        # directory, one init, one version read and one install serve every audit.
+        good = (1, json.dumps(ts.audit_output("0.9.14")))
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        calls = []
+
+        def judge(report):
+            calls.append(report)
+            if len(calls) < 4:
+                raise rc._NotIndexedYet("not yet")
+            return "judged"
+
+        run, sleeps = FakeRun(audits=[unindexed, unindexed, unindexed, good]), []
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=judge)
+        self.assertEqual(result, "judged")
+        self.assertEqual([run.count(c) for c in ("init", "--version", "install", "audit")], [1, 1, 1, 4])
+        self.assertEqual(sleeps, [20, 20, 20])
+        self.assertEqual(len({cwd for _, cwd in run.calls}), 1)
+        self.assertEqual(calls[-1]["verified"][0]["version"], "0.9.14")
+
+    def test_every_audit_revalidates_npms_cache(self):
+        # The registry's packument is cacheable for five minutes, so an audit repeated 20 s later
+        # would read the same cached answer. --prefer-online makes each one ask the registry.
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        run = FakeRun(audits=[unindexed])
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None, judge=never)
+        audits = [args for args, _ in run.calls if args[1] == "audit"]
+        self.assertEqual(len(audits), 5)
+        self.assertTrue(all("--prefer-online" in args for args in audits))
+
+    def test_a_report_that_is_never_indexed_is_given_up_on_after_five_audits(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_nothing_printed_and_not_indexed_yet_share_one_budget_of_five_audits(self):
+        nothing = (1, "")
+        report = (1, json.dumps(ts.audit_output("0.9.14")))
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        for label, audits, expected in (
+            ("ends on a report", [nothing, report, nothing, report, report], rc._NotIndexedYet),
+            ("ends on nothing", [report, nothing, report, nothing, nothing], rc.InfraError),
+        ):
+            with self.subTest(label):
+                run, sleeps = FakeRun(audits=audits), []
+                with self.assertRaises(expected):
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+                self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_a_judgement_that_is_not_waiting_for_the_index_is_final(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def refuse(report):
+            raise rc.ReleaseCheckError("provenance", "no")
+
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=refuse)
+        self.assertEqual((run.count("audit"), sleeps), (1, []))
+
+    def test_verify_release_retries_through_one_install(self):
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        release = rc.verify_release(
+            "0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append
+        )
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
+    def test_verify_release_refuses_a_release_that_is_never_indexed_after_one_install(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False)))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "provenance")
+        self.assertIn("did not come from the release pipeline", caught.exception.detail)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
 
     def test_every_npm_call_carries_a_timeout(self):
         # install gets the longest: it fetches the tarball and its dependencies.
@@ -415,11 +522,12 @@ class TestNpmAuditSignatures(unittest.TestCase):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
 
     def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
-        sleeps = []
+        sleeps, run = [], FakeRun(audit=(1, ""))
         with self.assertRaises(rc.InfraError) as caught:
-            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "")), sleep=sleeps.append)
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
         self.assertEqual(caught.exception.check, "toolchain")
         self.assertEqual(sleeps, [20, 20, 20, 20])
+        self.assertEqual((run.count("install"), run.count("audit")), (1, 5))
 
     def test_a_late_audit_answer_is_used(self):
         answers = ["", "", json.dumps(ts.audit_output("0.9.14"))]
@@ -446,8 +554,8 @@ class TestNpmAuditSignatures(unittest.TestCase):
             rc.verify_release(
                 "0.9.14",
                 fetch=ts.FakeFetch(ts.release_routes("0.9.14")),
-                audit=lambda package, version: rc.npm_audit_signatures(
-                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None
+                audit=lambda package, version, judge: rc.npm_audit_signatures(
+                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None, judge=judge
                 ),
                 sleep=lambda s: None,
             )
@@ -521,13 +629,8 @@ class TestNpmAuditSignatures(unittest.TestCase):
 class TestVerifyRelease(unittest.TestCase):
     def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
         fetch = ts.FakeFetch(routes if routes is not None else ts.release_routes(version))
-        queue = list(audits if audits is not None else [ts.audit_output(version)])
-
-        def audit(package, v):
-            self.assertEqual((package, v), (rc.PACKAGE, version))
-            return queue.pop(0) if len(queue) > 1 else queue[0]
-
         recorded = sleeps if sleeps is not None else []
+        audit = ts.scripted_audit(self, version, audits if audits is not None else [ts.audit_output(version)], recorded.append)
         return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
 
     def refused(self, check, **kwargs):
@@ -613,7 +716,7 @@ class TestVerifyRelease(unittest.TestCase):
     def test_a_non_exact_version_is_refused_before_any_request(self):
         fetch = ts.FakeFetch()
         with self.assertRaises(rc.ReleaseCheckError) as caught:
-            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v: {}, sleep=lambda s: None)
+            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v, judge: {}, sleep=lambda s: None)
         self.assertEqual((caught.exception.check, fetch.calls), ("version", []))
 
     def test_registry_lag_is_retried(self):
