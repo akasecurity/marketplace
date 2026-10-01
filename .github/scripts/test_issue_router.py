@@ -31,6 +31,11 @@ def existing(detail="npm has 0.9.15, unpinned for 25 hours", *, last="2026-10-01
             "assignees": [{"login": login} for login in assignees]}
 
 
+def cleared_issue(cleared="2026-10-01T09:00:00Z", **kwargs):
+    """An issue the router closed at `cleared`: closed, last updated then, and carrying the marker it leaves."""
+    return dict(existing(extra=rt.marker("cleared", cleared), **kwargs), state="closed", updated_at=cleared)
+
+
 class RouterCase(unittest.TestCase):
     def setUp(self):
         self.issues = []
@@ -45,10 +50,12 @@ class RouterCase(unittest.TestCase):
 
     def listed(self, body, params):
         """GitHub's issue list as the router asks for it: a filter that is not sent filters nothing, the state
-        defaults to open, and a fixture without a `state` is open and one without a `user` was filed by the
+        defaults to open, `since` keeps the issues updated after it (a fixture with no `updated_at` always
+        qualifies), and a fixture without a `state` is open and one without a `user` was filed by the
         workflow's token."""
         return [issue for issue in self.issues
                 if issue.get("state", "open") == params.get("state", "open")
+                and issue.get("updated_at", params.get("since", "")) >= params.get("since", "")
                 and ("creator" not in params or issue.get("user", {"login": rt.ACTIONS_BOT})["login"] == params["creator"])
                 and ("labels" not in params or any(label["name"] == params["labels"] for label in issue["labels"]))]
 
@@ -127,7 +134,80 @@ class TestRouter(RouterCase):
         self.issues.append(existing())
         cleared = rt.Result(rule="staleness-i", label="staleness", title="t", red=False)
         self.assertEqual(self.router().apply(cleared), "staleness-i: cleared; closed #40")
-        self.assertEqual(self.gh.called("PATCH", R("issues/40"))[0][2], {"state": "closed", "state_reason": "completed"})
+        patches = self.gh.called("PATCH", R("issues/40"))
+        self.assertEqual(len(patches), 1)
+        closed = patches[0][2]
+        self.assertEqual((closed["state"], closed["state_reason"]), ("closed", "completed"))
+        # The marker goes in the same edit as the close, and the rest of the body is as it was.
+        self.assertEqual(rt.read_marker(closed["body"], "cleared"), "2026-10-01T12:00:00Z")
+        self.assertEqual(rt.drop_marker(closed["body"], "cleared"), self.issues[0]["body"])
+
+    def test_a_rule_red_again_within_48_hours_reopens_its_issue(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+        self.assertEqual(self.gh.called("POST", R("issues")), [])
+        looked = self.gh.called("GET", R("issues"))[-1][3]
+        self.assertEqual((looked["state"], looked["creator"], looked["since"]),
+                         ("closed", "github-actions[bot]", "2026-09-29T12:00:00Z"))
+        patched = self.gh.called("PATCH", R("issues/40"))[0][2]
+        self.assertEqual((patched["state"], patched["state_reason"]), ("open", "reopened"))
+        self.assertEqual(rt.read_marker(patched["body"], "state"), rt.digest(red().detail))
+        self.assertEqual(rt.read_marker(patched["body"], "last-comment"), "2026-10-01T12:00:00Z")
+        self.assertEqual(rt.read_marker(patched["body"], "rule"), "staleness-i")
+        comments = self.gh.called("POST", R("issues/40/comments"))
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Red again at 2026-10-01T12:00:00Z (cleared at 2026-10-01T09:00:00Z)", comments[0][2]["body"])
+        self.assertIn("npm has 0.9.15", comments[0][2]["body"])
+        self.assertIn(RUN, comments[0][2]["body"])
+
+    def test_a_rule_red_again_after_48_hours_opens_a_new_issue(self):
+        # 49 hours ago. The listing may still return the issue (a comment since then moves its update time),
+        # so the marker, not only the listing's window, rules it out.
+        for label, updated in (("untouched since", "2026-09-29T11:00:00Z"), ("commented on since", "2026-10-01T08:00:00Z")):
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [dict(cleared_issue("2026-09-29T11:00:00Z"), updated_at=updated)]
+                self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+                self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+
+    def test_an_issue_a_person_closed_is_not_reopened(self):
+        person_closed = dict(existing(), state="closed", updated_at="2026-10-01T11:00:00Z")
+        cases = {
+            "no cleared marker": person_closed,
+            "an unreadable one": dict(cleared_issue("not a time")),
+            "one without a zone": dict(cleared_issue("2026-10-01T09:00:00")),
+            "filed by a person": dict(cleared_issue(), user={"login": "some-writer"}),
+        }
+        for label, issue in cases.items():
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [issue]
+                self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+                self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+
+    def test_a_reopened_issue_a_person_then_closes_stays_closed(self):
+        self.issues.append(cleared_issue())
+        self.router().apply(red())
+        reopened = self.gh.called("PATCH", R("issues/40"))[0][2]["body"]
+        self.assertIsNone(rt.read_marker(reopened, "cleared"))
+        self.gh.calls.clear()
+        self.issues[:] = [dict(existing(), body=reopened, state="closed", updated_at="2026-10-01T11:30:00Z")]
+        self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+
+    def test_a_result_the_router_never_closes_does_not_look_for_a_cleared_issue(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red(auto_close=False)), "staleness-i: opened #41")
+        self.assertEqual([call[3]["state"] for call in self.gh.called("GET", R("issues"))], ["open"])
+
+    def test_the_issue_cleared_last_is_the_one_reopened(self):
+        self.issues[:] = [dict(cleared_issue("2026-09-30T16:00:00Z"), number=39), cleared_issue("2026-10-01T09:00:00Z")]
+        self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+
+    def test_the_original_creation_time_still_drives_escalation_after_a_reopen(self):
+        self.issues.append(cleared_issue(created="2026-09-28T10:00:00Z"))
+        outcome = self.router(escalation="org-owner-example").apply(red())
+        self.assertEqual(outcome, "staleness-i: red again; reopened #40, escalated")
+        self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["org-owner-example"]})
 
     def test_a_rule_a_person_closes_is_never_closed_by_the_router(self):
         self.issues.append(existing())
