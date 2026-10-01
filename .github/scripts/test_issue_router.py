@@ -96,22 +96,25 @@ class TestRouter(RouterCase):
         self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
         self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["org-owner-example"]})
 
+    def carry_edits_to_the_issue(self):
+        """What GitHub keeps between two runs: the issue's body as the router last edited it. Nobody is
+        assigned in the fake, which is the owner having taken themselves off the issue."""
+        for call in self.gh.called("PATCH", R("issues/40")):
+            self.issues[0] = dict(self.issues[0], body=call[2].get("body", self.issues[0]["body"]))
+        self.gh.calls.clear()
+
     def test_the_escalation_owner_is_assigned_once_even_if_unassigned(self):
         self.issues.append(existing(created="2026-09-29T11:00:00Z"))
         self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
-        noted = self.gh.called("PATCH", R("issues/40"))[0][2]["body"]
-        self.assertEqual(rt.read_marker(noted, "escalated"), "org-owner-example")
-        # The owner takes themselves off the issue. The next run must neither assign nor comment again.
-        self.issues[0] = dict(self.issues[0], body=noted)
-        self.gh.calls.clear()
+        self.carry_edits_to_the_issue()
         self.assertEqual(self.router(escalation="org-owner-example").apply(red()), "staleness-i: #40 unchanged")
         self.assertEqual(self.gh.writes(), [])
+        self.assertEqual(rt.read_marker(self.issues[0]["body"], "escalated"), "org-owner-example")
 
     def test_a_new_escalation_owner_is_assigned_in_turn(self):
         self.issues.append(existing(created="2026-09-29T11:00:00Z"))
         self.router(escalation="org-owner-example").apply(red())
-        self.issues[0] = dict(self.issues[0], body=self.gh.called("PATCH", R("issues/40"))[0][2]["body"])
-        self.gh.calls.clear()
+        self.carry_edits_to_the_issue()
         self.assertIn("escalated", self.router(escalation="next-owner-example").apply(red()))
         self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["next-owner-example"]})
 
