@@ -94,6 +94,17 @@ class TestRuleI(StalenessCase):
         self.assertIn("provenance: ref refs/heads/release", refused.detail)
         self.assertNotIn("0.9.17", refused.detail)
 
+    def test_the_refused_detail_says_the_signing_certificate_names_the_branch(self):
+        # Who signed a release is read from the signing certificate, not from the statement the
+        # publisher wrote, so the explanation for a branch publish must name the certificate.
+        self.candidates = ["0.9.16"]
+        self.bad = {"0.9.16": ("provenance", "ref refs/heads/release")}
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=3))}
+        refused = self.rules()["staleness-i-refused"]
+        self.assertTrue(refused.red)
+        self.assertIn("its signing certificate names a branch, not the version's tag", refused.detail)
+        self.assertNotIn("its attestation binds", refused.detail)
+
     def test_nothing_new_on_npm_is_green(self):
         rules = self.rules()
         self.assertFalse(rules["staleness-i"].red)

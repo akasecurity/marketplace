@@ -125,8 +125,9 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
                    "import-plugin-release run."),
             result("staleness-i-refused", True if refused else (None if undecided else False),
                    f"npm has versions above `{highest}` that the importer refuses:\n" + "\n".join(refused)
-                   + "\n\nA version published from a branch can never pass (its attestation binds a branch, not "
-                   "the version's tag). If npm `latest` names one, the runbook's dist-tag step moves it back."),
+                   + "\n\nA version published from a branch can never pass (its signing certificate names a "
+                   "branch, not the version's tag). If npm `latest` names one, the runbook's dist-tag step moves "
+                   "it back."),
             result("staleness-i-no-verdict", bool(unverified),
                    f"The release checks could not finish on npm versions above `{highest}`: a registry, network, "
                    "npm or GitHub API failure, which is no verdict on the release:\n" + "\n".join(unverified)
