@@ -261,12 +261,15 @@ def _manifest_at(repo_dir: str, rev: str):
 
 
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient about content: a tag whose manifest does not
-    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
-    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
-    dropping that tag's pin would hide a version from the candidate and rollback floors."""
+    """What a historical tag pins. Lenient about content: a tag at a commit with no manifest
+    file (tag-release cuts those as "entry removed"), or whose manifest does not parse, or
+    does not pin the package exactly once, pins nothing. NOT lenient about the read itself:
+    a git failure (a missing object, an unfetched blob) is InfraError, since dropping that
+    tag's pin would hide a version from the candidate and rollback floors."""
     try:
-        doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
+        doc = _manifest_at(repo_dir, f"refs/tags/{tag}")
+        if doc is None:
+            return None
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
     except InfraError:
         raise
