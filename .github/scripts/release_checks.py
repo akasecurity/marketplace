@@ -249,6 +249,17 @@ def _read_manifest(repo_dir: str, rev: str):
     return parse_json(_git(repo_dir, "show", f"{rev}:{MANIFEST}"))
 
 
+def _manifest_at(repo_dir: str, rev: str):
+    """The manifest at rev, or None when rev's tree holds no such file. The tree is listed
+    first so that "the file is not there" (a commit that removed it, which tag-release
+    records as "entry removed") is told apart from "git could not read it" (a missing
+    object, an unfetched blob), which is InfraError. ls-tree exits 0 with no output for an
+    absent path and non-zero for a revision it cannot find."""
+    if not _git(repo_dir, "ls-tree", "--name-only", rev, "--", MANIFEST).strip():
+        return None
+    return _read_manifest(repo_dir, rev)
+
+
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
     """What a historical tag pins. Lenient about content: a tag whose manifest does not
     parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
@@ -1433,6 +1444,19 @@ def _tag_rows(path: str, label: str, problems: list):
     return rows
 
 
+def _github_json(url: str, body: bytes, kind: type):
+    """The JSON document a 200 answer from GitHub carries, which must be a `kind` (dict or
+    list). GitHub answered, but not with this document: that is no verdict about the repository,
+    never a finding in it."""
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("api", f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(document, kind):
+        raise InfraError("api", f"GET {url} did not answer a JSON {'object' if kind is dict else 'list'}")
+    return document
+
+
 def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     """The checks for a tag cut after the frozen list, i.e. by tag-release."""
     problems = []
@@ -1446,7 +1470,8 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     if message["subject"] != f"{name}: ai-tc {recorded}":
         problems.append(f"{name}'s subject {message['subject']!r} is not '{name}: ai-tc <version>'")
     try:
-        entry = find_ai_tc_entry(_read_manifest(repo_dir, commit))
+        manifest = _manifest_at(repo_dir, commit)
+        entry = None if manifest is None else find_ai_tc_entry(manifest)
         expected = "entry removed" if entry is None else entry_version(entry)
     except (ReleaseCheckError, ValueError) as exc:
         expected = f"an unreadable manifest ({exc})"
@@ -1456,12 +1481,17 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     if number is None:
         problems.append(f"{name} names no PR (a 'pr: <number>' line)")
         return problems
-    status, body = fetch(f"{MARKETPLACE_API}/pulls/{number.group(1)}", {})
-    if status != 200:
-        problems.append(f"{name}: GET pull {number.group(1)} answered {status}")
+    url = f"{MARKETPLACE_API}/pulls/{number.group(1)}"
+    status, body = fetch(url, {})
+    if status == 404:
+        # The one answer that is a finding: a tag naming a PR that is not there was cut outside tag-release.
+        problems.append(f"{name} names PR #{number.group(1)}, which does not exist")
         return problems
-    pull = json.loads(body)
-    author = (pull.get("user") or {}).get("login")
+    if status != 200:
+        raise InfraError("api", f"GET {url} answered {status}")
+    pull = _github_json(url, body, dict)
+    user = pull.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
     if BOT_LOGIN is None:
         problems.append(f"{name}: no bot identity is configured (release_checks.BOT_LOGIN), so no tag after the frozen list can be confirmed")
     elif author != BOT_LOGIN:
@@ -1495,22 +1525,28 @@ def _main_ruleset_problems(rules: dict) -> list:
 
 
 def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
-    """Every expected ruleset exists, is active, targets the right refs and has its rules."""
-    status, body = fetch(f"{MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100", {})
+    """Every expected ruleset exists, is active, targets the right refs and has its rules.
+    A read of GitHub that fails, or that answers something other than the document asked
+    for, is InfraError: no verdict. It is never reported as a ruleset that is missing."""
+    url = f"{MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"
+    status, body = fetch(url, {})
     if status != 200:
-        return [f"could not list the repository's rulesets (HTTP {status})"]
-    listed = {r.get("name"): r for r in json.loads(body) if isinstance(r, dict)}
+        raise InfraError("api", f"GET {url} answered {status}")
+    listing = _github_json(url, body, list)
+    if not all(isinstance(r, dict) for r in listing):
+        raise InfraError("api", f"GET {url} listed an entry that is not a ruleset")
+    listed = {r.get("name"): r for r in listing}
     problems = []
     for name, (target, rule_types) in EXPECTED_RULESETS.items():
         summary = listed.get(name)
         if summary is None:
             problems.append(f"ruleset {name!r} does not exist")
             continue
-        status, body = fetch(f"{MARKETPLACE_API}/rulesets/{summary.get('id')}", {})
+        url = f"{MARKETPLACE_API}/rulesets/{summary.get('id')}"
+        status, body = fetch(url, {})
         if status != 200:
-            problems.append(f"ruleset {name!r}: GET answered {status}")
-            continue
-        ruleset = json.loads(body)
+            raise InfraError("api", f"GET {url} answered {status}")
+        ruleset = _github_json(url, body, dict)
         if ruleset.get("enforcement") != "active":
             problems.append(f"ruleset {name!r} is {ruleset.get('enforcement')!r}, not active")
         if ruleset.get("target") != target:
@@ -1535,7 +1571,9 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
 
 def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
     """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
-    detection, not prevention: the rulesets prevent, and this notices when one was edited."""
+    detection, not prevention: the rulesets prevent, and this notices when one was edited.
+    A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
+    verdict, and a problem would file a drift that did not happen."""
     problems = []
     current = {row["tag"]: row for row in snapshot_tags(repo_dir)}
     for name in _git(repo_dir, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags").split():

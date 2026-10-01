@@ -1350,6 +1350,35 @@ class TestAuditTags(unittest.TestCase):
         self.tag_at(self.repo.commit(doc), "entry removed", 4)
         self.assertEqual(self.audit(), [])
 
+    def drop_the_manifest(self):
+        ts.git(self.repo.path, "rm", "-q", rc.MANIFEST)
+        ts.git(self.repo.path, "commit", "-q", "-m", "drop the manifest")
+        return self.repo.head()
+
+    def test_a_tag_at_a_commit_without_the_manifest_records_entry_removed(self):
+        # tag-release cuts a tag at a commit that holds no manifest as "entry removed", so the
+        # audit reads that commit the same way. It is not a failure of git.
+        self.tag_at(self.drop_the_manifest(), "entry removed", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_tag_at_a_commit_without_the_manifest_must_still_record_entry_removed(self):
+        self.tag_at(self.drop_the_manifest(), "0.9.10", 4)
+        self.assertEqual(
+            self.audit(),
+            ["fleet-v4 records version '0.9.10', but the manifest at its commit pins 'entry removed'"],
+        )
+
+    def test_a_manifest_object_git_cannot_read_is_no_verdict_not_drift(self):
+        # The tree lists the file and the blob is gone: git failed, which says nothing about the tag.
+        commit = self.cut("0.9.10", 4)
+        blob = ts.git(self.repo.path, "rev-parse", f"{commit}:{rc.MANIFEST}").strip()
+        loose = os.path.join(self.repo.path, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
     def test_a_tag_that_misstates_the_version_is_caught(self):
         self.cut("0.9.10", 4, recorded="0.9.11")
         self.assertTrue(any("records version '0.9.11'" in p for p in self.audit()))
@@ -1382,6 +1411,45 @@ class TestAuditTags(unittest.TestCase):
     def test_a_different_merge_commit_is_caught(self):
         self.cut("0.9.10", 4, merge_commit="d" * 40)
         self.assertTrue(any("is not merged with" in p for p in self.audit()))
+
+    def pull_answer(self, answer, number=12):
+        self.fetch.routes[f"{rc.MARKETPLACE_API}/pulls/{number}"] = answer
+
+    def test_a_tag_naming_a_pull_request_that_does_not_exist_is_caught(self):
+        self.cut("0.9.10", 4)
+        self.pull_answer((404, {"message": "Not Found"}))
+        self.assertEqual(self.audit(), ["fleet-v4 names PR #12, which does not exist"])
+
+    def test_a_pull_request_read_that_fails_is_no_verdict_not_drift(self):
+        self.cut("0.9.10", 4)
+        for status in (401, 403, 429, 500, 502):
+            with self.subTest(status=status):
+                self.pull_answer((status, {"message": "no"}))
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+                self.assertIn(str(status), caught.exception.detail)
+
+    def test_a_pull_request_answer_that_is_not_a_json_object_is_no_verdict(self):
+        self.cut("0.9.10", 4)
+        for label, answer in (
+            ("not JSON", (200, b"<html>")),
+            ("a list", (200, [])),
+            ("a string", (200, b'"merged"')),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'{"merged_at": null, "merged_at": "2026-10-01T00:00:00Z"}')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+        ):
+            with self.subTest(answer=label):
+                self.pull_answer(answer)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+
+    def test_a_pull_request_whose_author_is_not_an_object_is_not_the_bot(self):
+        commit = self.cut("0.9.10", 4)
+        self.pull_answer((200, {"user": "the-bot", "merged_at": "2026-10-01T00:00:00Z", "merge_commit_sha": commit}))
+        self.assertTrue(any("was opened by None, not the bot App" in p for p in self.audit()))
 
     def test_no_bot_identity_confirms_no_new_tag(self):
         self.cut("0.9.10", 4)
@@ -1513,9 +1581,47 @@ class TestAuditRulesets(unittest.TestCase):
             ],
         )
 
-    def test_an_unlistable_repository_is_a_problem(self):
-        fetch = ts.FakeFetch({f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100": (403, b"")})
-        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["could not list the repository's rulesets (HTTP 403)"])
+    LISTING = f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"
+
+    def no_verdict(self, routes):
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+        self.assertEqual(caught.exception.check, "api")
+        return caught.exception
+
+    def test_a_listing_that_fails_is_no_verdict_not_drift(self):
+        # A 403 or a 502 says nothing about the rulesets, so it must not read as "every ruleset is missing".
+        for status in (401, 403, 404, 429, 500, 502):
+            with self.subTest(status=status):
+                error = self.no_verdict({self.LISTING: (status, b"")})
+                self.assertIn(str(status), error.detail)
+
+    def test_a_listing_that_is_not_a_json_list_is_no_verdict(self):
+        # Iterating a JSON object visits its keys, so every ruleset used to read as missing.
+        for label, answer in (
+            ("an object", (200, {})),
+            ("an object with a message", (200, {"message": "Server Error"})),
+            ("not JSON", (200, b"<html>")),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'[{"name": "main", "name": "other"}]')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+            ("entries that are not objects", (200, ["main", 3])),
+        ):
+            with self.subTest(listing=label):
+                self.no_verdict(ruleset_routes() | {self.LISTING: answer})
+
+    def test_a_ruleset_read_that_fails_is_no_verdict_not_drift(self):
+        for status in (403, 404, 500, 502):
+            with self.subTest(status=status):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/3"] = (status, b"")
+                error = self.no_verdict(routes)
+                self.assertIn(str(status), error.detail)
+
+    def test_a_ruleset_answer_that_is_not_a_json_object_is_no_verdict(self):
+        for label, answer in (("a list", (200, [])), ("not JSON", (200, b"<html>")), ("null", (200, b"null"))):
+            with self.subTest(ruleset=label):
+                self.no_verdict(ruleset_routes() | {f"{rc.MARKETPLACE_API}/rulesets/3": answer})
 
 
 def cli(*argv):
