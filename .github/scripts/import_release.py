@@ -274,6 +274,27 @@ def facts(release: Any) -> dict:
             "git_commit": release.git_commit, "run_url": release.run_url}
 
 
+def check_recorded_entry(version: str, recorded: Any, computed: dict) -> None:
+    """Refuse, red, a version whose entry on main validate would fail on the pin PR.
+
+    validate recomputes a recorded entry the same way (validate_pr._recorded_entry_rules): the commit
+    it runs up to must be the release's attested commit, and a class weaker than the computed one is
+    wrong. A stronger class stands, and a different starting commit is only a note there (the highest
+    pinned version below a release moves after a re-import of a lower one), so neither is checked."""
+    problems = release_checks.safety_problems({"versions": {version: recorded}})
+    if problems:
+        raise Refused(f"main's {SAFETY_FILE} entry for {version} is malformed ({problems[0]}); validate would "
+                      "fail the pin PR, so a code owner corrects the entry in a reviewed PR first")
+    if recorded["to"] != computed["to"]:
+        raise Refused(f"main's {SAFETY_FILE} records {version} up to commit {recorded['to']}, but its attested "
+                      f"commit is {computed['to']}; validate would fail the pin PR, so a code owner corrects the "
+                      "entry in a reviewed PR first")
+    if recorded["classification"] == "additive" and computed["classification"] == "not-rollback-safe":
+        raise Refused(f"main's {SAFETY_FILE} records {version} as additive, but the importer computes "
+                      f"not-rollback-safe ({', '.join(computed['migrations']) or 'none'}); validate would fail "
+                      "the pin PR, so a code owner corrects the entry in a reviewed PR first")
+
+
 def plan_forward(ctx: Context) -> dict:
     scheduled = ctx.event == "schedule"
     if ctx.current is None:
@@ -332,22 +353,26 @@ def plan_forward(ctx: Context) -> dict:
             raise Refused(f"a bot PR for {version} (#{closed[0]['number']}) was closed unmerged; that rejection "
                           "stands until a dispatch with reimport: true", red=not scheduled)
     known = ctx.safety.get("versions", {})
+    # Computed whether or not main already records the version, by the computation validate repeats
+    # (release_checks.safety_entry): the migrations since the highest version main or a fleet-v tag
+    # has pinned below this one, which after a rollback is the release rolled back from, not main's
+    # pin. The candidate is not re-verified.
+    try:
+        computed = release_checks.safety_entry(
+            version, pinned,
+            verify=lambda v: release if v == version else release_checks.verify_release(v),
+            classify=release_checks.classify_migrations)
+    except release_checks.InfraError as error:
+        raise Refused(f"no verdict computing {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
+    except release_checks.ReleaseCheckError as error:
+        raise Refused(f"could not compute {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
     if version in known:
-        classification = known[version].get("classification", "unknown")
-        migrations, safety_entry = list(known[version].get("migrations", [])), None
+        # An entry already on main is shown and left alone, but not taken on trust: it may have been
+        # typed in for a release nobody classified.
+        check_recorded_entry(version, known[version], computed)
+        classification, migrations, safety_entry = known[version]["classification"], list(known[version]["migrations"]), None
     else:
-        # The same computation validate repeats (release_checks.safety_entry): the migrations since
-        # the highest version main or a fleet-v tag has pinned below this one, which after a
-        # rollback is the release rolled back from, not main's pin. The candidate is not re-verified.
-        try:
-            safety_entry = release_checks.safety_entry(
-                version, pinned,
-                verify=lambda v: release if v == version else release_checks.verify_release(v),
-                classify=release_checks.classify_migrations)
-        except release_checks.InfraError as error:
-            raise Refused(f"no verdict computing {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
-        except release_checks.ReleaseCheckError as error:
-            raise Refused(f"could not compute {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
+        safety_entry = computed
         classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
     return {**facts(release), "branch": branch, "title": f"feat: advance the ai-tc pin to {version}",
             "labels": [], "classification": classification, "migrations": migrations,
