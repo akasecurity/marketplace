@@ -564,18 +564,25 @@ def supersede_lower(gh: GitHub, plan: dict, number: int) -> list[int]:
     return closed
 
 
+def disable_auto_merge(gh: GitHub, pr: dict) -> bool:
+    """Turn auto-merge off on `pr`; True once it is off. The mutation answers an error when auto-merge was
+    never on (another run's hold got there first), so after an error the PR's own autoMergeRequest decides."""
+    try:
+        gh.graphql(AUTO_MERGE_OFF, {"id": pr["node_id"]})
+    except GitHubError:
+        owner, name = gh.repo.split("/", 1)
+        state = gh.graphql(AUTO_MERGE_STATE, {"owner": owner, "name": name, "number": pr["number"]})
+        return state["repository"]["pullRequest"]["autoMergeRequest"] is None
+    return True
+
+
 def hold_forward(gh: GitHub, number: int, kind: str = "rollback") -> list[int]:
     """Turn auto-merge off on every open forward pin PR while a rollback (or remove) PR is open."""
-    owner, name = gh.repo.split("/", 1)
     held = []
     for other in pulls_by(bot_pulls(list_pulls(gh, "open")), PIN_BRANCH):
-        try:
-            gh.graphql(AUTO_MERGE_OFF, {"id": other["node_id"]})
-        except GitHubError:
-            state = gh.graphql(AUTO_MERGE_STATE, {"owner": owner, "name": name, "number": other["number"]})
-            if state["repository"]["pullRequest"]["autoMergeRequest"] is not None:
-                raise Refused(f"could not turn off auto-merge on forward pin PR #{other['number']} while {kind} "
-                              f"PR #{number} is open; turn it off by hand")
+        if not disable_auto_merge(gh, other):
+            raise Refused(f"could not turn off auto-merge on forward pin PR #{other['number']} while {kind} "
+                          f"PR #{number} is open; turn it off by hand")
         comment(gh, other["number"], f"Auto-merge is off: {kind} PR #{number} is open. If it merges, this PR "
                 "conflicts: close it and dispatch import-plugin-release with this version as `target` and "
                 "`reimport: true` to reopen it on the new `main` (it then needs a fresh approval).")
@@ -603,6 +610,19 @@ def after_forward(gh: GitHub, plan: dict, pr: dict) -> str:
         return (f"opened #{pr['number']} without auto-merge (rollback PR #{rollbacks[0]['number']} is open); "
                 f"superseded {closed}")
     enable_auto_merge(gh, pr)
+    # The check above and the enable are not one step, and a rollback run has its own concurrency group.
+    # A rollback run opens its PR before it holds the forward PRs, so look again: if its hold ran before
+    # the enable, its PR is listed now; if after, its hold turned this PR's auto-merge off itself.
+    meanwhile = pulls_by(bot_pulls(list_pulls(gh, "open")), ROLLBACK_BRANCH)
+    if meanwhile:
+        late = meanwhile[0]["number"]
+        if not disable_auto_merge(gh, pr):
+            raise Refused(f"rollback PR #{late} opened while auto-merge was being enabled on #{pr['number']}, and "
+                          "auto-merge could not be turned off again; turn it off by hand")
+        comment(gh, pr["number"], f"Auto-merge is off: rollback PR #{late} opened while it was being enabled. Once it "
+                "resolves, enable auto-merge here, or close this PR and dispatch the import with `reimport: true`.")
+        return (f"opened #{pr['number']}; auto-merge turned off again: rollback PR #{late} opened meanwhile; "
+                f"superseded {closed}")
     return f"opened #{pr['number']} with auto-merge (squash); superseded {closed}"
 
 

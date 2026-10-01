@@ -683,6 +683,43 @@ class TestOpenPrForward(OpenPrCase):
         self.assertIn("rollback PR #5", self.gh.called("POST", R("issues/12/comments"))[0][2]["body"])
         self.assertEqual(self.gh.called("PATCH", R("pulls/5")), [])
 
+    def enable_while_a_rollback_opens(self):
+        """The enable route of a PR whose rollback run opened its PR just before the forward run's second look."""
+        def enable(variables, params):
+            self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
+            return {"enablePullRequestAutoMerge": {"pullRequest": {"number": 12}}}
+
+        self.gh.routes[("GRAPHQL", "enablePullRequestAutoMerge")] = enable
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = {"disablePullRequestAutoMerge": {"pullRequest": {"number": 12}}}
+
+    def test_a_rollback_opened_while_auto_merge_was_enabled_turns_it_off_again(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.assertEqual(self.open(forward_plan()), "opened #12; auto-merge turned off again: rollback PR #5 opened "
+                                                    "meanwhile; superseded []")
+        self.assertEqual([call[1] for call in self.gh.calls if call[0] == "GRAPHQL"],
+                         ["enablePullRequestAutoMerge", "disablePullRequestAutoMerge"])
+        self.assertEqual(self.gh.called("GRAPHQL", "disablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
+        self.assertIn("rollback PR #5", self.gh.called("POST", R("issues/12/comments"))[0][2]["body"])
+
+    def test_turning_it_off_when_it_is_already_off_is_not_red(self):
+        # The rollback run's own hold got there first, so the mutation answers an error and the PR has no request.
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "not enabled")
+        self.gh.routes[("GRAPHQL", "repository")] = {"repository": {"pullRequest": {"autoMergeRequest": None}}}
+        self.assertIn("auto-merge turned off again", self.open(forward_plan()))
+
+    def test_auto_merge_that_cannot_be_turned_off_again_is_red(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "forbidden")
+        self.gh.routes[("GRAPHQL", "repository")] = {"repository": {"pullRequest": {"autoMergeRequest": {"enabledAt": "2026-09-29T00:00:00Z"}}}}
+        with self.assertRaisesRegex(ir.Refused, "rollback PR #5 opened while auto-merge was being enabled on #12, "
+                                                "and auto-merge could not be turned off again") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
+
     def test_an_existing_branch_with_an_open_pr_is_a_green_skip_with_no_writes(self):
         self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15"))
