@@ -9,7 +9,10 @@ re-reads main through the API, writes the bot commit through the Git Data API
 ref, never a force-push (an existing branch with an open PR is skipped; one with no
 open PR is skipped on a plain forward run, and deleted and created again only by a
 reimport or rollback dispatch), opens the PR and enables
-auto-merge. AGENTS.md ("ai-tc is pinned", "The workflows") describes the flow.
+auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
+GitHub API failure) stops the plan red, and the importer never falls back to a lower
+version while a higher one has no verdict. AGENTS.md ("ai-tc is pinned", "The workflows")
+describes the flow.
 """
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ def load_stable(raw: str, path: str) -> dict:
 
 
 def describe(error: Exception) -> str:
-    """A release_checks.ReleaseCheckError as '<check>: <detail>'."""
+    """A release_checks.ReleaseCheckError or InfraError as '<check>: <detail>'."""
     return f"{getattr(error, 'check', 'check')}: {getattr(error, 'detail', error)}"
 
 
@@ -259,6 +262,9 @@ class Context:
 def verify(version: str) -> Any:
     try:
         return release_checks.verify_release(version)
+    except release_checks.InfraError as error:
+        raise Refused(f"no verdict on {version}: {describe(error)} (a registry, network, npm or GitHub API "
+                      "failure, not a verdict on the release; the next run or a re-dispatch retries)") from error
     except release_checks.ReleaseCheckError as error:
         raise Refused(f"{version} fails the release checks: {describe(error)}") from error
 
@@ -297,6 +303,16 @@ def plan_forward(ctx: Context) -> dict:
             try:
                 release = release_checks.verify_release(candidate)
                 break
+            except release_checks.InfraError as error:
+                # A version the checks could not reach a verdict on is not a version they refused. Falling
+                # back to a lower one would pin an older release while a newer one might be the real
+                # newest, and ending quietly would read as "nothing new". So stop, red, and let the next
+                # run try again. A dispatch naming a lower target that is still above every pin imports
+                # that release meanwhile, since that path reads no candidate list; the scheduled run stays
+                # red until a higher release passes.
+                raise Refused(f"no verdict on {candidate}: {describe(error)}. The importer takes the highest "
+                              "release that passes and does not fall back to a lower one while a higher one "
+                              "has no verdict; the next run retries.") from error
             except release_checks.ReleaseCheckError as error:
                 refused.append({"version": candidate, "reason": describe(error)})
                 print(f"::warning::npm has {candidate}, which the importer refuses: {describe(error)}")
@@ -328,6 +344,8 @@ def plan_forward(ctx: Context) -> dict:
                 version, pinned,
                 verify=lambda v: release if v == version else release_checks.verify_release(v),
                 classify=release_checks.classify_migrations)
+        except release_checks.InfraError as error:
+            raise Refused(f"no verdict computing {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
         except release_checks.ReleaseCheckError as error:
             raise Refused(f"could not compute {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
         classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
@@ -631,6 +649,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             write_output("proceed", "false")
         return 1 if refusal.red else 0
+    except (release_checks.InfraError, release_checks.ReleaseCheckError) as error:
+        # A call into release_checks that no planner wraps (the npm version list, the pins, the tag
+        # ledger, the rollback floor) ends here as one annotation and `proceed=false`, which skips
+        # open-pr: red, as before, but one line in the run instead of a traceback.
+        print(f"::error::{describe(error)}")
+        if args.command == "plan":
+            write_output("proceed", "false")
+        return 1
     return 0
 
 
