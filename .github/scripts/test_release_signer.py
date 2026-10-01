@@ -317,6 +317,35 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
         self.assertIn("maintainers", error.detail)
         self.assertNotIn("anyone can publish", error.detail)
 
+    def test_an_off_tag_publish_is_described_by_the_trigger_the_certificate_records(self):
+        # The certificate carries how the run began. A dispatch and a push are different
+        # facts for ai-tc's maintainers, so the text may say only the one that happened.
+        ref = "refs/heads/release-hotfix"
+        for trigger, said, unsaid in (
+            ("workflow_dispatch", "dispatched on a branch", "pushed on"),
+            ("push", "pushed on that branch", "dispatched"),
+        ):
+            with self.subTest(trigger):
+                cert = self.branch_cert(ref, trigger=trigger)
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=cert)])
+                self.assertIn(ref, error.detail)
+                self.assertIn("only from a tag push", error.detail)
+                self.assertIn("not a stolen npm credential", error.detail)
+                self.assertIn("maintainers", error.detail)
+                self.assertIn(said, error.detail)
+                self.assertNotIn(unsaid, error.detail)
+
+    def test_an_off_tag_publish_from_a_trigger_the_text_does_not_know_is_not_described(self):
+        ref = "refs/heads/main"
+        for trigger in ("schedule", "workflow_run", "pull_request_target"):
+            with self.subTest(trigger):
+                cert = self.branch_cert(ref, trigger=trigger)
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=cert)])
+                self.assertNotIn("dispatched", error.detail)
+                self.assertNotIn("pushed on", error.detail)
+                self.assertNotIn("stolen", error.detail)
+                self.assertIn("anyone can publish with provenance", error.detail)
+
     def test_an_off_tag_publish_that_is_also_something_else_is_not_excused(self):
         ref = "refs/heads/main"
         cases = {
