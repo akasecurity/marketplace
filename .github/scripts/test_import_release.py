@@ -346,10 +346,11 @@ class TestPlanForward(PlanCase):
         self.candidates = ["0.9.15"]
         for kwargs in (dict(), dict(event="workflow_dispatch", target="0.9.15"),
                        dict(mode="rollback", target="fleet-v7", event="workflow_dispatch")):
-            with self.subTest(**kwargs), mock.patch.object(release_checks, "BOT_LOGIN", None), \
-                    self.assertRaisesRegex(ir.Refused, "no bot identity is configured") as caught:
-                self.plan(**kwargs)
-            self.assertTrue(caught.exception.red)
+            with self.subTest(**kwargs):
+                with mock.patch.object(release_checks, "BOT_LOGIN", None):
+                    with self.assertRaisesRegex(ir.Refused, "no bot identity is configured") as caught:
+                        self.plan(**kwargs)
+                self.assertTrue(caught.exception.red)
         self.stubs["verify_release"].assert_not_called()
 
     def test_an_open_pr_for_the_version_is_a_green_skip(self):
@@ -660,11 +661,11 @@ class TestOpenPrForward(OpenPrCase):
         self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
         for plan in (forward_plan(), forward_plan(reimport=True)):
-            with self.subTest(reimport=plan["reimport"]), \
-                    self.assertRaisesRegex(ir.Refused, "head of PR #6, which some-writer opened, not the release bot") as caught:
-                self.open(plan)
-            self.assertTrue(caught.exception.red)
-            self.assertEqual(self.gh.writes(), [])
+            with self.subTest(reimport=plan["reimport"]):
+                with self.assertRaisesRegex(ir.Refused, "head of PR #6, which some-writer opened, not the release bot") as caught:
+                    self.open(plan)
+                self.assertTrue(caught.exception.red)
+                self.assertEqual(self.gh.writes(), [])
 
     def test_without_a_bot_identity_nothing_is_written(self):
         self.route_branch("bot/pin-ai-tc-0.9.15")
