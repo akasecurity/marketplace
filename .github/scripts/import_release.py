@@ -11,8 +11,11 @@ open PR is skipped on a plain forward run, and deleted and created again only by
 reimport or rollback dispatch), opens the PR and enables
 auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
-version while a higher one has no verdict. AGENTS.md ("ai-tc is pinned", "The workflows")
-describes the flow.
+version while a higher one has no verdict. Every decision about an open or closed PR looks at
+the pull requests the release bot opened and no others (release_checks.BOT_LOGIN), so a person's
+PR from a `bot/` branch name neither stops the schedule nor is closed; while no bot login is
+configured the importer refuses, red. AGENTS.md ("ai-tc is pinned", "The workflows") describes
+the flow.
 """
 from __future__ import annotations
 
@@ -94,7 +97,9 @@ def tag_pins(repo_dir: str) -> dict[str, str | None]:
 
 
 def list_pulls(gh: GitHub, state: str) -> list[dict]:
-    """Same-repository PRs into main in `state`. A fork PR's head name proves nothing, so forks are skipped."""
+    """Same-repository PRs into main in `state`, with their authors. A fork PR's head name proves
+    nothing, so forks are skipped. Nor does a same-repository head name prove who opened the PR, so a
+    decision about the importer's own PRs reads through bot_pulls."""
     pulls = []
     for item in gh.paginate(gh.repo_path("pulls"), {"state": state, "base": "main"}):
         head = item.get("head") or {}
@@ -102,9 +107,27 @@ def list_pulls(gh: GitHub, state: str) -> list[dict]:
             continue
         pulls.append({"number": item["number"], "node_id": item.get("node_id", ""), "head": head.get("ref", ""),
                       "head_sha": head.get("sha", ""), "merged": item.get("merged_at") is not None,
-                      "created_at": item.get("created_at", ""),
+                      "created_at": item.get("created_at", ""), "author": (item.get("user") or {}).get("login") or "",
                       "labels": [label.get("name") for label in item.get("labels", [])]})
     return pulls
+
+
+def bot_login() -> str:
+    """The release bot App's login, or a red refusal while none is configured: with no login the importer
+    cannot tell its own pull requests from anyone else's, and acting on a branch name alone would let any
+    writer's PR from a `bot/` branch stop the schedule, block a version or be closed by a later import."""
+    login = release_checks.BOT_LOGIN
+    if login is None:
+        raise Refused("no bot identity is configured (release_checks.BOT_LOGIN), so the importer cannot tell its "
+                      "own pull requests from anyone else's")
+    return login
+
+
+def bot_pulls(pulls: list[dict]) -> list[dict]:
+    """The pull requests the release bot opened. Every importer decision about an open or closed PR reads
+    through this, as validate does when it asks whose PR it is judging."""
+    login = bot_login()
+    return [p for p in pulls if p["author"] == login]
 
 
 def pulls_by(pulls: list[dict], pattern: re.Pattern) -> list[dict]:
@@ -243,7 +266,8 @@ def pr_body(plan: dict, run_url: str) -> str:
 
 @dataclass
 class Context:
-    """What a planner reads: the checkout, the API (read-only in the verify job) and the dispatch inputs."""
+    """What a planner reads: the checkout, the API (read-only in the verify job), the dispatch inputs and
+    the open pull requests the release bot opened."""
 
     git: Any
     gh: Any
@@ -256,7 +280,7 @@ class Context:
     doc: dict
     current: str | None
     safety: dict
-    pulls_open: list
+    bot_open: list
 
 
 def verify(version: str) -> Any:
@@ -299,7 +323,7 @@ def plan_forward(ctx: Context) -> dict:
     scheduled = ctx.event == "schedule"
     if ctx.current is None:
         raise Refused("main has no ai-tc entry: nothing is imported until a restore merges", red=not scheduled)
-    rollbacks = pulls_by(ctx.pulls_open, ROLLBACK_BRANCH)
+    rollbacks = pulls_by(ctx.bot_open, ROLLBACK_BRANCH)
     if scheduled and rollbacks:
         raise Refused(f"rollback PR #{rollbacks[0]['number']} is open: the scheduled import opens nothing "
                       "until it merges or closes", red=False)
@@ -344,11 +368,11 @@ def plan_forward(ctx: Context) -> dict:
             raise Refused(f"npm has no exact release above {highest}", red=False)
     version = release.version
     branch = f"bot/pin-ai-tc-{version}"
-    same = [p for p in ctx.pulls_open if p["head"] == branch]
+    same = [p for p in ctx.bot_open if p["head"] == branch]
     if same:
         raise Refused(f"PR #{same[0]['number']} for {version} is already open", red=False)
     if not ctx.reimport:
-        closed = [p for p in list_pulls(ctx.gh, "closed") if p["head"] == branch and not p["merged"]]
+        closed = [p for p in bot_pulls(list_pulls(ctx.gh, "closed")) if p["head"] == branch and not p["merged"]]
         if closed:
             raise Refused(f"a bot PR for {version} (#{closed[0]['number']}) was closed unmerged; that rejection "
                           "stands until a dispatch with reimport: true", red=not scheduled)
@@ -411,7 +435,7 @@ def plan_rollback(ctx: Context) -> dict:
                       "opens the PR anyway, but validate fails it and only an org owner's break-glass merge lands it")
     release = verify(version)
     branch = f"bot/rollback-ai-tc-{ctx.current}-to-{version}"
-    same = [p for p in ctx.pulls_open if p["head"] == branch]
+    same = [p for p in ctx.bot_open if p["head"] == branch]
     if same:
         raise Refused(f"rollback PR #{same[0]['number']} for {ctx.current} -> {version} is already open", red=False)
     known = ctx.safety.get("versions", {})
@@ -435,6 +459,7 @@ def make_plan(git: Any, gh: Any, *, repo_dir: str, mode: str, target: str, reimp
     if planner is None:
         raise Refused(f"{mode} mode is not available: remove and restore are built only once removal is "
                       "qualified as an emergency stop")
+    bot_login()
     main_sha = git.rev_parse("main")
     raw = git.show(main_sha, MANIFEST)
     if raw is None:
@@ -446,7 +471,7 @@ def make_plan(git: Any, gh: Any, *, repo_dir: str, mode: str, target: str, reimp
     ctx = Context(git=git, gh=gh, repo_dir=repo_dir, event=event, target=target.strip(),
                   reimport=reimport and mode == "forward", below_floor=below_floor and mode != "forward",
                   run_id=run_id, doc=doc, current=pinned_version(doc), safety=json.loads(safety_raw),
-                  pulls_open=list_pulls(gh, "open"))
+                  bot_open=bot_pulls(list_pulls(gh, "open")))
     plan = {"mode": mode, "version": None, "from_version": ctx.current, "integrity": None, "shasum": None,
             "git_commit": None, "run_url": None, "branch": None, "title": None, "labels": [],
             "classification": None, "migrations": [], "safety_entry": None, "refused": [],
@@ -522,7 +547,7 @@ def enable_auto_merge(gh: GitHub, pr: dict) -> None:
 def supersede_lower(gh: GitHub, plan: dict, number: int) -> list[int]:
     """Close open forward pin PRs for lower versions. Never a rollback PR; a failure only warns."""
     closed = []
-    for other in pulls_by(list_pulls(gh, "open"), PIN_BRANCH):
+    for other in pulls_by(bot_pulls(list_pulls(gh, "open")), PIN_BRANCH):
         other_version = PIN_BRANCH.fullmatch(other["head"]).group(1)
         if other["number"] == number or not vkey(other_version) < vkey(plan["version"]):
             continue
@@ -542,7 +567,7 @@ def hold_forward(gh: GitHub, number: int, kind: str = "rollback") -> list[int]:
     """Turn auto-merge off on every open forward pin PR while a rollback (or remove) PR is open."""
     owner, name = gh.repo.split("/", 1)
     held = []
-    for other in pulls_by(list_pulls(gh, "open"), PIN_BRANCH):
+    for other in pulls_by(bot_pulls(list_pulls(gh, "open")), PIN_BRANCH):
         try:
             gh.graphql(AUTO_MERGE_OFF, {"id": other["node_id"]})
         except GitHubError:
@@ -559,7 +584,7 @@ def hold_forward(gh: GitHub, number: int, kind: str = "rollback") -> list[int]:
 
 def close_other_rollbacks(gh: GitHub, number: int, branch: str) -> list[int]:
     closed = []
-    for other in pulls_by(list_pulls(gh, "open"), ROLLBACK_BRANCH):
+    for other in pulls_by(bot_pulls(list_pulls(gh, "open")), ROLLBACK_BRANCH):
         if other["number"] == number or other["head"] == branch:
             continue
         comment(gh, other["number"], f"Superseded by rollback PR #{number}.")
@@ -570,7 +595,7 @@ def close_other_rollbacks(gh: GitHub, number: int, branch: str) -> list[int]:
 
 def after_forward(gh: GitHub, plan: dict, pr: dict) -> str:
     closed = supersede_lower(gh, plan, pr["number"])
-    rollbacks = pulls_by(list_pulls(gh, "open"), ROLLBACK_BRANCH)
+    rollbacks = pulls_by(bot_pulls(list_pulls(gh, "open")), ROLLBACK_BRANCH)
     if rollbacks:
         comment(gh, pr["number"], f"Auto-merge is not enabled: rollback PR #{rollbacks[0]['number']} is open. Once it "
                 "resolves, enable auto-merge here, or close this PR and dispatch the import with `reimport: true`.")
@@ -597,6 +622,7 @@ ACTIONS: dict[str, dict] = {
 
 def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
     check_plan(plan)
+    bot_login()
     actions = ACTIONS[plan["mode"]]
     main_sha = gh.get(gh.repo_path("git/ref/heads/main"))["object"]["sha"]
     raw = read_file(gh, MANIFEST, main_sha)
@@ -606,8 +632,14 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
         raise Refused("main's ai-tc entry changed after the verify job read it; the next run re-evaluates", red=False)
     branch = plan["branch"]
     if branch_exists(gh, branch):
-        if [p for p in list_pulls(gh, "open") if p["head"] == branch]:
+        open_here = [p for p in list_pulls(gh, "open") if p["head"] == branch]
+        if bot_pulls(open_here):
             raise Refused(f"a PR for {branch} is already open", red=False)
+        if open_here:
+            # Deleting the branch would close that PR. Only the bot's own are the importer's to replace.
+            raise Refused(f"{branch} is the head of PR #{open_here[0]['number']}, which {open_here[0]['author'] or 'someone'} "
+                          "opened, not the release bot; the importer does not delete a branch another PR uses, so a "
+                          "person closes that PR or renames its branch first")
         if plan["mode"] == "forward" and not plan.get("reimport"):
             raise Refused(f"{branch} already exists with no open PR (another run got there first, or tag-release "
                           "has not yet deleted a closed PR's branch); a dispatch with reimport: true replaces it",
