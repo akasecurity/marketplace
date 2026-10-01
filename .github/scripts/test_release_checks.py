@@ -849,6 +849,21 @@ class TestVerifyRelease(unittest.TestCase):
     def test_diverged_is_refused(self):
         self.refused("commit-on-main", routes=ts.release_routes("0.9.14", compare="diverged"))
 
+    def test_a_422_and_an_object_with_no_known_status_are_verdicts(self):
+        # What commit_on_ai_tc_main's docstring says: GitHub cannot compare the two (404 or
+        # 422), or it answered a JSON object whose status is neither ahead nor identical.
+        # Only a body that is not that object, or another HTTP status, is no verdict.
+        for label, answer in (
+            ("a 422", (422, {"message": "No common ancestor"})),
+            ("an empty object", (200, {})),
+            ("a status of another kind", (200, {"status": "later"})),
+            ("a status that is not a string", (200, {"status": 7})),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = answer
+                self.refused("commit-on-main", routes=routes)
+
     def test_an_unknown_commit_is_refused(self):
         routes = ts.release_routes("0.9.14")
         routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (404, {"message": "Not Found"})
