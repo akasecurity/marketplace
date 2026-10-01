@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import pathlib
 import re
 import unittest
 from unittest import mock
@@ -594,6 +595,55 @@ class TestEvaluate(unittest.TestCase):
         head_doc["plugins"].append(copy.deepcopy(head_doc["plugins"][2]))
         report = run(pull(**HUMAN), files(ts.manifest()), files(head_doc), [rc.MANIFEST])
         self.assertEqual((report.rows, report.exit_code), ([], 1))
+
+
+class TestWorkflow(unittest.TestCase):
+    """validate.yml cannot run here, but what it promises the script can be read from it."""
+
+    WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / "workflows" / "validate.yml"
+    # The first Node 24 release that bundles an npm of MIN_NPM or later: v24.15.0 ships npm
+    # 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
+    FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
+
+    @staticmethod
+    def lowest_admitted(spec):
+        """The lowest release setup-node's version spec can resolve to, or None when it admits
+        older ones (a bare major, an x-range, an alias). Only an exact version or a range that
+        starts at one is accepted."""
+        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", spec)
+        return tuple(int(part) for part in match.groups()) if match else None
+
+    def test_the_lowest_release_a_spec_admits(self):
+        for spec, lowest in (
+            ("24.15.0", (24, 15, 0)),
+            (">=24.15.0 <25", (24, 15, 0)),
+            (">=24.16.1", (24, 16, 1)),
+            ("24", None),
+            ("24.x", None),
+            ("^24.15.0", None),
+            (">=24", None),
+            ("lts/*", None),
+            ("latest", None),
+        ):
+            with self.subTest(spec):
+                self.assertEqual(self.lowest_admitted(spec), lowest)
+
+    def test_the_workflow_runs_a_node_that_ships_an_npm_the_gate_accepts(self):
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        specs = re.findall(r"uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: \"([^\"]+)\"", text)
+        self.assertEqual(len(specs), 1, "validate.yml must install Node exactly once, with a quoted node-version")
+        lowest = self.lowest_admitted(specs[0])
+        self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_npm_floor_the_node_version_was_chosen_for_is_the_gates(self):
+        # If the gate's floor moves, the Node release above has to move with it.
+        self.assertEqual(rc.MIN_NPM, (11, 12, 0))
+
+    def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("npm 11 (Node 24)", text)
+        self.assertIn("npm 11.12", text)
 
 
 class TestSummary(unittest.TestCase):
