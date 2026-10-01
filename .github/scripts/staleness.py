@@ -6,10 +6,12 @@ Each rule is its own result, filed as its own issue by issue_router.py:
         hours ago; a version the importer refuses is its own result once it has
         been on npm for an hour, and so is a version the checks could not finish
         on (the registry, the network, npm or GitHub failed: no verdict, which is
-        neither a refusal nor a release that is gone). While a version has no
+        neither a refusal nor a release that is gone). While a version that has
+        been on npm for over an hour, or whose publish time is unknown, has no
         verdict, (i) and the refused-version rule can still go red from the
-        versions that did finish, but neither is cleared, so an outage can never
-        close their issues;
+        versions that did finish, but neither is cleared. A younger version is
+        left out: neither rule can name it yet. So an outage never closes the
+        issue of a version either rule could name;
   (ii)  a bot PR has been open for more than 24 hours;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
         than an hour old, changed the ai-tc version and carries no fleet-v tag;
@@ -109,8 +111,10 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
             continue
         if on_npm is None or on_npm > DAY:
             stale.append(f"- `{version}`, published {published}")
-    # A version with no verdict might be the very one these two rules name, or the one that clears them, so
-    # while one exists they can go red from the versions that did finish, but they cannot be cleared.
+    # A version with no verdict that has been on npm for over an hour, or whose publish time is unknown, might be
+    # the very one these two rules name, or the one that clears them, so while one exists they can go red from
+    # the versions that did finish, but they cannot be cleared. A younger one is not in `unverified`: neither
+    # rule can name it yet (they need more than an hour and more than a day).
     undecided = bool(unverified)
     return [entry,
             result("staleness-i", True if stale else (None if undecided else False),
@@ -125,8 +129,10 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
                    f"The release checks could not finish on npm versions above `{highest}`: a registry, network, "
                    "npm or GitHub API failure, which is no verdict on the release:\n" + "\n".join(unverified)
                    + "\n\nThe unpinned-release and refused-version rules can still open an issue from the "
-                   "versions that did finish, but they cannot close one until every version has a verdict. The "
-                   "check is repeated every hour, and this workflow's run log holds the full error.")]
+                   "versions that did finish, but they cannot close one until every version that has been on npm "
+                   "for over an hour, or whose publish time is unknown, has a verdict. A younger version is not "
+                   "listed: neither rule can name it yet. The check is repeated every hour, and this workflow's "
+                   "run log holds the full error.")]
 
 
 def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
