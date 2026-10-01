@@ -192,6 +192,13 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("`validate` fails this PR", body)
         self.assertIn("claude plugin marketplace add akasecurity/marketplace#bot/rollback-ai-tc-0.9.14-to-0.9.13", body)
 
+    def test_a_rollback_body_asks_the_approver_to_rerun_validate_after_the_safety_file_moves(self):
+        body = ir.pr_body(rollback_plan(), "u")
+        self.assertIn("- [ ] If `rollback-safety.json` changed on `main` after `validate` ran (compare the "
+                      "`Main read at` row of its summary with `main`'s head), re-run `validate` before approving.", body)
+        # Only a rollback is judged against the floor, so a forward PR's checklist does not carry the line.
+        self.assertNotIn("Main read at", ir.pr_body(forward_plan(), "u"))
+
 
 PLAN_KEYS = {"mode", "version", "from_version", "integrity", "shasum", "git_commit", "run_url", "branch", "title",
              "labels", "classification", "migrations", "safety_entry", "refused", "highest_pinned", "floor",
