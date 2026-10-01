@@ -989,9 +989,12 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
 
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
     """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
-    against main's head as resolved from its full ref. Refuses behind (built on main's tip,
-    never merged), diverged and 404. Every other error, and an answer that is not the
-    comparison document, is no verdict."""
+    against main's head as resolved from its full ref.
+
+    These are verdicts: behind (built on main's tip, never merged), diverged, a 404 or a 422
+    (GitHub cannot compare the two), and a JSON object whose status is neither 'ahead' nor
+    'identical', whatever else it holds. These are no verdict: any other HTTP status, and a
+    body that is not a JSON object."""
     head = ai_tc_main_head(fetch=fetch)
     url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
