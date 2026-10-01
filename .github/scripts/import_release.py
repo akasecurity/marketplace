@@ -250,6 +250,11 @@ def pr_body(plan: dict, run_url: str) -> str:
         "",
         "- [ ] Open the `validate` check run and confirm it is `validate.yml`'s run from `main` "
         "(event `pull_request_target`); read its summary.",
+        # validate read the rollback floor from main when it ran, so a reviewed edit to rollback-safety.json
+        # that reached main since is not in its verdict.
+        *(["- [ ] If `rollback-safety.json` changed on `main` after `validate` ran (compare the `Main read at` "
+           "row of its summary with `main`'s head), re-run `validate` before approving."]
+          if plan["mode"] == "rollback" else []),
         "- [ ] Open the ai-tc release run above and confirm its hook fail-open smoke tests passed.",
         f"- [ ] Run `{version}` in one real session on a machine or VM without AKA's managed settings, with a "
         "throwaway home (a fresh `~/.aka`): "
