@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import http.client
 import io
 import json
 import os
@@ -199,6 +200,91 @@ class TestHttpHeaders(unittest.TestCase):
 
     def test_the_packument_url_escapes_the_scope_slash(self):
         self.assertEqual(rc.packument_url(), "https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code")
+
+
+class _Response:
+    """What urlopen returns: a context manager with a status and a body that may fail."""
+
+    status = 200
+
+    def __init__(self, body=b"", read_error=None):
+        self.body = body
+        self.read_error = read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self.read_error is not None:
+            raise self.read_error
+        return self.body
+
+
+class _FailingBody(io.BytesIO):
+    def __init__(self, error):
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, *args):
+        raise self.error
+
+
+class TestHttpFetch(unittest.TestCase):
+    URL = "https://registry.npmjs.org/x"
+
+    def fetch_with(self, **patch):
+        with mock.patch.object(rc.urllib.request, "urlopen", **patch):
+            return rc.http_fetch(self.URL, {})
+
+    def test_a_status_and_body_come_back_as_they_are(self):
+        self.assertEqual(self.fetch_with(return_value=_Response(b"ok")), (200, b"ok"))
+
+    def test_an_http_error_status_is_returned_and_not_raised(self):
+        error = rc.urllib.error.HTTPError(self.URL, 503, "unavailable", {}, io.BytesIO(b"later"))
+        self.assertEqual(self.fetch_with(side_effect=error), (503, b"later"))
+
+    def test_no_answer_at_all_is_no_verdict(self):
+        for label, error in (
+            ("an unreachable host", rc.urllib.error.URLError("no route")),
+            ("a timeout", TimeoutError("timed out")),
+            ("a reset connection", ConnectionResetError("reset")),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.fetch_with(side_effect=error)
+                self.assertEqual(caught.exception.check, "network")
+
+    def test_a_response_the_http_client_cuts_short_is_no_verdict(self):
+        # urllib wraps socket errors in URLError, but not http.client's own, which come out
+        # of getresponse() and read(): without a class of their own they would reach the
+        # caller as neither a verdict nor an outage. An error status is read in a handler,
+        # where a sibling except clause cannot see what that read raises.
+        def error_status(error):
+            return rc.urllib.error.HTTPError(self.URL, 502, "bad gateway", {}, _FailingBody(error))
+
+        for label, patch in (
+            ("a status line that is not HTTP", {"side_effect": http.client.BadStatusLine("")}),
+            (
+                "a body that stops before its length",
+                {"return_value": _Response(read_error=http.client.IncompleteRead(b"par", 9))},
+            ),
+            (
+                "an error status whose body stops early",
+                {"side_effect": error_status(http.client.IncompleteRead(b"par", 9))},
+            ),
+            (
+                "an error status whose body cannot be read",
+                {"side_effect": error_status(ConnectionResetError("reset"))},
+            ),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.fetch_with(**patch)
+                self.assertEqual(caught.exception.check, "network")
+                self.assertIn(self.URL, caught.exception.detail)
 
 
 class TestNpmCandidates(unittest.TestCase):
