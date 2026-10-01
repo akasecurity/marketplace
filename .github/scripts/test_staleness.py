@@ -1,9 +1,12 @@
 """Tests for staleness.py: each rule, the rollback-hold notice and the drill."""
+import contextlib
 import datetime as dt
+import io
 import types
 import unittest
 from unittest import mock
 
+import issue_router
 import release_checks
 import staleness as st
 from fakes import INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, pull, pulls_route
@@ -34,7 +37,8 @@ def repo(*, main_entry=True, pin_change_age=dt.timedelta(hours=2), tags=None, me
 
 class StalenessCase(unittest.TestCase):
     def setUp(self):
-        self.candidates, self.bad, self.pulls, self.times = [], {}, [], {}
+        self.candidates, self.bad, self.down, self.pulls, self.times = [], {}, {}, [], {}
+        self.log = io.StringIO()
         self.gh = FakeGitHub({("GET", R("pulls")): pulls_route(self.pulls)})
         stubs = {"pinned_versions": lambda repo_dir: {"0.9.13", "0.9.14", "0.9.15"},
                  "npm_candidates": lambda pinned: list(self.candidates),
@@ -46,13 +50,16 @@ class StalenessCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def fake_verify(self, version):
+        if version in self.down:
+            raise release_checks.InfraError(*self.down[version])
         if version in self.bad:
             raise release_checks.ReleaseCheckError(*self.bad[version])
         return types.SimpleNamespace(version=version)
 
     def rules(self, git=None, refs=("refs/heads/main", "refs/tags/fleet-v8", "refs/tags/fleet-v8^{}"), drill=False):
-        results = st.evaluate(git=git or repo(), gh=self.gh, repo_dir="/fake/marketplace", frozen=FROZEN, now=NOW,
-                              times=self.times, remote_refs=list(refs), drill=drill, actor="venuverse")
+        with contextlib.redirect_stdout(self.log):
+            results = st.evaluate(git=git or repo(), gh=self.gh, repo_dir="/fake/marketplace", frozen=FROZEN, now=NOW,
+                                  times=self.times, remote_refs=list(refs), drill=drill, actor="venuverse")
         return {item.rule: item for item in results}
 
 
@@ -81,13 +88,115 @@ class TestRuleI(StalenessCase):
         rules = self.rules()
         self.assertFalse(rules["staleness-i"].red)
         self.assertFalse(rules["staleness-i-refused"].red)
+        self.assertFalse(rules["staleness-i-no-verdict"].red)
 
     def test_a_removed_entry_is_red_and_rule_i_is_not_evaluated(self):
         rules = self.rules(repo(main_entry=False))
         self.assertTrue(rules["staleness-entry"].red)
         self.assertIsNone(rules["staleness-i"].red)
         self.assertIsNone(rules["staleness-i-refused"].red)
+        self.assertIsNone(rules["staleness-i-no-verdict"].red)
         self.stubs["pinned_versions"].assert_not_called()
+
+
+class TestRuleINoVerdict(StalenessCase):
+    """A check that could not finish (the registry, the network, npm or GitHub failed) is no verdict on the
+    release. It is its own result: never a refused version, and never a release that is gone, which would
+    close the open issue of the rule that names it."""
+
+    def test_an_outage_is_its_own_result_and_never_clears_rule_i(self):
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=30))}
+        self.down = {"0.9.16": ("toolchain", "npm install did not finish")}
+        rules = self.rules()
+        self.assertIsNone(rules["staleness-i"].red)
+        self.assertIsNone(rules["staleness-i-refused"].red)
+        unverified = rules["staleness-i-no-verdict"]
+        self.assertTrue(unverified.red)
+        self.assertEqual((unverified.kind, unverified.title),
+                         ("alert", "staleness: the release checks reached no verdict on an ai-tc version"))
+        self.assertIn("- `0.9.16` (published", unverified.detail)
+        self.assertIn("the `toolchain` check did not finish", unverified.detail)
+
+    def test_a_verdict_still_names_the_refused_version_beside_an_outage(self):
+        self.candidates = ["0.9.16", "0.9.17"]
+        self.bad = {"0.9.16": ("provenance", "ref refs/heads/release")}
+        self.down = {"0.9.17": ("network", "registry answered 503")}
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=3)), "0.9.17": stamp(dt.timedelta(hours=3))}
+        rules = self.rules()
+        self.assertTrue(rules["staleness-i-refused"].red)
+        self.assertIn("`0.9.16`", rules["staleness-i-refused"].detail)
+        self.assertNotIn("0.9.17", rules["staleness-i-refused"].detail)
+        self.assertTrue(rules["staleness-i-no-verdict"].red)
+        self.assertIn("`0.9.17`", rules["staleness-i-no-verdict"].detail)
+        self.assertNotIn("0.9.16", rules["staleness-i-no-verdict"].detail)
+        self.assertIsNone(rules["staleness-i"].red)
+
+    def test_a_passing_release_is_still_red_beside_an_outage(self):
+        self.candidates = ["0.9.16", "0.9.17"]
+        self.down = {"0.9.17": ("network", "registry answered 503")}
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=30)), "0.9.17": stamp(dt.timedelta(hours=3))}
+        rules = self.rules()
+        self.assertTrue(rules["staleness-i"].red)
+        self.assertIn("`0.9.16`", rules["staleness-i"].detail)
+        self.assertNotIn("0.9.17", rules["staleness-i"].detail)
+        self.assertIsNone(rules["staleness-i-refused"].red)
+        self.assertIn("`0.9.17`", rules["staleness-i-no-verdict"].detail)
+
+    def test_an_outage_in_the_first_hour_is_not_reported(self):
+        self.candidates = ["0.9.16"]
+        self.down = {"0.9.16": ("network", "registry answered 503")}
+        for age_of_release, reported in ((dt.timedelta(minutes=30), False), (dt.timedelta(hours=1), False),
+                                         (dt.timedelta(hours=1, seconds=1), True)):
+            with self.subTest(on_npm=age_of_release):
+                self.times = {"0.9.16": stamp(age_of_release)}
+                rules = self.rules()
+                self.assertEqual(rules["staleness-i-no-verdict"].red, reported)
+                self.assertEqual(rules["staleness-i"].red, None if reported else False)
+                self.assertEqual(rules["staleness-i-refused"].red, None if reported else False)
+
+    def test_an_outage_on_a_version_with_no_publish_time_is_reported(self):
+        self.candidates = ["0.9.16"]
+        self.down = {"0.9.16": ("npm", "registry answered 503")}
+        rule = self.rules()["staleness-i-no-verdict"]
+        self.assertTrue(rule.red)
+        self.assertIn("(published at an unknown time)", rule.detail)
+
+    def test_the_detail_names_only_the_check_so_a_lasting_outage_comments_once_a_day(self):
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=5))}
+        details = []
+        for text in ("npm install failed, log at /home/runner/.npm/_logs/2026-10-05T11_00_00_000Z-debug-0.log",
+                     "npm install failed, log at /home/runner/.npm/_logs/2026-10-05T12_00_00_000Z-debug-0.log"):
+            self.down = {"0.9.16": ("toolchain", text)}
+            details.append(self.rules()["staleness-i-no-verdict"].detail)
+        self.assertEqual(details[0], details[1])
+        self.assertNotIn("_logs", details[0])
+        self.assertNotIn("npm install failed", details[0])
+
+    def test_the_full_error_goes_to_the_run_log(self):
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(minutes=10))}
+        self.down = {"0.9.16": ("toolchain", "npm install did not finish within 300 s")}
+        self.rules()
+        self.assertIn("::warning::no verdict on 0.9.16: toolchain: npm install did not finish within 300 s",
+                      self.log.getvalue())
+
+    def test_the_router_opens_the_new_issue_and_leaves_rule_is_open_issue_alone(self):
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=30))}
+        self.down = {"0.9.16": ("network", "registry answered 503")}
+        open_issue = {"number": 40, "created_at": "2026-10-05T01:00:00Z", "labels": [{"name": "staleness"}],
+                      "assignees": [], "body": issue_router.marker("rule", "staleness-i") + "\nnpm has 0.9.16"}
+        router_gh = FakeGitHub({("GET", R("issues")): [open_issue], ("POST", R("issues")): {"number": 41}})
+        router = issue_router.Router(router_gh, approvers=["venuverse"], escalation=None, owners=["venuverse"],
+                                     now=NOW, run_url="https://github.com/akasecurity/marketplace/actions/runs/9")
+        # a pin change younger than an hour, so rule (iii) is clear and the new rule is the only one to file
+        outcomes = [router.apply(item) for item in self.rules(repo(pin_change_age=dt.timedelta(minutes=30))).values()]
+        self.assertEqual([call[:2] for call in router_gh.calls if call[0] != "GET"], [("POST", R("issues"))])
+        self.assertEqual(router_gh.called("POST", R("issues"))[0][2]["title"],
+                         "staleness: the release checks reached no verdict on an ai-tc version")
+        self.assertIn("staleness-i: not evaluated this run; its issue is left as it is", outcomes)
 
 
 class TestOtherRules(StalenessCase):

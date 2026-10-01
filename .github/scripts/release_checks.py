@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """The marketplace's one release-verification module (standard library only).
 
-Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin, runs
-THIS file from main's copy. validate.yml imports it through validate_pr.py; the
-importer, tag-release, staleness and tag-audit run it as a CLI.
+Every workflow that verifies an ai-tc release, or judges a change to the ai-tc pin,
+imports THIS file from main's copy: validate through validate_pr.py, and the importer,
+tag-release, staleness and tag-audit directly. The command line below is for a person,
+and for a copy run outside this repository.
 
 It has no third-party dependency on purpose. Nothing is installed before it runs, so
 nothing outside this reviewed file can change a verdict.
@@ -11,8 +12,11 @@ nothing outside this reviewed file can change a verdict.
     python3 .github/scripts/release_checks.py <command> [args]
 
 prints one JSON document on stdout. The exit status is 0 when the check passes, 1 when
-it fails, and 2 on a usage error or when no verdict could be reached (network, npm, git
-or GitHub API trouble). Human-readable detail goes to stderr.
+it fails, and 2 on a usage error, when no verdict could be reached (network, npm, git or
+GitHub API trouble), or on any unexpected error (reported as the check "internal"). Only
+a verdict exits 1, so a caller that fails on any non-zero status never reads a defect in
+this tool as a release that failed its checks. The argument parser reports its own usage
+errors on stderr alone, with no JSON. Human-readable detail goes to stderr.
 """
 
 from __future__ import annotations
@@ -34,15 +38,23 @@ from typing import Callable
 
 # The one plugin this marketplace pins, and what a publish of it must attest to. These
 # are constants of this reviewed file: nothing read from a PR, the registry or an
-# attestation may nominate the workflow that is supposed to vouch for a release.
+# attestation may nominate the workflow that is supposed to vouch for a release. Who
+# signed a release is read from the Sigstore certificate npm verified, never from the
+# statement the publisher wrote.
 PACKAGE = "@akasecurity/ai-tc-claude-code"
 ENTRY_NAME = "ai-tc"
 REGISTRY = "https://registry.npmjs.org"
 PROV_REPO = "https://github.com/akasecurity/ai-tc"
+OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 RELEASE_PIPELINE = {
     PACKAGE: {
         "workflow": ".github/workflows/release-plugin-claude.yml",
         "tag_prefix": "plugin-claude-v",
+        # GitHub's numeric ids of ai-tc and of the account that owns it. A name can be
+        # taken over after a rename, a transfer or a deleted and re-created repository;
+        # an id cannot.
+        "repository_id": "1296880286",
+        "owner_id": "300515195",
     },
 }
 AI_TC_API = "https://api.github.com/repos/akasecurity/ai-tc"
@@ -54,6 +66,12 @@ SAFETY_FILE = "rollback-safety.json"
 FROZEN_TAGS_FILE = ".github/fleet-tags.frozen.json"
 
 SLSA = "https://slsa.dev/provenance/v1"
+# The builder id of a GitHub-hosted runner in a SLSA statement. Matched exactly: a
+# substring would accept any id that merely mentions it.
+GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
+# The attestation the npm registry itself signs at publish time. npm verifies it against
+# the registry's keys, so it verifying shows npm held them.
+PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
 # The bot App's login, "<app-slug>[bot]". None until the App exists. While it is None, no
@@ -81,8 +99,10 @@ ATTEMPTS = 5
 RETRY_SECONDS = 20
 
 
-class ReleaseCheckError(Exception):
-    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+class _CheckFailure(Exception):
+    """What every release-check failure carries: the check's name and a detail. It exists
+    to share the constructor. Nothing catches it: a handler names ReleaseCheckError or
+    InfraError, whichever it means."""
 
     def __init__(self, check: str, detail: str) -> None:
         super().__init__(f"{check}: {detail}")
@@ -90,8 +110,14 @@ class ReleaseCheckError(Exception):
         self.detail = detail
 
 
-class InfraError(ReleaseCheckError):
-    """No verdict: the network, npm, git or an API failed (CLI exit 2). Still a refusal."""
+class ReleaseCheckError(_CheckFailure):
+    """A check reached a verdict, and the verdict is no (CLI exit 1)."""
+
+
+class InfraError(_CheckFailure):
+    """No verdict: the network, npm, git or an API failed (CLI exit 2). Deliberately NOT a
+    ReleaseCheckError: a handler written for a verdict never catches an outage, so an
+    unhandled one stops the run instead of reading as a refusal."""
 
 
 def _reject_duplicates(pairs):
@@ -223,13 +249,27 @@ def _read_manifest(repo_dir: str, rev: str):
     return parse_json(_git(repo_dir, "show", f"{rev}:{MANIFEST}"))
 
 
+def _manifest_at(repo_dir: str, rev: str):
+    """The manifest at rev, or None when rev's tree holds no such file. The tree is listed
+    first so that "the file is not there" (a commit that removed it, which tag-release
+    records as "entry removed") is told apart from "git could not read it" (a missing
+    object, an unfetched blob), which is InfraError. ls-tree exits 0 with no output for an
+    absent path and non-zero for a revision it cannot find."""
+    if not _git(repo_dir, "ls-tree", "--name-only", rev, "--", MANIFEST).strip():
+        return None
+    return _read_manifest(repo_dir, rev)
+
+
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient about content: a tag whose manifest does not
-    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
-    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
-    dropping that tag's pin would hide a version from the candidate and rollback floors."""
+    """What a historical tag pins. Lenient about content: a tag at a commit with no manifest
+    file (tag-release cuts those as "entry removed"), or whose manifest does not parse, or
+    does not pin the package exactly once, pins nothing. NOT lenient about the read itself:
+    a git failure (a missing object, an unfetched blob) is InfraError, since dropping that
+    tag's pin would hide a version from the candidate and rollback floors."""
     try:
-        doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
+        doc = _manifest_at(repo_dir, f"refs/tags/{tag}")
+        if doc is None:
+            return None
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
     except InfraError:
         raise
@@ -295,6 +335,19 @@ def http_fetch(url: str, headers: dict) -> tuple:
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
+def _github_json(url: str, body: bytes, kind: type, check: str = "api"):
+    """The JSON document a 200 answer from GitHub carries, which must be a `kind` (dict or
+    list). GitHub answered, but not with this document: that is no verdict about the
+    repository or the release, never a finding in it, and never a crash."""
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError(check, f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(document, kind):
+        raise InfraError(check, f"GET {url} did not answer a JSON {'object' if kind is dict else 'list'}")
+    return document
+
+
 def packument_url() -> str:
     return f"{REGISTRY}/{urllib.parse.quote(PACKAGE, safe='@')}"
 
@@ -305,55 +358,130 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     status, body = fetch(packument_url(), {"Accept": "application/json"})
     if status != 200:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
-    versions = json.loads(body).get("versions")
-    if isinstance(versions, dict):
-        names = list(versions)
-    elif isinstance(versions, list):
-        names = versions
-    elif isinstance(versions, str):
-        names = [versions]
-    else:
-        raise InfraError("npm", f"{REGISTRY} returned no versions for {PACKAGE}")
-    exact = {v for v in names if isinstance(v, str) and SEMVER.fullmatch(v)}
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except ValueError as exc:
+        raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
+    versions = document.get("versions") if isinstance(document, dict) else None
+    if not isinstance(versions, dict):
+        # The packument keys "versions" by version. A list or a bare string is what
+        # `npm view ... versions --json` prints, not what the registry serves.
+        raise InfraError("npm", f"{REGISTRY} returned no versions object for {PACKAGE}")
+    exact = {v for v in versions if SEMVER.fullmatch(v)}
     floor = max((vkey(v) for v in pinned), default=None)
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
 
 
+# How long one npm call may run before it is reported as hung, by npm sub-command. install
+# fetches the tarball and its dependencies. A hang is not lag, so it is not retried: waiting
+# it out again would only push the run toward its job's own timeout.
+NPM_TIMEOUT = {"init": 120, "--version": 120, "install": 300, "audit": 120}
+
+
 def _npm(run, args: list, work: str):
+    seconds = NPM_TIMEOUT[args[0]]
     try:
-        return run(["npm", *args], cwd=work, capture_output=True, text=True)
+        return run(["npm", *args], cwd=work, capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired as exc:
+        raise InfraError("toolchain", f"npm {args[0]} did not finish within {seconds} s (NOT a signature result)") from exc
     except OSError as exc:
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
 
 
-def _require_npm_11(result) -> None:
-    """An npm older than 11 audits without attestations and reports an empty verified set,
-    which would read as a release with no provenance."""
-    match = re.match(r"(\d+)\.", (result.stdout or "").strip()) if result.returncode == 0 else None
+# The first npm whose `audit signatures` honours --include-attestations and prints the verified
+# attestation bundles. An older npm (11.0 to 11.11 as well as 10.x) takes the flag with only a
+# warning and prints no `verified` list, which would read as a release with no provenance.
+MIN_NPM = (11, 12, 0)
+
+
+def _require_npm_attestations(result) -> None:
+    """The npm on PATH must be 11.12.0 or later."""
+    match = (
+        re.match(r"(\d+)\.(\d+)\.(\d+)", (result.stdout or "").strip()) if result.returncode == 0 else None
+    )
     if match is None:
         raise InfraError("toolchain", f"could not read npm's version: {(result.stdout or result.stderr or '')[:200]}")
-    if int(match.group(1)) < 11:
+    if tuple(int(part) for part in match.groups()) < MIN_NPM:
         raise InfraError(
             "toolchain",
-            f"npm {result.stdout.strip()} is older than 11, whose audit output cannot show attestations "
-            "(NOT a signature result)",
+            f"npm {result.stdout.strip()} is older than {'.'.join(map(str, MIN_NPM))}, the first release whose "
+            "audit prints attestation bundles (NOT a signature result)",
         )
 
 
-def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, sleep=time.sleep) -> dict:
-    """Run `npm audit signatures --json --include-attestations` over a scratch,
-    --ignore-scripts install of exactly package@version from npmjs.
+class _NotIndexedYet(Exception):
+    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
 
-    npm does the cryptography (the registry signature and the sigstore bundle); the
-    caller judges what the attestation binds. Needs npm 11 (Node 24): an older npm
-    returns an EMPTY verified set, which reads as "no attestation" and would refuse a
-    good release."""
+
+def _npm_report(stdout: str) -> dict:
+    """npm audit's JSON report, or InfraError when what it printed is not one."""
+    try:
+        report = json.loads(stdout)
+    except ValueError as exc:
+        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {stdout[:500]}") from exc
+    # A report from an npm that honours --include-attestations always carries an "invalid" list
+    # and a "verified" list (empty when nothing verified). npm prints its own failures
+    # ({"error": {...}}) on the same stream with the same exit status, and those are not a
+    # statement about the package.
+    if (
+        not isinstance(report, dict)
+        or "error" in report
+        or not isinstance(report.get("invalid"), list)
+        or not isinstance(report.get("verified"), list)
+    ):
+        raise InfraError(
+            "toolchain",
+            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {stdout[:500]}",
+        )
+    return report
+
+
+def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
+    """Audit and judge, ATTEMPTS audits in all, with RETRY_SECONDS between them.
+
+    audit_once() returns npm's report, or None when npm printed nothing. judge(report)
+    returns the result, or raises _NotIndexedYet when the release has no verified attestation
+    YET. Nothing printed and not-yet-indexed are waited out alike, from one budget: on the
+    last audit each ends as its own error (InfraError, or _NotIndexedYet for the caller to
+    turn into a verdict). Any other outcome of judge is final."""
+    for attempt in range(1, ATTEMPTS + 1):
+        report = audit_once()
+        if report is None:
+            if attempt == ATTEMPTS:
+                raise InfraError(
+                    "toolchain",
+                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
+                )
+        else:
+            try:
+                return judge(report)
+            except _NotIndexedYet:
+                if attempt == ATTEMPTS:
+                    raise
+        sleep(RETRY_SECONDS)
+
+
+def npm_audit_signatures(
+    package: str, version: str, judge: Callable = lambda report: report, *, run=subprocess.run, sleep=time.sleep
+):
+    """Run `npm audit signatures --json --include-attestations` over a scratch,
+    --ignore-scripts install of exactly package@version from npmjs, and return judge(report).
+    verify_release calls this as audit(package, version, judge), so judge is positional.
+
+    npm does the cryptography (the registry signature and the sigstore bundle); judge decides
+    what the attestation binds, and raises _NotIndexedYet while the registry has not indexed
+    it. The install happens ONCE: a lagging registry is waited out by auditing again, and each
+    audit passes --prefer-online so that it asks the registry instead of reading npm's cached
+    copy of the packument (cacheable for five minutes, which would make the retries pointless).
+    Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
+    `verified` list at all, which is reported as a toolchain failure, not as a missing
+    attestation."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
         if init.returncode != 0:
             raise InfraError("toolchain", f"npm init failed: {init.stderr[:2000]}")
-        _require_npm_11(_npm(run, ["--version"], work))
+        _require_npm_attestations(_npm(run, ["--version"], work))
         for attempt in range(1, ATTEMPTS + 1):
             install = _npm(
                 run,
@@ -369,36 +497,14 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
                     f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
                 )
             sleep(RETRY_SECONDS)
-        # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
-        # exit status is not.
-        for attempt in range(1, ATTEMPTS + 1):
-            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
-            if audit.stdout.strip():
-                break
-            if attempt == ATTEMPTS:
-                raise InfraError(
-                    "toolchain",
-                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
-                )
-            sleep(RETRY_SECONDS)
-    try:
-        report = json.loads(audit.stdout)
-    except ValueError as exc:
-        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
-    # A verdict always carries an "invalid" list (and a "verified" list when there is
-    # anything verified). npm prints its own failures ({"error": {...}}) on the same
-    # stream with the same exit status, and those are not a statement about the package.
-    if (
-        not isinstance(report, dict)
-        or "error" in report
-        or not isinstance(report.get("invalid"), list)
-        or not isinstance(report.get("verified", []), list)
-    ):
-        raise InfraError(
-            "toolchain",
-            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {audit.stdout[:500]}",
-        )
-    return report
+
+        def audit_once():
+            # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
+            # exit status is not.
+            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations", "--prefer-online"], work)
+            return _npm_report(audit.stdout) if audit.stdout.strip() else None
+
+        return _audit_until_judged(audit_once, judge, sleep)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -410,26 +516,30 @@ class VerifiedRelease:
     run_url: str
 
 
-class _NotIndexedYet(Exception):
-    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
-
-
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
-    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read."""
+    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read.
+
+    Only a 404 that outlasts the read-replica lag is a verdict (the registry does not serve
+    this version), and so is a document that is not a dist for this version. Every other
+    answer that is not a 200 (a 429, a 403, a 5xx), and a 200 that is not a JSON object, says
+    nothing about the release: it is retried and then reported as no verdict."""
     url = f"{packument_url()}/{version}"
     for attempt in range(1, ATTEMPTS + 1):
         status, body = fetch(url, {"Accept": "application/json"})
         if status == 200:
             break
-        if status != 404 and status < 500:
-            raise ReleaseCheckError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
         if attempt == ATTEMPTS:
             if status == 404:
                 raise ReleaseCheckError("dist", f"{REGISTRY} does not serve {PACKAGE}@{version}")
             raise InfraError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
         sleep(RETRY_SECONDS)
-    doc = json.loads(body)
-    dist = doc.get("dist") if isinstance(doc, dict) else None
+    try:
+        doc = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("dist", f"{REGISTRY} answered non-JSON for {PACKAGE}@{version}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise InfraError("dist", f"{REGISTRY} did not answer a JSON object for {PACKAGE}@{version}")
+    dist = doc.get("dist")
     if not isinstance(dist, dict) or doc.get("version") != version:
         raise ReleaseCheckError("dist", f"{REGISTRY} returned no dist for {PACKAGE}@{version}")
     integrity, shasum = dist.get("integrity"), dist.get("shasum")
@@ -440,95 +550,405 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
     return integrity, shasum
 
 
-def provenance_verdict(sig: dict, version: str, integrity: str) -> dict:
-    """The SLSA statement for PACKAGE@version, once it binds the tarball the dist read saw
-    to ai-tc's release workflow, at the version's own tag, on a GitHub-hosted runner.
+class _CertError(ValueError):
+    """The signing certificate could not be read as a Fulcio leaf certificate."""
 
-    A cryptographically valid attestation alone proves only that SOMEONE published with
-    provenance. The repository, workflow and ref binding carries the security."""
+
+# What the release checks read from the signing certificate beyond its subject alternative
+# name: the Fulcio v2 extensions, each one DER UTF8String under 1.3.6.1.4.1.57264.1.<arc>,
+# filled by Fulcio from the claims of the GitHub OIDC token, so a workflow cannot choose
+# them. Every other extension is skipped unread: the deprecated raw-string arcs 1 to 6, the
+# v2 arcs the checks do not use (7, 10, 16, 19, 22, 24), key usage and the SCT list. So a
+# new Fulcio arc cannot break the reader. Arc 23, the deployment environment, is not
+# pinned because the release job names no GitHub environment: pin it in the commit that
+# adds one.
+FULCIO_ARC = "1.3.6.1.4.1.57264.1."
+SAN_OID = "2.5.29.17"
+SIGNER_FIELDS = {
+    "issuer": ("8", "OIDC issuer"),
+    "build_signer": ("9", "build signer URI"),
+    "runner": ("11", "runner environment"),
+    "repository": ("12", "source repository URI"),
+    "commit": ("13", "source repository digest"),
+    "ref": ("14", "source repository ref"),
+    "repository_id": ("15", "source repository id"),
+    "owner_id": ("17", "source repository owner id"),
+    "build_config": ("18", "build config URI"),
+    "trigger": ("20", "build trigger"),
+    "run_url": ("21", "run invocation URI"),
+}
+
+
+# The required fields a workflow run on a branch instead of the version's tag changes: the
+# ones that carry the ref, and how the run was triggered.
+REF_FIELDS = frozenset({"san", "build_signer", "build_config", "ref", "trigger"})
+
+
+def _field_label(name: str) -> str:
+    if name == "san":
+        return "certificate subject alternative name"
+    arc, what = SIGNER_FIELDS[name]
+    return f"certificate {what} (Fulcio {FULCIO_ARC}{arc})"
+
+
+def _der(buf: bytes, pos: int, end: int) -> tuple:
+    """(tag, value_start, value_end) of the DER element at buf[pos:end]. Only definite,
+    minimal lengths and single-byte tags, and no element may outrun its parent."""
+    if pos + 2 > end:
+        raise _CertError("truncated element")
+    tag, first = buf[pos], buf[pos + 1]
+    pos += 2
+    if tag & 0x1F == 0x1F:
+        raise _CertError("high tag number form")
+    if first < 0x80:
+        size = first
+    elif first == 0x80:
+        raise _CertError("indefinite length")
+    else:
+        count = first & 0x7F
+        if count > 4 or pos + count > end:
+            raise _CertError("length over four bytes or truncated")
+        size = int.from_bytes(buf[pos : pos + count], "big")
+        if buf[pos] == 0 or size < 0x80:
+            raise _CertError("length not minimal")
+        pos += count
+    if pos + size > end:
+        raise _CertError("element overruns its parent")
+    return tag, pos, pos + size
+
+
+def _der_items(buf: bytes, start: int, stop: int) -> list:
+    """The children of the constructed element whose content is buf[start:stop]. They must
+    fill it exactly."""
+    items, pos = [], start
+    while pos < stop:
+        tag, content_start, content_end = _der(buf, pos, stop)
+        items.append((tag, content_start, content_end))
+        pos = content_end
+    return items
+
+
+def _der_oid(raw: bytes) -> str:
+    if not raw or raw[-1] & 0x80:
+        raise _CertError("malformed OID")
+    arcs, value = [], 0
+    for byte in raw:
+        if value == 0 and byte == 0x80:
+            raise _CertError("OID arc not minimal")
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            arcs.append(value)
+            value = 0
+    head = min(arcs[0] // 40, 2)
+    return ".".join(str(arc) for arc in [head, arcs[0] - 40 * head, *arcs[1:]])
+
+
+def _san_uri(der: bytes, start: int, stop: int) -> str:
+    """The one URI a Fulcio leaf's subjectAltName holds."""
+    tag, content_start, content_end = _der(der, start, stop)
+    if tag != 0x30 or content_end != stop:
+        raise _CertError("the subject alternative name is not one SEQUENCE")
+    names = _der_items(der, content_start, content_end)
+    if len(names) != 1 or names[0][0] != 0x86:
+        raise _CertError("the subject alternative name is not exactly one URI")
+    raw = der[names[0][1] : names[0][2]]
+    if not raw or any(byte < 0x21 or byte > 0x7E for byte in raw):
+        raise _CertError("the subject alternative name URI is not printable ASCII")
+    return raw.decode("ascii")
+
+
+def _fulcio_string(der: bytes, start: int, stop: int, oid: str) -> str:
+    tag, content_start, content_end = _der(der, start, stop)
+    if tag != 0x0C or content_end != stop:
+        raise _CertError(f"extension {oid} is not exactly one UTF8String")
+    try:
+        return der[content_start:content_end].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _CertError(f"extension {oid} is not UTF-8") from exc
+
+
+def signer_identity(der: bytes) -> dict:
+    """Who a Fulcio leaf certificate (DER) names: {"san": <URI>, "issuer": ..., "commit": ...,
+    one key per SIGNER_FIELDS name}. Reads the standard library only, verifies nothing
+    cryptographic (npm did: the chain to Fulcio's CA, the signed certificate timestamp,
+    Rekor, and the envelope signature made with this leaf's key), and refuses anything it
+    does not expect with _CertError."""
+    tag, start, stop = _der(der, 0, len(der))
+    if tag != 0x30 or stop != len(der):
+        raise _CertError("not exactly one certificate SEQUENCE")
+    parts = _der_items(der, start, stop)
+    if len(parts) != 3 or parts[0][0] != 0x30:
+        raise _CertError("a certificate is a tbsCertificate, an algorithm and a signature")
+    tbs = _der_items(der, parts[0][1], parts[0][2])
+    if not tbs or tbs[-1][0] != 0xA3:
+        raise _CertError("the certificate has no extensions field")
+    wrapper = _der_items(der, tbs[-1][1], tbs[-1][2])
+    if len(wrapper) != 1 or wrapper[0][0] != 0x30:
+        raise _CertError("the extensions field is not one SEQUENCE")
+    wanted = {FULCIO_ARC + arc: name for name, (arc, _) in SIGNER_FIELDS.items()}
+    seen, found = set(), {}
+    for tag, extension_start, extension_end in _der_items(der, wrapper[0][1], wrapper[0][2]):
+        if tag != 0x30:
+            raise _CertError("an extension is not a SEQUENCE")
+        extension = _der_items(der, extension_start, extension_end)
+        if len(extension) not in (2, 3) or extension[0][0] != 0x06 or extension[-1][0] != 0x04:
+            raise _CertError("an extension is not an OID, an optional flag and an OCTET STRING")
+        if len(extension) == 3 and extension[1][0] != 0x01:
+            raise _CertError("an extension's critical flag is not a BOOLEAN")
+        oid = _der_oid(der[extension[0][1] : extension[0][2]])
+        if oid in seen:
+            raise _CertError(f"extension {oid} appears twice")
+        seen.add(oid)
+        value_start, value_end = extension[-1][1], extension[-1][2]
+        if oid == SAN_OID:
+            found["san"] = _san_uri(der, value_start, value_end)
+        elif oid in wanted:
+            found[wanted[oid]] = _fulcio_string(der, value_start, value_end, oid)
+    absent = [name for name in ("san", *SIGNER_FIELDS) if name not in found]
+    if absent:
+        raise _CertError(f"the certificate does not carry {', '.join(_field_label(n) for n in absent)}")
+    return found
+
+
+def _leaf_der(bundle) -> bytes:
+    """The DER of the certificate a sigstore bundle was signed with: verificationMaterial
+    must hold exactly one of `certificate` or `x509CertificateChain` (whose first entry is
+    the leaf, as sigstore reads it). A public key, both, or neither is refused."""
+    material = bundle.get("verificationMaterial") if isinstance(bundle, dict) else None
+    if not isinstance(material, dict):
+        raise _CertError("the bundle has no verification material")
+    present = [key for key in ("certificate", "x509CertificateChain", "publicKey") if key in material]
+    if present == ["certificate"]:
+        holder = material["certificate"]
+    elif present == ["x509CertificateChain"]:
+        chain = material["x509CertificateChain"]
+        certificates = chain.get("certificates") if isinstance(chain, dict) else None
+        holder = certificates[0] if isinstance(certificates, list) and certificates else None
+    else:
+        raise _CertError(f"the verification material holds {present or 'nothing'}, not one signing certificate")
+    raw = holder.get("rawBytes") if isinstance(holder, dict) else None
+    if not isinstance(raw, str):
+        raise _CertError("the signing certificate has no rawBytes")
+    try:
+        return base64.b64decode(raw, validate=True)
+    except ValueError as exc:
+        raise _CertError(f"the signing certificate is not base64: {exc}") from exc
+
+
+def required_signer(version: str) -> dict:
+    """What the signing certificate of PACKAGE@version must say: ai-tc's release workflow,
+    at the version's own tag, pushed by the tag, from ai-tc's own repository, on a
+    GitHub-hosted runner. The commit and the run are bound to the statement instead."""
     pipeline = RELEASE_PIPELINE[PACKAGE]
-    want = {
+    tag_ref = f"refs/tags/{pipeline['tag_prefix']}{version}"
+    workflow = f"{PROV_REPO}/{pipeline['workflow']}@{tag_ref}"
+    return {
+        "san": workflow,
+        "issuer": OIDC_ISSUER,
+        "build_signer": workflow,
+        "runner": "github-hosted",
         "repository": PROV_REPO,
-        "path": pipeline["workflow"],
-        "ref": f"refs/tags/{pipeline['tag_prefix']}{version}",
+        "ref": tag_ref,
+        "repository_id": pipeline["repository_id"],
+        "owner_id": pipeline["owner_id"],
+        "build_config": workflow,
+        "trigger": "push",
     }
+
+
+def _field(doc, *keys):
+    """doc[keys[0]][keys[1]]...; None when any step is absent or passes through something
+    that is not an object. A statement is the publisher's JSON, so no level can be assumed."""
+    for key in keys:
+        if not isinstance(doc, dict):
+            return None
+        doc = doc.get(key)
+    return doc
+
+
+@dataclasses.dataclass(frozen=True)
+class SignedStatement:
+    """The in-toto statement a provenance bundle carries, with who signed it. `signer` is
+    read from the certificate npm verified; `body` is what the publisher wrote."""
+
+    body: dict
+    signer: dict
+
+
+def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStatement:
+    """The SLSA statement for PACKAGE@version and the certificate that signed it, once the
+    certificate binds the tarball the dist read saw to ai-tc's release workflow, at the
+    version's own tag, pushed by that tag, on a GitHub-hosted runner.
+
+    npm checks the signature and the certificate's chain, but no identity: an attestation
+    that verifies proves only that SOMEONE published with provenance. So who signed is read
+    from the signing certificate (Fulcio fills it from GitHub's token, and the envelope is
+    signed with that certificate's key), never from the statement, which the publisher
+    wrote. The statement must then agree with the certificate."""
+    pipeline = RELEASE_PIPELINE[PACKAGE]
+    if not isinstance(sig, dict):
+        raise InfraError("toolchain", f"npm audit signatures did not print a report object (NOT a signature result): {sig!r:.200}")
     if sig.get("invalid"):
         raise ReleaseCheckError("provenance", f"npm reports INVALID signatures or attestations: {sig['invalid']}")
-    entry = next(
-        (v for v in sig.get("verified") or [] if v.get("name") == PACKAGE and v.get("version") == version),
-        None,
-    )
-    if entry is None:
-        raise _NotIndexedYet(
-            f"{PACKAGE}@{version} carries no VERIFIED attestation (npm's missing list, which "
-            f"names packages with no registry signature: {sig.get('missing')})"
+    # npm fills `missing` (no registry signature) and `verified` (a verified attestation)
+    # independently, so one package can be in both.
+    missing = sig.get("missing")
+    if not isinstance(missing, list) or not all(isinstance(item, dict) for item in missing):
+        raise InfraError(
+            "toolchain", f"npm audit signatures printed no list of missing signatures (NOT a signature result): {missing!r}"
         )
-    bundles = [b for b in entry.get("attestationBundles") or [] if b.get("predicateType") == SLSA]
+    if any(item.get("name") == PACKAGE and item.get("version") == version for item in missing):
+        raise ReleaseCheckError(
+            "signature",
+            f"npm reports no registry signature for {PACKAGE}@{version}: the registry's own "
+            "signature over this tarball is missing, so the attestation alone cannot be relied on",
+        )
+    if "verified" not in sig:
+        # npm prints `verified` whenever it honours --include-attestations, even when it
+        # verified nothing. No list at all means an npm that ignored the flag (before 11.12):
+        # a statement about npm, not about the release.
+        raise InfraError(
+            "toolchain",
+            "npm audit signatures printed no `verified` list (NOT a signature result): npm lists "
+            "verified attestations only when it honours --include-attestations, which needs npm 11.12 or later",
+        )
+    verified = sig["verified"]
+    if not isinstance(verified, list) or not all(isinstance(item, dict) for item in verified):
+        raise InfraError("toolchain", f"npm audit signatures printed a verified list that is not a list of objects (NOT a signature result): {verified!r:.200}")
+    entries = [v for v in verified if v.get("name") == PACKAGE and v.get("version") == version]
+    if len(entries) > 1:
+        raise InfraError("toolchain", f"npm audit signatures lists {PACKAGE}@{version} as verified {len(entries)} times (NOT a signature result)")
+    if not entries:
+        raise _NotIndexedYet(f"{PACKAGE}@{version} carries no VERIFIED attestation in npm's report")
+    attestations = entries[0].get("attestationBundles")
+    if not isinstance(attestations, list) or not all(isinstance(item, dict) for item in attestations):
+        raise InfraError("toolchain", f"npm audit signatures printed attestation bundles that are not a list of objects (NOT a signature result): {attestations!r:.200}")
+    if not any(b.get("predicateType") == PUBLISH for b in attestations):
+        # Absent from `missing` means something only if npm held the registry's keys, and
+        # the registry's own publish attestation verifying is what shows it did.
+        raise ReleaseCheckError(
+            "signature",
+            f"{PACKAGE}@{version} has no verified registry publish attestation, so nothing shows "
+            "that npm checked the registry's signature",
+        )
+    bundles = [b for b in attestations if b.get("predicateType") == SLSA]
     if not bundles:
         raise ReleaseCheckError("provenance", f"{PACKAGE}@{version} has no {SLSA} attestation")
+    if len(bundles) > 1:
+        raise ReleaseCheckError(
+            "provenance",
+            f"{PACKAGE}@{version} has {len(bundles)} {SLSA} attestations, not exactly one, so "
+            "there is no single signer to read",
+        )
     try:
-        statement = json.loads(base64.b64decode(bundles[0]["bundle"]["dsseEnvelope"]["payload"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ReleaseCheckError("provenance", f"the SLSA bundle is unreadable: {exc}") from exc
-    predicate = statement.get("predicate") or {}
-    got = ((predicate.get("buildDefinition") or {}).get("externalParameters") or {}).get("workflow") or {}
-    builder = str(((predicate.get("runDetails") or {}).get("builder") or {}).get("id", ""))
-    dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
+        signer = signer_identity(_leaf_der(bundles[0].get("bundle")))
+    except _CertError as exc:
+        raise ReleaseCheckError("provenance", f"the SLSA bundle's signing certificate is unreadable: {exc}") from exc
+    payload = _field(bundles[0], "bundle", "dsseEnvelope", "payload")
+    try:
+        if not isinstance(payload, str):
+            raise ValueError("the envelope has no payload")
+        statement = parse_json(base64.b64decode(payload, validate=True).decode("utf-8"))
+        if not isinstance(statement, dict):
+            raise ValueError("the statement is not a JSON object")
+    except (ValueError, RecursionError) as exc:
+        raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
+    subjects = statement.get("subject")
     attested = {
-        (s.get("digest") or {}).get("sha512", "") for s in statement.get("subject") or [] if isinstance(s, dict)
+        _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
     }
+    dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
+    wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}
+    workflow = ("predicate", "buildDefinition", "externalParameters", "workflow")
+    claimed = {"repository": signer["repository"], "path": pipeline["workflow"], "ref": signer["ref"]}
+    disagree = [
+        f"{k}: statement {_field(statement, *workflow, k)!r} != certificate {v!r}"
+        for k, v in claimed.items()
+        if _field(statement, *workflow, k) != v
+    ]
+    builder = _field(statement, "predicate", "runDetails", "builder", "id")
+    if builder != GITHUB_HOSTED_BUILDER:
+        disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
+    if wrong:
+        # The fields that carry the ref are the only ones a workflow dispatched on a branch
+        # changes, so only a difference confined to them, in a certificate that is otherwise
+        # consistent and that the statement agrees with, is said to be an off-tag publish.
+        branch = signer["ref"]
+        at_branch = f"{PROV_REPO}/{pipeline['workflow']}@{branch}"
+        if (
+            set(wrong) <= REF_FIELDS
+            and branch.startswith("refs/heads/")
+            and all(signer[name] == at_branch for name in ("san", "build_signer", "build_config"))
+            and not disagree
+        ):
+            raise ReleaseCheckError(
+                "provenance",
+                f"{PACKAGE}@{version} was signed by {PROV_REPO} :: {pipeline['workflow']} at the branch "
+                f"{branch!r}, not at its tag {required_signer(version)['ref']!r}. ai-tc's release "
+                "workflow publishes only from a tag push, so an older copy of it was dispatched on a "
+                "branch. An attestation is immutable, so this version can never be imported. This is "
+                "not a stolen npm credential: the signing certificate names ai-tc's own workflow. "
+                "Tell ai-tc's maintainers.",
+            )
+        raise ReleaseCheckError(
+            "provenance",
+            "the signing certificate does not bind this tarball to ai-tc's release workflow: "
+            + "; ".join(
+                f"{_field_label(name)}: attested {signer[name]!r} != required {value!r}"
+                for name, value in wrong.items()
+            )
+            + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
+            "with provenance from their own repository.",
+        )
     if dist_hex not in attested:
         raise ReleaseCheckError(
             "provenance",
             f"the attestation covers a different tarball than the dist read ({integrity}); "
             "the two registry reads disagree about the bytes",
         )
-    bad = [f"{k}: attested {got.get(k)!r} != required {v!r}" for k, v in want.items() if got.get(k) != v]
-    if "github-hosted" not in builder:
-        bad.append(f"builder {builder!r} is not a github-hosted runner")
-    if bad:
-        if (
-            got.get("repository") == want["repository"]
-            and got.get("path") == want["path"]
-            and str(got.get("ref", "")).startswith("refs/heads/")
-        ):
-            raise ReleaseCheckError(
-                "provenance",
-                f"{PACKAGE}@{version} was published by {want['repository']} :: {want['path']} from "
-                f"{got.get('ref')!r}, not from its tag {want['ref']!r}: an off-tag publish from a "
-                "branch dispatch. An attestation is immutable, so this version can never be "
-                "imported. This is NOT a stolen-token signal.",
-            )
+    if disagree:
         raise ReleaseCheckError(
             "provenance",
-            "the attestation does not bind this tarball to ai-tc's release workflow: "
-            + "; ".join(bad)
-            + ". A cryptographically valid attestation is NOT sufficient: anyone can publish "
-            "with provenance from their own repository.",
+            "the signed statement disagrees with the certificate that signed it: "
+            + "; ".join(disagree)
+            + ". A statement that contradicts its own signer is forged.",
         )
-    return statement
+    return SignedStatement(statement, signer)
 
 
-def attested_commit(statement: dict, version: str) -> str:
-    """The git commit the provenance says the release was built from, for the tag's own URI."""
+def attested_commit(statement: SignedStatement, version: str) -> str:
+    """The git commit the release was built from: the signing certificate's source
+    repository digest, which the statement's own commit for the tag's URI must equal."""
     tag_ref = f"refs/tags/{RELEASE_PIPELINE[PACKAGE]['tag_prefix']}{version}"
     uri = f"git+{PROV_REPO}@{tag_ref}"
-    dependencies = ((statement.get("predicate") or {}).get("buildDefinition") or {}).get("resolvedDependencies") or []
+    dependencies = _field(statement.body, "predicate", "buildDefinition", "resolvedDependencies")
     commits = [
-        (d.get("digest") or {}).get("gitCommit")
-        for d in dependencies
-        if isinstance(d, dict) and d.get("uri") == uri
+        _field(dependency, "digest", "gitCommit")
+        for dependency in (dependencies if isinstance(dependencies, list) else [])
+        if isinstance(dependency, dict) and dependency.get("uri") == uri
     ]
     if len(commits) != 1 or not isinstance(commits[0], str) or not SHA40.fullmatch(commits[0]):
         raise ReleaseCheckError("attested-commit", f"the provenance names no single commit for {uri} (found {commits!r})")
-    return commits[0]
+    if commits[0] != statement.signer["commit"]:
+        raise ReleaseCheckError(
+            "attested-commit",
+            f"the statement builds {uri} at {commits[0]} but the signing certificate names "
+            f"{statement.signer['commit']} as the commit the workflow ran at",
+        )
+    return statement.signer["commit"]
 
 
-def release_run_url(statement: dict) -> str:
-    """The ai-tc release run that built the tarball, for the PR body."""
-    url = (((statement.get("predicate") or {}).get("runDetails") or {}).get("metadata") or {}).get("invocationId", "")
-    if not isinstance(url, str) or not RUN_URL.fullmatch(url):
-        raise ReleaseCheckError("run-url", f"the provenance names no ai-tc Actions run: {url!r}")
+def release_run_url(statement: SignedStatement) -> str:
+    """The ai-tc release run that built the tarball, for the PR body: the signing
+    certificate's run invocation URI, which the statement's own must equal."""
+    url = statement.signer["run_url"]
+    if not RUN_URL.fullmatch(url):
+        raise ReleaseCheckError("run-url", f"the signing certificate names no ai-tc Actions run: {url!r}")
+    claimed = _field(statement.body, "predicate", "runDetails", "metadata", "invocationId")
+    if claimed != url:
+        raise ReleaseCheckError(
+            "run-url", f"the statement names the run {claimed!r} but the signing certificate names {url!r}"
+        )
     return url
 
 
@@ -540,18 +960,10 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
     status, body = fetch(url, {})
     if status != 200:
         raise InfraError("commit-on-main", f"GET {url} answered {status}")
-    try:
-        ref = json.loads(body)
-    except ValueError as exc:
-        raise InfraError("commit-on-main", f"GET {url} answered non-JSON: {exc}") from exc
-    obj = ref.get("object") if isinstance(ref, dict) else None
+    ref = _github_json(url, body, dict, "commit-on-main")
+    obj = ref.get("object")
     sha = obj.get("sha") if isinstance(obj, dict) else None
-    if (
-        not isinstance(ref, dict)
-        or ref.get("ref") != "refs/heads/main"
-        or not isinstance(sha, str)
-        or not SHA40.fullmatch(sha)
-    ):
+    if ref.get("ref") != "refs/heads/main" or not isinstance(sha, str) or not SHA40.fullmatch(sha):
         raise InfraError("commit-on-main", f"GET {url} answered a body that names no commit for refs/heads/main")
     return sha
 
@@ -559,7 +971,8 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
     """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
     against main's head as resolved from its full ref. Refuses behind (built on main's tip,
-    never merged), diverged, 404 and every error."""
+    never merged), diverged and 404. Every other error, and an answer that is not the
+    comparison document, is no verdict."""
     head = ai_tc_main_head(fetch=fetch)
     url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
@@ -567,7 +980,7 @@ def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
         raise ReleaseCheckError("commit-on-main", f"GitHub cannot compare {git_commit} with ai-tc main ({status})")
     if status != 200:
         raise InfraError("commit-on-main", f"GET {url} answered {status}")
-    result = json.loads(body).get("status")
+    result = _github_json(url, body, dict, "commit-on-main").get("status")
     if result not in ("ahead", "identical"):
         raise ReleaseCheckError(
             "commit-on-main",
@@ -578,23 +991,21 @@ def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
 
 def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_signatures, sleep=time.sleep) -> VerifiedRelease:
     """Every check a version must pass before any PR pins it, re-derived from npmjs and
-    GitHub. Nothing is taken on trust."""
+    GitHub. Nothing the publisher wrote is taken on trust. What is trusted is npm's
+    cryptography (the registry signature and the sigstore bundle, including the signing
+    certificate it verified) and GitHub's answer about ai-tc main."""
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z (pre-releases are never pinned)")
     integrity, shasum = registry_dist(version, fetch=fetch, sleep=sleep)
-    for attempt in range(1, ATTEMPTS + 1):
-        try:
-            statement = provenance_verdict(audit(PACKAGE, version), version, integrity)
-            break
-        except _NotIndexedYet as exc:
-            if attempt == ATTEMPTS:
-                raise ReleaseCheckError(
-                    "provenance",
-                    f"{exc}. Every release of this package is published by GitHub Actions with "
-                    f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
-                    "release pipeline.",
-                ) from None
-            sleep(RETRY_SECONDS)
+    try:
+        statement = audit(PACKAGE, version, lambda report: provenance_verdict(report, version, integrity))
+    except _NotIndexedYet as exc:
+        raise ReleaseCheckError(
+            "provenance",
+            f"{exc}. Every release of this package is published by GitHub Actions with "
+            f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
+            "release pipeline.",
+        ) from None
     git_commit = attested_commit(statement, version)
     run_url = release_run_url(statement)
     commit_on_ai_tc_main(git_commit, fetch=fetch)
@@ -609,26 +1020,111 @@ class Classification:
     note: str = dataclasses.field(default="", compare=False)
 
 
+# ai-tc runs a migration as the chunks left by splitting its text on this pattern, wherever
+# it stands: after a statement on the same line, inside a comment, across a line break (see
+# splitStatements in its migrations module). The split is on the raw text, before any quote
+# or comment is read, so it is made first here too. JavaScript's \s is not Python's: it
+# counts U+FEFF and leaves out a few control characters, so its set is spelled out.
+_JS_WHITESPACE = "".join(
+    map(
+        chr,
+        (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B))
+        + (0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF),
+    )
+)
+STATEMENT_BREAKPOINT = re.compile("-->[" + re.escape(_JS_WHITESPACE) + "]*statement-breakpoint")
+
+
+class _Unterminated(ValueError):
+    """A quoted string or name, or a block comment, that never closes."""
+
+
+def _closing_quote(text: str, start: int) -> int:
+    """The index of the quote that closes the one at `start`. A doubled quote inside reads
+    as a close and a re-open, which comes to the same thing, so it needs no case of its own."""
+    stop = text.find(text[start], start + 1)
+    if stop < 0:
+        raise _Unterminated(f"a {text[start]} at {start} is never closed")
+    return stop
+
+
+def _chunk_statements(chunk: str) -> list:
+    """The statements of one chunk, read left to right the way SQLite reads them.
+
+    A single-quoted string becomes '' (what it says decides nothing, and a ';' or '--' in it
+    ends nothing). A quoted name ("..." `...` [...]) is kept whole, so a __new_ table is
+    still seen. A -- comment runs to the end of the line and a /* */ comment to its close;
+    both are dropped. A ';' outside all of those ends a statement."""
+    statements: list = []
+    parts: list = []
+
+    def end() -> None:
+        statement = " ".join("".join(parts).split())
+        if statement:
+            statements.append(statement)
+        parts.clear()
+
+    i, size = 0, len(chunk)
+    while i < size:
+        char = chunk[i]
+        if char == "'":
+            i = _closing_quote(chunk, i) + 1
+            parts.append("''")
+        elif char in '"`':
+            stop = _closing_quote(chunk, i) + 1
+            parts.append(chunk[i:stop])
+            i = stop
+        elif char == "[":
+            stop = chunk.find("]", i + 1) + 1
+            if stop == 0:
+                raise _Unterminated(f"a [ at {i} is never closed")
+            parts.append(chunk[i:stop])
+            i = stop
+        elif chunk.startswith("--", i):
+            stop = chunk.find("\n", i)
+            i = size if stop < 0 else stop
+            parts.append(" ")
+        elif chunk.startswith("/*", i):
+            stop = chunk.find("*/", i + 2)
+            if stop < 0:
+                raise _Unterminated(f"a /* at {i} is never closed")
+            i = stop + 2
+            parts.append(" ")
+        elif char == ";":
+            end()
+            i += 1
+        else:
+            parts.append(char)
+            i += 1
+    end()
+    return statements
+
+
 def _statements(sql: str) -> list:
-    text = sql.replace("--> statement-breakpoint", ";")
-    lines = [line.split("--", 1)[0] for line in text.splitlines()]
-    return [" ".join(part.split()) for part in " ".join(lines).split(";") if part.strip()]
+    """Every statement ai-tc would run for one migration file. Raises _Unterminated."""
+    return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
 
 
 def _non_additive_reason(statement: str) -> str | None:
     upper = statement.upper()
     if upper.startswith("PRAGMA "):
-        return None
+        # The two drizzle writes around a table rebuild, and nothing else: any other
+        # pragma changes how the store behaves (journal mode, schema writes, user_version).
+        if re.fullmatch(r"PRAGMA FOREIGN_KEYS\s*=\s*(?:ON|OFF)", upper):
+            return None
+        return "a PRAGMA other than foreign_keys=ON/OFF"
     if "__NEW_" in upper:
         return "a table rebuild (drizzle's __new_ copy)"
     if re.match(r"CREATE TABLE ", upper) or re.match(r"CREATE INDEX ", upper):
         return None
     if re.match(r"CREATE UNIQUE INDEX ", upper):
         return "a UNIQUE index, a new constraint an older build's writes can violate"
-    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(.*)", upper)
+    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
     if added:
-        column = added.group(1)
-        if "NOT NULL" in column and "DEFAULT" not in column and "GENERATED" not in column:
+        # Only the words after the column's name count, and only as words: the name itself
+        # (`is_default`, `x default`) and any quoted name further on are not keywords.
+        definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
+        if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
             return "a NOT NULL column without a default"
         return None
     if re.match(r"ALTER TABLE \S+ RENAME", upper):
@@ -646,7 +1142,10 @@ def _non_additive_reason(statement: str) -> str | None:
 
 def migration_kind(sql: str) -> str:
     """'additive', or 'non-additive: <first reason>', for one migration file."""
-    statements = _statements(sql)
+    try:
+        statements = _statements(sql)
+    except _Unterminated:
+        return "non-additive: an unterminated quoted string or comment"
     if not statements:
         return "non-additive: no statements"
     for statement in statements:
@@ -663,22 +1162,93 @@ def _ai_tc_file(path: str, commit: str, fetch: Fetch) -> str | None:
         return None
     if status != 200:
         raise InfraError("classify", f"GET {url} answered {status}")
-    return body.decode("utf-8")
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The file at an attested commit never changes, so this is a verdict, not an outage.
+        raise ReleaseCheckError("classify", f"{path} at {commit} is not UTF-8: {exc}") from exc
 
 
 def _journal_tags(commit: str, fetch: Fetch):
     raw = _ai_tc_file(f"{MIGRATIONS_DIR}/meta/_journal.json", commit, fetch)
     if raw is None:
         return None
-    entries = json.loads(raw).get("entries")
-    tags = [e.get("tag") for e in entries] if isinstance(entries, list) else None
+    try:
+        document = parse_json(raw)
+    except (ValueError, RecursionError) as exc:
+        raise ReleaseCheckError("classify", f"the migration journal at {commit} does not parse: {exc}") from exc
+    entries = document.get("entries") if isinstance(document, dict) else None
+    tags = [e.get("tag") if isinstance(e, dict) else None for e in entries] if isinstance(entries, list) else None
     if tags is None or not all(isinstance(t, str) and MIGRATION_TAG.fullmatch(t) for t in tags):
         raise ReleaseCheckError("classify", f"the migration journal at {commit} has an unexpected shape")
     return tags
 
 
+# The Contents API lists at most this many entries of a directory, and does not say it stopped.
+CONTENTS_LISTING_CAP = 1000
+EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
+UNREADABLE_FILE = "non-additive: the migration file cannot be read"
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there. One request however many files it holds.
+    The raw media type the file reads use returns bytes with no sha, so this asks for the
+    JSON listing instead."""
+    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+    status, body = fetch(url, {"Accept": "application/vnd.github+json"})
+    if status == 404:
+        return None
+    if status != 200:
+        raise InfraError("classify", f"GET {url} answered {status}")
+    try:
+        listing = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("classify", f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(listing, list) or not all(isinstance(entry, dict) for entry in listing):
+        raise InfraError("classify", f"GET {url} did not answer a directory listing")
+    if len(listing) >= CONTENTS_LISTING_CAP:
+        raise InfraError(
+            "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
+        )
+    return {
+        entry["name"][: -len(".sql")]: entry.get("sha")
+        for entry in listing
+        if entry.get("type") == "file" and isinstance(entry.get("name"), str) and entry["name"].endswith(".sql")
+    }
+
+
+def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{tag: kind} for each migration that both journals name and whose file is not the same
+    blob at the two commits, or cannot be compared. ai-tc's store migrator records an
+    applied migration by its tag and never re-runs it, so an edit changes what a fresh store
+    gets but not what an existing one has: the two diverge, and no rollback across the
+    release is safe. A file that cannot be found counts the same way, as it does for an added
+    migration. A listing that fails or is malformed is no verdict."""
+    if not tags:
+        return {}
+    listings = [_migration_blobs(commit, fetch) for commit in (from_commit, to_commit)]
+    kinds = {}
+    for tag in tags:
+        shas = []
+        for blobs in listings:
+            if blobs is None or tag not in blobs:
+                shas.append(None)
+                continue
+            sha = blobs[tag]
+            if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+                raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {tag}.sql")
+            shas.append(sha)
+        if None in shas:
+            kinds[tag] = UNREADABLE_FILE
+        elif shas[0] != shas[1]:
+            kinds[tag] = EDITED_IN_PLACE
+    return kinds
+
+
 def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
-    """Classify the local-store migrations ai-tc added between two attested commits."""
+    """Classify the local-store migrations ai-tc added, removed from the journal or edited
+    in place between two attested commits."""
     for commit in (from_commit, to_commit):
         if not isinstance(commit, str) or not SHA40.fullmatch(commit):
             raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
@@ -696,10 +1266,12 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
     kinds = {}
     for tag in added:
         sql = _ai_tc_file(f"{MIGRATIONS_DIR}/{tag}.sql", to_commit, fetch)
-        kinds[tag] = "non-additive: the migration file cannot be read" if sql is None else migration_kind(sql)
+        kinds[tag] = UNREADABLE_FILE if sql is None else migration_kind(sql)
     for tag in removed:
         kinds[tag] = "non-additive: removed from the journal (history rewritten)"
-    migrations = added + removed
+    edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
+    kinds.update(edited)
+    migrations = added + removed + list(edited)
     if not migrations:
         return Classification("additive", [], kinds)
     if EVERY_MIGRATION_COUNTS:
@@ -716,28 +1288,30 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
 SAFETY_KEYS = ["classification", "from", "to", "migrations"]
 
 
+def _entry_problems(version, entry) -> list:
+    """What is wrong with one rollback-safety.json entry (empty = well formed)."""
+    where = f"{SAFETY_FILE} {version!r}"
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        return [f"{where}: not an exact x.y.z"]
+    if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
+        return [f"{where}: keys must be exactly {SAFETY_KEYS}, in that order"]
+    problems = []
+    if entry["classification"] not in ("additive", "not-rollback-safe"):
+        problems.append(f"{where}: classification must be additive or not-rollback-safe")
+    for key in ("from", "to"):
+        if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
+            problems.append(f"{where}: {key} must be a 40-hex commit id")
+    migrations = entry["migrations"]
+    if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
+        problems.append(f"{where}: migrations must be a list of migration tags")
+    return problems
+
+
 def safety_problems(doc) -> list:
     """What is wrong with a rollback-safety.json document (empty = well formed)."""
     if not isinstance(doc, dict) or list(doc) != ["versions"] or not isinstance(doc["versions"], dict):
         return [f'{SAFETY_FILE} must be exactly {{"versions": {{...}}}}']
-    problems = []
-    for version, entry in doc["versions"].items():
-        where = f"{SAFETY_FILE} {version!r}"
-        if not SEMVER.fullmatch(version):
-            problems.append(f"{where}: not an exact x.y.z")
-            continue
-        if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
-            problems.append(f"{where}: keys must be exactly {SAFETY_KEYS}, in that order")
-            continue
-        if entry["classification"] not in ("additive", "not-rollback-safe"):
-            problems.append(f"{where}: classification must be additive or not-rollback-safe")
-        for key in ("from", "to"):
-            if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
-                problems.append(f"{where}: {key} must be a 40-hex commit id")
-        migrations = entry["migrations"]
-        if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
-            problems.append(f"{where}: migrations must be a list of migration tags")
-    return problems
+    return [problem for version, entry in doc["versions"].items() for problem in _entry_problems(version, entry)]
 
 
 def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=classify_migrations) -> dict:
@@ -754,9 +1328,12 @@ def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=c
 
 def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
     """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
-    or None. Anything but an explicit "additive" entry counts as flagged, and so does a
-    version in `pinned` with no entry at all: a pin that reached main without a computed
-    entry (a break-glass merge, a restore, a hand-run import) is no evidence of safety."""
+    or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
+    so does a version in `pinned` with no entry at all: a pin that reached main without a
+    computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
+    safety. An entry is judged on its own: one malformed entry flags its own version and
+    does not stop the others being read, because refusing the file would block every
+    rollback."""
     versions = safety.get("versions") if isinstance(safety, dict) else None
     if not isinstance(versions, dict):
         raise ReleaseCheckError("safety", f'{SAFETY_FILE} must be {{"versions": {{...}}}}')
@@ -768,7 +1345,11 @@ def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=())
         if isinstance(version, str)
         and SEMVER.fullmatch(version)
         and low < vkey(version) <= high
-        and not (isinstance(versions.get(version), dict) and versions[version].get("classification") == "additive")
+        and not (
+            version in versions
+            and not _entry_problems(version, versions[version])
+            and versions[version]["classification"] == "additive"
+        )
     ]
     return min(flagged, key=vkey) if flagged else None
 
@@ -859,6 +1440,8 @@ EXPECTED_RULESETS = {
 # default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
 # `/`), so bot-branches and tags-locked each list both depths. tags-locked never uses ~ALL:
 # GitHub documents it as every branch, and on a tag ruleset it could lock no tag.
+# x4 is one level on purpose: the branches it protects are named x4/<name>, and a tag that
+# shadows one carries the same name. Any deeper tag is covered by tags-locked.
 EXPECTED_REF_PATTERNS = {
     "main": ([["refs/heads/main"]], []),
     "tags-locked": ([["refs/tags/*", "refs/tags/**/*"]], ["refs/tags/fleet-v*"]),
@@ -930,7 +1513,8 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     if message["subject"] != f"{name}: ai-tc {recorded}":
         problems.append(f"{name}'s subject {message['subject']!r} is not '{name}: ai-tc <version>'")
     try:
-        entry = find_ai_tc_entry(_read_manifest(repo_dir, commit))
+        manifest = _manifest_at(repo_dir, commit)
+        entry = None if manifest is None else find_ai_tc_entry(manifest)
         expected = "entry removed" if entry is None else entry_version(entry)
     except (ReleaseCheckError, ValueError) as exc:
         expected = f"an unreadable manifest ({exc})"
@@ -940,12 +1524,17 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     if number is None:
         problems.append(f"{name} names no PR (a 'pr: <number>' line)")
         return problems
-    status, body = fetch(f"{MARKETPLACE_API}/pulls/{number.group(1)}", {})
-    if status != 200:
-        problems.append(f"{name}: GET pull {number.group(1)} answered {status}")
+    url = f"{MARKETPLACE_API}/pulls/{number.group(1)}"
+    status, body = fetch(url, {})
+    if status == 404:
+        # The one answer that is a finding: a tag naming a PR that is not there was cut outside tag-release.
+        problems.append(f"{name} names PR #{number.group(1)}, which does not exist")
         return problems
-    pull = json.loads(body)
-    author = (pull.get("user") or {}).get("login")
+    if status != 200:
+        raise InfraError("api", f"GET {url} answered {status}")
+    pull = _github_json(url, body, dict)
+    user = pull.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
     if BOT_LOGIN is None:
         problems.append(f"{name}: no bot identity is configured (release_checks.BOT_LOGIN), so no tag after the frozen list can be confirmed")
     elif author != BOT_LOGIN:
@@ -979,22 +1568,34 @@ def _main_ruleset_problems(rules: dict) -> list:
 
 
 def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
-    """Every expected ruleset exists, is active, targets the right refs and has its rules."""
-    status, body = fetch(f"{MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100", {})
+    """Every expected ruleset exists, is active, targets the right refs and has its rules.
+    A read of GitHub that fails, or that answers something other than the document asked
+    for, is InfraError: no verdict. It is never reported as a ruleset that is missing."""
+    # includes_parents=false leaves out the organisation's and the enterprise's rulesets: a
+    # ruleset this repository does not own is not one it can be said to carry.
+    url = f"{MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
+    status, body = fetch(url, {})
     if status != 200:
-        return [f"could not list the repository's rulesets (HTTP {status})"]
-    listed = {r.get("name"): r for r in json.loads(body) if isinstance(r, dict)}
+        raise InfraError("api", f"GET {url} answered {status}")
+    listing = _github_json(url, body, list)
+    if not all(isinstance(r, dict) for r in listing):
+        raise InfraError("api", f"GET {url} listed an entry that is not a ruleset")
     problems = []
     for name, (target, rule_types) in EXPECTED_RULESETS.items():
-        summary = listed.get(name)
-        if summary is None:
+        found = [r for r in listing if r.get("name") == name]
+        if not found:
             problems.append(f"ruleset {name!r} does not exist")
             continue
-        status, body = fetch(f"{MARKETPLACE_API}/rulesets/{summary.get('id')}", {})
-        if status != 200:
-            problems.append(f"ruleset {name!r}: GET answered {status}")
+        if len(found) != 1:
+            # Which of them is the one in force is not for this audit to guess.
+            problems.append(f"ruleset {name!r}: expected exactly one, found {len(found)}")
             continue
-        ruleset = json.loads(body)
+        summary = found[0]
+        url = f"{MARKETPLACE_API}/rulesets/{summary.get('id')}"
+        status, body = fetch(url, {})
+        if status != 200:
+            raise InfraError("api", f"GET {url} answered {status}")
+        ruleset = _github_json(url, body, dict)
         if ruleset.get("enforcement") != "active":
             problems.append(f"ruleset {name!r} is {ruleset.get('enforcement')!r}, not active")
         if ruleset.get("target") != target:
@@ -1017,9 +1618,11 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
     return problems
 
 
-def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
+def audit_tags(repo_dir: str, frozen_path: str, *, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
     """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
-    detection, not prevention: the rulesets prevent, and this notices when one was edited."""
+    detection, not prevention: the rulesets prevent, and this notices when one was edited.
+    A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
+    verdict, and a problem would file a drift that did not happen."""
     problems = []
     current = {row["tag"]: row for row in snapshot_tags(repo_dir)}
     for name in _git(repo_dir, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags").split():
@@ -1028,19 +1631,15 @@ def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fe
     frozen = _tag_rows(frozen_path, "frozen tag list", problems)
     if frozen is None:
         return problems
-    compared = [("frozen list", frozen)]
-    if previous_path is not None and os.path.exists(previous_path):
-        compared.append(("previous run", _tag_rows(previous_path, "previous run's tag list", problems) or []))
-    for label, rows in compared:
-        for row in rows:
-            now = current.get(row["tag"])
-            if now is None:
-                problems.append(f"{row['tag']} is in the {label} but no longer exists")
-            elif now != row:
-                problems.append(
-                    f"{row['tag']} changed since the {label}: {row['object']} -> {row['commit']} "
-                    f"is now {now['object']} -> {now['commit']}"
-                )
+    for row in frozen:
+        now = current.get(row["tag"])
+        if now is None:
+            problems.append(f"{row['tag']} is in the frozen list but no longer exists")
+        elif now != row:
+            problems.append(
+                f"{row['tag']} changed since the frozen list: {row['object']} -> {row['commit']} "
+                f"is now {now['object']} -> {now['commit']}"
+            )
     for name, row in current.items():
         if _git(repo_dir, "cat-file", "-t", row["object"]).strip() != "tag":
             problems.append(f"{name} is a lightweight tag; every fleet-v tag is annotated")
@@ -1086,7 +1685,6 @@ def _parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
     audit.add_argument("--repo", default=".")
     audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
-    audit.add_argument("--previous", default=None)
     audit.add_argument("--no-rulesets", action="store_true")
     sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
     mode = sub.add_parser("diff-mode", help="classify a manifest change")
@@ -1139,7 +1737,7 @@ def _command(args) -> int:
         result["error"] = {"check": "floor", "detail": detail}
         return _emit(result, 1)
     if args.command == "audit-tags":
-        problems = audit_tags(args.repo, args.frozen, previous_path=args.previous, check_rulesets=not args.no_rulesets)
+        problems = audit_tags(args.repo, args.frozen, check_rulesets=not args.no_rulesets)
         for problem in problems:
             print(f"::error::{problem}", file=sys.stderr)
         return _emit({"problems": problems}, 1 if problems else 0)
@@ -1164,6 +1762,13 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
+    except Exception as exc:
+        # Neither a verdict nor a known failure: a defect in this tool, or a document shaped in
+        # a way it did not expect. It reached no verdict, so it must not exit 1 (a verdict).
+        # KeyboardInterrupt and SystemExit are not Exceptions and pass through.
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"::error::internal: {detail}", file=sys.stderr)
+        return _emit({"error": {"check": "internal", "detail": detail}}, 2)
 
 
 if __name__ == "__main__":
