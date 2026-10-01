@@ -93,18 +93,23 @@ class TestRegistryDist(ts.VerifyMixin, unittest.TestCase):
         self.refused("dist", routes=self.routes_answering((404, b'"version not found"')), sleeps=sleeps)
         self.assertEqual(sleeps, [20, 20, 20, 20])
 
-    def test_a_non_json_dist_body_is_no_verdict(self):
+    def test_a_non_json_dist_body_is_no_verdict_and_is_not_read_again(self):
+        # Only an answer that is not a 200 is waited out as replica lag.
         for body in (b"<html>bad gateway</html>", b"", b"\xff\xfe", b'{"version": "0.9.14", "version": "0.9.14"}'):
             with self.subTest(body):
-                self.no_verdict("dist", routes=self.routes_answering((200, body)))
+                sleeps = []
+                self.no_verdict("dist", routes=self.routes_answering((200, body)), sleeps=sleeps)
+                self.assertEqual(sleeps, [])
 
     def test_a_dist_body_nested_too_deep_to_parse_is_no_verdict(self):
         self.no_verdict("dist", routes=self.routes_answering((200, b"[" * 200000)))
 
-    def test_a_dist_body_that_is_not_an_object_is_no_verdict(self):
+    def test_a_dist_body_that_is_not_an_object_is_no_verdict_and_is_not_read_again(self):
         for body in (b"[]", b'"text"', b"null", b"7"):
             with self.subTest(body):
-                self.no_verdict("dist", routes=self.routes_answering((200, body)))
+                sleeps = []
+                self.no_verdict("dist", routes=self.routes_answering((200, body)), sleeps=sleeps)
+                self.assertEqual(sleeps, [])
 
     def test_a_dist_document_without_a_dist_or_for_another_version_is_still_a_verdict(self):
         for doc in ({"version": VERSION}, {"version": "0.9.13", "dist": {}}, {"dist": {}}):
