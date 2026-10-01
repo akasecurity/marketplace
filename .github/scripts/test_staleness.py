@@ -166,6 +166,20 @@ class TestRuleINoVerdict(StalenessCase):
                 self.assertEqual(rules["staleness-i"].red, None if reported else False)
                 self.assertEqual(rules["staleness-i-refused"].red, None if reported else False)
 
+    def test_the_detail_says_which_versions_hold_the_other_rules(self):
+        # Only a version on npm for over an hour, or with no known publish time, is reported
+        # and holds the other two rules (test_an_outage_in_the_first_hour_is_not_reported).
+        # The text a person reads must not claim more than that.
+        self.candidates = ["0.9.16"]
+        self.down = {"0.9.16": ("network", "registry answered 503")}
+        for label, times in (("over an hour", {"0.9.16": stamp(dt.timedelta(hours=5))}), ("no publish time", {})):
+            with self.subTest(label):
+                self.times = times
+                detail = self.rules()["staleness-i-no-verdict"].detail
+                self.assertIn("until every version that has been on npm for over an hour, or whose publish time is "
+                              "unknown, has a verdict", detail)
+                self.assertNotIn("until every version has a verdict", detail)
+
     def test_an_outage_on_a_version_with_no_publish_time_is_reported(self):
         self.candidates = ["0.9.16"]
         self.down = {"0.9.16": ("npm", "registry answered 503")}
