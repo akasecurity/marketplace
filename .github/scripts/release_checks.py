@@ -309,7 +309,7 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
     try:
         document = parse_json(body.decode("utf-8"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
     versions = document.get("versions") if isinstance(document, dict) else None
     if not isinstance(versions, dict):
