@@ -154,7 +154,7 @@ def human_report(head_doc, *, base_doc=None, changed=(rc.MANIFEST,), head_safety
     report = vp.Report()
     entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
     head = copy.deepcopy(ts.SEED) if head_safety is None else head_safety
-    vp.human_rules(entries, copy.deepcopy(ts.SEED), head, sorted(changed), report)
+    vp.human_rules(entries, copy.deepcopy(ts.SEED), head, sorted(changed), report, pinned={v for v in ts.PINS.values() if v})
     return report
 
 
@@ -195,10 +195,49 @@ class TestHumanRules(unittest.TestCase):
         report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
         self.assertEqual(report.failures, [])
         self.assertIn(
-            "HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
+            "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
             "the approving code owner owns this classification",
             report.notes,
         )
+
+    def test_an_edit_that_does_not_lower_the_floor_is_not_labelled_so(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety["0.9.13"]["classification"] = "not-rollback-safe"
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertIn(
+            "HUMAN EDIT of rollback-safety.json 0.9.13: additive -> not-rollback-safe; "
+            "the approving code owner owns this classification",
+            report.notes,
+        )
+        self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
+
+    def test_a_hand_added_entry_for_a_version_nothing_pins_fails(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety["0.9.15"] = copy.deepcopy(NEXT_ENTRY)
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        failed_with(self, report, "rollback-safety.json gains 0.9.15, which nothing pins")
+        failed_with(self, report, "never typed ahead of it")
+
+    def test_an_entry_added_for_a_version_a_tag_pins_is_only_a_note(self):
+        # 0.9.8 is pinned by fleet-v3, and the seed has no entry for it: a person may supply it.
+        head_safety = {"0.9.8": copy.deepcopy(NEXT_ENTRY), **copy.deepcopy(ts.SEED)}
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any("0.9.8: absent -> not-rollback-safe" in n for n in report.notes), report.notes)
+
+    def test_a_human_added_entry_that_is_additive_for_a_pinned_version_lowers_the_floor(self):
+        head_safety = {"0.9.8": {**copy.deepcopy(NEXT_ENTRY), "classification": "additive", "migrations": []}, **copy.deepcopy(ts.SEED)}
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any(n.startswith("LOWERS THE ROLLBACK FLOOR: ") and "0.9.8: absent -> additive" in n for n in report.notes), report.notes)
+
+    def test_evaluate_gives_a_human_pr_the_versions_main_and_the_tags_pin(self):
+        head_safety = {**ts.SEED, "0.9.15": NEXT_ENTRY}
+        report = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety=head_safety), [rc.SAFETY_FILE])
+        failed_with(self, report, "rollback-safety.json gains 0.9.15, which nothing pins")
+        pinned_now = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety=head_safety), [rc.SAFETY_FILE], pins={**ts.PINS, "main": "0.9.15"})
+        self.assertEqual(pinned_now.failures, [])
 
     def test_removing_a_safety_entry_is_called_out(self):
         head_safety = copy.deepcopy(ts.SEED)
