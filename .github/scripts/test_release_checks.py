@@ -55,12 +55,12 @@ class TestErrorClasses(unittest.TestCase):
     def test_a_handler_written_for_a_verdict_lets_an_outage_through(self):
         # _tag_pin is lenient about what a tag's manifest says, so every verdict-shaped
         # failure pins nothing. A failed read is no verdict and must not be dropped with them.
-        with mock.patch.object(rc, "_read_manifest", side_effect=rc.InfraError("git", "show failed")):
+        with mock.patch.object(rc, "_manifest_at", side_effect=rc.InfraError("git", "show failed")):
             with self.assertRaises(rc.InfraError):
                 rc._tag_pin("unused", "fleet-v1")
         for verdict in (rc.ReleaseCheckError("manifest", "no plugins list"), ValueError("does not parse")):
             with self.subTest(verdict=repr(verdict)):
-                with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
+                with mock.patch.object(rc, "_manifest_at", side_effect=verdict):
                     self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
 
 
@@ -204,13 +204,21 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
                 call(repo.path)
             self.assertEqual(caught.exception.check, "git")
 
-    def test_a_tag_without_the_manifest_file_is_infrastructure(self):
+    def test_a_tag_at_a_commit_without_the_manifest_file_pins_nothing(self):
+        # tag-release cuts such a tag as "entry removed", and a tag is immutable, so reading
+        # it as a failed git read would be a permanent outage. The file is not there: the
+        # tag pins nothing, and every other tag keeps its pin.
         repo = self.ledger()
         ts.git(repo.path, "rm", "-q", rc.MANIFEST)
         ts.git(repo.path, "commit", "-q", "-m", "drop the manifest")
         repo.tag("fleet-v5")
-        with self.assertRaises(rc.InfraError):
-            rc.pinned_versions(repo.path)
+        repo.commit(ts.manifest("0.9.15"))  # main holds its manifest again: only the tag lacks one
+        pins = rc.pins_by_ref(repo.path)
+        self.assertEqual(pins["main"], "0.9.15")
+        self.assertIsNone(pins["fleet-v5"])
+        self.assertEqual([pins[f"fleet-v{n}"] for n in (1, 2, 3, 4)], ["0.9.12", "0.9.13", "0.9.14", "0.9.15"])
+        self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+        self.assertEqual(rc.tag_pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
 
     def test_a_manifest_that_does_not_parse_still_pins_nothing(self):
         repo = self.ledger()
