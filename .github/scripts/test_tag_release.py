@@ -35,14 +35,15 @@ def sweep_github() -> FakeGitHub:
         ("GET", R("git/ref/tags/fleet-v9")): not_found(),
         ("GET", R("git/ref/tags/fleet-v10")): not_found(),
         ("GET", R("git/ref/tags/fleet-v11")): not_found(),
-        ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z"}],
+        ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+                                        "base": {"ref": "main"}}],
         ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
         ("GET", R("pulls/13/reviews")): [
             {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
             {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}],
         ("GET", R("commits/c/pulls")): [
-            {"number": 15, "merge_commit_sha": "other", "merged_at": None},
-            {"number": 14, "merge_commit_sha": "c", "merged_at": "2026-10-03T00:00:00Z"}],
+            {"number": 15, "merge_commit_sha": "other", "merged_at": None, "base": {"ref": "main"}},
+            {"number": 14, "merge_commit_sha": "c", "merged_at": "2026-10-03T00:00:00Z", "base": {"ref": "main"}}],
         ("GET", R("pulls/14")): {"head": {"sha": "h14"}, "labels": [{"name": "rollback"}, {"name": "drill"}],
                                  "merged_by": {"login": "org-owner-example"}},
         ("GET", R("pulls/14/reviews")): [
@@ -122,10 +123,20 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(gh.writes(), [])
 
     def test_an_association_that_appears_on_the_second_ask_is_used(self):
-        answers = [[], [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z"}]]
+        answers = [[], [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+                         "base": {"ref": "main"}}]]
         gh = sweep_github()
         gh.routes[("GET", R("commits/b/pulls"))] = lambda body, params: answers.pop(0)
         self.assertEqual(tr.merged_pull(gh, "b", sleep=lambda seconds: None)["number"], 13)
+
+    def test_a_pr_merged_into_another_branch_is_not_mains_merge(self):
+        gh = sweep_github()
+        gh.routes[("GET", R("commits/b/pulls"))] = [
+            {"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z", "base": {"ref": "release"}}]
+        self.assertIsNone(tr.merged_pull(gh, "b", sleep=lambda seconds: None))
+        gh.routes[("GET", R("commits/b/pulls"))] = [
+            {"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z"}]
+        self.assertIsNone(tr.merged_pull(gh, "b", sleep=lambda seconds: None))  # no base at all: not main's either
 
     def test_a_forward_version_without_a_safety_entry_records_unknown(self):
         git = FakeGit(chain=["t8", "b"], files={("b", SAFETY_FILE): safety({})})
@@ -163,7 +174,8 @@ class TestStoreMigration(unittest.TestCase):
 class TestApprover(unittest.TestCase):
     def test_the_last_owner_approval_on_the_final_head_is_named(self):
         gh = FakeGitHub({
-            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z"}],
+            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+                                             "base": {"ref": "main"}}],
             ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
             ("GET", R("pulls/13/reviews")): [
                 {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
