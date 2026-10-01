@@ -335,6 +335,19 @@ def http_fetch(url: str, headers: dict) -> tuple:
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
+def _github_json(url: str, body: bytes, kind: type, check: str = "api"):
+    """The JSON document a 200 answer from GitHub carries, which must be a `kind` (dict or
+    list). GitHub answered, but not with this document: that is no verdict about the
+    repository or the release, never a finding in it, and never a crash."""
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError(check, f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(document, kind):
+        raise InfraError(check, f"GET {url} did not answer a JSON {'object' if kind is dict else 'list'}")
+    return document
+
+
 def packument_url() -> str:
     return f"{REGISTRY}/{urllib.parse.quote(PACKAGE, safe='@')}"
 
@@ -946,18 +959,10 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
     status, body = fetch(url, {})
     if status != 200:
         raise InfraError("commit-on-main", f"GET {url} answered {status}")
-    try:
-        ref = json.loads(body)
-    except ValueError as exc:
-        raise InfraError("commit-on-main", f"GET {url} answered non-JSON: {exc}") from exc
-    obj = ref.get("object") if isinstance(ref, dict) else None
+    ref = _github_json(url, body, dict, "commit-on-main")
+    obj = ref.get("object")
     sha = obj.get("sha") if isinstance(obj, dict) else None
-    if (
-        not isinstance(ref, dict)
-        or ref.get("ref") != "refs/heads/main"
-        or not isinstance(sha, str)
-        or not SHA40.fullmatch(sha)
-    ):
+    if ref.get("ref") != "refs/heads/main" or not isinstance(sha, str) or not SHA40.fullmatch(sha):
         raise InfraError("commit-on-main", f"GET {url} answered a body that names no commit for refs/heads/main")
     return sha
 
@@ -965,7 +970,8 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
     """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
     against main's head as resolved from its full ref. Refuses behind (built on main's tip,
-    never merged), diverged, 404 and every error."""
+    never merged), diverged and 404. Every other error, and an answer that is not the
+    comparison document, is no verdict."""
     head = ai_tc_main_head(fetch=fetch)
     url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
@@ -973,7 +979,7 @@ def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
         raise ReleaseCheckError("commit-on-main", f"GitHub cannot compare {git_commit} with ai-tc main ({status})")
     if status != 200:
         raise InfraError("commit-on-main", f"GET {url} answered {status}")
-    result = json.loads(body).get("status")
+    result = _github_json(url, body, dict, "commit-on-main").get("status")
     if result not in ("ahead", "identical"):
         raise ReleaseCheckError(
             "commit-on-main",
@@ -1491,19 +1497,6 @@ def _tag_rows(path: str, label: str, problems: list):
         problems.append(f"the {label} {path} must be a list of {{tag, object, commit}} rows")
         return None
     return rows
-
-
-def _github_json(url: str, body: bytes, kind: type):
-    """The JSON document a 200 answer from GitHub carries, which must be a `kind` (dict or
-    list). GitHub answered, but not with this document: that is no verdict about the repository,
-    never a finding in it."""
-    try:
-        document = parse_json(body.decode("utf-8"))
-    except (ValueError, RecursionError) as exc:
-        raise InfraError("api", f"GET {url} answered non-JSON: {exc}") from exc
-    if not isinstance(document, kind):
-        raise InfraError("api", f"GET {url} did not answer a JSON {'object' if kind is dict else 'list'}")
-    return document
 
 
 def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:

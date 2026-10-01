@@ -684,6 +684,8 @@ class TestVerifyRelease(unittest.TestCase):
             ("uppercase sha", {"ref": "refs/heads/main", "object": {"sha": "E" * 40}}),
             ("sha not a string", {"ref": "refs/heads/main", "object": {"sha": 7}}),
             ("another ref", {**good, "ref": "refs/tags/main"}),
+            ("a duplicated key", b'{"ref": "refs/heads/main", "ref": "refs/heads/main", "object": {"sha": "' + b"e" * 40 + b'"}}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
         ):
             with self.subTest(label):
                 routes = ts.release_routes("0.9.14")
@@ -691,6 +693,26 @@ class TestVerifyRelease(unittest.TestCase):
                 with self.assertRaises(rc.InfraError) as caught:
                     self.verify(routes=routes)
                 self.assertEqual(caught.exception.check, "commit-on-main")
+
+    def test_a_compare_answer_that_is_not_a_json_object_is_no_verdict(self):
+        # A 200 whose body is not the comparison says nothing about the commit, so it is neither a
+        # refusal nor a crash.
+        for label, body in (
+            ("not json", b"<html>"),
+            ("empty", b""),
+            ("a list", b"[]"),
+            ("a string", b'"ahead"'),
+            ("null", b"null"),
+            ("a duplicated key", b'{"status": "behind", "status": "ahead"}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (200, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+                self.assertIn("compare", caught.exception.detail)
 
     def test_identical_to_main_passes(self):
         self.verify(routes=ts.release_routes("0.9.14", compare="identical"))
