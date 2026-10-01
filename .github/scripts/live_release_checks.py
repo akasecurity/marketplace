@@ -19,7 +19,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 
 # Every release a fleet-v tag pins, with the commit its signing certificate names: the
 # versions the fleet can be rolled back to. 0.9.11 is on npm, but no tag pins it. The
-# first test below fails when a tag pins a version this table lacks, so add it here.
+# table test below fails when a tag pins a version this table lacks, so add it here.
 FLEET_PINNED = {
     # The oldest rollback target (fleet-v2); the unit fixtures hold no commit for it.
     "0.9.6": "dc73c73f3ca46aa644bda144cc99e972b60814f7",
@@ -45,7 +45,8 @@ class TestLiveRelease(unittest.TestCase):
         )
 
     def test_the_table_names_every_version_a_fleet_tag_pins(self):
-        # Reads this checkout's tags: run `git fetch --tags` first, or nothing is checked.
+        # Reads this checkout's tags: run `git fetch --tags` first. With no fleet-v tags that
+        # pin a version the test fails, and with only some of them it checks only those.
         pinned = rc.tag_pinned_versions(str(REPO))
         self.assertTrue(pinned, "this checkout has no fleet-v tags that pin a version: fetch the tags")
         self.assertEqual(sorted(pinned - set(FLEET_PINNED), key=rc.vkey), [])
