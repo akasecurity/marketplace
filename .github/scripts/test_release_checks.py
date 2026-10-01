@@ -426,28 +426,62 @@ class TestNpmAuditSignatures(unittest.TestCase):
             )
 
     def test_output_that_is_not_a_report_object_is_toolchain(self):
-        for text in ("[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}'):
+        for text in (
+            "[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}',
+            '{"invalid": []}', '{"invalid": [], "missing": []}',
+        ):
             with self.subTest(text=text), self.assertRaises(rc.InfraError):
                 rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, text)), sleep=lambda s: None)
 
     def test_a_report_with_nothing_verified_is_still_a_verdict(self):
+        # An npm that honours --include-attestations prints the verified list even when it is empty.
         report = rc.npm_audit_signatures(
-            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=lambda s: None
+            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": [], "verified": []}))),
+            sleep=lambda s: None,
         )
-        self.assertEqual(report["invalid"], [])
+        self.assertEqual((report["invalid"], report["verified"]), ([], []))
 
-    def test_an_npm_older_than_11_is_toolchain(self):
-        for version in ("10.9.2", "9.0.0"):
+    def test_a_report_without_a_verified_list_is_toolchain_not_a_missing_attestation(self):
+        # No list at all is an npm that ignored the flag, and says nothing about the release.
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(
+                rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=sleeps.append
+            )
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+        self.assertEqual(sleeps, [], "a report npm cannot have meant is not waited out")
+
+    def test_an_npm_older_than_11_12_is_toolchain(self):
+        # --include-attestations first shipped in 11.12.0. An 11.0 to 11.11 npm takes the flag
+        # without an error and prints no attestations, so it must be refused as the toolchain.
+        for version in ("10.9.2", "9.0.0", "11.0.0", "11.5.1", "11.11.0", "11.11.9"):
             with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
                 rc.npm_audit_signatures(
                     rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
                     sleep=lambda s: None,
                 )
             self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("11.12.0", caught.exception.detail)
+            self.assertIn("NOT a signature result", caught.exception.detail)
+
+    def test_npm_11_12_and_later_is_accepted(self):
+        for version in ("11.12.0", "11.12.1", "11.16.0", "11.19.0", "12.0.0", "11.12.0-pre.1"):
+            with self.subTest(version=version):
+                run = FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+                report = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+                self.assertEqual(report["verified"][0]["version"], "0.9.14")
 
     def test_an_unreadable_npm_version_is_toolchain(self):
-        with self.assertRaises(rc.InfraError):
-            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(npm_version="banana"), sleep=lambda s: None)
+        # The audit itself would pass, so only the version gate can be what refuses.
+        for version in ("banana", "11", "11.12", ""):
+            with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
+                rc.npm_audit_signatures(
+                    rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
+                    sleep=lambda s: None,
+                )
+            self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("could not read npm's version", caught.exception.detail)
 
     def test_missing_npm_is_toolchain(self):
         def run(args, **kwargs):
