@@ -242,6 +242,8 @@ class TestNpmCandidates(unittest.TestCase):
             ("text that is not JSON", b"not json", not_json),
             ("bytes that are not UTF-8", b"\xff", not_json),
             ("a duplicated key", b'{"versions": {"0.9.15": {}}, "versions": {"0.9.16": {}}}', not_json),
+            # json.loads raises RecursionError, not ValueError, past the interpreter's depth.
+            ("nesting deeper than the parser reads", b"[" * 100_000 + b"]" * 100_000, not_json),
         ):
             with self.subTest(label):
                 fetch = ts.FakeFetch({rc.packument_url(): (200, body)})
