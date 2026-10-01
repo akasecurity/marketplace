@@ -1553,6 +1553,28 @@ class TestCli(unittest.TestCase):
         self.assertEqual(cli("no-such-command")[0], 2)
         self.assertEqual(cli("floor")[0], 2)
 
+    def test_an_unexpected_error_exits_2_as_internal(self):
+        # Only a verdict exits 1. A bug in this tool, or a document shaped in a way it did
+        # not expect, reaches no verdict, so a caller that fails on any non-zero status
+        # never reads a traceback (exit 1) as "the release failed its checks".
+        before, after = "a" * 40, "b" * 40
+        for error in (AttributeError("'list' object has no attribute 'get'"), TypeError("not subscriptable"), KeyError("status")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    code, out, err = cli("classify", before, after)
+                self.assertEqual(code, 2)
+                document = json.loads(out)["error"]
+                self.assertEqual(document["check"], "internal")
+                self.assertIn(type(error).__name__, document["detail"])
+                self.assertIn("::error::internal: " + type(error).__name__, err)
+
+    def test_an_interrupt_is_not_reported_as_an_internal_error(self):
+        for error in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        cli("classify", "a" * 40, "b" * 40)
+
     def test_candidates(self):
         repo = self.repo()
         with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
