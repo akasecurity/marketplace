@@ -103,16 +103,28 @@ def freeze_text(git: Git) -> str:
     return release_checks.dump_json(snapshot(git))
 
 
-def compare_previous(previous: list[dict], current: list[dict]) -> list[str]:
+REFREEZE = "if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
+
+
+def compare_previous(previous: list[dict], current: list[dict], frozen: list[dict] | None = None) -> list[str]:
+    """What changed since the last green run's snapshot. A change a reviewed pull request re-froze is
+    accepted: the committed list is where a person records that a tag's new state is explained. Only an
+    exact match counts, so a tag that moved again after the re-freeze is still named, and a deleted tag
+    is never accepted (the list has no row that says "gone"): it has to be put back and then re-frozen.
+    `frozen` is None when the list could not be read, which accepts nothing."""
     now = {tag["tag"]: tag for tag in current}
+    recorded = {(row["tag"], row["object"], row["commit"]) for row in frozen or []}
     problems = []
     for tag in previous:
         seen = now.get(tag["tag"])
         if seen is None:
-            problems.append(f"{tag['tag']} (tag object {tag['object']}) existed at the last green run and is gone")
+            problems.append(f"{tag['tag']} (tag object {tag['object']}) existed at the last green run and is gone; "
+                            f"re-create it at commit {tag['commit']}, then {REFREEZE}")
         elif (seen["object"], seen["commit"]) != (tag["object"], tag["commit"]):
+            if (tag["tag"], seen["object"], seen["commit"]) in recorded:
+                continue
             problems.append(f"{tag['tag']} moved since the last green run: tag object {tag['object']} -> "
-                            f"{seen['object']}, commit {tag['commit']} -> {seen['commit']}")
+                            f"{seen['object']}, commit {tag['commit']} -> {seen['commit']}; {REFREEZE}")
     return problems
 
 
@@ -125,7 +137,9 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None) ->
                 for problem in release_checks.audit_tags(git.repo_dir, frozen, check_rulesets=False)]
     problems += check_rulesets(gh)
     if previous is not None:
-        problems += compare_previous(previous, snapshot(git))
+        # An unreadable list is already a ledger problem above, and accepts nothing here.
+        rows = release_checks._tag_rows(frozen, "frozen tag list", [])
+        problems += compare_previous(previous, snapshot(git), rows)
     return problems
 
 

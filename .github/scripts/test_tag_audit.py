@@ -1,6 +1,8 @@
 """Tests for tag_audit.py: the ruleset read, the previous-run comparison and the frozen list."""
 import copy
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -39,6 +41,20 @@ def good_rulesets():
         6: ruleset(6, "x4-branches", "branch", ["refs/heads/x4/*"], LOCKED),
         7: ruleset(7, "x4-tags", "tag", ["refs/tags/x4/*"], LOCKED),
     }
+
+
+COMMIT = "1" * 40
+FROZEN = "if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
+
+
+def frozen_file(testcase, rows):
+    """A frozen tag list on disk holding `rows`; removed when the test ends."""
+    root = tempfile.TemporaryDirectory()
+    testcase.addCleanup(root.cleanup)
+    path = os.path.join(root.name, "fleet-tags.frozen.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(release_checks.dump_json(rows))
+    return path
 
 
 def github(rulesets):
@@ -120,8 +136,27 @@ class TestSnapshots(unittest.TestCase):
         previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}, {"tag": "fleet-v2", "object": "o2", "commit": "c2"}]
         current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v3", "object": "o3", "commit": "c3"}]
         self.assertEqual(ta.compare_previous(previous, current), [
-            "fleet-v1 moved since the last green run: tag object o1 -> o9, commit c1 -> c9",
-            "fleet-v2 (tag object o2) existed at the last green run and is gone"])
+            f"fleet-v1 moved since the last green run: tag object o1 -> o9, commit c1 -> c9; {FROZEN}",
+            f"fleet-v2 (tag object o2) existed at the last green run and is gone; re-create it at commit c2, then {FROZEN}"])
+
+    def test_a_change_the_frozen_list_records_is_accepted_and_only_that_exact_change(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}, {"tag": "fleet-v2", "object": "o2", "commit": "c2"}]
+        current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v2", "object": "o8", "commit": "c8"}]
+        frozen = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v2", "object": "o7", "commit": "c7"}]
+        problems = ta.compare_previous(previous, current, frozen)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("fleet-v2 moved since the last green run"), problems)
+
+    def test_a_deleted_tag_is_not_accepted_by_a_frozen_row(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}]
+        problems = ta.compare_previous(previous, [], [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is gone", problems[0])
+
+    def test_an_unreadable_frozen_list_accepts_nothing(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}]
+        current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}]
+        self.assertEqual(len(ta.compare_previous(previous, current, None)), 1)
 
 
 class TestRunCheck(unittest.TestCase):
@@ -135,6 +170,18 @@ class TestRunCheck(unittest.TestCase):
         self.assertTrue(problems[1].startswith("fleet-v1 moved since the last green run"))
         result = ta.as_result(problems)
         self.assertEqual((result.rule, result.label, result.red), ("tag-audit", "tag-audit", True))
+
+    def test_a_change_a_reviewed_refreeze_records_is_accepted(self):
+        git = FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT)])
+        moved = [{"tag": "fleet-v1", "object": "f" * 40, "commit": COMMIT}]
+        refrozen = frozen_file(self, [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT}])
+        stale = frozen_file(self, moved)
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            self.assertEqual(ta.run_check(git, github(good_rulesets()), refrozen, moved), [])
+            # The same move against a list that does not record it stays red.
+            problems = ta.run_check(git, github(good_rulesets()), stale, moved)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("fleet-v1 moved since the last green run"), problems)
 
     def test_a_clean_audit_is_green(self):
         git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
