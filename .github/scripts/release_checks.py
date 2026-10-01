@@ -1528,20 +1528,26 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
     """Every expected ruleset exists, is active, targets the right refs and has its rules.
     A read of GitHub that fails, or that answers something other than the document asked
     for, is InfraError: no verdict. It is never reported as a ruleset that is missing."""
-    url = f"{MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"
+    # includes_parents=false leaves out the organisation's and the enterprise's rulesets: a
+    # ruleset this repository does not own is not one it can be said to carry.
+    url = f"{MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
     status, body = fetch(url, {})
     if status != 200:
         raise InfraError("api", f"GET {url} answered {status}")
     listing = _github_json(url, body, list)
     if not all(isinstance(r, dict) for r in listing):
         raise InfraError("api", f"GET {url} listed an entry that is not a ruleset")
-    listed = {r.get("name"): r for r in listing}
     problems = []
     for name, (target, rule_types) in EXPECTED_RULESETS.items():
-        summary = listed.get(name)
-        if summary is None:
+        found = [r for r in listing if r.get("name") == name]
+        if not found:
             problems.append(f"ruleset {name!r} does not exist")
             continue
+        if len(found) != 1:
+            # Which of them is the one in force is not for this audit to guess.
+            problems.append(f"ruleset {name!r}: expected exactly one, found {len(found)}")
+            continue
+        summary = found[0]
         url = f"{MARKETPLACE_API}/rulesets/{summary.get('id')}"
         status, body = fetch(url, {})
         if status != 200:
