@@ -24,10 +24,10 @@ import time
 from typing import Callable
 
 from ghapi import GitHub, GitHubError
-from gitrepo import Git
+from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
 from issue_router import CODEOWNERS_FILE, parse_codeowners
-from release_checks import MANIFEST, SAFETY_FILE, SEMVER, vkey
+from release_checks import MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
 
 ABSENT = "entry removed"
 ASSOCIATION_ATTEMPTS = 3
@@ -137,6 +137,14 @@ def message(n: int, version: str, previous: str, integrity: str, facts: dict, mi
     return "\n".join(lines) + "\n"
 
 
+def refused_by_github(what: str, error: GitHubError, cause: str, done: list[str]) -> Refused:
+    """A write GitHub refused, as the one-line refusal the workflow annotates: what was refused, GitHub's answer,
+    the likely cause, and what this run had already done (it is not undone)."""
+    answer = " ".join(error.body.split())[:300]
+    already = f" Already done in this run: {', '.join(done)}." if done else ""
+    return Refused(f"GitHub refused {what} (HTTP {error.status}: {answer}). {cause}{already}")
+
+
 def tag_exists(gh: GitHub, name: str) -> bool:
     try:
         gh.get(gh.repo_path(f"git/ref/tags/{name}"))
@@ -172,9 +180,15 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
                           "is tagged as a push without a pull request.")
         text = message(number, version, previous, integrity_at(git, sha), facts,
                        store_migration(git, sha, version, previous))
-        tag_object = gh.post(gh.repo_path("git/tags"),
-                             {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
-        gh.post(gh.repo_path("git/refs"), {"ref": f"refs/tags/{name}", "sha": tag_object})
+        try:
+            tag_object = gh.post(gh.repo_path("git/tags"),
+                                 {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
+            gh.post(gh.repo_path("git/refs"), {"ref": f"refs/tags/{name}", "sha": tag_object})
+        except GitHubError as error:
+            raise refused_by_github(
+                f"to create {name} at {sha[:12]}", error,
+                "The release bot App must be a bypass actor of the fleet-tags-create ruleset, the only way a "
+                "fleet-v tag can be created, and have contents: write.", created) from error
         created.append(f"{name} -> {sha} (ai-tc {version})")
         print(f"created {created[-1]}")
     return created
@@ -189,7 +203,13 @@ def cleanup_branches(gh: GitHub) -> list[str]:
         branch = ref["ref"][len("refs/heads/"):]
         if branch in open_heads or branch not in closed_heads:
             continue
-        gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        try:
+            gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        except GitHubError as error:
+            raise refused_by_github(
+                f"to delete {branch}", error,
+                "The release bot App must be a bypass actor of the bot-branches ruleset, which restricts "
+                "deleting bot/** branches, and have contents: write.", deleted) from error
         deleted.append(branch)
     return deleted
 
@@ -210,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
             print("deleted " + (", ".join(deleted) if deleted else "no branch"))
     except Refused as refusal:
         print(f"::error::{refusal}")
+        return 1
+    except (GitHubError, GitError, InfraError) as error:
+        # A failed read or write, or a checkout without main: one annotation, not a traceback.
+        print(f"::error::{' '.join(str(error).split())}")
         return 1
     return 0
 
