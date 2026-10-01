@@ -655,6 +655,7 @@ class TestSummary(unittest.TestCase):
             "path": ".github/<b>workflow</b>.yml",
             "duplicate": "<u>twice</u>",
             "version": "<i>9.9.9</i>",
+            "safety key": "[approve here](https://example.invalid) <img src=x>",
         }
         agents = copy.deepcopy(ts.AGENTS_MANIFEST)
         agents["plugins"] += [{"name": hostile["plugin"]}, {"name": hostile["plugin"]}]
@@ -665,6 +666,11 @@ class TestSummary(unittest.TestCase):
         head["plugins.json"] = '{"%s": 1, "%s": 2, "plugins": []}' % (hostile["duplicate"], hostile["duplicate"])
         head[rc.SAFETY_FILE] = rc.dump_json({"versions": {hostile["version"]: {}}})
         report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, hostile["path"]])
+        # A rollback-safety.json that repeats a key is refused with the key quoted in the message.
+        repeated = files(ts.manifest())
+        repeated[rc.SAFETY_FILE] = '{"versions": {}, "%s": 1, "%s": 2}' % ((hostile["safety key"],) * 2)
+        unparsed = run(pull(**HUMAN), files(ts.manifest()), repeated, [rc.SAFETY_FILE])
+        failed_with(self, unparsed, "rollback-safety.json does not parse at the PR head")
         human = vp.Report()
         vp.human_rules((None, None, "none"), {}, {}, [hostile["path"]], human)
         bot = vp.Report()
@@ -672,12 +678,14 @@ class TestSummary(unittest.TestCase):
             pull(), (ts.ai_tc(ts.manifest()), ts.ai_tc(ts.manifest("0.9.15")), "advance"), dict(ts.PINS), {}, {}, {},
             [rc.MANIFEST, hostile["path"]], bot, bot_login=BOT, verify=verify, classify=classify,
         )
-        text = "\n".join(vp.render_summary(r, 7) for r in (report, human, bot))
+        text = "\n".join(vp.render_summary(r, 7) for r in (report, unparsed, human, bot))
         for what, value in hostile.items():
             with self.subTest(what):
                 self.assertIn(value, text)  # it reached the summary ...
         # ... and every one of them sits inside a code span, so none is left to be read as markup.
-        self.assertNotIn("<", re.sub(r"`[^`]*`", "", text))
+        outside = re.sub(r"`[^`]*`", "", text)
+        self.assertNotIn("<", outside)
+        self.assertNotIn("](", outside)
 
     def test_a_pass_names_the_verdict_the_rows_and_the_run_to_confirm(self):
         report = vp.Report()
