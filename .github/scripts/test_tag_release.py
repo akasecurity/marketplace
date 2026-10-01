@@ -268,6 +268,47 @@ class TestApprover(unittest.TestCase):
         facts = tr.pr_facts(gh, "b", ["Vaishnav-OM", "venuverse"], sleep=lambda seconds: None)
         self.assertEqual(facts["approver"], "Vaishnav-OM")
 
+    def facts_for(self, reviews, owners=("Vaishnav-OM", "venuverse")):
+        gh = FakeGitHub({
+            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+                                             "base": {"ref": "main"}}],
+            ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "org-owner-example"}},
+            ("GET", R("pulls/13/reviews")): reviews})
+        return tr.pr_facts(gh, "b", list(owners), sleep=lambda seconds: None)
+
+    def test_an_owner_who_approved_then_requested_changes_is_not_the_approver(self):
+        facts = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                                {"state": "CHANGES_REQUESTED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
+    def test_an_owner_who_requested_changes_and_then_approved_is_the_approver(self):
+        facts = self.facts_for([{"state": "CHANGES_REQUESTED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_dismissed_approval_does_not_count_and_a_later_comment_does_not_withdraw_one(self):
+        dismissed = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                                    {"state": "DISMISSED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        self.assertEqual(dismissed["approver"], "none")
+        commented = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                                    {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        self.assertEqual(commented["approver"], "venuverse")
+
+    def test_the_approver_named_is_the_owner_who_approved_last(self):
+        reviews = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
+                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}]
+        self.assertEqual(self.facts_for(reviews)["approver"], "Vaishnav-OM")
+        self.assertEqual(tr.owner_approvals(reviews, "h13", ["Vaishnav-OM", "venuverse"]), ["venuverse", "Vaishnav-OM"])
+
+    def test_owner_approvals_leaves_out_an_excluded_reviewer(self):
+        reviews = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
+                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
+                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "writer-example"}},
+                   {"state": "APPROVED", "commit_id": "old", "user": None}]
+        self.assertEqual(tr.owner_approvals(reviews, "h13", ["Vaishnav-OM", "venuverse"], exclude={"venuverse"}),
+                         ["Vaishnav-OM"])
+
     def test_owners_are_read_from_the_merged_commits_parent(self):
         git = history(chain=("t8", "b"))
         git.files[("b", ".github/CODEOWNERS")] = "* @Vaishnav-OM @venuverse @added-by-the-merge\n"
