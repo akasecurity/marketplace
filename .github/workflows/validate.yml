@@ -52,7 +52,8 @@ jobs:
       # release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm). A bare
       # "24" is not enough: setup-node takes a copy of Node in the runner's tool cache that
       # matches the spec before it downloads anything, so "24" can resolve to an older cached
-      # 24.x. No older copy matches a range that starts at 24.15.0, so the action downloads one.
+      # 24.x. No older copy matches a range that starts at 24.15.0, so the action uses a cached
+      # copy of 24.15.0 or later if there is one, and downloads a release otherwise.
       # The check refuses an older npm with no verdict (MIN_NPM in release_checks.py), but the
       # workflow should not depend on that.
       # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (the pin import-plugin-release.yml uses).
