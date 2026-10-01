@@ -11,7 +11,7 @@ from unittest import mock
 import _testsupport as ts
 import import_release as ir
 import release_checks
-from fakes import (ATTESTED, INTEGRITY, REPO, FakeGit, FakeGitHub, contents, fleet_tag, manifest,
+from fakes import (ATTESTED, BOT, INTEGRITY, REPO, FakeGit, FakeGitHub, contents, fleet_tag, manifest,
                    not_found, pull, pulls_route, safety, safety_entry)
 from ghapi import GitHubError
 from release_checks import MANIFEST, SAFETY_FILE
@@ -139,6 +139,20 @@ class TestLedgerReads(unittest.TestCase):
         self.assertEqual(listed[0]["head"], "bot/pin-ai-tc-0.9.15")
         self.assertEqual(gh.calls[0][3], {"state": "open", "base": "main"})
 
+    def test_list_pulls_keeps_the_author(self):
+        pulls = [pull(3, "bot/pin-ai-tc-0.9.15"), pull(4, "bot/pin-ai-tc-0.9.16", author="some-writer")]
+        gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls)})
+        self.assertEqual([p["author"] for p in ir.list_pulls(gh, "open")], [BOT, "some-writer"])
+
+    def test_bot_pulls_keeps_only_the_release_bots_and_needs_its_login(self):
+        listed = [{"number": 1, "author": BOT}, {"number": 2, "author": "some-writer"}, {"number": 3, "author": ""}]
+        with mock.patch.object(release_checks, "BOT_LOGIN", BOT):
+            self.assertEqual([p["number"] for p in ir.bot_pulls(listed)], [1])
+        with mock.patch.object(release_checks, "BOT_LOGIN", None), \
+                self.assertRaisesRegex(ir.Refused, "no bot identity is configured") as caught:
+            ir.bot_pulls(listed)
+        self.assertTrue(caught.exception.red)
+
 
 class TestCheckPlan(unittest.TestCase):
     def test_a_well_formed_plan_passes(self):
@@ -178,6 +192,13 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("`validate` fails this PR", body)
         self.assertIn("claude plugin marketplace add akasecurity/marketplace#bot/rollback-ai-tc-0.9.14-to-0.9.13", body)
 
+    def test_a_rollback_body_asks_the_approver_to_rerun_validate_after_the_safety_file_moves(self):
+        body = ir.pr_body(rollback_plan(), "u")
+        self.assertIn("- [ ] If `rollback-safety.json` changed on `main` after `validate` ran (compare the "
+                      "`Main read at` row of its summary with `main`'s head), re-run `validate` before approving.", body)
+        # Only a rollback is judged against the floor, so a forward PR's checklist does not carry the line.
+        self.assertNotIn("Main read at", ir.pr_body(forward_plan(), "u"))
+
 
 PLAN_KEYS = {"mode", "version", "from_version", "integrity", "shasum", "git_commit", "run_url", "branch", "title",
              "labels", "classification", "migrations", "safety_entry", "refused", "highest_pinned", "floor",
@@ -207,6 +228,9 @@ class PlanCase(unittest.TestCase):
         self.floor = None
         self.pulls: list[dict] = []
         self.gh = FakeGitHub({("GET", R("pulls")): pulls_route(self.pulls)})
+        bot = mock.patch.object(release_checks, "BOT_LOGIN", BOT)  # the App exists; the importer reads its PRs by it
+        bot.start()
+        self.addCleanup(bot.stop)
         classification = types.SimpleNamespace(classification="additive", migrations=["0036_add_column"])
         stubs = {"pinned_versions": lambda repo_dir: set(self.pinned),
                  "pins_by_ref": lambda repo_dir: dict(self.pins),
@@ -312,6 +336,30 @@ class TestPlanForward(PlanCase):
         self.assertFalse(caught.exception.red)
         self.stubs["npm_candidates"].assert_not_called()
 
+    def test_a_rollback_named_pr_from_anyone_else_does_not_stop_the_schedule(self):
+        self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13", author="some-writer"))
+        self.candidates = ["0.9.15"]
+        self.assertEqual(self.plan()["version"], "0.9.15")
+
+    def test_a_pin_named_pr_from_anyone_else_does_not_block_the_version(self):
+        self.candidates = ["0.9.15"]
+        self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
+        self.assertEqual(self.plan()["version"], "0.9.15")
+        # Nor does a closed one stand as a code owner's rejection: it was not the bot's PR.
+        self.pulls[:] = [pull(7, "bot/pin-ai-tc-0.9.15", state="closed", author="some-writer")]
+        self.assertEqual(self.plan()["version"], "0.9.15")
+
+    def test_without_a_bot_identity_the_plan_is_red(self):
+        self.candidates = ["0.9.15"]
+        for kwargs in (dict(), dict(event="workflow_dispatch", target="0.9.15"),
+                       dict(mode="rollback", target="fleet-v7", event="workflow_dispatch")):
+            with self.subTest(**kwargs):
+                with mock.patch.object(release_checks, "BOT_LOGIN", None):
+                    with self.assertRaisesRegex(ir.Refused, "no bot identity is configured") as caught:
+                        self.plan(**kwargs)
+                self.assertTrue(caught.exception.red)
+        self.stubs["verify_release"].assert_not_called()
+
     def test_an_open_pr_for_the_version_is_a_green_skip(self):
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15"))
         self.candidates = ["0.9.15"]
@@ -341,7 +389,9 @@ class TestPlanForward(PlanCase):
         plan = self.plan(repo(entries=entries), event="workflow_dispatch", target="0.9.15", reimport=True)
         self.assertIsNone(plan["safety_entry"])
         self.assertEqual((plan["classification"], plan["migrations"]), ("additive", ["0036_add_column"]))
-        self.stubs["classify_migrations"].assert_not_called()
+        # The recorded entry is left alone, and still recomputed.
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+        self.stubs["classify_migrations"].reset_mock()
         # A fix-forward after that rollback: its entry is computed from 0.9.15, the highest version
         # pinned below it, exactly as validate recomputes it, not from main's 0.9.14.
         self.candidates = ["0.9.16"]
@@ -387,6 +437,84 @@ class TestPlanForward(PlanCase):
         with self.assertRaisesRegex(ir.Refused, "could not compute 0.9.15's rollback-safety.json entry: provenance: ") as caught:
             self.plan()
         self.assertTrue(caught.exception.red)
+
+    def recorded(self, **entry) -> FakeGit:
+        """main with an entry for 0.9.15 (not pinned by main or any tag), as computed against 0.9.14 unless changed."""
+        entries = {"0.9.13": safety_entry("0.9.13", "0.9.12", "additive", ()), "0.9.14": safety_entry("0.9.14", "0.9.13"),
+                   "0.9.15": {**safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",)), **entry}}
+        return repo(entries=entries)
+
+    def test_a_recorded_entry_weaker_than_the_computed_one_is_refused(self):
+        # An entry typed in as additive for a release nobody classified must not stand as evidence the
+        # release is rollback-safe: validate would fail the pin PR, so the importer opens none.
+        self.candidates = ["0.9.15"]
+        self.stubs["classify_migrations"].side_effect = lambda start, end: types.SimpleNamespace(
+            classification="not-rollback-safe", migrations=["0036_add_column"])
+        with self.assertRaisesRegex(ir.Refused, "records 0.9.15 as additive, but the importer computes "
+                                                r"not-rollback-safe \(0036_add_column\); validate would fail the pin PR") as caught:
+            self.plan(self.recorded())
+        self.assertTrue(caught.exception.red)
+
+    def test_a_recorded_entry_for_another_commit_is_refused(self):
+        self.candidates = ["0.9.15"]
+        wrong = "2" * 40
+        with self.assertRaisesRegex(
+                ir.Refused, f"records 0.9.15 up to commit {wrong}, but its attested commit is {ATTESTED['0.9.15']}") as caught:
+            self.plan(self.recorded(classification="not-rollback-safe", to=wrong))
+        self.assertTrue(caught.exception.red)
+
+    def test_a_recorded_entry_at_least_as_strong_is_reused_and_still_checked(self):
+        self.candidates = ["0.9.15"]
+        plan = self.plan(self.recorded(classification="not-rollback-safe", migrations=["0035_example"]))
+        self.assertIsNone(plan["safety_entry"])
+        self.assertEqual((plan["classification"], plan["migrations"]), ("not-rollback-safe", ["0035_example"]))
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+
+    def test_a_recorded_entry_starting_from_another_commit_is_not_refused(self):
+        # The highest pinned version below a release moves after a re-import of a lower one, so only
+        # the commit the entry runs up to and its class are checked, as validate does.
+        self.candidates = ["0.9.15"]
+        plan = self.plan(self.recorded(**{"from": ATTESTED["0.9.13"]}))
+        self.assertIsNone(plan["safety_entry"])
+
+    def test_a_malformed_recorded_entry_is_refused_not_a_traceback(self):
+        self.candidates = ["0.9.15"]
+        entries = {"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": {"classification": "additive"}}
+        with self.assertRaisesRegex(ir.Refused, "entry for 0.9.15 is malformed") as caught:
+            self.plan(repo(entries=entries))
+        self.assertTrue(caught.exception.red)
+
+    def test_an_outage_recomputing_a_recorded_entry_is_no_verdict(self):
+        self.candidates = ["0.9.15"]
+        self.stubs["classify_migrations"].side_effect = release_checks.InfraError("classify", "GET contents answered 502")
+        with self.assertRaisesRegex(ir.Refused, "no verdict computing 0.9.15's rollback-safety.json entry: ") as caught:
+            self.plan(self.recorded())
+        self.assertTrue(caught.exception.red)
+
+    def test_a_verdict_recomputing_a_recorded_entry_says_could_not_compute(self):
+        self.candidates = ["0.9.15"]
+        self.bad = {"0.9.14": ("provenance", "ref refs/heads/release is not the version's tag")}
+        with self.assertRaisesRegex(ir.Refused, "could not compute 0.9.15's rollback-safety.json entry: provenance: ") as caught:
+            self.plan(self.recorded())
+        self.assertTrue(caught.exception.red)
+
+    def test_the_plan_reads_main_by_its_full_ref(self):
+        # A tag named main wins over the branch when git resolves the bare name, so the plan asks the
+        # checkout which full ref is main and never looks the bare name up.
+        class FullRefGit(FakeGit):
+            def main(self):
+                return "refs/remotes/origin/main"
+
+            def rev_parse(self, rev):
+                if rev == "main":
+                    raise AssertionError("the bare name main was resolved")
+                return self.chain[-1] if rev == "refs/remotes/origin/main" else rev
+
+        git = repo()
+        full = FullRefGit(chain=git.chain, files=git.files, tags=git.tags)
+        self.candidates = ["0.9.15"]
+        plan = self.plan(full)
+        self.assertEqual((plan["version"], plan["base_sha"]), ("0.9.15", "m"))
 
     def test_a_forward_target_must_be_above_the_pin_and_reimport_needs_a_target(self):
         with self.assertRaisesRegex(ir.Refused, "rollback-mode dispatch"):
@@ -437,6 +565,10 @@ class TestPlanRollback(PlanCase):
             self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
         self.assertFalse(caught.exception.red)
 
+    def test_a_rollback_named_pr_from_anyone_else_is_not_the_same_move(self):
+        self.pulls.append(pull(9, "bot/rollback-ai-tc-0.9.14-to-0.9.13", author="some-writer"))
+        self.assertEqual(self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")["version"], "0.9.13")
+
     def test_a_rollback_target_with_no_verdict_is_red_and_says_so(self):
         self.down = {"0.9.13": ("network", "down")}
         with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.13: network: down") as caught:
@@ -465,6 +597,9 @@ TREE = "e" * 40
 
 class OpenPrCase(unittest.TestCase):
     def setUp(self):
+        bot = mock.patch.object(release_checks, "BOT_LOGIN", BOT)
+        bot.start()
+        self.addCleanup(bot.stop)
         self.pulls: list[dict] = []
         self.main_manifest = manifest("0.9.14", INTEGRITY["0.9.14"])
         self.gh = FakeGitHub({
@@ -534,6 +669,37 @@ class TestOpenPrForward(OpenPrCase):
         self.assertEqual(self.gh.called("PATCH", R("pulls/8"))[0][2], {"state": "closed"})
         self.assertEqual(self.gh.called("PATCH", R("pulls/9")), [])
 
+    def test_a_pin_named_pr_from_anyone_else_is_not_superseded(self):
+        self.route_branch("bot/pin-ai-tc-0.9.16")
+        self.pulls.append(pull(8, "bot/pin-ai-tc-0.9.15", author="some-writer"))
+        self.assertTrue(self.open(forward_plan("0.9.16", "0.9.14")).endswith("superseded []"))
+        self.assertEqual(self.gh.called("PATCH", R("pulls/8")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/8/comments")), [])
+
+    def test_a_rollback_named_pr_from_anyone_else_does_not_withhold_auto_merge(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13", author="some-writer"))
+        self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+
+    def test_a_branch_another_authors_pr_is_open_from_is_not_deleted(self):
+        # GitHub closes a PR when its head branch is deleted, so the importer leaves that branch alone.
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
+        for plan in (forward_plan(), forward_plan(reimport=True)):
+            with self.subTest(reimport=plan["reimport"]):
+                with self.assertRaisesRegex(ir.Refused, "head of PR #6, which some-writer opened, not the release bot") as caught:
+                    self.open(plan)
+                self.assertTrue(caught.exception.red)
+                self.assertEqual(self.gh.writes(), [])
+
+    def test_without_a_bot_identity_nothing_is_written(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        with mock.patch.object(release_checks, "BOT_LOGIN", None), \
+                self.assertRaisesRegex(ir.Refused, "no bot identity is configured") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
+        self.assertEqual(self.gh.calls, [])
+
     def test_no_auto_merge_while_a_rollback_pr_is_open(self):
         self.route_branch("bot/pin-ai-tc-0.9.15")
         self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
@@ -541,6 +707,43 @@ class TestOpenPrForward(OpenPrCase):
         self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge"), [])
         self.assertIn("rollback PR #5", self.gh.called("POST", R("issues/12/comments"))[0][2]["body"])
         self.assertEqual(self.gh.called("PATCH", R("pulls/5")), [])
+
+    def enable_while_a_rollback_opens(self):
+        """The enable route of a PR whose rollback run opened its PR just before the forward run's second look."""
+        def enable(variables, params):
+            self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
+            return {"enablePullRequestAutoMerge": {"pullRequest": {"number": 12}}}
+
+        self.gh.routes[("GRAPHQL", "enablePullRequestAutoMerge")] = enable
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = {"disablePullRequestAutoMerge": {"pullRequest": {"number": 12}}}
+
+    def test_a_rollback_opened_while_auto_merge_was_enabled_turns_it_off_again(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.assertEqual(self.open(forward_plan()), "opened #12; auto-merge turned off again: rollback PR #5 opened "
+                                                    "meanwhile; superseded []")
+        self.assertEqual([call[1] for call in self.gh.calls if call[0] == "GRAPHQL"],
+                         ["enablePullRequestAutoMerge", "disablePullRequestAutoMerge"])
+        self.assertEqual(self.gh.called("GRAPHQL", "disablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
+        self.assertIn("rollback PR #5", self.gh.called("POST", R("issues/12/comments"))[0][2]["body"])
+
+    def test_turning_it_off_when_it_is_already_off_is_not_red(self):
+        # The rollback run's own hold got there first, so the mutation answers an error and the PR has no request.
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "not enabled")
+        self.gh.routes[("GRAPHQL", "repository")] = {"repository": {"pullRequest": {"autoMergeRequest": None}}}
+        self.assertIn("auto-merge turned off again", self.open(forward_plan()))
+
+    def test_auto_merge_that_cannot_be_turned_off_again_is_red(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.enable_while_a_rollback_opens()
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = GitHubError(200, "POST", "graphql", "forbidden")
+        self.gh.routes[("GRAPHQL", "repository")] = {"repository": {"pullRequest": {"autoMergeRequest": {"enabledAt": "2026-09-29T00:00:00Z"}}}}
+        with self.assertRaisesRegex(ir.Refused, "rollback PR #5 opened while auto-merge was being enabled on #12, "
+                                                "and auto-merge could not be turned off again") as caught:
+            self.open(forward_plan())
+        self.assertTrue(caught.exception.red)
 
     def test_an_existing_branch_with_an_open_pr_is_a_green_skip_with_no_writes(self):
         self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
@@ -550,16 +753,40 @@ class TestOpenPrForward(OpenPrCase):
         self.assertFalse(caught.exception.red)
         self.assertEqual(self.gh.writes(), [])
 
-    def test_an_existing_branch_without_a_pr_is_skipped_unless_reimport(self):
+    def deleted_before_created(self, branch: str) -> bool:
+        order = [f"{call[0]} {call[1]}" for call in self.gh.writes()]
+        return order.index(f"DELETE {R(f'git/refs/heads/{branch}')}") < order.index(f"POST {R('git/refs')}")
+
+    def test_a_branch_left_with_no_pull_request_is_replaced_on_a_plain_run(self):
+        # An earlier run died between creating the branch and opening the PR. No run owns it now, so the
+        # branch is deleted and created again (never a force-push), and the run says so.
         self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
+        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run, "
+                      "and created it again", out.getvalue())
+        self.assertEqual([call for call in self.gh.calls if call[0] == "PATCH"], [])
+
+    def test_a_branch_whose_bot_pr_was_closed_is_skipped_unless_reimport(self):
+        # The rejection stands until a reimport, and the branch is the evidence a closed PR leaves.
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(7, "bot/pin-ai-tc-0.9.15", state="closed"))
         with self.assertRaisesRegex(ir.Refused, "already exists") as caught:
             self.open(forward_plan())
         self.assertFalse(caught.exception.red)
         self.assertEqual(self.gh.writes(), [])
         self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
         self.open(forward_plan(reimport=True))
-        order = [f"{call[0]} {call[1]}" for call in self.gh.writes()]
-        self.assertLess(order.index(f"DELETE {R('git/refs/heads/bot/pin-ai-tc-0.9.15')}"), order.index(f"POST {R('git/refs')}"))
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
+
+    def test_a_closed_pr_from_someone_else_does_not_make_a_branch_a_rejection(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(7, "bot/pin-ai-tc-0.9.15", state="closed", author="some-writer"))
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        self.assertTrue(self.open(forward_plan()).startswith("opened #12"))
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
 
     def test_a_moved_entry_on_main_is_a_green_skip_with_no_writes(self):
         self.main_manifest = manifest("0.9.15", INTEGRITY["0.9.15"])
@@ -632,6 +859,17 @@ class TestOpenPrRollback(OpenPrCase):
         self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
         self.open(rollback_plan())
         self.assertEqual(len(self.gh.called("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13"))), 1)
+
+    def test_pull_requests_from_anyone_else_are_neither_held_nor_closed(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.pulls += [pull(8, "bot/pin-ai-tc-0.9.15", author="some-writer"),
+                       pull(9, "bot/rollback-ai-tc-0.9.14-to-0.9.12", author="some-writer")]
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.assertEqual(self.open(rollback_plan()),
+                         "opened rollback #12 with auto-merge (squash); auto-merge off on []; closed []")
+        self.assertEqual(self.gh.called("GRAPHQL", "disablePullRequestAutoMerge"), [])
+        self.assertEqual(self.gh.called("PATCH", R("pulls/9")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/8/comments")), [])
 
     def test_an_auto_merge_that_cannot_be_turned_off_is_red(self):
         self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")

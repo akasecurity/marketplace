@@ -91,6 +91,20 @@ class TestGit(Scratch):
         self.assertEqual(len(self.git.commits_between(base, merge)), 3)
         self.assertEqual(self.git.rev_parse("main"), merge)
 
+    def test_main_is_the_branch_when_a_tag_is_named_main(self):
+        first = self.commit("a.txt", "1\n")
+        second = self.commit("a.txt", "2\n")
+        self.sh("tag", "main", first)
+        # The hazard: git resolves a bare name to the tag before the branch.
+        self.assertEqual(self.git.rev_parse("main"), first)
+        self.assertEqual(self.git.main(), "refs/heads/main")
+        self.assertEqual(self.git.rev_parse(self.git.main()), second)
+        # With origin's main fetched, that is the one read, whatever the local branch has since moved to.
+        self.commit("a.txt", "3\n")
+        self.sh("update-ref", "refs/remotes/origin/main", second)
+        self.assertEqual(self.git.main(), "refs/remotes/origin/main")
+        self.assertEqual(self.git.rev_parse(self.git.main()), second)
+
     def test_commit_time_and_ls_remote(self):
         sha = self.commit("a.txt", "1\n", when="2026-09-02T03:04:05+00:00")
         self.sh("tag", "-a", "fleet-v1", "-m", "one", sha)
