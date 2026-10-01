@@ -64,7 +64,9 @@ class Report:
 
 
 def _code(value) -> str:
-    """Inline code for the summary: PR-controlled text cannot break out of it."""
+    """Inline code for the summary: PR-controlled text cannot break out of it. Every value a
+    pull request supplies (a plugin or key name, a path, a message quoting one) goes through
+    here, since the summary is rendered as markdown and a raw name would be read as markup."""
     text = " ".join(str(value).replace("`", "'").split())
     return f"`{text[:200]}`"
 
@@ -98,7 +100,7 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
         try:
             doc = rc.parse_json(text)
         except ValueError as exc:
-            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {exc}")
+            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {_code(exc)}")
             continue
         plugins = doc.get("plugins") if isinstance(doc, dict) else None
         if not isinstance(plugins, list) or not all(isinstance(p, dict) and isinstance(p.get("name"), str) for p in plugins):
@@ -107,7 +109,7 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
         names = [p["name"] for p in plugins]
         repeated = sorted({n for n in names if names.count(n) > 1})
         if repeated:
-            report.fail(f"{path} at {label}: plugin names must be unique; repeated: {', '.join(repeated)}")
+            report.fail(f"{path} at {label}: plugin names must be unique; repeated: {', '.join(_code(n) for n in repeated)}")
         docs[path] = doc
     return docs
 
@@ -122,7 +124,7 @@ def every_pr_rules(base_doc: dict, head_doc: dict, report: Report):
         changed = sorted(k for k in set(base_top) | set(head_top) if base_top.get(k) != head_top.get(k))
         report.fail(
             "top-level keys are frozen (only description, metadata.description and metadata.version "
-            "may change); changed: " + ", ".join(changed)
+            "may change); changed: " + ", ".join(_code(k) for k in changed)
         )
     try:
         base_entry = rc.find_ai_tc_entry(base_doc)
@@ -149,7 +151,7 @@ def safety_versions(text, report: Report, *, label: str):
         return None
     problems = rc.safety_problems(doc)
     for problem in problems:
-        report.fail(f"at {label}: {problem}")
+        report.fail(f"at {label}: {_code(problem)}")
     return None if problems else doc["versions"]
 
 
@@ -218,7 +220,7 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
     _safety_edit_notes(base_safety, head_safety, changed, report, pinned=pinned)
     touched = [p for p in changed if p.startswith(".github/")]
     if touched:
-        report.note("touches automation or ownership, review the diff line by line: " + ", ".join(touched))
+        report.note("touches automation or ownership, review the diff line by line: " + ", ".join(_code(p) for p in touched))
 
 
 REF_PATTERNS = {
@@ -385,7 +387,10 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
     allowed = {rc.MANIFEST, rc.SAFETY_FILE} if mode == "advance" else {rc.MANIFEST}
     extra = sorted(set(changed) - allowed)
     if extra:
-        report.fail(f"a bot {mode} PR may change only {', '.join(sorted(allowed))}; it also changes: {', '.join(extra)}")
+        report.fail(
+            f"a bot {mode} PR may change only {', '.join(sorted(allowed))}; "
+            f"it also changes: {', '.join(_code(p) for p in extra)}"
+        )
     if mode == "remove":
         report.note("REMOVE: this marketplace stops serving ai-tc until a restore merges")
         return

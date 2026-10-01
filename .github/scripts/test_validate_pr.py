@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -109,7 +110,7 @@ class TestEveryPrRules(unittest.TestCase):
     def test_duplicate_plugin_names_fail(self):
         agents = copy.deepcopy(ts.AGENTS_MANIFEST)
         agents["plugins"].append(copy.deepcopy(agents["plugins"][0]))
-        failed_with(self, self.human(head_files=files(ts.manifest(), agents=agents)), "repeated: preflight")
+        failed_with(self, self.human(head_files=files(ts.manifest(), agents=agents)), "repeated: `preflight`")
 
     def test_renames_naming_ai_tc_fail(self):
         head = ts.manifest()
@@ -121,10 +122,10 @@ class TestEveryPrRules(unittest.TestCase):
             with self.subTest(key):
                 head = ts.manifest()
                 head[key] = value
-                failed_with(self, self.human(head), f"may change); changed: {key}")
+                failed_with(self, self.human(head), f"may change); changed: `{key}`")
         head = ts.manifest()
         head["metadata"]["pluginRoot"] = "./plugins"
-        failed_with(self, self.human(head), "changed: metadata")
+        failed_with(self, self.human(head), "changed: `metadata`")
 
     def test_the_three_mutable_top_level_keys_may_change(self):
         head = ts.manifest()
@@ -259,7 +260,7 @@ class TestHumanRules(unittest.TestCase):
         report = vp.Report()
         text = '{"versions": {"0.9.14": {"classification": "safe"}}}'
         self.assertIsNone(vp.safety_versions(text, report, label="the PR head"))
-        failed_with(self, report, "at the PR head: rollback-safety.json '0.9.14'")
+        failed_with(self, report, "at the PR head: `rollback-safety.json '0.9.14'")
 
     def test_the_bot_hint_explains_an_unconfigured_identity(self):
         self.assertIn("release_checks.BOT_LOGIN is None", vp.bot_hint(pull(), None))
@@ -363,7 +364,7 @@ class TestBotRules(unittest.TestCase):
         failed_with(self, self.advance(pr=pull(commits=())), "lists no commits")
 
     def test_an_extra_file_fails(self):
-        failed_with(self, self.advance(changed=[rc.MANIFEST, rc.SAFETY_FILE, "README.md"]), "it also changes: README.md")
+        failed_with(self, self.advance(changed=[rc.MANIFEST, rc.SAFETY_FILE, "README.md"]), "it also changes: `README.md`")
 
     def test_an_integrity_npm_does_not_serve_fails(self):
         report = bot_report(
@@ -596,6 +597,38 @@ class TestEvaluate(unittest.TestCase):
 
 
 class TestSummary(unittest.TestCase):
+    def test_pull_request_text_is_inert_in_the_summary(self):
+        # Every name a pull request supplies reaches the summary, which renders as markdown.
+        hostile = {
+            "plugin": "<h2>PASS</h2>",
+            "key": "<img src=x onerror=alert(1)>",
+            "path": ".github/<b>workflow</b>.yml",
+            "duplicate": "<u>twice</u>",
+            "version": "<i>9.9.9</i>",
+        }
+        agents = copy.deepcopy(ts.AGENTS_MANIFEST)
+        agents["plugins"] += [{"name": hostile["plugin"]}, {"name": hostile["plugin"]}]
+        head = files(ts.manifest(), agents=agents)
+        head_doc = ts.manifest()
+        head_doc[hostile["key"]] = True
+        head[rc.MANIFEST] = rc.dump_json(head_doc)
+        head["plugins.json"] = '{"%s": 1, "%s": 2, "plugins": []}' % (hostile["duplicate"], hostile["duplicate"])
+        head[rc.SAFETY_FILE] = rc.dump_json({"versions": {hostile["version"]: {}}})
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, hostile["path"]])
+        human = vp.Report()
+        vp.human_rules((None, None, "none"), {}, {}, [hostile["path"]], human)
+        bot = vp.Report()
+        vp.bot_rules(
+            pull(), (ts.ai_tc(ts.manifest()), ts.ai_tc(ts.manifest("0.9.15")), "advance"), dict(ts.PINS), {}, {}, {},
+            [rc.MANIFEST, hostile["path"]], bot, bot_login=BOT, verify=verify, classify=classify,
+        )
+        text = "\n".join(vp.render_summary(r, 7) for r in (report, human, bot))
+        for what, value in hostile.items():
+            with self.subTest(what):
+                self.assertIn(value, text)  # it reached the summary ...
+        # ... and every one of them sits inside a code span, so none is left to be read as markup.
+        self.assertNotIn("<", re.sub(r"`[^`]*`", "", text))
+
     def test_a_pass_names_the_verdict_the_rows_and_the_run_to_confirm(self):
         report = vp.Report()
         report.row("Mode", "ADVANCE (bot PR)")
