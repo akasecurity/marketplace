@@ -462,10 +462,11 @@ def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
 
 
 def npm_audit_signatures(
-    package: str, version: str, *, run=subprocess.run, sleep=time.sleep, judge: Callable = lambda report: report
+    package: str, version: str, judge: Callable = lambda report: report, *, run=subprocess.run, sleep=time.sleep
 ):
     """Run `npm audit signatures --json --include-attestations` over a scratch,
     --ignore-scripts install of exactly package@version from npmjs, and return judge(report).
+    verify_release calls this as audit(package, version, judge), so judge is positional.
 
     npm does the cryptography (the registry signature and the sigstore bundle); judge decides
     what the attestation binds, and raises _NotIndexedYet while the registry has not indexed
