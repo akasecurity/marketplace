@@ -179,6 +179,13 @@ class TestPinnedVersions(unittest.TestCase):
             rc.pinned_versions(self.repo.path)
 
 
+def forget_object(repo_path, oid):
+    """Remove one loose git object, as a failed fetch or a damaged checkout leaves it missing."""
+    loose = os.path.join(repo_path, ".git", "objects", oid[:2], oid[2:])
+    os.chmod(loose, 0o644)
+    os.remove(loose)
+
+
 class TestPinnedVersionsReadFailures(unittest.TestCase):
     """A tag that cannot be READ is no verdict. It must never be taken as a tag that pins
     nothing: that would drop a version from the candidate floor and the rollback floor."""
@@ -200,6 +207,18 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
         repo = self.ledger()
         self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
         self.delete_blob(repo, "fleet-v3")
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
+                call(repo.path)
+            self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_whose_manifest_directory_cannot_be_listed_is_infrastructure(self):
+        # The probe that tells an absent manifest from an unreadable one lists the tree
+        # first. When the listing itself fails, the file may well be there: the tag must
+        # not be taken as one that pins nothing, or its version leaves both floors.
+        repo = self.ledger()
+        directory = os.path.dirname(rc.MANIFEST)
+        forget_object(repo.path, ts.git(repo.path, "rev-parse", f"refs/tags/fleet-v3^{{commit}}:{directory}").strip())
         for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
             with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
                 call(repo.path)
@@ -1685,6 +1704,16 @@ class TestAuditTags(unittest.TestCase):
         loose = os.path.join(self.repo.path, ".git", "objects", blob[:2], blob[2:])
         os.chmod(loose, 0o644)
         os.remove(loose)
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
+    def test_a_manifest_directory_git_cannot_list_is_no_verdict_not_drift(self):
+        # The same failure one step earlier: the listing that looks for the file fails, so
+        # nothing is known about the manifest, and reading it as "entry removed" would call
+        # the tag's honest record drift.
+        commit = self.cut("0.9.10", 4)
+        forget_object(self.repo.path, ts.git(self.repo.path, "rev-parse", f"{commit}:{os.path.dirname(rc.MANIFEST)}").strip())
         with self.assertRaises(rc.InfraError) as caught:
             self.audit()
         self.assertEqual(caught.exception.check, "git")
