@@ -639,6 +639,13 @@ class TestNpmAuditSignatures(unittest.TestCase):
         with self.assertRaises(rc.InfraError):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
 
+    def test_audit_output_nested_too_deep_to_parse_is_toolchain(self):
+        # json.loads raises RecursionError, not ValueError, past the interpreter's depth.
+        deep = "[" * 100_000 + "]" * 100_000
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, deep)), sleep=lambda s: None)
+        self.assertEqual(caught.exception.check, "toolchain")
+
     def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
         sleeps, run = [], FakeRun(audit=(1, ""))
         with self.assertRaises(rc.InfraError) as caught:
