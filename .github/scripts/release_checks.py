@@ -366,17 +366,24 @@ def _npm(run, args: list, work: str):
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
 
 
-def _require_npm_11(result) -> None:
-    """An npm older than 11 audits without attestations and reports an empty verified set,
-    which would read as a release with no provenance."""
-    match = re.match(r"(\d+)\.", (result.stdout or "").strip()) if result.returncode == 0 else None
+# The first npm whose `audit signatures` honours --include-attestations and prints the verified
+# attestation bundles. An older npm (11.0 to 11.11 as well as 10.x) takes the flag with only a
+# warning and prints no `verified` list, which would read as a release with no provenance.
+MIN_NPM = (11, 12, 0)
+
+
+def _require_npm_attestations(result) -> None:
+    """The npm on PATH must be 11.12.0 or later."""
+    match = (
+        re.match(r"(\d+)\.(\d+)\.(\d+)", (result.stdout or "").strip()) if result.returncode == 0 else None
+    )
     if match is None:
         raise InfraError("toolchain", f"could not read npm's version: {(result.stdout or result.stderr or '')[:200]}")
-    if int(match.group(1)) < 11:
+    if tuple(int(part) for part in match.groups()) < MIN_NPM:
         raise InfraError(
             "toolchain",
-            f"npm {result.stdout.strip()} is older than 11, whose audit output cannot show attestations "
-            "(NOT a signature result)",
+            f"npm {result.stdout.strip()} is older than {'.'.join(map(str, MIN_NPM))}, the first release whose "
+            "audit prints attestation bundles (NOT a signature result)",
         )
 
 
@@ -393,7 +400,7 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
         init = _npm(run, ["init", "-y"], work)
         if init.returncode != 0:
             raise InfraError("toolchain", f"npm init failed: {init.stderr[:2000]}")
-        _require_npm_11(_npm(run, ["--version"], work))
+        _require_npm_attestations(_npm(run, ["--version"], work))
         for attempt in range(1, ATTEMPTS + 1):
             install = _npm(
                 run,
@@ -425,14 +432,15 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
         report = json.loads(audit.stdout)
     except ValueError as exc:
         raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
-    # A verdict always carries an "invalid" list (and a "verified" list when there is
-    # anything verified). npm prints its own failures ({"error": {...}}) on the same
-    # stream with the same exit status, and those are not a statement about the package.
+    # A report from an npm that honours --include-attestations always carries an "invalid" list
+    # and a "verified" list (empty when nothing verified). npm prints its own failures
+    # ({"error": {...}}) on the same stream with the same exit status, and those are not a
+    # statement about the package.
     if (
         not isinstance(report, dict)
         or "error" in report
         or not isinstance(report.get("invalid"), list)
-        or not isinstance(report.get("verified", []), list)
+        or not isinstance(report.get("verified"), list)
     ):
         raise InfraError(
             "toolchain",
