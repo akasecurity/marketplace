@@ -26,6 +26,8 @@ from ghapi import GitHub
 # The login every router job files issues under (they all use the workflow's token). find looks only at
 # issues this login created, so an issue a person filed cannot stand in for a rule's.
 ACTIONS_BOT = "github-actions[bot]"
+# A rule that goes red again this soon after the router closed its issue reopens that issue (apply).
+REOPEN_WITHIN = dt.timedelta(hours=48)
 APPROVERS_FILE = ".github/release-approvers.json"
 CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
@@ -82,6 +84,10 @@ def set_marker(body: str, name: str, value: str) -> str:
     return re.sub(rf"<!-- {re.escape(name)}:.*? -->", lambda _: marker(name, value), body, count=1)
 
 
+def drop_marker(body: str, name: str) -> str:
+    return re.sub(rf"<!-- {re.escape(name)}:.*? -->\n?", "", body, count=1)
+
+
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -104,24 +110,62 @@ class Router:
         self.now = now
         self.run_url = run_url
 
+    def _issues(self, state: str, since: dt.datetime | None = None):
+        """The issues the workflow's own token filed (ACTIONS_BOT) in `state`, never a pull request.
+        `since` keeps only those updated after that moment."""
+        params = {"state": state, "creator": ACTIONS_BOT}
+        if since is not None:
+            params["since"] = stamp(since)
+        return (issue for issue in self.gh.paginate(self.gh.repo_path("issues"), params)
+                if "pull_request" not in issue)
+
     def find(self, result: Result) -> dict | None:
-        """The rule's open issue: one the workflow's own token filed (ACTIONS_BOT) that carries the rule's
-        hidden marker. The label is not part of the match, so taking it off an issue does not hide the issue
-        (_update puts it back), and an issue a person filed with the label and marker copied is not the rule's."""
-        for issue in self.gh.paginate(self.gh.repo_path("issues"), {"state": "open", "creator": ACTIONS_BOT}):
-            if "pull_request" not in issue and read_marker(issue.get("body"), "rule") == result.rule:
+        """The rule's open issue: one the workflow's own token filed that carries the rule's hidden marker.
+        The label is not part of the match, so taking it off an issue does not hide the issue (_refresh puts
+        it back), and an issue a person filed with the label and marker copied is not the rule's."""
+        for issue in self._issues("open"):
+            if read_marker(issue.get("body"), "rule") == result.rule:
                 return issue
         return None
 
+    def find_cleared(self, result: Result) -> dict | None:
+        """The rule's issue this router closed within REOPEN_WITHIN, the latest if several. The router leaves
+        a `cleared` marker when it closes an issue (apply), so an issue a person closed never matches."""
+        found: tuple[dt.datetime, dict] | None = None
+        for issue in self._issues("closed", self.now - REOPEN_WITHIN):
+            if read_marker(issue.get("body"), "rule") != result.rule:
+                continue
+            try:
+                cleared = when(read_marker(issue.get("body"), "cleared") or "")
+                age = self.now - cleared
+            except (ValueError, TypeError):
+                continue
+            if age <= REOPEN_WITHIN and (found is None or cleared > found[0]):
+                found = (cleared, issue)
+        return found[1] if found else None
+
     def apply(self, result: Result) -> str:
+        """Bring the rule's issue in line with its result.
+
+        Red with no open issue opens one, unless the router closed this rule's issue less than REOPEN_WITHIN
+        ago: that issue is reopened instead, so a rule that flaps keeps one issue, and keeps the creation time
+        the 48-hour escalation counts from. Only a result that closes by itself (auto_close) is looked up that
+        way; an issue a person closed, or one the router never closes, is not reopened. Clear closes the
+        issue and records when, in the same edit."""
         if result.red is None:
             return f"{result.rule}: not evaluated this run; its issue is left as it is"
         issue = self.find(result)
         if result.red:
+            if issue is None and result.auto_close:
+                cleared = self.find_cleared(result)
+                if cleared is not None:
+                    return self._reopen(result, cleared)
             return self._open(result) if issue is None else self._update(result, issue)
         if issue is not None and result.auto_close:
             self._comment(issue["number"], f"Cleared at {stamp(self.now)} ({self.run_url}).")
-            self.gh.patch(self.gh.repo_path(f"issues/{issue['number']}"), {"state": "closed", "state_reason": "completed"})
+            self.gh.patch(self.gh.repo_path(f"issues/{issue['number']}"),
+                          {"state": "closed", "state_reason": "completed",
+                           "body": set_marker(issue.get("body") or "", "cleared", stamp(self.now))})
             return f"{result.rule}: cleared; closed #{issue['number']}"
         return f"{result.rule}: clear"
 
@@ -139,7 +183,23 @@ class Router:
                                                            "assignees": self.approvers})
         return f"{result.rule}: opened #{issue['number']}"
 
+    def _reopen(self, result: Result, issue: dict) -> str:
+        number, body = issue["number"], issue.get("body") or ""
+        self._comment(number, f"Red again at {stamp(self.now)} (cleared at {read_marker(body, 'cleared')}).\n\n"
+                              f"{result.detail}\n\n({self.run_url})")
+        # The `cleared` marker goes, so a person who closes the reopened issue is not overruled by it.
+        body = set_marker(set_marker(drop_marker(body, "cleared"), "state", digest(result.detail)),
+                          "last-comment", stamp(self.now))
+        self.gh.patch(self.gh.repo_path(f"issues/{number}"), {"state": "open", "state_reason": "reopened", "body": body})
+        actions = self._refresh(result, dict(issue, state="open", body=body))
+        return f"{result.rule}: red again; reopened #{number}" + "".join(f", {action}" for action in actions)
+
     def _update(self, result: Result, issue: dict) -> str:
+        return f"{result.rule}: #{issue['number']} " + (", ".join(self._refresh(result, issue)) or "unchanged")
+
+    def _refresh(self, result: Result, issue: dict) -> list[str]:
+        """Comment if the detail changed or a day passed, restore a missing label, escalate once the issue has
+        been open 48 hours, and save the markers. Returns what it did."""
         number, body = issue["number"], issue.get("body") or ""
         new_body, actions = body, []
         state, last = digest(result.detail), read_marker(body, "last-comment")
@@ -166,7 +226,7 @@ class Router:
                 actions.append("escalation owner unset")
         if new_body != body:
             self.gh.patch(self.gh.repo_path(f"issues/{number}"), {"body": new_body})
-        return f"{result.rule}: #{number} " + (", ".join(actions) or "unchanged")
+        return actions
 
     def _comment(self, number: int, text: str) -> None:
         self.gh.post(self.gh.repo_path(f"issues/{number}/comments"), {"body": text})
