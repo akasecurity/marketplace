@@ -56,7 +56,7 @@ def load_stable(raw: str, path: str) -> dict:
 
 
 def describe(error: Exception) -> str:
-    """A release_checks.ReleaseCheckError as '<check>: <detail>'."""
+    """A release_checks.ReleaseCheckError or InfraError as '<check>: <detail>'."""
     return f"{getattr(error, 'check', 'check')}: {getattr(error, 'detail', error)}"
 
 
@@ -259,6 +259,9 @@ class Context:
 def verify(version: str) -> Any:
     try:
         return release_checks.verify_release(version)
+    except release_checks.InfraError as error:
+        raise Refused(f"no verdict on {version}: {describe(error)} (a registry, network, npm or GitHub API "
+                      "failure, not a verdict on the release; the next run or a re-dispatch retries)") from error
     except release_checks.ReleaseCheckError as error:
         raise Refused(f"{version} fails the release checks: {describe(error)}") from error
 
@@ -337,6 +340,8 @@ def plan_forward(ctx: Context) -> dict:
                 version, pinned,
                 verify=lambda v: release if v == version else release_checks.verify_release(v),
                 classify=release_checks.classify_migrations)
+        except release_checks.InfraError as error:
+            raise Refused(f"no verdict computing {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
         except release_checks.ReleaseCheckError as error:
             raise Refused(f"could not compute {version}'s {SAFETY_FILE} entry: {describe(error)}") from error
         classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
@@ -640,6 +645,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             write_output("proceed", "false")
         return 1 if refusal.red else 0
+    except (release_checks.InfraError, release_checks.ReleaseCheckError) as error:
+        # A call into release_checks that no planner wraps (the npm version list, the pins, the tag
+        # ledger, the rollback floor) ends here as one annotation and no `proceed`, which skips open-pr:
+        # red, as before, but one line in the run instead of a traceback.
+        print(f"::error::{describe(error)}")
+        if args.command == "plan":
+            write_output("proceed", "false")
+        return 1
     return 0
 
 
