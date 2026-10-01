@@ -1575,7 +1575,7 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
     return problems
 
 
-def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
+def audit_tags(repo_dir: str, frozen_path: str, *, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
     """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
     detection, not prevention: the rulesets prevent, and this notices when one was edited.
     A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
@@ -1588,19 +1588,15 @@ def audit_tags(repo_dir: str, frozen_path: str, *, previous_path=None, fetch: Fe
     frozen = _tag_rows(frozen_path, "frozen tag list", problems)
     if frozen is None:
         return problems
-    compared = [("frozen list", frozen)]
-    if previous_path is not None and os.path.exists(previous_path):
-        compared.append(("previous run", _tag_rows(previous_path, "previous run's tag list", problems) or []))
-    for label, rows in compared:
-        for row in rows:
-            now = current.get(row["tag"])
-            if now is None:
-                problems.append(f"{row['tag']} is in the {label} but no longer exists")
-            elif now != row:
-                problems.append(
-                    f"{row['tag']} changed since the {label}: {row['object']} -> {row['commit']} "
-                    f"is now {now['object']} -> {now['commit']}"
-                )
+    for row in frozen:
+        now = current.get(row["tag"])
+        if now is None:
+            problems.append(f"{row['tag']} is in the frozen list but no longer exists")
+        elif now != row:
+            problems.append(
+                f"{row['tag']} changed since the frozen list: {row['object']} -> {row['commit']} "
+                f"is now {now['object']} -> {now['commit']}"
+            )
     for name, row in current.items():
         if _git(repo_dir, "cat-file", "-t", row["object"]).strip() != "tag":
             problems.append(f"{name} is a lightweight tag; every fleet-v tag is annotated")
@@ -1646,7 +1642,6 @@ def _parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
     audit.add_argument("--repo", default=".")
     audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
-    audit.add_argument("--previous", default=None)
     audit.add_argument("--no-rulesets", action="store_true")
     sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
     mode = sub.add_parser("diff-mode", help="classify a manifest change")
@@ -1699,7 +1694,7 @@ def _command(args) -> int:
         result["error"] = {"check": "floor", "detail": detail}
         return _emit(result, 1)
     if args.command == "audit-tags":
-        problems = audit_tags(args.repo, args.frozen, previous_path=args.previous, check_rulesets=not args.no_rulesets)
+        problems = audit_tags(args.repo, args.frozen, check_rulesets=not args.no_rulesets)
         for problem in problems:
             print(f"::error::{problem}", file=sys.stderr)
         return _emit({"problems": problems}, 1 if problems else 0)
