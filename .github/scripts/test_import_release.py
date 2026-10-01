@@ -345,6 +345,39 @@ class TestPlanForward(PlanCase):
             self.plan(event="workflow_dispatch", target="0.9.15")
         self.assertTrue(caught.exception.red)
 
+    def test_a_dispatched_target_with_no_verdict_is_red_and_says_so(self):
+        self.down = {"0.9.15": ("network", "down")}
+        with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.15: network: down") as caught:
+            self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(caught.exception.red)
+        # It is not worded as a failed verification, and it says what to do about it.
+        self.assertNotIn("fails the release checks", str(caught.exception))
+        self.assertIn("not a verdict on the release", str(caught.exception))
+        self.assertIn("retries", str(caught.exception))
+
+    def assert_no_verdict_computing_the_safety_entry(self):
+        self.candidates = ["0.9.15"]
+        with self.assertRaisesRegex(ir.Refused, "no verdict computing 0.9.15's rollback-safety.json entry: ") as caught:
+            self.plan()
+        self.assertTrue(caught.exception.red)
+        self.assertNotIn("could not compute", str(caught.exception))
+
+    def test_an_outage_in_the_migration_classifier_is_no_verdict(self):
+        self.stubs["classify_migrations"].side_effect = release_checks.InfraError("classify", "GET contents answered 502")
+        self.assert_no_verdict_computing_the_safety_entry()
+
+    def test_an_outage_verifying_the_version_below_is_no_verdict(self):
+        # safety_entry verifies the highest pinned version below the candidate to find where to start from.
+        self.down = {"0.9.14": ("network", "down")}
+        self.assert_no_verdict_computing_the_safety_entry()
+
+    def test_a_verdict_computing_the_safety_entry_still_says_could_not_compute(self):
+        self.candidates = ["0.9.15"]
+        self.bad = {"0.9.14": ("provenance", "ref refs/heads/release is not the version's tag")}
+        with self.assertRaisesRegex(ir.Refused, "could not compute 0.9.15's rollback-safety.json entry: provenance: ") as caught:
+            self.plan()
+        self.assertTrue(caught.exception.red)
+
     def test_a_forward_target_must_be_above_the_pin_and_reimport_needs_a_target(self):
         with self.assertRaisesRegex(ir.Refused, "rollback-mode dispatch"):
             self.plan(event="workflow_dispatch", target="0.9.13")
@@ -393,6 +426,19 @@ class TestPlanRollback(PlanCase):
         with self.assertRaisesRegex(ir.Refused, "#9") as caught:
             self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
         self.assertFalse(caught.exception.red)
+
+    def test_a_rollback_target_with_no_verdict_is_red_and_says_so(self):
+        self.down = {"0.9.13": ("network", "down")}
+        with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.13: network: down") as caught:
+            self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
+        self.assertTrue(caught.exception.red)
+        self.assertNotIn("fails the release checks", str(caught.exception))
+
+    def test_a_rollback_target_that_fails_a_check_is_red(self):
+        self.bad = {"0.9.13": ("commit-on-main", "behind")}
+        with self.assertRaisesRegex(ir.Refused, "0.9.13 fails the release checks: commit-on-main: behind") as caught:
+            self.plan(mode="rollback", target="fleet-v7", event="workflow_dispatch")
+        self.assertTrue(caught.exception.red)
 
 
 class TestModes(PlanCase):
@@ -604,6 +650,82 @@ class TestMain(unittest.TestCase):
         with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(ir.main(["open-pr"]), 1)
         self.assertIn("::error::", out.getvalue())
+
+    def test_a_check_error_outside_a_refusal_exits_one_with_no_proceed(self):
+        env = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule"}
+        for error in (release_checks.InfraError("network", "down"),
+                      release_checks.ReleaseCheckError("safety", "rollback-safety.json must be a versions table")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.dict(ir.os.environ, env, clear=True), \
+                        mock.patch.object(ir, "make_plan", side_effect=error), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(ir.main(["plan"]), 1)
+                self.assertIn(f"::error::{error.check}: {error.detail}", out.getvalue())
+                self.assertIn("proceed=false", out.getvalue())
+                self.assertNotIn("proceed=true", out.getvalue())
+
+    def test_the_open_pr_command_reports_a_check_error_the_same_way_without_a_proceed_output(self):
+        env = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
+               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+        with mock.patch.dict(ir.os.environ, env, clear=True), \
+                mock.patch.object(ir, "open_pr", side_effect=release_checks.InfraError("network", "down")), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(ir.main(["open-pr"]), 1)
+        self.assertIn("::error::network: down", out.getvalue())
+        self.assertNotIn("proceed=", out.getvalue())
+
+
+class TestMainNet(PlanCase):
+    """Calls into release_checks that a planner leaves unwrapped: an outage or a malformed file there
+    ends the run as one annotation and `proceed=false`, so open-pr is skipped, not as a traceback."""
+
+    def run_plan(self, **env: str) -> tuple[int, str]:
+        variables = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule", "TARGET": ""}
+        variables.update(env)
+        with mock.patch.dict(ir.os.environ, variables, clear=True), \
+                mock.patch.object(ir, "Git", return_value=repo()), \
+                mock.patch.object(ir, "GitHub", return_value=self.gh), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = ir.main(["plan"])
+        return code, out.getvalue()
+
+    def assert_stopped(self, code: int, output: str, annotation: str) -> None:
+        self.assertEqual(code, 1)
+        self.assertIn(f"::error::{annotation}", output)
+        self.assertIn("proceed=false", output)
+        self.assertNotIn("proceed=true", output)
+
+    def test_an_outage_reading_the_npm_versions_stops_the_run(self):
+        self.stubs["npm_candidates"].side_effect = release_checks.InfraError("npm", "the registry answered 503")
+        self.assert_stopped(*self.run_plan(), "npm: the registry answered 503")
+
+    def test_an_outage_reading_the_pins_stops_the_run(self):
+        self.stubs["pinned_versions"].side_effect = release_checks.InfraError("git", "no fleet-v tags")
+        self.assert_stopped(*self.run_plan(), "git: no fleet-v tags")
+
+    def test_an_outage_reading_the_tag_ledger_stops_a_rollback(self):
+        self.stubs["pins_by_ref"].side_effect = release_checks.InfraError("git", "cannot read refs/tags/fleet-v7")
+        self.assert_stopped(*self.run_plan(MODE="rollback", TARGET="fleet-v7", EVENT_NAME="workflow_dispatch"),
+                            "git: cannot read refs/tags/fleet-v7")
+
+    def test_a_malformed_safety_file_stops_a_rollback(self):
+        self.stubs["rollback_floor"].side_effect = release_checks.ReleaseCheckError("safety", "not a versions table")
+        self.assert_stopped(*self.run_plan(MODE="rollback", TARGET="fleet-v7", EVENT_NAME="workflow_dispatch"),
+                            "safety: not a versions table")
+
+    def test_a_refusal_the_planner_wraps_keeps_its_own_wording(self):
+        self.candidates = ["0.9.15"]
+        self.down = {"0.9.15": ("network", "down")}
+        code, output = self.run_plan()
+        self.assertEqual(code, 1)
+        self.assertIn("::error::no verdict on 0.9.15: network: down", output)
+        self.assertIn("proceed=false", output)
+
+
+class TestDescribe(unittest.TestCase):
+    def test_both_kinds_of_check_failure_read_as_check_and_detail(self):
+        self.assertEqual(ir.describe(release_checks.ReleaseCheckError("provenance", "no")), "provenance: no")
+        self.assertEqual(ir.describe(release_checks.InfraError("network", "down")), "network: down")
 
 
 if __name__ == "__main__":
