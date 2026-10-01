@@ -1477,6 +1477,10 @@ class TestAuditTags(unittest.TestCase):
         self.assertEqual(rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch), [])
 
 
+# Only this repository's own rulesets: includes_parents=false leaves out the organisation's and the enterprise's.
+RULESET_LISTING = f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
+
+
 def ruleset_routes(overrides=None, missing=()):
     listing, routes = [], {}
     for number, (name, (target, types)) in enumerate(rc.EXPECTED_RULESETS.items(), start=1):
@@ -1518,7 +1522,7 @@ def ruleset_routes(overrides=None, missing=()):
         }
         body.update((overrides or {}).get(name, {}))
         routes[f"{rc.MARKETPLACE_API}/rulesets/{number}"] = (200, body)
-    routes[f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"] = (200, listing)
+    routes[RULESET_LISTING] = (200, listing)
     return routes
 
 
@@ -1543,6 +1547,38 @@ class TestAuditRulesets(unittest.TestCase):
     def test_a_missing_ruleset_is_caught(self):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(missing=("x4-tags",))))
         self.assertEqual(problems, ["ruleset 'x4-tags' does not exist"])
+
+    def test_a_duplicated_ruleset_name_is_flagged(self):
+        # Two rulesets named "main" cannot both be the one audited, and the last must not win
+        # silently: an inherited or stray ruleset of the same name would hide the real one.
+        routes = ruleset_routes()
+        listing = routes[RULESET_LISTING][1]
+        # The stray one comes first: neither copy is audited, so it is never fetched.
+        routes[RULESET_LISTING] = (200, [{"id": 99, "name": "main"}] + listing)
+        fetch = ts.FakeFetch(routes)
+        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["ruleset 'main': expected exactly one, found 2"])
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/99", fetch.urls())
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/1", fetch.urls())
+
+    def test_every_duplicated_name_is_flagged_once_and_the_others_are_still_audited(self):
+        routes = ruleset_routes({"bot-branches": {"enforcement": "disabled"}})
+        listing = routes[RULESET_LISTING][1]
+        extra = [{"id": 90 + n, "name": name} for n, name in enumerate(("x4-tags", "x4-tags", "tags-locked"))]
+        routes[RULESET_LISTING] = (200, listing + extra)
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            [
+                "ruleset 'tags-locked': expected exactly one, found 2",
+                "ruleset 'bot-branches' is 'disabled', not active",
+                "ruleset 'x4-tags': expected exactly one, found 3",
+            ],
+        )
+
+    def test_only_the_repositorys_own_rulesets_are_listed(self):
+        fetch = ts.FakeFetch(ruleset_routes())
+        rc.audit_rulesets(fetch=fetch)
+        self.assertIn("includes_parents=false", fetch.urls()[0])
+        self.assertIn("per_page=100", fetch.urls()[0])
 
     def test_a_disabled_ruleset_is_caught(self):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"enforcement": "disabled"}})))
@@ -1581,7 +1617,7 @@ class TestAuditRulesets(unittest.TestCase):
             ],
         )
 
-    LISTING = f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"
+    LISTING = RULESET_LISTING
 
     def no_verdict(self, routes):
         with self.assertRaises(rc.InfraError) as caught:
