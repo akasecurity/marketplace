@@ -12,6 +12,8 @@ import tempfile
 import textwrap
 import unittest
 
+import release_checks
+
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
 
 
@@ -78,6 +80,27 @@ class ImporterWorkflow(WorkflowCase):
 
     def test_the_workflow_token_never_writes(self):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
+
+    # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
+    # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
+    FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
+
+    def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
+        # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
+        # can resolve to an older cached 24.x whose npm the release checks refuse, red, on every run.
+        # Only an exact version, or a range that starts at one, cannot.
+        specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
+        self.assertEqual(len(specs), 1, "the importer installs Node exactly once, with a quoted node-version")
+        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
+        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
+        self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
+
+    def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
+        self.assertIn("npm 11.12", self.text)
+        self.assertNotIn("npm 11 (node 24)", self.text.lower())
 
 
 RUN_77 = '[{"databaseId": 77, "event": "schedule"}]'
