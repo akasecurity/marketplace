@@ -57,7 +57,8 @@ def pending(git: Git) -> list[str]:
     if not tags:
         raise Refused("no fleet-v tag exists to sweep from")
     tagged = {tag["commit"] for tag in tags}
-    return [sha for sha in git.first_parent_after(tags[-1]["commit"], "main")
+    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
+    return [sha for sha in git.first_parent_after(tags[-1]["commit"], git.main())
             if sha not in tagged and version_at(git, sha) != version_at(git, git.first_parent(sha))]
 
 
