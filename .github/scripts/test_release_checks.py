@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -178,6 +179,13 @@ class TestPinnedVersions(unittest.TestCase):
             rc.pinned_versions(self.repo.path)
 
 
+def forget_object(repo_path, oid):
+    """Remove one loose git object, as a failed fetch or a damaged checkout leaves it missing."""
+    loose = os.path.join(repo_path, ".git", "objects", oid[:2], oid[2:])
+    os.chmod(loose, 0o644)
+    os.remove(loose)
+
+
 class TestPinnedVersionsReadFailures(unittest.TestCase):
     """A tag that cannot be READ is no verdict. It must never be taken as a tag that pins
     nothing: that would drop a version from the candidate floor and the rollback floor."""
@@ -199,6 +207,18 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
         repo = self.ledger()
         self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
         self.delete_blob(repo, "fleet-v3")
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
+                call(repo.path)
+            self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_whose_manifest_directory_cannot_be_listed_is_infrastructure(self):
+        # The probe that tells an absent manifest from an unreadable one lists the tree
+        # first. When the listing itself fails, the file may well be there: the tag must
+        # not be taken as one that pins nothing, or its version leaves both floors.
+        repo = self.ledger()
+        directory = os.path.dirname(rc.MANIFEST)
+        forget_object(repo.path, ts.git(repo.path, "rev-parse", f"refs/tags/fleet-v3^{{commit}}:{directory}").strip())
         for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
             with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
                 call(repo.path)
@@ -262,6 +282,91 @@ class TestHttpHeaders(unittest.TestCase):
         self.assertEqual(rc.packument_url(), "https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code")
 
 
+class _Response:
+    """What urlopen returns: a context manager with a status and a body that may fail."""
+
+    status = 200
+
+    def __init__(self, body=b"", read_error=None):
+        self.body = body
+        self.read_error = read_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if self.read_error is not None:
+            raise self.read_error
+        return self.body
+
+
+class _FailingBody(io.BytesIO):
+    def __init__(self, error):
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, *args):
+        raise self.error
+
+
+class TestHttpFetch(unittest.TestCase):
+    URL = "https://registry.npmjs.org/x"
+
+    def fetch_with(self, **patch):
+        with mock.patch.object(rc.urllib.request, "urlopen", **patch):
+            return rc.http_fetch(self.URL, {})
+
+    def test_a_status_and_body_come_back_as_they_are(self):
+        self.assertEqual(self.fetch_with(return_value=_Response(b"ok")), (200, b"ok"))
+
+    def test_an_http_error_status_is_returned_and_not_raised(self):
+        error = rc.urllib.error.HTTPError(self.URL, 503, "unavailable", {}, io.BytesIO(b"later"))
+        self.assertEqual(self.fetch_with(side_effect=error), (503, b"later"))
+
+    def test_no_answer_at_all_is_no_verdict(self):
+        for label, error in (
+            ("an unreachable host", rc.urllib.error.URLError("no route")),
+            ("a timeout", TimeoutError("timed out")),
+            ("a reset connection", ConnectionResetError("reset")),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.fetch_with(side_effect=error)
+                self.assertEqual(caught.exception.check, "network")
+
+    def test_a_response_the_http_client_cuts_short_is_no_verdict(self):
+        # urllib wraps socket errors in URLError, but not http.client's own, which come out
+        # of getresponse() and read(): without a class of their own they would reach the
+        # caller as neither a verdict nor an outage. An error status is read in a handler,
+        # where a sibling except clause cannot see what that read raises.
+        def error_status(error):
+            return rc.urllib.error.HTTPError(self.URL, 502, "bad gateway", {}, _FailingBody(error))
+
+        for label, patch in (
+            ("a status line that is not HTTP", {"side_effect": http.client.BadStatusLine("")}),
+            (
+                "a body that stops before its length",
+                {"return_value": _Response(read_error=http.client.IncompleteRead(b"par", 9))},
+            ),
+            (
+                "an error status whose body stops early",
+                {"side_effect": error_status(http.client.IncompleteRead(b"par", 9))},
+            ),
+            (
+                "an error status whose body cannot be read",
+                {"side_effect": error_status(ConnectionResetError("reset"))},
+            ),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.fetch_with(**patch)
+                self.assertEqual(caught.exception.check, "network")
+                self.assertIn(self.URL, caught.exception.detail)
+
+
 class TestNpmCandidates(unittest.TestCase):
     def fetch(self, versions, latest="0.9.14"):
         return ts.FakeFetch(
@@ -303,6 +408,8 @@ class TestNpmCandidates(unittest.TestCase):
             ("text that is not JSON", b"not json", not_json),
             ("bytes that are not UTF-8", b"\xff", not_json),
             ("a duplicated key", b'{"versions": {"0.9.15": {}}, "versions": {"0.9.16": {}}}', not_json),
+            # json.loads raises RecursionError, not ValueError, past the interpreter's depth.
+            ("nesting deeper than the parser reads", b"[" * 100_000 + b"]" * 100_000, not_json),
         ):
             with self.subTest(label):
                 fetch = ts.FakeFetch({rc.packument_url(): (200, body)})
@@ -532,6 +639,13 @@ class TestNpmAuditSignatures(unittest.TestCase):
         with self.assertRaises(rc.InfraError):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
 
+    def test_audit_output_nested_too_deep_to_parse_is_toolchain(self):
+        # json.loads raises RecursionError, not ValueError, past the interpreter's depth.
+        deep = "[" * 100_000 + "]" * 100_000
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, deep)), sleep=lambda s: None)
+        self.assertEqual(caught.exception.check, "toolchain")
+
     def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
         sleeps, run = [], FakeRun(audit=(1, ""))
         with self.assertRaises(rc.InfraError) as caught:
@@ -735,6 +849,21 @@ class TestVerifyRelease(unittest.TestCase):
     def test_diverged_is_refused(self):
         self.refused("commit-on-main", routes=ts.release_routes("0.9.14", compare="diverged"))
 
+    def test_a_422_and_an_object_with_no_known_status_are_verdicts(self):
+        # What commit_on_ai_tc_main's docstring says: GitHub cannot compare the two (404 or
+        # 422), or it answered a JSON object whose status is neither ahead nor identical.
+        # Only a body that is not that object, or another HTTP status, is no verdict.
+        for label, answer in (
+            ("a 422", (422, {"message": "No common ancestor"})),
+            ("an empty object", (200, {})),
+            ("a status of another kind", (200, {"status": "later"})),
+            ("a status that is not a string", (200, {"status": 7})),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = answer
+                self.refused("commit-on-main", routes=routes)
+
     def test_an_unknown_commit_is_refused(self):
         routes = ts.release_routes("0.9.14")
         routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (404, {"message": "Not Found"})
@@ -936,6 +1065,23 @@ class TestMigrationKind(unittest.TestCase):
         # runs to the next quote and blanks the DROP in between.
         sql = "/* don't */ DROP TABLE `users`; CREATE TABLE `a` (`b` text DEFAULT 'x');"
         self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_a_line_comment_ends_at_its_line_so_the_next_line_still_counts(self):
+        # SQLite ends a -- comment at the newline. A lexer that let it run on to the end of
+        # the chunk would drop every statement after it, and read this file as additive.
+        drop = "non-additive: a drop (drop table)"
+        cases = {
+            "after a statement": "CREATE TABLE `a` (`x` integer); -- note\nDROP TABLE `users`;",
+            "before the first statement": "-- note\nDROP TABLE `users`;",
+            "between two statements": "CREATE TABLE `a` (`x` integer);\n-- note\nDROP TABLE `users`;\nCREATE TABLE `b` (`y` integer);",
+            "one comment line after another": "-- one\n-- two\nDROP TABLE `users`;",
+            "inside a statement": "CREATE TABLE `a` (`x` integer -- note\n); DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), drop)
+        # The comment does end at the end of the file when no newline follows it.
+        self.assertEqual(rc.migration_kind("CREATE TABLE `a` (`x` integer); -- DROP TABLE `users`;"), "additive")
 
     def test_a_statement_breakpoint_ends_a_statement_with_no_semicolon(self):
         sql = "CREATE TABLE `a` (`x` integer)\n--> statement-breakpoint\nDROP TABLE `users`;"
@@ -1580,6 +1726,16 @@ class TestAuditTags(unittest.TestCase):
         loose = os.path.join(self.repo.path, ".git", "objects", blob[:2], blob[2:])
         os.chmod(loose, 0o644)
         os.remove(loose)
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
+    def test_a_manifest_directory_git_cannot_list_is_no_verdict_not_drift(self):
+        # The same failure one step earlier: the listing that looks for the file fails, so
+        # nothing is known about the manifest, and reading it as "entry removed" would call
+        # the tag's honest record drift.
+        commit = self.cut("0.9.10", 4)
+        forget_object(self.repo.path, ts.git(self.repo.path, "rev-parse", f"{commit}:{os.path.dirname(rc.MANIFEST)}").strip())
         with self.assertRaises(rc.InfraError) as caught:
             self.audit()
         self.assertEqual(caught.exception.check, "git")
