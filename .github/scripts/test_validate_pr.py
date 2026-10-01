@@ -739,6 +739,21 @@ class TestMain(unittest.TestCase):
         start = ts.git(self.repo.path, "merge-base", "HEAD", head).strip()
         self.assertEqual(vp.changed_files(self.repo.path, start, head), ["README.md"])
 
+    def test_the_summary_names_the_main_commit_it_read(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.repo.commit(files={"llms.txt": "moved on main\n"})
+        tip = ts.git(self.repo.path, "rev-parse", "main").strip()
+        self.assertEqual(self.main(head, self.commits(head)), 0)
+        self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
+
+    def test_a_failing_pr_names_the_main_commit_it_read_too(self):
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head = self.pr_commit(doc)
+        tip = ts.git(self.repo.path, "rev-parse", "main").strip()
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
+
     def test_a_non_hex_head_is_no_verdict(self):
         self.assertEqual(self.main("main", ts.FakeFetch()), 2)
         self.assertIn("NO VERDICT", self.summary_text())

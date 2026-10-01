@@ -559,10 +559,13 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     verify = verify or functools.lru_cache(maxsize=None)(rc.verify_release)
     classify = classify or rc.classify_migrations
     number = env.get("PR_NUMBER", "?")
+    main_sha = None
     try:
         head_sha, base_repo = env.get("HEAD_SHA", ""), env.get("BASE_REPO", "")
         if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
             raise rc.InfraError("input", "HEAD_SHA, BASE_REPO and PR_NUMBER must be a 40-hex sha, owner/name and a number")
+        # The commit of main this run reads the pins and the rollback floor from, resolved once.
+        main_sha = _run_git(repo, "rev-parse", "--verify", f"{rc.main_ref(repo)}^{{commit}}").strip()
         start = _run_git(repo, "merge-base", "HEAD", head_sha).strip()
         base = {path: read_at(repo, start, path) for path in WATCHED}
         head = {path: read_at(repo, head_sha, path) for path in WATCHED}
@@ -581,7 +584,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
             head,
             changed_files(repo, start, head_sha),
             rc.pins_by_ref(repo),
-            read_at(repo, rc.main_ref(repo), rc.SAFETY_FILE),
+            read_at(repo, main_sha, rc.SAFETY_FILE),
             bot_login=rc.BOT_LOGIN,
             verify=verify,
             classify=classify,
@@ -591,6 +594,9 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     except rc.ReleaseCheckError as exc:
         report = Report()
         report.fail(f"{exc.check}: {exc.detail}")
+    if main_sha:
+        # main moves without starting this check again, so the summary says which commit it read.
+        report.row("Main read at", _code(main_sha[:12]))
     text = render_summary(report, number)
     print(text)
     summary_path = env.get("GITHUB_STEP_SUMMARY")
