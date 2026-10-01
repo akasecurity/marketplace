@@ -208,9 +208,10 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
         self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
         self.delete_blob(repo, "fleet-v3")
         for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
-            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
-                call(repo.path)
-            self.assertEqual(caught.exception.check, "git")
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
 
     def test_a_tag_whose_manifest_directory_cannot_be_listed_is_infrastructure(self):
         # The probe that tells an absent manifest from an unreadable one lists the tree
@@ -220,9 +221,10 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
         directory = os.path.dirname(rc.MANIFEST)
         forget_object(repo.path, ts.git(repo.path, "rev-parse", f"refs/tags/fleet-v3^{{commit}}:{directory}").strip())
         for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
-            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
-                call(repo.path)
-            self.assertEqual(caught.exception.check, "git")
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
 
     def test_a_tag_at_a_commit_without_the_manifest_file_pins_nothing(self):
         # tag-release cuts such a tag as "entry removed", and a tag is immutable, so reading
@@ -253,9 +255,10 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
         repo = ts.Repo(self)
         repo.commit(ts.manifest("0.9.14"))
         for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
-            with self.subTest(call=call.__name__), self.assertRaises(rc.InfraError) as caught:
-                call(repo.path)
-            self.assertEqual(caught.exception.check, "git")
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
 
 
 class TestHttpHeaders(unittest.TestCase):
