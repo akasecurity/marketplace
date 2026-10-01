@@ -240,6 +240,9 @@ class TestHumanRules(unittest.TestCase):
         failed_with(self, report, "rollback-safety.json gains 0.9.15, which nothing pins")
         pinned_now = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety=head_safety), [rc.SAFETY_FILE], pins={**ts.PINS, "main": "0.9.15"})
         self.assertEqual(pinned_now.failures, [])
+        # 0.9.8 is pinned by fleet-v3 alone, not by main: a version only a tag pins is accepted too.
+        tag_only = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety={"0.9.8": NEXT_ENTRY, **ts.SEED}), [rc.SAFETY_FILE])
+        self.assertEqual(tag_only.failures, [])
 
     def test_removing_a_safety_entry_is_called_out(self):
         head_safety = copy.deepcopy(ts.SEED)
