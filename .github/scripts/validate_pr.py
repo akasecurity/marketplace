@@ -229,29 +229,39 @@ REF_PATTERNS = {
 REMOVE_REF = re.compile(r"bot/remove-ai-tc-[0-9]+")
 # The bot-branches ruleset lets only the bot App create, update or delete these refs.
 BOT_REF_PREFIX = "bot/"
-# GitHub's own committer login. A commit the App creates through the Git Data API with no
-# author or committer carries the App as author, web-flow as committer, and GitHub's signature.
+# GitHub's own committer login. The importer makes every bot commit through the Git Data API
+# with no author or committer, which GitHub records with the App as author and web-flow as
+# committer, and signs. That signed shape is the only bot commit there is.
 WEB_FLOW = "web-flow"
 
 
 def commit_problems(commit: dict, bot_login: str) -> list:
-    """Why one PR commit is not the bot App's, or [].
+    """Why one PR commit is not one GitHub created for the bot App and signed, or [].
 
     A login is only GitHub's match of the commit's email, which anyone can write into a
-    commit, so no name is trusted alone: these checks sit beside the PR the App opened and
-    the bot/ ref only the App may push, and web-flow counts only with a verified signature."""
+    commit, so no name is trusted alone. Every commit must also carry GitHub's verified
+    signature, even one that names the App as both author and committer: anyone who can push
+    to the branch can write those two lines. The signature narrows that gap, but it does not
+    replace the bot-branches ruleset that lets only the App push the bot/ refs, and these
+    checks sit beside that ruleset and the PR the App opened."""
     sha = str(commit.get("sha"))[:12]
     author, committer = commit.get("author"), commit.get("committer")
+    signed = commit.get("verified") is True
     problems = []
     if author != bot_login:
         problems.append(f"commit {sha} is authored by {author}, not by {bot_login}")
     if committer == WEB_FLOW:
-        if commit.get("verified") is not True:
+        if not signed:
             problems.append(f"commit {sha} is committed by {WEB_FLOW} without a verified signature")
-    elif committer != bot_login:
+    elif committer == bot_login:
+        if not signed:
+            problems.append(
+                f"commit {sha} has no verified signature: a bot commit is one GitHub created for the App and signed"
+            )
+    else:
         problems.append(
-            f"commit {sha} is committed by {committer}: a bot commit's committer is {bot_login}, "
-            f"or {WEB_FLOW} with a verified signature"
+            f"commit {sha} is committed by {committer}: a bot commit's committer is {bot_login} "
+            f"or {WEB_FLOW}, with a verified signature"
         )
     return problems
 
