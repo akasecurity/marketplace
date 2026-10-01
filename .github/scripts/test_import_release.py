@@ -341,7 +341,9 @@ class TestPlanForward(PlanCase):
         plan = self.plan(repo(entries=entries), event="workflow_dispatch", target="0.9.15", reimport=True)
         self.assertIsNone(plan["safety_entry"])
         self.assertEqual((plan["classification"], plan["migrations"]), ("additive", ["0036_add_column"]))
-        self.stubs["classify_migrations"].assert_not_called()
+        # The recorded entry is left alone, and still recomputed.
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+        self.stubs["classify_migrations"].reset_mock()
         # A fix-forward after that rollback: its entry is computed from 0.9.15, the highest version
         # pinned below it, exactly as validate recomputes it, not from main's 0.9.14.
         self.candidates = ["0.9.16"]
@@ -386,6 +388,66 @@ class TestPlanForward(PlanCase):
         self.bad = {"0.9.14": ("provenance", "ref refs/heads/release is not the version's tag")}
         with self.assertRaisesRegex(ir.Refused, "could not compute 0.9.15's rollback-safety.json entry: provenance: ") as caught:
             self.plan()
+        self.assertTrue(caught.exception.red)
+
+    def recorded(self, **entry) -> FakeGit:
+        """main with an entry for 0.9.15 (not pinned by main or any tag), as computed against 0.9.14 unless changed."""
+        entries = {"0.9.13": safety_entry("0.9.13", "0.9.12", "additive", ()), "0.9.14": safety_entry("0.9.14", "0.9.13"),
+                   "0.9.15": {**safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",)), **entry}}
+        return repo(entries=entries)
+
+    def test_a_recorded_entry_weaker_than_the_computed_one_is_refused(self):
+        # An entry typed in as additive for a release nobody classified must not stand as evidence the
+        # release is rollback-safe: validate would fail the pin PR, so the importer opens none.
+        self.candidates = ["0.9.15"]
+        self.stubs["classify_migrations"].side_effect = lambda start, end: types.SimpleNamespace(
+            classification="not-rollback-safe", migrations=["0036_add_column"])
+        with self.assertRaisesRegex(ir.Refused, "records 0.9.15 as additive, but the importer computes "
+                                                r"not-rollback-safe \(0036_add_column\); validate would fail the pin PR") as caught:
+            self.plan(self.recorded())
+        self.assertTrue(caught.exception.red)
+
+    def test_a_recorded_entry_for_another_commit_is_refused(self):
+        self.candidates = ["0.9.15"]
+        wrong = "2" * 40
+        with self.assertRaisesRegex(
+                ir.Refused, f"records 0.9.15 up to commit {wrong}, but its attested commit is {ATTESTED['0.9.15']}") as caught:
+            self.plan(self.recorded(classification="not-rollback-safe", to=wrong))
+        self.assertTrue(caught.exception.red)
+
+    def test_a_recorded_entry_at_least_as_strong_is_reused_and_still_checked(self):
+        self.candidates = ["0.9.15"]
+        plan = self.plan(self.recorded(classification="not-rollback-safe", migrations=["0035_example"]))
+        self.assertIsNone(plan["safety_entry"])
+        self.assertEqual((plan["classification"], plan["migrations"]), ("not-rollback-safe", ["0035_example"]))
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+
+    def test_a_recorded_entry_starting_from_another_commit_is_not_refused(self):
+        # The highest pinned version below a release moves after a re-import of a lower one, so only
+        # the commit the entry runs up to and its class are checked, as validate does.
+        self.candidates = ["0.9.15"]
+        plan = self.plan(self.recorded(**{"from": ATTESTED["0.9.13"]}))
+        self.assertIsNone(plan["safety_entry"])
+
+    def test_a_malformed_recorded_entry_is_refused_not_a_traceback(self):
+        self.candidates = ["0.9.15"]
+        entries = {"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": {"classification": "additive"}}
+        with self.assertRaisesRegex(ir.Refused, "entry for 0.9.15 is malformed") as caught:
+            self.plan(repo(entries=entries))
+        self.assertTrue(caught.exception.red)
+
+    def test_an_outage_recomputing_a_recorded_entry_is_no_verdict(self):
+        self.candidates = ["0.9.15"]
+        self.stubs["classify_migrations"].side_effect = release_checks.InfraError("classify", "GET contents answered 502")
+        with self.assertRaisesRegex(ir.Refused, "no verdict computing 0.9.15's rollback-safety.json entry: ") as caught:
+            self.plan(self.recorded())
+        self.assertTrue(caught.exception.red)
+
+    def test_a_verdict_recomputing_a_recorded_entry_says_could_not_compute(self):
+        self.candidates = ["0.9.15"]
+        self.bad = {"0.9.14": ("provenance", "ref refs/heads/release is not the version's tag")}
+        with self.assertRaisesRegex(ir.Refused, "could not compute 0.9.15's rollback-safety.json entry: provenance: ") as caught:
+            self.plan(self.recorded())
         self.assertTrue(caught.exception.red)
 
     def test_a_forward_target_must_be_above_the_pin_and_reimport_needs_a_target(self):
