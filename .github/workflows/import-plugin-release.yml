@@ -9,8 +9,9 @@ name: import-plugin-release
 # moving the pin. It never takes npm `latest` on trust. A candidate the checks
 # cannot reach a verdict on (a registry, network, npm or GitHub API failure) stops
 # the run red: it never falls back to a lower version while a higher one has no
-# verdict, and the next run tries again. A version that can never be verified is
-# stepped over by a dispatch naming a lower target that is still above every pin.
+# verdict, and the next run tries again. A dispatch naming a lower target that is
+# still above every pin imports that release meanwhile, because it reads no
+# candidate list; the scheduled run stays red until a higher release passes.
 #
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
 # marketplace-bot environment, whose deployment policy admits only main, and acts
