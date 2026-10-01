@@ -2,7 +2,9 @@ name: staleness
 
 # Hourly checks that the release chain has not stalled (AGENTS.md, "The
 # workflows"): a passing release left unpinned for a day, a version the importer
-# refuses, a bot PR open for a day, a pin change left untagged for an hour, a
+# refuses, a version the release checks could not finish on (a registry, network,
+# npm or GitHub API failure: no verdict, reported on its own and never as a
+# refusal), a bot PR open for a day, a pin change left untagged for an hour, a
 # stray tag or a second ref named main, the ai-tc entry gone from main, and the
 # "rolled back, awaiting fix-forward" notice. Each rule is its own issue, filed
 # by the only job here that may write issues: GitHub mails a failed scheduled run
@@ -42,7 +44,9 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      # npm 11 (node 24) for the release checks' `npm audit signatures`.
+      # npm 11.12 or later, for the release checks' `npm audit signatures
+      # --include-attestations`: on an older npm the checks reach no verdict (a
+      # toolchain failure), which this workflow reports as a version with no verdict.
       # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
