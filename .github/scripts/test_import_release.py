@@ -491,6 +491,24 @@ class TestPlanForward(PlanCase):
             self.plan(self.recorded())
         self.assertTrue(caught.exception.red)
 
+    def test_the_plan_reads_main_by_its_full_ref(self):
+        # A tag named main wins over the branch when git resolves the bare name, so the plan asks the
+        # checkout which full ref is main and never looks the bare name up.
+        class FullRefGit(FakeGit):
+            def main(self):
+                return "refs/remotes/origin/main"
+
+            def rev_parse(self, rev):
+                if rev == "main":
+                    raise AssertionError("the bare name main was resolved")
+                return self.chain[-1] if rev == "refs/remotes/origin/main" else rev
+
+        git = repo()
+        full = FullRefGit(chain=git.chain, files=git.files, tags=git.tags)
+        self.candidates = ["0.9.15"]
+        plan = self.plan(full)
+        self.assertEqual((plan["version"], plan["base_sha"]), ("0.9.15", "m"))
+
     def test_a_forward_target_must_be_above_the_pin_and_reimport_needs_a_target(self):
         with self.assertRaisesRegex(ir.Refused, "rollback-mode dispatch"):
             self.plan(event="workflow_dispatch", target="0.9.13")
