@@ -335,8 +335,17 @@ class TestBotRules(unittest.TestCase):
         failed_with(self, report, f"commit dddddddddddd is committed by venuverse: a bot commit's committer is {BOT}")
         self.assertFalse(any("eeeeeeeeeeee" in f for f in report.failures), report.failures)
 
-    def test_a_commit_the_app_pushed_itself_passes_unsigned(self):
-        commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": False},)
+    def test_an_unsigned_commit_fails_whoever_it_names_as_committer(self):
+        # Naming the App as author and committer is two lines anyone who can push may write.
+        for verified in (False, None):
+            with self.subTest(verified=verified):
+                commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": verified},)
+                report = self.advance(pr=pull(commits=commits))
+                failed_with(self, report, "commit eeeeeeeeeeee has no verified signature: a bot commit is one GitHub created for the App and signed")
+                self.assertEqual(len(report.failures), 1, report.failures)
+
+    def test_a_signed_commit_naming_the_app_as_committer_passes(self):
+        commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": True},)
         self.assertEqual(self.advance(pr=pull(commits=commits)).failures, [])
 
     def test_a_web_flow_commit_needs_a_verified_signature(self):
