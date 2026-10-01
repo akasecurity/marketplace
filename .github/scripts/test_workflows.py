@@ -142,7 +142,7 @@ class TagAuditWorkflow(WorkflowCase):
         self.assertIn("name: fleet-tags-snapshot", upload)
         self.assertIn("retention-days: 90", upload)
         self.assertIn("# Kept only from a green audit", self.jobs["audit"])
-        self.assertRegex(self.jobs["audit"], r"It lasts 90\s+# days")
+        self.assertRegex(self.jobs["audit"], r"It lasts 90(?:\s+#)?\s+days")
 
     def test_the_baseline_comes_only_from_a_green_run_on_main(self):
         fetch = self.step("name: fetch the snapshot the last green run kept")
@@ -242,10 +242,11 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertTrue(calls[-1].startswith("run download 55 "))
 
-    def test_the_fetch_step_with_no_earlier_green_run_compares_against_the_frozen_list_only(self):
+    def test_the_fetch_step_with_no_earlier_green_run_requires_the_frozen_list_to_cover_every_tag(self):
         done, calls = self.run_fetch()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
+        self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
         # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
         self.assertTrue(calls[0].startswith("run list "))
         self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
@@ -255,7 +256,25 @@ class TagAuditWorkflow(WorkflowCase):
                                      artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::run 77 kept a snapshot that has expired", done.stdout)
+        self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
         self.assertFalse([call for call in calls if call.startswith("run download")])
+
+    def test_a_green_run_with_no_snapshot_takes_the_no_baseline_path(self):
+        # A snapshot someone deleted must not wedge the audit red for good: the run goes on without a
+        # baseline, and tag_audit.py then requires the frozen list to record every fleet-v tag.
+        cases = {
+            "the green run lists no artifact": '{"artifacts": []}',
+            "another artifact only": '{"artifacts": [{"name": "other", "expired": false}]}',
+        }
+        for label, artifacts in cases.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=RUN_77, artifacts=artifacts)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("::notice::run 77 is the last green run but lists no fleet-tags-snapshot artifact",
+                              done.stdout)
+                self.assertNotIn("expired", done.stdout)
+                self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
+                self.assertFalse([call for call in calls if call.startswith("run download")])
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,
@@ -263,9 +282,6 @@ class TagAuditWorkflow(WorkflowCase):
         cases = {
             "the run listing fails": dict(runs=RUN_77, list_fails=True),
             "the artifact listing fails": dict(listed, api_fails=True),
-            "the green run lists no snapshot": dict(runs=RUN_77, artifacts='{"artifacts": []}'),
-            "another artifact only": dict(runs=RUN_77,
-                                          artifacts='{"artifacts": [{"name": "other", "expired": false}]}'),
             "the download fails": dict(listed, download_fails=True),
         }
         for label, kwargs in cases.items():
