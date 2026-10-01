@@ -64,11 +64,11 @@ field — so "change all four" does not apply to a version change.
 **How the pin moves: only through the release bot's pull requests** (see "The workflows").
 
 - **A release** is a `bot/pin-ai-tc-<v>` PR that `import-plugin-release` opens after verifying the
-  npm release: an exact `x.y.z`, the registry's dist, SLSA provenance bound to ai-tc's release
-  workflow at the version's own tag, and the attested commit on ai-tc's `main`. It changes the
-  version and `metadata.integrity`, and adds the version's entry to `rollback-safety.json`. One code
-  owner approves it after running the candidate in one real session (the PR's checklist), and
-  auto-merge squash-merges it once `validate` is green.
+  npm release: an exact `x.y.z`, the registry's dist, SLSA provenance whose signing certificate
+  names ai-tc's release workflow at the version's own tag, and the certificate's commit on ai-tc's
+  `main`. It changes the version and `metadata.integrity`, and adds the version's entry to
+  `rollback-safety.json`. One code owner approves it after running the candidate in one real
+  session (the PR's checklist), and auto-merge squash-merges it once `validate` is green.
 - **A rollback** is a rollback-mode dispatch of the same workflow, with a version or a `fleet-v<N>`
   name. Its `bot/rollback-ai-tc-<from>-to-<v>` PR moves only the pin, down to a version a `fleet-v`
   tag has pinned and not below the rollback floor that `rollback-safety.json` records; one code
@@ -76,6 +76,17 @@ field — so "change all four" does not apply to a version change.
   that would undo the other entries' edits.
 - **Nobody edits the ai-tc entry by hand.** `validate` fails any human change to it other than its
   `description` (see "Adding or renaming a plugin", step 5).
+
+**Who signed a release is read from its signing certificate, never from the statement.**
+`npm audit signatures` checks the signature and the certificate's chain, but no identity: a release
+that verifies proves only that someone published with provenance, and anyone can do that from their
+own repository. So `release_checks.py` reads the identity from the Sigstore certificate that npm
+verified, the one that signed the statement, and requires it to name ai-tc's release workflow at the
+version's own tag, pushed by that tag, from ai-tc's repository and owner (compared by GitHub's
+numeric ids, which a rename cannot move), on a GitHub-hosted runner. The commit and the run the PR
+shows are the certificate's too. The statement the publisher wrote must agree with the certificate,
+and the commit must be on ai-tc's `main`; a statement that contradicts its own signer is refused as
+forged.
 
 **`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
 annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
@@ -97,7 +108,11 @@ other tag name:
   serves different bytes for the same version:
   `npm view @akasecurity/ai-tc-claude-code@<v> dist --@akasecurity:registry=https://registry.npmjs.org`
   (or `curl -s https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code | jq '.versions["<v>"].dist'`).
-  `npm audit signatures` in a scratch dir that installs exactly `<v>` shows its provenance.
+  `npm audit signatures` in a scratch dir that installs exactly `<v>` shows that its provenance
+  verifies, but not who signed it (see above). To repeat every check, identity included, run
+  `python3 .github/scripts/release_checks.py verify-version <v>` with npm 11.12 or later, the first
+  npm that prints the attestations; an older one gives no verdict. It exits 0 when the release
+  passes, 1 when a check refuses it, and 2 when no verdict could be reached.
 
 `preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
 
@@ -135,22 +150,42 @@ may use.
   `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
   open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
   rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it.
-  While a rollback PR is open, the scheduled import opens nothing.
+  While a rollback PR is open, the scheduled import opens nothing. A candidate that fails a check
+  is logged once and skipped, so it never hides a release above or below it. A candidate the
+  checks cannot finish on (no verdict, below) is not skipped: the run stops there, red, and does
+  not fall back to a lower version, because the one it could not check may be the real newest.
+  The next run tries again, and a dispatch with a lower `target` imports that release meanwhile,
+  since it reads no candidate list. A dispatched `target` or rollback target with no verdict ends
+  red the same way.
 - **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
   its script, reading the PR's files as data. An approver confirms the check run is `validate.yml`'s
-  run from `main`, and trusts its summary over the PR body.
+  run from `main`, and trusts its summary over the PR body. A check that cannot finish reports
+  NO VERDICT and fails the required check; it is never reported as the PR breaking a rule.
 - **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
   comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
   ai-tc version changed and has no `fleet-v` tag yet, and deletes the bot's branches whose PRs are
   closed.
 - **`staleness`** (hourly) files an issue when a passing release sits unpinned for 24 hours, npm has
-  a version the importer refuses, a bot PR is open for 24 hours, a pin change is untagged for an
-  hour, a stray tag or a second ref named `main` exists, or the ai-tc entry is gone; it posts a
-  "rolled back, awaiting fix-forward" notice while the latest tag is a rollback.
+  a version the importer refuses, the release checks reached no verdict on a version that has been
+  on npm for over an hour (its own issue, naming the version and the check that did not finish),
+  a bot PR is open for 24 hours, a pin change is untagged for an hour, a stray tag or a second ref
+  named `main` exists, or the ai-tc entry is gone; it posts a "rolled back, awaiting fix-forward"
+  notice while the latest tag is a rollback. While a version has no verdict, the unpinned-release
+  and refused-version rules can still go red from the versions that did finish, but they are not
+  cleared, so an outage never closes their issues.
 - **`tag-audit`** (daily and on tag pushes) checks the `fleet-v` ledger against the frozen list, the
   last green run and `main`'s history, and that the rulesets are active as configured.
 - **`main-audit`** (every push to `main`) opens an issue for any commit that reached `main` without
   a code-owner-approved PR.
+
+**No verdict is not a refusal.** `release_checks.py` keeps two outcomes apart. A check that reached
+a verdict and said no raises `ReleaseCheckError` (the command exits 1). A check that could not
+finish, because the registry, the network, npm, git or the GitHub API failed, raises `InfraError`
+(exit 2). They are sibling classes, not parent and child, so a handler written for a refusal never
+catches an outage by accident, and a caller that forgets to handle one fails the run closed and
+visibly instead of reading the outage as a verdict. Write new callers the same way: name the class
+you mean, and decide what no verdict does there (`validate` fails, the importer stops red, and
+`staleness` reports it on its own rule).
 
 Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners.
 
