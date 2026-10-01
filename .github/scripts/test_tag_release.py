@@ -280,6 +280,10 @@ class TestApprover(unittest.TestCase):
         self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
 
 
+def branch_ref(name: str, tip: str) -> dict:
+    return {"ref": f"refs/heads/{name}", "object": {"sha": tip, "type": "commit"}}
+
+
 def run_main(command: str, git, gh) -> tuple[int, str]:
     """tag_release.main with the checkout and the GitHub client replaced: its exit code and its output."""
     out = io.StringIO()
@@ -329,7 +333,7 @@ class TestGitHubFailures(unittest.TestCase):
     def test_a_branch_deletion_github_refuses_is_an_error(self):
         pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True)]
         gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
-                         ("GET", R("git/matching-refs/heads/bot/")): [{"ref": "refs/heads/bot/pin-ai-tc-0.9.15"}],
+                         ("GET", R("git/matching-refs/heads/bot/")): [branch_ref("bot/pin-ai-tc-0.9.15", f"{20:040x}")],
                          ("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15")): refused(R("git/refs/heads/bot/pin-ai-tc-0.9.15"))})
         code, out = run_main("cleanup-branches", FakeGit(chain=[]), gh)
         self.assertEqual(code, 1)
@@ -379,8 +383,9 @@ class TestCleanup(unittest.TestCase):
     def test_only_the_bots_branches_with_a_closed_pr_are_deleted(self):
         pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True), pull(21, "bot/pin-ai-tc-0.9.16"),
                  pull(22, "bot/rollback-ai-tc-0.9.14-to-0.9.13", state="closed")]
-        refs = [{"ref": f"refs/heads/{name}"} for name in
-                ("bot/pin-ai-tc-0.9.15", "bot/pin-ai-tc-0.9.16", "bot/rollback-ai-tc-0.9.14-to-0.9.13", "bot/remove-ai-tc-7")]
+        # pull(n, ...) gives its PR the head f"{n:040x}"; a branch is at its closed PR's head here.
+        refs = [branch_ref("bot/pin-ai-tc-0.9.15", f"{20:040x}"), branch_ref("bot/pin-ai-tc-0.9.16", f"{21:040x}"),
+                branch_ref("bot/rollback-ai-tc-0.9.14-to-0.9.13", f"{22:040x}"), branch_ref("bot/remove-ai-tc-7", f"{23:040x}")]
         gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls), ("GET", R("git/matching-refs/heads/bot/")): refs,
                          ("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15")): None,
                          ("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13")): None})
@@ -388,6 +393,21 @@ class TestCleanup(unittest.TestCase):
 
     def test_a_reimport_reusing_a_closed_prs_branch_name_keeps_the_branch(self):
         pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True), pull(30, "bot/pin-ai-tc-0.9.15")]
+        gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
+                         ("GET", R("git/matching-refs/heads/bot/")): [branch_ref("bot/pin-ai-tc-0.9.15", f"{20:040x}")]})
+        self.assertEqual(tr.cleanup_branches(gh), [])
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_branch_re_created_after_its_pr_closed_is_kept(self):
+        # A reimport deleted the closed PR's branch and made it again: a new commit, which no closed PR closed on.
+        pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True)]
+        gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
+                         ("GET", R("git/matching-refs/heads/bot/")): [branch_ref("bot/pin-ai-tc-0.9.15", f"{99:040x}")]})
+        self.assertEqual(tr.cleanup_branches(gh), [])
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_branch_whose_tip_is_not_given_is_kept(self):
+        pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True)]
         gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
                          ("GET", R("git/matching-refs/heads/bot/")): [{"ref": "refs/heads/bot/pin-ai-tc-0.9.15"}]})
         self.assertEqual(tr.cleanup_branches(gh), [])
