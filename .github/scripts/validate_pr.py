@@ -536,7 +536,12 @@ def pr_commits(base_repo: str, number: int, *, fetch) -> list:
         status, body = fetch(url, {})
         if status != 200:
             raise rc.InfraError("api", f"GET {url} answered {status}")
-        batch = json.loads(body)
+        try:
+            batch = rc.parse_json(body)
+        except (ValueError, RecursionError) as exc:
+            raise rc.InfraError("api", f"GET {url} answered non-JSON") from exc
+        if not isinstance(batch, list) or not all(isinstance(c, dict) for c in batch):
+            raise rc.InfraError("api", f"GET {url} did not answer a list of commits")
         commits += [
             {
                 "sha": c.get("sha"),
@@ -594,6 +599,11 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     except rc.ReleaseCheckError as exc:
         report = Report()
         report.fail(f"{exc.check}: {exc.detail}")
+    except Exception as exc:
+        # Neither a verdict nor a known failure: a defect here, or an answer shaped in a way
+        # this did not expect. No verdict, so exit 2 with the summary written, never a stack
+        # trace alone. KeyboardInterrupt and SystemExit are not Exceptions and pass through.
+        report = Report(infra=f"internal: {type(exc).__name__}: {exc}")
     if main_sha:
         # main moves without starting this check again, so the summary says which commit it read.
         report.row("Main read at", _code(main_sha[:12]))
