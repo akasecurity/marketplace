@@ -6,9 +6,10 @@ release_checks, and prints one JSON plan. `open-pr` runs in the
 marketplace-bot environment with the bot App's installation credential: it
 re-reads main through the API, writes the bot commit through the Git Data API
 (no local push and no persisted credential), creates the branch with a create-only
-ref, never a force-push (an existing branch with an open PR is skipped; one with no
-open PR is skipped on a plain forward run, and deleted and created again only by a
-reimport or rollback dispatch), opens the PR and enables
+ref, never a force-push (an existing branch with an open PR is skipped; one the bot's
+closed PR used is skipped on a plain forward run, and deleted and created again only by a
+reimport or rollback dispatch; one no PR ever used was left by a run that died before
+opening it, and any run deletes it and creates it again), opens the PR and enables
 auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
 version while a higher one has no verdict. Every decision about an open or closed PR looks at
@@ -640,12 +641,19 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
             raise Refused(f"{branch} is the head of PR #{open_here[0]['number']}, which {open_here[0]['author'] or 'someone'} "
                           "opened, not the release bot; the importer does not delete a branch another PR uses, so a "
                           "person closes that PR or renames its branch first")
+        leftover = False
         if plan["mode"] == "forward" and not plan.get("reimport"):
-            raise Refused(f"{branch} already exists with no open PR (another run got there first, or tag-release "
-                          "has not yet deleted a closed PR's branch); a dispatch with reimport: true replaces it",
-                          red=False)
+            if [p for p in bot_pulls(list_pulls(gh, "closed")) if p["head"] == branch]:
+                raise Refused(f"{branch} already exists, and the bot's PR for it was closed (tag-release has not yet "
+                              "deleted its branch); that rejection stands, and a dispatch with reimport: true "
+                              "replaces it", red=False)
+            # No PR ever used it, so an earlier run died between creating the branch and opening the PR.
+            # Forward runs share one concurrency group, so no live run owns it. Delete and create, as a
+            # reimport does; the ref is still never force-pushed.
+            leftover = True
         gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
-        print(f"deleted {branch}, which had no open PR, before creating it again")
+        print(f"::notice::deleted {branch}, left with no pull request by an earlier run, and created it again"
+              if leftover else f"deleted {branch}, which had no open PR, before creating it again")
     files = {MANIFEST: actions["edit"](raw, plan)}
     if plan.get("safety_entry"):
         safety_raw = read_file(gh, SAFETY_FILE, main_sha)

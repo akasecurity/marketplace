@@ -691,16 +691,40 @@ class TestOpenPrForward(OpenPrCase):
         self.assertFalse(caught.exception.red)
         self.assertEqual(self.gh.writes(), [])
 
-    def test_an_existing_branch_without_a_pr_is_skipped_unless_reimport(self):
+    def deleted_before_created(self, branch: str) -> bool:
+        order = [f"{call[0]} {call[1]}" for call in self.gh.writes()]
+        return order.index(f"DELETE {R(f'git/refs/heads/{branch}')}") < order.index(f"POST {R('git/refs')}")
+
+    def test_a_branch_left_with_no_pull_request_is_replaced_on_a_plain_run(self):
+        # An earlier run died between creating the branch and opening the PR. No run owns it now, so the
+        # branch is deleted and created again (never a force-push), and the run says so.
         self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
+        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run, "
+                      "and created it again", out.getvalue())
+        self.assertEqual([call for call in self.gh.calls if call[0] == "PATCH"], [])
+
+    def test_a_branch_whose_bot_pr_was_closed_is_skipped_unless_reimport(self):
+        # The rejection stands until a reimport, and the branch is the evidence a closed PR leaves.
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(7, "bot/pin-ai-tc-0.9.15", state="closed"))
         with self.assertRaisesRegex(ir.Refused, "already exists") as caught:
             self.open(forward_plan())
         self.assertFalse(caught.exception.red)
         self.assertEqual(self.gh.writes(), [])
         self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
         self.open(forward_plan(reimport=True))
-        order = [f"{call[0]} {call[1]}" for call in self.gh.writes()]
-        self.assertLess(order.index(f"DELETE {R('git/refs/heads/bot/pin-ai-tc-0.9.15')}"), order.index(f"POST {R('git/refs')}"))
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
+
+    def test_a_closed_pr_from_someone_else_does_not_make_a_branch_a_rejection(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(7, "bot/pin-ai-tc-0.9.15", state="closed", author="some-writer"))
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        self.assertTrue(self.open(forward_plan()).startswith("opened #12"))
+        self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
 
     def test_a_moved_entry_on_main_is_a_green_skip_with_no_writes(self):
         self.main_manifest = manifest("0.9.15", INTEGRITY["0.9.15"])
