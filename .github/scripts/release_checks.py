@@ -396,14 +396,72 @@ def _require_npm_attestations(result) -> None:
         )
 
 
-def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, sleep=time.sleep) -> dict:
-    """Run `npm audit signatures --json --include-attestations` over a scratch,
-    --ignore-scripts install of exactly package@version from npmjs.
+class _NotIndexedYet(Exception):
+    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
 
-    npm does the cryptography (the registry signature and the sigstore bundle); the
-    caller judges what the attestation binds. Needs an npm that honours
-    --include-attestations (11.12 or later). An older one prints no `verified` list at all,
-    which provenance_verdict reports as a toolchain failure, not as a missing attestation."""
+
+def _npm_report(stdout: str) -> dict:
+    """npm audit's JSON report, or InfraError when what it printed is not one."""
+    try:
+        report = json.loads(stdout)
+    except ValueError as exc:
+        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {stdout[:500]}") from exc
+    # A report from an npm that honours --include-attestations always carries an "invalid" list
+    # and a "verified" list (empty when nothing verified). npm prints its own failures
+    # ({"error": {...}}) on the same stream with the same exit status, and those are not a
+    # statement about the package.
+    if (
+        not isinstance(report, dict)
+        or "error" in report
+        or not isinstance(report.get("invalid"), list)
+        or not isinstance(report.get("verified"), list)
+    ):
+        raise InfraError(
+            "toolchain",
+            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {stdout[:500]}",
+        )
+    return report
+
+
+def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
+    """Audit and judge, ATTEMPTS audits in all, with RETRY_SECONDS between them.
+
+    audit_once() returns npm's report, or None when npm printed nothing. judge(report)
+    returns the result, or raises _NotIndexedYet when the release has no verified attestation
+    YET. Nothing printed and not-yet-indexed are waited out alike, from one budget: on the
+    last audit each ends as its own error (InfraError, or _NotIndexedYet for the caller to
+    turn into a verdict). Any other outcome of judge is final."""
+    for attempt in range(1, ATTEMPTS + 1):
+        report = audit_once()
+        if report is None:
+            if attempt == ATTEMPTS:
+                raise InfraError(
+                    "toolchain",
+                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
+                )
+        else:
+            try:
+                return judge(report)
+            except _NotIndexedYet:
+                if attempt == ATTEMPTS:
+                    raise
+        sleep(RETRY_SECONDS)
+
+
+def npm_audit_signatures(
+    package: str, version: str, *, run=subprocess.run, sleep=time.sleep, judge: Callable = lambda report: report
+):
+    """Run `npm audit signatures --json --include-attestations` over a scratch,
+    --ignore-scripts install of exactly package@version from npmjs, and return judge(report).
+
+    npm does the cryptography (the registry signature and the sigstore bundle); judge decides
+    what the attestation binds, and raises _NotIndexedYet while the registry has not indexed
+    it. The install happens ONCE: a lagging registry is waited out by auditing again, and each
+    audit passes --prefer-online so that it asks the registry instead of reading npm's cached
+    copy of the packument (cacheable for five minutes, which would make the retries pointless).
+    Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
+    `verified` list at all, which is reported as a toolchain failure, not as a missing
+    attestation."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
@@ -425,37 +483,14 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
                     f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
                 )
             sleep(RETRY_SECONDS)
-        # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
-        # exit status is not.
-        for attempt in range(1, ATTEMPTS + 1):
-            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
-            if audit.stdout.strip():
-                break
-            if attempt == ATTEMPTS:
-                raise InfraError(
-                    "toolchain",
-                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
-                )
-            sleep(RETRY_SECONDS)
-    try:
-        report = json.loads(audit.stdout)
-    except ValueError as exc:
-        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
-    # A report from an npm that honours --include-attestations always carries an "invalid" list
-    # and a "verified" list (empty when nothing verified). npm prints its own failures
-    # ({"error": {...}}) on the same stream with the same exit status, and those are not a
-    # statement about the package.
-    if (
-        not isinstance(report, dict)
-        or "error" in report
-        or not isinstance(report.get("invalid"), list)
-        or not isinstance(report.get("verified"), list)
-    ):
-        raise InfraError(
-            "toolchain",
-            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {audit.stdout[:500]}",
-        )
-    return report
+
+        def audit_once():
+            # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
+            # exit status is not.
+            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations", "--prefer-online"], work)
+            return _npm_report(audit.stdout) if audit.stdout.strip() else None
+
+        return _audit_until_judged(audit_once, judge, sleep)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -465,10 +500,6 @@ class VerifiedRelease:
     shasum: str
     git_commit: str
     run_url: str
-
-
-class _NotIndexedYet(Exception):
-    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
 
 
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
@@ -959,19 +990,15 @@ def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_s
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z (pre-releases are never pinned)")
     integrity, shasum = registry_dist(version, fetch=fetch, sleep=sleep)
-    for attempt in range(1, ATTEMPTS + 1):
-        try:
-            statement = provenance_verdict(audit(PACKAGE, version), version, integrity)
-            break
-        except _NotIndexedYet as exc:
-            if attempt == ATTEMPTS:
-                raise ReleaseCheckError(
-                    "provenance",
-                    f"{exc}. Every release of this package is published by GitHub Actions with "
-                    f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
-                    "release pipeline.",
-                ) from None
-            sleep(RETRY_SECONDS)
+    try:
+        statement = audit(PACKAGE, version, lambda report: provenance_verdict(report, version, integrity))
+    except _NotIndexedYet as exc:
+        raise ReleaseCheckError(
+            "provenance",
+            f"{exc}. Every release of this package is published by GitHub Actions with "
+            f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
+            "release pipeline.",
+        ) from None
     git_commit = attested_commit(statement, version)
     run_url = release_run_url(statement)
     commit_on_ai_tc_main(git_commit, fetch=fetch)
