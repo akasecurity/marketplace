@@ -294,6 +294,16 @@ class TestPlanForward(PlanCase):
         self.assertTrue(caught.exception.red)
         self.assertEqual([call.args[0] for call in self.stubs["verify_release"].call_args_list], ["0.9.17", "0.9.16"])
 
+    def test_a_dispatch_naming_a_lower_target_steps_over_a_version_with_no_verdict(self):
+        # The way out for a version that can never be verified (the workflow header says so): a target
+        # below it, still above every pin, reads no candidate list and so never meets the outage.
+        self.candidates = ["0.9.15", "0.9.16"]
+        self.down = {"0.9.16": ("toolchain", "install failed")}
+        plan = self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertEqual((plan["mode"], plan["version"], plan["from_version"]), ("forward", "0.9.15", "0.9.14"))
+        self.stubs["npm_candidates"].assert_not_called()
+        self.assertEqual([call.args[0] for call in self.stubs["verify_release"].call_args_list], ["0.9.15", "0.9.14"])
+
     def test_the_schedule_opens_nothing_while_a_rollback_pr_is_open(self):
         self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))
         self.candidates = ["0.9.15"]

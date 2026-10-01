@@ -9,7 +9,10 @@ re-reads main through the API, writes the bot commit through the Git Data API
 ref, never a force-push (an existing branch with an open PR is skipped; one with no
 open PR is skipped on a plain forward run, and deleted and created again only by a
 reimport or rollback dispatch), opens the PR and enables
-auto-merge. AGENTS.md ("ai-tc is pinned", "The workflows") describes the flow.
+auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
+GitHub API failure) stops the plan red, and the importer never falls back to a lower
+version while a higher one has no verdict. AGENTS.md ("ai-tc is pinned", "The workflows")
+describes the flow.
 """
 from __future__ import annotations
 
@@ -647,8 +650,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if refusal.red else 0
     except (release_checks.InfraError, release_checks.ReleaseCheckError) as error:
         # A call into release_checks that no planner wraps (the npm version list, the pins, the tag
-        # ledger, the rollback floor) ends here as one annotation and no `proceed`, which skips open-pr:
-        # red, as before, but one line in the run instead of a traceback.
+        # ledger, the rollback floor) ends here as one annotation and `proceed=false`, which skips
+        # open-pr: red, as before, but one line in the run instead of a traceback.
         print(f"::error::{describe(error)}")
         if args.command == "plan":
             write_output("proceed", "false")
