@@ -203,6 +203,7 @@ class PlanCase(unittest.TestCase):
         self.pins = {"main": "0.9.14", "fleet-v6": "0.9.12", "fleet-v7": "0.9.13", "fleet-v8": "0.9.14"}
         self.candidates: list[str] = []
         self.bad: dict[str, tuple[str, str]] = {}
+        self.down: dict[str, tuple[str, str]] = {}
         self.floor = None
         self.pulls: list[dict] = []
         self.gh = FakeGitHub({("GET", R("pulls")): pulls_route(self.pulls)})
@@ -220,6 +221,8 @@ class PlanCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def fake_verify(self, version):
+        if version in self.down:
+            raise release_checks.InfraError(*self.down[version])
         if version in self.bad:
             raise release_checks.ReleaseCheckError(*self.bad[version])
         return verified(version)
@@ -258,6 +261,38 @@ class TestPlanForward(PlanCase):
         with self.assertRaisesRegex(ir.Refused, r"refused: 0\.9\.15") as caught:
             self.plan()
         self.assertFalse(caught.exception.red)
+
+    def test_an_outage_on_the_highest_candidate_never_falls_back(self):
+        # 0.9.16 could not be checked and 0.9.15 passes: a pin for 0.9.15 must not be opened while a
+        # higher release has no verdict, because the outage may be hiding the real newest release.
+        self.candidates = ["0.9.15", "0.9.16"]
+        self.down = {"0.9.16": ("network", "down")}
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                self.stubs["verify_release"].reset_mock()
+                with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.16: network: down") as caught:
+                    self.plan(event=event)
+                self.assertTrue(caught.exception.red)
+                self.assertIn("does not fall back to a lower one", str(caught.exception))
+                self.stubs["verify_release"].assert_called_once_with("0.9.16")
+
+    def test_an_outage_on_every_candidate_is_red_not_a_green_skip(self):
+        self.candidates = ["0.9.15"]
+        self.down = {"0.9.15": ("toolchain", "npm did not finish")}
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.15") as caught:
+                    self.plan(event=event)
+                self.assertTrue(caught.exception.red)
+
+    def test_a_verdict_above_an_outage_is_skipped_and_the_outage_stops_the_walk(self):
+        self.candidates = ["0.9.15", "0.9.16", "0.9.17"]
+        self.bad = {"0.9.17": ("provenance", "ref refs/heads/release is not the version's tag")}
+        self.down = {"0.9.16": ("network", "down")}
+        with self.assertRaisesRegex(ir.Refused, "no verdict on 0.9.16") as caught:
+            self.plan()
+        self.assertTrue(caught.exception.red)
+        self.assertEqual([call.args[0] for call in self.stubs["verify_release"].call_args_list], ["0.9.17", "0.9.16"])
 
     def test_the_schedule_opens_nothing_while_a_rollback_pr_is_open(self):
         self.pulls.append(pull(5, "bot/rollback-ai-tc-0.9.14-to-0.9.13"))

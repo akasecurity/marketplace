@@ -297,6 +297,15 @@ def plan_forward(ctx: Context) -> dict:
             try:
                 release = release_checks.verify_release(candidate)
                 break
+            except release_checks.InfraError as error:
+                # A version the checks could not reach a verdict on is not a version they refused. Falling
+                # back to a lower one would pin an older release while a newer one might be the real
+                # newest, and ending quietly would read as "nothing new". So stop, red, and let the next
+                # run try again. A version that can never be verified is stepped over by a dispatch
+                # naming a lower target that is still above every pin: that path reads no candidate list.
+                raise Refused(f"no verdict on {candidate}: {describe(error)}. The importer takes the highest "
+                              "release that passes and does not fall back to a lower one while a higher one "
+                              "has no verdict; the next run retries.") from error
             except release_checks.ReleaseCheckError as error:
                 refused.append({"version": candidate, "reason": describe(error)})
                 print(f"::warning::npm has {candidate}, which the importer refuses: {describe(error)}")
