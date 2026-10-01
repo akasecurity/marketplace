@@ -164,7 +164,10 @@ def bot_hint(pr: PullRequest, bot_login) -> str:
     return f" Its author {pr.author} is not the marketplace bot App ({bot_login})."
 
 
-def _safety_edit_notes(base, head, changed, report: Report) -> None:
+def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
+    """A person may correct or remove an entry in a reviewed PR, and validate calls each change
+    out. Adding one is different: the file holds one entry per pinned version, computed by the
+    pin PR that pins it, so an entry for a version nothing pins is typed ahead of its release."""
     if rc.SAFETY_FILE not in changed:
         return
     if head is None:
@@ -175,16 +178,24 @@ def _safety_edit_notes(base, head, changed, report: Report) -> None:
         before, after = base.get(version), head.get(version)
         if before == after:
             continue
+        if before is None and version not in pinned:
+            report.fail(
+                f"{rc.SAFETY_FILE} gains {version}, which nothing pins: an entry is computed by the "
+                "pin PR that pins it, never typed ahead of it"
+            )
+            continue
         old = before["classification"] if before else "absent"
         new = after["classification"] if after else "removed"
+        lowers = "LOWERS THE ROLLBACK FLOOR: " if new == "additive" and old != "additive" else ""
         report.note(
-            f"HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
+            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
             "the approving code owner owns this classification"
         )
 
 
-def human_rules(entries, base_safety, head_safety, changed, report: Report, *, bot_hint: str = "") -> None:
-    """A human PR may change the ai-tc entry's description and nothing else of it."""
+def human_rules(entries, base_safety, head_safety, changed, report: Report, *, bot_hint: str = "", pinned=frozenset()) -> None:
+    """A human PR may change the ai-tc entry's description and nothing else of it. `pinned`
+    is every version main or a fleet-v tag pins; with none given, no added entry is accepted."""
     base_entry, head_entry, mode = entries
     if mode == "none":
         report.row("Mode", "HUMAN PR, ai-tc entry unchanged")
@@ -204,7 +215,7 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
             "moves only through the importer's bot PRs; a package or name change is an org "
             "owner's break-glass merge." + bot_hint
         )
-    _safety_edit_notes(base_safety, head_safety, changed, report)
+    _safety_edit_notes(base_safety, head_safety, changed, report, pinned=pinned)
     touched = [p for p in changed if p.startswith(".github/")]
     if touched:
         report.note("touches automation or ownership, review the diff line by line: " + ", ".join(touched))
@@ -438,7 +449,10 @@ def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins,
     if bot_login is not None and pr.author == bot_login and pr.author_type == "Bot":
         bot_rules(pr, entries, pins, base_safety, head_safety, tip_safety, changed, report, bot_login=bot_login, verify=verify, classify=classify)
     else:
-        human_rules(entries, base_safety, head_safety, changed, report, bot_hint=bot_hint(pr, bot_login))
+        human_rules(
+            entries, base_safety, head_safety, changed, report,
+            bot_hint=bot_hint(pr, bot_login), pinned={v for v in pins.values() if v},
+        )
     return report
 
 
