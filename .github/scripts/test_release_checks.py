@@ -329,14 +329,19 @@ class TestNpmCandidates(unittest.TestCase):
 class FakeRun:
     """Stands in for subprocess.run, answering by npm sub-command."""
 
-    def __init__(self, *, install=(0,), audit=(1, "{}"), npm_version="11.19.0"):
+    def __init__(self, *, install=(0,), audit=(1, "{}"), npm_version="11.19.0", hang=None):
         self.install = list(install)
         self.audit = audit
         self.npm_version = npm_version
+        self.hang = hang
         self.calls = []
+        self.timeouts = []  # (sub-command, the timeout the call carried), one per call
 
     def __call__(self, args, **kwargs):
         self.calls.append((list(args), kwargs.get("cwd")))
+        self.timeouts.append((args[1], kwargs.get("timeout")))
+        if args[1] == self.hang:
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
         if args[:2] == ["npm", "init"]:
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:2] == ["npm", "--version"]:
@@ -365,6 +370,28 @@ class TestNpmAuditSignatures(unittest.TestCase):
         run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
         rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
         self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+
+    def test_every_npm_call_carries_a_timeout(self):
+        # install gets the longest: it fetches the tarball and its dependencies.
+        run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(
+            run.timeouts, [("init", 120), ("--version", 120), ("install", 300), ("audit", 120)]
+        )
+        self.assertEqual(len(run.timeouts), len(run.calls))
+
+    def test_a_hung_npm_is_toolchain_and_is_not_retried(self):
+        # A hang is not lag: waiting it out again would only push the run toward its job's timeout.
+        for command, seconds in (("init", 120), ("--version", 120), ("install", 300), ("audit", 120)):
+            with self.subTest(command=command):
+                run, sleeps = FakeRun(hang=command, audit=(1, json.dumps(ts.audit_output("0.9.14")))), []
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
+                self.assertEqual(caught.exception.check, "toolchain")
+                self.assertIn(f"npm {command} did not finish within {seconds} s", caught.exception.detail)
+                self.assertIn("NOT a signature result", caught.exception.detail)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(sum(1 for args, _ in run.calls if args[1] == command), 1)
 
     def test_install_is_retried_then_reported_as_toolchain(self):
         sleeps = []

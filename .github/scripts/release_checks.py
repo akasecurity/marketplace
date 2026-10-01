@@ -359,9 +359,18 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
 
 
+# How long one npm call may run before it is reported as hung, by npm sub-command. install
+# fetches the tarball and its dependencies. A hang is not lag, so it is not retried: waiting
+# it out again would only push the run toward its job's own timeout.
+NPM_TIMEOUT = {"init": 120, "--version": 120, "install": 300, "audit": 120}
+
+
 def _npm(run, args: list, work: str):
+    seconds = NPM_TIMEOUT[args[0]]
     try:
-        return run(["npm", *args], cwd=work, capture_output=True, text=True)
+        return run(["npm", *args], cwd=work, capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired as exc:
+        raise InfraError("toolchain", f"npm {args[0]} did not finish within {seconds} s (NOT a signature result)") from exc
     except OSError as exc:
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
 
