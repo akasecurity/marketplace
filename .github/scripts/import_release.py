@@ -461,7 +461,7 @@ def make_plan(git: Any, gh: Any, *, repo_dir: str, mode: str, target: str, reimp
         raise Refused(f"{mode} mode is not available: remove and restore are built only once removal is "
                       "qualified as an emergency stop")
     bot_login()
-    main_sha = git.rev_parse("main")
+    main_sha = git.rev_parse(git.main())
     raw = git.show(main_sha, MANIFEST)
     if raw is None:
         raise Refused(f"main has no {MANIFEST}")

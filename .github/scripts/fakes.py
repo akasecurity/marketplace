@@ -61,6 +61,9 @@ class FakeGit:
     def rev_parse(self, rev: str) -> str:
         return self.chain[-1] if rev == "main" else rev
 
+    def main(self) -> str:
+        return "main"
+
     def show(self, rev: str, path: str) -> str | None:
         return self.files.get((self.rev_parse(rev), path))
 
