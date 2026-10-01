@@ -167,12 +167,13 @@ may use.
   closed.
 - **`staleness`** (hourly) files an issue when a passing release sits unpinned for 24 hours, npm has
   a version the importer refuses, the release checks reached no verdict on a version that has been
-  on npm for over an hour (its own issue, naming the version and the check that did not finish),
-  a bot PR is open for 24 hours, a pin change is untagged for an hour, a stray tag or a second ref
-  named `main` exists, or the ai-tc entry is gone; it posts a "rolled back, awaiting fix-forward"
-  notice while the latest tag is a rollback. While a version has no verdict, the unpinned-release
-  and refused-version rules can still go red from the versions that did finish, but they are not
-  cleared, so an outage never closes their issues.
+  on npm for over an hour, or whose publish time is unknown (its own issue, naming the version and
+  the check that did not finish), a bot PR is open for 24 hours, a pin change is untagged for an
+  hour, a stray tag or a second ref named `main` exists, or the ai-tc entry is gone; it posts a
+  "rolled back, awaiting fix-forward" notice while the latest tag is a rollback. While such a
+  version has no verdict, the unpinned-release and refused-version rules can still go red from the
+  versions that did finish, but they are not cleared. A younger version is left out, because
+  neither rule can name it yet, so an outage never closes the issue of a version they could name.
 - **`tag-audit`** (daily and on tag pushes) checks the `fleet-v` ledger against the frozen list, the
   last green run and `main`'s history, and that the rulesets are active as configured.
 - **`main-audit`** (every push to `main`) opens an issue for any commit that reached `main` without
