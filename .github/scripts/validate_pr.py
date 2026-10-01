@@ -64,7 +64,9 @@ class Report:
 
 
 def _code(value) -> str:
-    """Inline code for the summary: PR-controlled text cannot break out of it."""
+    """Inline code for the summary: PR-controlled text cannot break out of it. Every value a
+    pull request supplies (a plugin or key name, a path, a message quoting one) goes through
+    here, since the summary is rendered as markdown and a raw name would be read as markup."""
     text = " ".join(str(value).replace("`", "'").split())
     return f"`{text[:200]}`"
 
@@ -98,7 +100,7 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
         try:
             doc = rc.parse_json(text)
         except ValueError as exc:
-            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {exc}")
+            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {_code(exc)}")
             continue
         plugins = doc.get("plugins") if isinstance(doc, dict) else None
         if not isinstance(plugins, list) or not all(isinstance(p, dict) and isinstance(p.get("name"), str) for p in plugins):
@@ -107,7 +109,7 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
         names = [p["name"] for p in plugins]
         repeated = sorted({n for n in names if names.count(n) > 1})
         if repeated:
-            report.fail(f"{path} at {label}: plugin names must be unique; repeated: {', '.join(repeated)}")
+            report.fail(f"{path} at {label}: plugin names must be unique; repeated: {', '.join(_code(n) for n in repeated)}")
         docs[path] = doc
     return docs
 
@@ -122,7 +124,7 @@ def every_pr_rules(base_doc: dict, head_doc: dict, report: Report):
         changed = sorted(k for k in set(base_top) | set(head_top) if base_top.get(k) != head_top.get(k))
         report.fail(
             "top-level keys are frozen (only description, metadata.description and metadata.version "
-            "may change); changed: " + ", ".join(changed)
+            "may change); changed: " + ", ".join(_code(k) for k in changed)
         )
     try:
         base_entry = rc.find_ai_tc_entry(base_doc)
@@ -145,11 +147,11 @@ def safety_versions(text, report: Report, *, label: str):
     try:
         doc = rc.parse_json(text)
     except ValueError as exc:
-        report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {exc}")
+        report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {_code(exc)}")
         return None
     problems = rc.safety_problems(doc)
     for problem in problems:
-        report.fail(f"at {label}: {problem}")
+        report.fail(f"at {label}: {_code(problem)}")
     return None if problems else doc["versions"]
 
 
@@ -164,7 +166,10 @@ def bot_hint(pr: PullRequest, bot_login) -> str:
     return f" Its author {pr.author} is not the marketplace bot App ({bot_login})."
 
 
-def _safety_edit_notes(base, head, changed, report: Report) -> None:
+def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
+    """A person may correct or remove an entry in a reviewed PR, and validate calls each change
+    out. Adding one is different: the file holds one entry per pinned version, computed by the
+    pin PR that pins it, so an entry for a version nothing pins is typed ahead of its release."""
     if rc.SAFETY_FILE not in changed:
         return
     if head is None:
@@ -175,16 +180,24 @@ def _safety_edit_notes(base, head, changed, report: Report) -> None:
         before, after = base.get(version), head.get(version)
         if before == after:
             continue
+        if before is None and version not in pinned:
+            report.fail(
+                f"{rc.SAFETY_FILE} gains {version}, which nothing pins: an entry is computed by the "
+                "pin PR that pins it, never typed ahead of it"
+            )
+            continue
         old = before["classification"] if before else "absent"
         new = after["classification"] if after else "removed"
+        lowers = "LOWERS THE ROLLBACK FLOOR: " if new == "additive" and old != "additive" else ""
         report.note(
-            f"HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
+            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
             "the approving code owner owns this classification"
         )
 
 
-def human_rules(entries, base_safety, head_safety, changed, report: Report, *, bot_hint: str = "") -> None:
-    """A human PR may change the ai-tc entry's description and nothing else of it."""
+def human_rules(entries, base_safety, head_safety, changed, report: Report, *, bot_hint: str = "", pinned=frozenset()) -> None:
+    """A human PR may change the ai-tc entry's description and nothing else of it. `pinned`
+    is every version main or a fleet-v tag pins; with none given, no added entry is accepted."""
     base_entry, head_entry, mode = entries
     if mode == "none":
         report.row("Mode", "HUMAN PR, ai-tc entry unchanged")
@@ -204,10 +217,10 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
             "moves only through the importer's bot PRs; a package or name change is an org "
             "owner's break-glass merge." + bot_hint
         )
-    _safety_edit_notes(base_safety, head_safety, changed, report)
+    _safety_edit_notes(base_safety, head_safety, changed, report, pinned=pinned)
     touched = [p for p in changed if p.startswith(".github/")]
     if touched:
-        report.note("touches automation or ownership, review the diff line by line: " + ", ".join(touched))
+        report.note("touches automation or ownership, review the diff line by line: " + ", ".join(_code(p) for p in touched))
 
 
 REF_PATTERNS = {
@@ -218,29 +231,39 @@ REF_PATTERNS = {
 REMOVE_REF = re.compile(r"bot/remove-ai-tc-[0-9]+")
 # The bot-branches ruleset lets only the bot App create, update or delete these refs.
 BOT_REF_PREFIX = "bot/"
-# GitHub's own committer login. A commit the App creates through the Git Data API with no
-# author or committer carries the App as author, web-flow as committer, and GitHub's signature.
+# GitHub's own committer login. The importer makes every bot commit through the Git Data API
+# with no author or committer, which GitHub records with the App as author and web-flow as
+# committer, and signs. That signed shape is the only bot commit there is.
 WEB_FLOW = "web-flow"
 
 
 def commit_problems(commit: dict, bot_login: str) -> list:
-    """Why one PR commit is not the bot App's, or [].
+    """Why one PR commit is not one GitHub created for the bot App and signed, or [].
 
     A login is only GitHub's match of the commit's email, which anyone can write into a
-    commit, so no name is trusted alone: these checks sit beside the PR the App opened and
-    the bot/ ref only the App may push, and web-flow counts only with a verified signature."""
+    commit, so no name is trusted alone. Every commit must also carry GitHub's verified
+    signature, even one that names the App as both author and committer: anyone who can push
+    to the branch can write those two lines. The signature narrows that gap, but it does not
+    replace the bot-branches ruleset that lets only the App push the bot/ refs, and these
+    checks sit beside that ruleset and the PR the App opened."""
     sha = str(commit.get("sha"))[:12]
     author, committer = commit.get("author"), commit.get("committer")
+    signed = commit.get("verified") is True
     problems = []
     if author != bot_login:
         problems.append(f"commit {sha} is authored by {author}, not by {bot_login}")
     if committer == WEB_FLOW:
-        if commit.get("verified") is not True:
+        if not signed:
             problems.append(f"commit {sha} is committed by {WEB_FLOW} without a verified signature")
-    elif committer != bot_login:
+    elif committer == bot_login:
+        if not signed:
+            problems.append(
+                f"commit {sha} has no verified signature: a bot commit is one GitHub created for the App and signed"
+            )
+    else:
         problems.append(
-            f"commit {sha} is committed by {committer}: a bot commit's committer is {bot_login}, "
-            f"or {WEB_FLOW} with a verified signature"
+            f"commit {sha} is committed by {committer}: a bot commit's committer is {bot_login} "
+            f"or {WEB_FLOW}, with a verified signature"
         )
     return problems
 
@@ -258,6 +281,42 @@ def _floor_crossed(target, highest, tip_safety, report: Report, what: str, *, pi
         )
 
 
+def _recorded_entry_rules(head_v, recorded, pinned, report: Report, *, verify, classify) -> None:
+    """A forward PR for a version the base already records. The recorded entry is recomputed,
+    never taken on trust: an entry typed in by hand for a release nobody classified would
+    otherwise stand as evidence the release is rollback-safe.
+
+    The commit the entry runs up to is the release's attested commit, which cannot change, so
+    a different one is wrong. A recorded class weaker than the computed one is wrong. A
+    stronger one is kept (fail-safe). A different starting commit is only noted: the highest
+    pinned version below a release moves legitimately after a re-import of a lower version."""
+    try:
+        expected = rc.safety_entry(head_v, pinned, verify=verify, classify=classify)
+    except rc.InfraError:
+        raise
+    except rc.ReleaseCheckError as exc:
+        report.fail(f"could not compute {head_v}'s store-migration entry ({exc.check}): {exc.detail}")
+        return
+    if recorded["to"] != expected["to"]:
+        report.fail(
+            f"{rc.SAFETY_FILE} records {head_v} up to commit {_code(recorded['to'])}, but {head_v}'s "
+            f"attested commit is {_code(expected['to'])}: the entry was not computed for this release"
+        )
+    if recorded["classification"] == "additive" and expected["classification"] == "not-rollback-safe":
+        report.fail(
+            f"{rc.SAFETY_FILE} records {head_v} as additive, but validate computes not-rollback-safe "
+            f"({', '.join(expected['migrations']) or 'none'}); a code owner corrects the entry in a "
+            "reviewed PR before this pin can merge"
+        )
+    if recorded["from"] != expected["from"]:
+        report.note(
+            f"{rc.SAFETY_FILE} records {head_v} from commit {_code(recorded['from'])}, but the highest "
+            f"pinned version below it is now at {_code(expected['from'])}; only the commit it runs up to "
+            "and its class are checked"
+        )
+    report.row("Store migration", f"{recorded['classification']} (recorded; validate computes {expected['classification']})")
+
+
 def _advance_rules(head_v, pinned, highest, base_safety, head_safety, report: Report, *, verify, classify) -> None:
     if highest is not None and rc.vkey(head_v) <= rc.vkey(highest):
         report.note(
@@ -271,7 +330,7 @@ def _advance_rules(head_v, pinned, highest, base_safety, head_safety, report: Re
     if head_v in base_safety:
         if head_safety != base_safety:
             report.fail(f"{rc.SAFETY_FILE} already records {head_v}; a forward PR for it must leave the file unchanged")
-        report.row("Store migration", f"{base_safety[head_v]['classification']} (recorded)")
+        _recorded_entry_rules(head_v, base_safety[head_v], pinned, report, verify=verify, classify=classify)
         return
     added = sorted(set(head_safety) - set(base_safety), key=rc.vkey)
     unchanged = all(head_safety.get(v) == e for v, e in base_safety.items())
@@ -328,7 +387,10 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
     allowed = {rc.MANIFEST, rc.SAFETY_FILE} if mode == "advance" else {rc.MANIFEST}
     extra = sorted(set(changed) - allowed)
     if extra:
-        report.fail(f"a bot {mode} PR may change only {', '.join(sorted(allowed))}; it also changes: {', '.join(extra)}")
+        report.fail(
+            f"a bot {mode} PR may change only {', '.join(sorted(allowed))}; "
+            f"it also changes: {', '.join(_code(p) for p in extra)}"
+        )
     if mode == "remove":
         report.note("REMOVE: this marketplace stops serving ai-tc until a restore merges")
         return
@@ -402,7 +464,10 @@ def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins,
     if bot_login is not None and pr.author == bot_login and pr.author_type == "Bot":
         bot_rules(pr, entries, pins, base_safety, head_safety, tip_safety, changed, report, bot_login=bot_login, verify=verify, classify=classify)
     else:
-        human_rules(entries, base_safety, head_safety, changed, report, bot_hint=bot_hint(pr, bot_login))
+        human_rules(
+            entries, base_safety, head_safety, changed, report,
+            bot_hint=bot_hint(pr, bot_login), pinned={v for v in pins.values() if v},
+        )
     return report
 
 
@@ -476,7 +541,12 @@ def pr_commits(base_repo: str, number: int, *, fetch) -> list:
         status, body = fetch(url, {})
         if status != 200:
             raise rc.InfraError("api", f"GET {url} answered {status}")
-        batch = json.loads(body)
+        try:
+            batch = rc.parse_json(body)
+        except (ValueError, RecursionError) as exc:
+            raise rc.InfraError("api", f"GET {url} answered non-JSON") from exc
+        if not isinstance(batch, list) or not all(isinstance(c, dict) for c in batch):
+            raise rc.InfraError("api", f"GET {url} did not answer a list of commits")
         commits += [
             {
                 "sha": c.get("sha"),
@@ -499,10 +569,13 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     verify = verify or functools.lru_cache(maxsize=None)(rc.verify_release)
     classify = classify or rc.classify_migrations
     number = env.get("PR_NUMBER", "?")
+    main_sha = None
     try:
         head_sha, base_repo = env.get("HEAD_SHA", ""), env.get("BASE_REPO", "")
         if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
             raise rc.InfraError("input", "HEAD_SHA, BASE_REPO and PR_NUMBER must be a 40-hex sha, owner/name and a number")
+        # The commit of main this run reads the pins and the rollback floor from, resolved once.
+        main_sha = _run_git(repo, "rev-parse", "--verify", f"{rc.main_ref(repo)}^{{commit}}").strip()
         start = _run_git(repo, "merge-base", "HEAD", head_sha).strip()
         base = {path: read_at(repo, start, path) for path in WATCHED}
         head = {path: read_at(repo, head_sha, path) for path in WATCHED}
@@ -521,7 +594,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
             head,
             changed_files(repo, start, head_sha),
             rc.pins_by_ref(repo),
-            read_at(repo, rc.main_ref(repo), rc.SAFETY_FILE),
+            read_at(repo, main_sha, rc.SAFETY_FILE),
             bot_login=rc.BOT_LOGIN,
             verify=verify,
             classify=classify,
@@ -531,6 +604,14 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     except rc.ReleaseCheckError as exc:
         report = Report()
         report.fail(f"{exc.check}: {exc.detail}")
+    except Exception as exc:
+        # Neither a verdict nor a known failure: a defect here, or an answer shaped in a way
+        # this did not expect. No verdict, so exit 2 with the summary written, never a stack
+        # trace alone. KeyboardInterrupt and SystemExit are not Exceptions and pass through.
+        report = Report(infra=f"internal: {type(exc).__name__}: {exc}")
+    if main_sha:
+        # main moves without starting this check again, so the summary says which commit it read.
+        report.row("Main read at", _code(main_sha[:12]))
     text = render_summary(report, number)
     print(text)
     summary_path = env.get("GITHUB_STEP_SUMMARY")

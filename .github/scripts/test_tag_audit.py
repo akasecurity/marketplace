@@ -1,6 +1,9 @@
 """Tests for tag_audit.py: the ruleset read, the previous-run comparison and the frozen list."""
 import copy
+import io
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -39,6 +42,20 @@ def good_rulesets():
         6: ruleset(6, "x4-branches", "branch", ["refs/heads/x4/*"], LOCKED),
         7: ruleset(7, "x4-tags", "tag", ["refs/tags/x4/*"], LOCKED),
     }
+
+
+COMMIT = "1" * 40
+FROZEN = "if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
+
+
+def frozen_file(testcase, rows):
+    """A frozen tag list on disk holding `rows`; removed when the test ends."""
+    root = tempfile.TemporaryDirectory()
+    testcase.addCleanup(root.cleanup)
+    path = os.path.join(root.name, "fleet-tags.frozen.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(release_checks.dump_json(rows))
+    return path
 
 
 def github(rulesets):
@@ -120,8 +137,27 @@ class TestSnapshots(unittest.TestCase):
         previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}, {"tag": "fleet-v2", "object": "o2", "commit": "c2"}]
         current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v3", "object": "o3", "commit": "c3"}]
         self.assertEqual(ta.compare_previous(previous, current), [
-            "fleet-v1 moved since the last green run: tag object o1 -> o9, commit c1 -> c9",
-            "fleet-v2 (tag object o2) existed at the last green run and is gone"])
+            f"fleet-v1 moved since the last green run: tag object o1 -> o9, commit c1 -> c9; {FROZEN}",
+            f"fleet-v2 (tag object o2) existed at the last green run and is gone; re-create it at commit c2, then {FROZEN}"])
+
+    def test_a_change_the_frozen_list_records_is_accepted_and_only_that_exact_change(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}, {"tag": "fleet-v2", "object": "o2", "commit": "c2"}]
+        current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v2", "object": "o8", "commit": "c8"}]
+        frozen = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}, {"tag": "fleet-v2", "object": "o7", "commit": "c7"}]
+        problems = ta.compare_previous(previous, current, frozen)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("fleet-v2 moved since the last green run"), problems)
+
+    def test_a_deleted_tag_is_not_accepted_by_a_frozen_row(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}]
+        problems = ta.compare_previous(previous, [], [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("is gone", problems[0])
+
+    def test_an_unreadable_frozen_list_accepts_nothing(self):
+        previous = [{"tag": "fleet-v1", "object": "o1", "commit": "c1"}]
+        current = [{"tag": "fleet-v1", "object": "o9", "commit": "c9"}]
+        self.assertEqual(len(ta.compare_previous(previous, current, None)), 1)
 
 
 class TestRunCheck(unittest.TestCase):
@@ -136,12 +172,103 @@ class TestRunCheck(unittest.TestCase):
         result = ta.as_result(problems)
         self.assertEqual((result.rule, result.label, result.red), ("tag-audit", "tag-audit", True))
 
+    def test_a_change_a_reviewed_refreeze_records_is_accepted(self):
+        git = FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT)])
+        moved = [{"tag": "fleet-v1", "object": "f" * 40, "commit": COMMIT}]
+        refrozen = frozen_file(self, [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT}])
+        stale = frozen_file(self, moved)
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            self.assertEqual(ta.run_check(git, github(good_rulesets()), refrozen, moved), [])
+            # The same move against a list that does not record it stays red.
+            problems = ta.run_check(git, github(good_rulesets()), stale, moved)
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("fleet-v1 moved since the last green run"), problems)
+
+    def two_tags(self):
+        return FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
+
+    def row(self, n):
+        return {"tag": f"fleet-v{n}", "object": fleet_tag(n, COMMIT)["object"], "commit": COMMIT}
+
+    def test_with_no_snapshot_every_tag_must_be_in_the_frozen_list(self):
+        short = frozen_file(self, [self.row(1)])
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), short, None, baseline_expected=True)
+        self.assertEqual(problems, [
+            "no snapshot from an earlier green run to compare against, and the frozen list does not record fleet-v2; "
+            "re-freeze every fleet-v tag in a reviewed pull request to set a new baseline"])
+
+    def test_with_no_snapshot_a_complete_frozen_list_is_enough(self):
+        complete = frozen_file(self, [self.row(1), self.row(2)])
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            self.assertEqual(
+                ta.run_check(self.two_tags(), github(good_rulesets()), complete, None, baseline_expected=True), [])
+
+    def test_a_caller_that_does_not_ask_for_a_baseline_gets_neither_rule(self):
+        short = frozen_file(self, [self.row(1)])
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            self.assertEqual(ta.run_check(self.two_tags(), github(good_rulesets()), short, None), [])
+
+    def test_an_unreadable_frozen_list_adds_no_coverage_problem_of_its_own(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "frozen.json")
+        with mock.patch.object(release_checks, "audit_tags", return_value=["the frozen tag list is unreadable"]):
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), missing, None, baseline_expected=True)
+        self.assertEqual(problems, ["tag ledger: the frozen tag list is unreadable"])
+
     def test_a_clean_audit_is_green(self):
         git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
         with mock.patch.object(release_checks, "audit_tags", return_value=[]):
             problems = ta.run_check(git, github(good_rulesets()), ".github/fleet-tags.frozen.json", None)
         self.assertEqual(problems, [])
         self.assertFalse(ta.as_result(problems).red)
+
+
+class TestMain(unittest.TestCase):
+    """main(): which invocations ask for a baseline. tag-release passes no --previous, and must never be
+    refused for a tag that only a snapshot (not the frozen list) records."""
+
+    def run_main(self, argv, rows):
+        git = FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
+        frozen = frozen_file(self, rows)
+        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(ta, "Git", return_value=git), \
+                mock.patch.object(ta, "GitHub", return_value=github(good_rulesets())), \
+                mock.patch.object(release_checks, "audit_tags", return_value=[]), \
+                mock.patch("sys.stdout", out):
+            code = ta.main(["check", "--repo-dir", "/fake/marketplace", "--frozen", frozen, *argv])
+        return code, out.getvalue()
+
+    ONLY_V1 = [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT}]
+
+    def test_tag_releases_invocation_never_asks_for_a_baseline(self):
+        code, out = self.run_main([], self.ONLY_V1)
+        self.assertEqual((code, out), (0, ""))
+
+    def test_a_missing_snapshot_file_asks_for_a_complete_frozen_list(self):
+        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
+        code, out = self.run_main(["--previous", absent], self.ONLY_V1)
+        self.assertEqual(code, 1)
+        self.assertIn("::notice::no snapshot from an earlier green tag-audit run", out)
+        self.assertIn("::error::no snapshot from an earlier green run to compare against, and the frozen list does "
+                      "not record fleet-v2", out)
+
+    def test_a_missing_snapshot_file_with_a_complete_frozen_list_is_green(self):
+        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
+        rows = self.ONLY_V1 + [{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}]
+        code, out = self.run_main(["--previous", absent], rows)
+        self.assertEqual(code, 0)
+        self.assertNotIn("::error::", out)
+
+    def test_a_snapshot_that_exists_is_compared_not_replaced_by_the_coverage_rule(self):
+        # fleet-v2 is not in the frozen list, but the snapshot knows it unchanged: the comparison is enough.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        previous = os.path.join(root.name, "previous.json")
+        with open(previous, "w", encoding="utf-8") as handle:
+            json.dump([{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}], handle)
+        code, out = self.run_main(["--previous", previous], self.ONLY_V1)
+        self.assertEqual((code, out), (0, ""))
 
 
 if __name__ == "__main__":
