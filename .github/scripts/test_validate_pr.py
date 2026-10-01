@@ -754,6 +754,31 @@ class TestMain(unittest.TestCase):
         self.assertEqual(self.main(head, self.commits(head)), 1)
         self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
 
+    def test_a_commit_listing_that_is_not_json_or_not_a_list_is_no_verdict(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        for body in (b"not json", {"a": 1}, [1], [{"sha": "x"}, "text"]):
+            with self.subTest(body=body):
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)  # the summary file is appended to, so read this run's alone
+                code = self.main(head, ts.FakeFetch({self.COMMITS_URL: (200, body)}))
+                self.assertEqual(code, 2)
+                text = self.summary_text()
+                self.assertIn("NO VERDICT", text)
+                self.assertIn("api: GET ", text)
+
+    def test_an_unexpected_error_is_no_verdict_with_a_summary(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        with mock.patch.object(vp, "evaluate", side_effect=KeyError("surprise")):
+            self.assertEqual(self.main(head, self.commits(head)), 2)
+        text = self.summary_text()
+        self.assertIn("NO VERDICT", text)
+        self.assertIn("internal: KeyError", text)
+
+    def test_an_interrupt_is_not_swallowed_by_the_net(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        with mock.patch.object(vp, "evaluate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.main(head, self.commits(head))
+
     def test_a_non_hex_head_is_no_verdict(self):
         self.assertEqual(self.main("main", ts.FakeFetch()), 2)
         self.assertIn("NO VERDICT", self.summary_text())
