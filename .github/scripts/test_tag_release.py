@@ -174,6 +174,54 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
 
 
+class TestRestore(unittest.TestCase):
+    def removal_then_restore(self, restored: str) -> tuple[FakeGit, FakeGitHub]:
+        """0.9.14 (fleet-v8) -> 0.9.15, which is not rollback-safe -> the entry removed -> the entry back at `restored`."""
+        older = {"0.9.14": safety_entry("0.9.14", "0.9.13", "additive", ())}
+        newer = dict(older, **{"0.9.15": safety_entry("0.9.15", "0.9.14")})
+        content = {"t8": (manifest("0.9.14", INTEGRITY["0.9.14"]), older), "b": (manifest("0.9.15", INTEGRITY["0.9.15"]), newer),
+                   "d": (manifest(entry=False), newer), "e": (manifest(restored, INTEGRITY[restored]), newer)}
+        files = {}
+        for sha, (text, table) in content.items():
+            files[(sha, MANIFEST)] = text
+            files[(sha, SAFETY_FILE)] = safety(table)
+            files[(sha, ".github/CODEOWNERS")] = CODEOWNERS
+        git = FakeGit(chain=["t8", "b", "d", "e"], files=files, tags=[fleet_tag(8, "t8")], times={"d": NOW - 7200})
+        gh = sweep_github()
+        gh.routes.update({
+            ("GET", R("commits/e/pulls")): [{"number": 16, "merge_commit_sha": "e", "merged_at": "2026-10-04T00:00:00Z",
+                                             "base": {"ref": "main"}}],
+            ("GET", R("pulls/16")): {"head": {"sha": "h16"}, "labels": [], "merged_by": {"login": "venuverse"}},
+            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}}]})
+        return git, gh
+
+    def messages(self, git, gh) -> list[str]:
+        tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        return [call[2]["message"] for call in gh.called("POST", R("git/tags"))]
+
+    def test_a_restore_below_the_pin_before_the_removal_records_a_rollback(self):
+        removal, restore = self.messages(*self.removal_then_restore("0.9.14"))[1:]
+        self.assertIn("store-migration: none\n", removal)  # the removal's own tag is as before
+        self.assertNotIn("rollback-from", removal)
+        self.assertIn("version: 0.9.14\n", restore)
+        self.assertIn("rollback-from: 0.9.15\n", restore)
+        self.assertIn("store-migration: not-rollback-safe\n", restore)
+
+    def test_a_restore_at_the_pin_before_the_removal_is_not_a_rollback(self):
+        restore = self.messages(*self.removal_then_restore("0.9.15"))[2]
+        self.assertIn("version: 0.9.15\n", restore)
+        self.assertNotIn("rollback-from", restore)
+
+    def test_the_last_pin_is_found_through_consecutive_removals_and_is_absent_at_the_root(self):
+        git = FakeGit(chain=["r", "x", "y", "z"], files={
+            ("r", MANIFEST): manifest(entry=False), ("x", MANIFEST): manifest("0.9.15", INTEGRITY["0.9.15"]),
+            ("y", MANIFEST): manifest(entry=False), ("z", MANIFEST): manifest(entry=False)})
+        self.assertEqual(tr.last_pinned(git, "z"), "0.9.15")
+        self.assertEqual(tr.last_pinned(git, "x"), "0.9.15")
+        self.assertEqual(tr.last_pinned(git, "r"), tr.ABSENT)
+        self.assertEqual(tr.last_pinned(git, None), tr.ABSENT)
+
+
 class TestStoreMigration(unittest.TestCase):
     def classify(self, version: str, previous: str, table: dict) -> str:
         git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): safety(table)})

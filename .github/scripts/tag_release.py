@@ -51,6 +51,17 @@ def version_at(git: Git, sha: str | None) -> str:
     return version if isinstance(version, str) and version else "unpinned"
 
 
+def last_pinned(git: Git, sha: str | None) -> str:
+    """The version main last pinned at or before `sha`: its own, or the nearest first-parent ancestor's
+    when the entry is removed there. ABSENT only when nothing back to the root pins one."""
+    while sha is not None:
+        version = version_at(git, sha)
+        if version != ABSENT:
+            return version
+        sha = git.first_parent(sha)
+    return ABSENT
+
+
 def integrity_at(git: Git, sha: str) -> str:
     raw = git.show(sha, MANIFEST)
     entry = entry_of(json.loads(raw)) if raw else None
@@ -148,6 +159,9 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
             raise Refused(f"{name} already exists on GitHub but not in this checkout; re-run the sweep")
         parent = git.first_parent(sha)
         version, previous = version_at(git, sha), version_at(git, parent)
+        if previous == ABSENT:
+            # A restore after a removal moves the Macs from the last version pinned before the removal.
+            previous = last_pinned(git, parent)
         owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
         facts = pr_facts(gh, sha, owners, sleep)
         if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
