@@ -661,6 +661,23 @@ class TestMigrationKind(unittest.TestCase):
         sql = "/* don't */ DROP TABLE `users`; CREATE TABLE `a` (`b` text DEFAULT 'x');"
         self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
 
+    def test_a_line_comment_ends_at_its_line_so_the_next_line_still_counts(self):
+        # SQLite ends a -- comment at the newline. A lexer that let it run on to the end of
+        # the chunk would drop every statement after it, and read this file as additive.
+        drop = "non-additive: a drop (drop table)"
+        cases = {
+            "after a statement": "CREATE TABLE `a` (`x` integer); -- note\nDROP TABLE `users`;",
+            "before the first statement": "-- note\nDROP TABLE `users`;",
+            "between two statements": "CREATE TABLE `a` (`x` integer);\n-- note\nDROP TABLE `users`;\nCREATE TABLE `b` (`y` integer);",
+            "one comment line after another": "-- one\n-- two\nDROP TABLE `users`;",
+            "inside a statement": "CREATE TABLE `a` (`x` integer -- note\n); DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), drop)
+        # The comment does end at the end of the file when no newline follows it.
+        self.assertEqual(rc.migration_kind("CREATE TABLE `a` (`x` integer); -- DROP TABLE `users`;"), "additive")
+
     def test_a_statement_breakpoint_ends_a_statement_with_no_semicolon(self):
         sql = "CREATE TABLE `a` (`x` integer)\n--> statement-breakpoint\nDROP TABLE `users`;"
         self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
