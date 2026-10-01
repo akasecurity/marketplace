@@ -7,7 +7,10 @@ that carries no fleet-v tag yet. GitHub keeps one pending run per concurrency
 group and drops the rest, so a dropped run loses nothing: the next one tags
 what it missed, in commit order. Each tag is annotated, and its message
 records the version, integrity, PR, approver and store-migration class, plus
-rollback-from, drill and approver-note when they apply. The run also deletes
+rollback-from, drill and approver-note when they apply. A commit that GitHub
+links to no merged PR is left untagged, and so is everything after it, until
+it is an hour old: a slow link must not become a permanent `pr: none` tag.
+After that hour it is tagged as a push without a PR. The run also deletes
 the bot's own branches whose PRs are closed, since only the bot may delete
 bot/** branches.
 """
@@ -29,6 +32,9 @@ from release_checks import MANIFEST, SAFETY_FILE, SEMVER, vkey
 ABSENT = "entry removed"
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
+# How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
+# hour staleness waits before it reports an untagged pin change).
+UNLINKED_GRACE = 3600
 
 
 def version_at(git: Git, sha: str | None) -> str:
@@ -130,7 +136,8 @@ def tag_exists(gh: GitHub, name: str) -> bool:
     return True
 
 
-def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
+          now: Callable[[], float] = time.time) -> list[str]:
     todo = pending(git)
     number = git.fleet_tags()[-1]["n"]
     created = []
@@ -142,7 +149,14 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep) -> 
         parent = git.first_parent(sha)
         version, previous = version_at(git, sha), version_at(git, parent)
         owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
-        text = message(number, version, previous, integrity_at(git, sha), pr_facts(gh, sha, owners, sleep),
+        facts = pr_facts(gh, sha, owners, sleep)
+        if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
+            raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
+                          "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
+                          "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
+                          "dispatch of tag-release asks again, and from an hour after the commit an unlinked commit "
+                          "is tagged as a push without a pull request.")
+        text = message(number, version, previous, integrity_at(git, sha), facts,
                        store_migration(git, sha, version, previous))
         tag_object = gh.post(gh.repo_path("git/tags"),
                              {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
