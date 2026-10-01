@@ -4,7 +4,12 @@ Each rule is its own result, filed as its own issue by issue_router.py:
   (i)   npm has an exact x.y.z above every version main or a fleet-v tag has
         pinned that passes the release checks and was published more than 24
         hours ago; a version the importer refuses is its own result once it has
-        been on npm for an hour;
+        been on npm for an hour, and so is a version the checks could not finish
+        on (the registry, the network, npm or GitHub failed: no verdict, which is
+        neither a refusal nor a release that is gone). While a version has no
+        verdict, (i) and the refused-version rule can still go red from the
+        versions that did finish, but neither is cleared, so an outage can never
+        close their issues;
   (ii)  a bot PR has been open for more than 24 hours;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
         than an hour old, changed the ai-tc version and carries no fleet-v tag;
@@ -43,6 +48,7 @@ TITLES = {
     "staleness-entry": "staleness: the ai-tc entry is missing from main",
     "staleness-i": "staleness: npm has a passing ai-tc release that no fleet-v tag pins, for over 24 hours",
     "staleness-i-refused": "staleness: npm has an ai-tc version the importer refuses",
+    "staleness-i-no-verdict": "staleness: the release checks reached no verdict on an ai-tc version",
     "staleness-ii": "staleness: a bot PR has been open for more than 24 hours",
     "staleness-iii": "staleness: a pin change on main has had no fleet-v tag for over an hour",
     "staleness-iv": "staleness: a stray tag, or a second ref named main",
@@ -79,30 +85,48 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
                    "main's `.claude-plugin/marketplace.json` has no ai-tc entry. Nothing is imported, and the "
                    "expected version reads unknown, until a restore PR merges.")
     if not present:
-        return [entry, result("staleness-i", None), result("staleness-i-refused", None)]
+        return [entry, result("staleness-i", None), result("staleness-i-refused", None),
+                result("staleness-i-no-verdict", None)]
     pinned = set(release_checks.pinned_versions(repo_dir))
     highest = max(pinned, key=vkey)
-    stale, refused = [], []
+    stale, refused, unverified = [], [], []
     for version in release_checks.npm_candidates(pinned):
         on_npm = age(now, times.get(version))
         published = times.get(version, "at an unknown time")
         try:
             release_checks.verify_release(version)
+        except release_checks.InfraError as error:
+            # No verdict: the failure is not the release's. The full error goes to the run log; the issue names
+            # only the check, because npm's own error output carries a log path with a timestamp, which would
+            # make every hourly run a changed detail and so a new comment.
+            print(f"::warning::no verdict on {version}: {describe(error)}")
+            if on_npm is None or on_npm > HOUR:
+                unverified.append(f"- `{version}` (published {published}): the `{error.check}` check did not finish")
+            continue
         except release_checks.ReleaseCheckError as error:
             if on_npm is None or on_npm > HOUR:
                 refused.append(f"- `{version}` (published {published}): {describe(error)}")
             continue
         if on_npm is None or on_npm > DAY:
             stale.append(f"- `{version}`, published {published}")
+    # A version with no verdict might be the very one these two rules name, or the one that clears them, so
+    # while one exists they can go red from the versions that did finish, but they cannot be cleared.
+    undecided = bool(unverified)
     return [entry,
-            result("staleness-i", bool(stale),
+            result("staleness-i", True if stale else (None if undecided else False),
                    f"npm has releases above `{highest}` that pass the importer's checks and that no `fleet-v` "
                    "tag pins, for more than 24 hours:\n" + "\n".join(stale) + "\n\nThe importer runs every 15 "
                    "minutes: look for an open or closed pin PR, or a failing import-plugin-release run."),
-            result("staleness-i-refused", bool(refused),
+            result("staleness-i-refused", True if refused else (None if undecided else False),
                    f"npm has versions above `{highest}` that the importer refuses:\n" + "\n".join(refused)
                    + "\n\nA version published from a branch can never pass (its attestation binds a branch, not "
-                   "the version's tag). If npm `latest` names one, the runbook's dist-tag step moves it back.")]
+                   "the version's tag). If npm `latest` names one, the runbook's dist-tag step moves it back."),
+            result("staleness-i-no-verdict", bool(unverified),
+                   f"The release checks could not finish on npm versions above `{highest}`: a registry, network, "
+                   "npm or GitHub API failure, which is no verdict on the release:\n" + "\n".join(unverified)
+                   + "\n\nThe unpinned-release and refused-version rules can still open an issue from the "
+                   "versions that did finish, but they cannot close one until every version has a verdict. The "
+                   "check is repeated every hour, and this workflow's run log holds the full error.")]
 
 
 def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
