@@ -46,8 +46,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # npm 11 (Node 24). The provenance check runs `npm audit signatures`, which on an
-      # older npm returns an empty verified set and would refuse a good release.
+      # npm 11.12 or later: on an older npm, `npm audit signatures --include-attestations`
+      # prints no attestations at all, so release_checks stops with no verdict (a
+      # toolchain failure, and the required check fails) rather than judge a release it
+      # cannot see.
       # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (the pin import-plugin-release.yml uses).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

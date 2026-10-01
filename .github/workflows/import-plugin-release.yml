@@ -4,14 +4,15 @@ name: import-plugin-release
 # minutes, and on a manual dispatch, it looks for an npm release of
 # @akasecurity/ai-tc-claude-code above every version main or a fleet-v tag has
 # pinned, verifies it against the live registry with .github/scripts/release_checks.py
-# (exact x.y.z, registry dist, SLSA provenance bound to ai-tc's release workflow at
-# the version's own tag, and the attested commit on ai-tc's main), and opens a PR
-# moving the pin. It never takes npm `latest` on trust. A candidate the checks
-# cannot reach a verdict on (a registry, network, npm or GitHub API failure) stops
-# the run red: it never falls back to a lower version while a higher one has no
-# verdict, and the next run tries again. A dispatch naming a lower target that is
-# still above every pin imports that release meanwhile, because it reads no
-# candidate list; the scheduled run stays red until a higher release passes.
+# (exact x.y.z, registry dist, SLSA provenance whose signing certificate, the one npm
+# verified, names ai-tc's release workflow at the version's own tag, and that
+# certificate's commit on ai-tc's main), and opens a PR moving the pin. It never
+# takes npm `latest` on trust. A candidate the checks cannot reach a verdict on (a
+# registry, network, npm or GitHub API failure) stops the run red: it never falls
+# back to a lower version while a higher one has no verdict, and the next run tries
+# again. A dispatch naming a lower target that is still above every pin imports that
+# release meanwhile, because it reads no candidate list; the scheduled run stays red
+# until a higher release passes.
 #
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
 # marketplace-bot environment, whose deployment policy admits only main, and acts
