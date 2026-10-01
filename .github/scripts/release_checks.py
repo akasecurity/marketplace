@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import dataclasses
+import http.client
 import json
 import os
 import re
@@ -300,14 +301,18 @@ def _headers_for(url: str, extra: dict) -> dict:
 
 
 def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError."""
+    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError,
+    and so is an answer that stops partway: http.client raises its own errors from the status
+    line and the body, which urllib does not wrap, and reading an error status's body can
+    fail the same way."""
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
-    except (urllib.error.URLError, OSError) as exc:
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
@@ -323,7 +328,7 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
     try:
         document = parse_json(body.decode("utf-8"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
     versions = document.get("versions") if isinstance(document, dict) else None
     if not isinstance(versions, dict):
