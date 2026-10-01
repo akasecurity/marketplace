@@ -12,8 +12,11 @@ nothing outside this reviewed file can change a verdict.
     python3 .github/scripts/release_checks.py <command> [args]
 
 prints one JSON document on stdout. The exit status is 0 when the check passes, 1 when
-it fails, and 2 on a usage error or when no verdict could be reached (network, npm, git
-or GitHub API trouble). Human-readable detail goes to stderr.
+it fails, and 2 on a usage error, when no verdict could be reached (network, npm, git or
+GitHub API trouble), or on any unexpected error (reported as the check "internal"). Only
+a verdict exits 1, so a caller that fails on any non-zero status never reads a defect in
+this tool as a release that failed its checks. The argument parser reports its own usage
+errors on stderr alone, with no JSON. Human-readable detail goes to stderr.
 """
 
 from __future__ import annotations
@@ -1677,6 +1680,13 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
+    except Exception as exc:
+        # Neither a verdict nor a known failure: a defect in this tool, or a document shaped in
+        # a way it did not expect. It reached no verdict, so it must not exit 1 (a verdict).
+        # KeyboardInterrupt and SystemExit are not Exceptions and pass through.
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"::error::internal: {detail}", file=sys.stderr)
+        return _emit({"error": {"check": "internal", "detail": detail}}, 2)
 
 
 if __name__ == "__main__":
