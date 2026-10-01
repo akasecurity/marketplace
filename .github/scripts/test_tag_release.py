@@ -1,11 +1,17 @@
 """Tests for tag_release.py: the sweep, the tag message, the PR facts and the branch clean-up."""
+import contextlib
+import io
+import os
 import unittest
+from unittest import mock
 
 import tag_release as tr
 from fakes import (CODEOWNERS, INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, not_found, pull,
                    pulls_route, safety, safety_entry)
+from ghapi import GitHubError
+from gitrepo import GitError
 from import_release import Refused
-from release_checks import MANIFEST, SAFETY_FILE
+from release_checks import MANIFEST, SAFETY_FILE, InfraError
 
 
 NOW = 1_790_000_000
@@ -272,6 +278,101 @@ class TestApprover(unittest.TestCase):
         message = gh.called("POST", R("git/tags"))[0][2]["message"]
         self.assertIn("approver: none\n", message)
         self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
+
+
+def run_main(command: str, git, gh) -> tuple[int, str]:
+    """tag_release.main with the checkout and the GitHub client replaced: its exit code and its output."""
+    out = io.StringIO()
+    with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}), \
+            mock.patch.object(tr, "Git", lambda path: git), mock.patch.object(tr, "GitHub", lambda token, repo: gh), \
+            contextlib.redirect_stdout(out):
+        code = tr.main([command])
+    return code, out.getvalue()
+
+
+def refused(path: str, status: int = 422, body: str = '{"message": "Repository rule violations found"}'):
+    return GitHubError(status, "POST", path, body)
+
+
+class TestGitHubFailures(unittest.TestCase):
+    def test_a_tag_ref_github_refuses_is_an_error_naming_the_ruleset(self):
+        gh = sweep_github()
+        gh.routes[("POST", R("git/refs"))] = lambda body, params: (
+            refused(R("git/refs")) if body["ref"] == "refs/tags/fleet-v10" else {"ref": "created"})
+        with self.assertRaises(Refused) as caught:
+            tr.sweep(history(times={"d": NOW - 7200}), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        text = str(caught.exception)
+        self.assertIn("fleet-v10 at c", text)
+        self.assertIn("HTTP 422", text)
+        self.assertIn("Repository rule violations found", text)
+        self.assertIn("fleet-tags-create", text)
+        self.assertIn("Already done in this run: fleet-v9 -> b (ai-tc 0.9.15)", text)
+        self.assertNotIn("fleet-v10 -> c", text)
+
+    def test_the_first_tag_refused_reports_nothing_as_done(self):
+        gh = sweep_github()
+        gh.routes[("POST", R("git/tags"))] = refused(R("git/tags"), 403, "Resource not accessible by integration")
+        with self.assertRaises(Refused) as caught:
+            tr.sweep(history(), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        self.assertIn("HTTP 403", str(caught.exception))
+        self.assertNotIn("Already done", str(caught.exception))
+
+    def test_a_refused_tag_ends_the_sweep_run_with_an_error_annotation(self):
+        gh = sweep_github()
+        gh.routes[("POST", R("git/refs"))] = refused(R("git/refs"))
+        code, out = run_main("sweep", history(chain=("t8", "b")), gh)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^::error::GitHub refused to create fleet-v9 at b \(HTTP 422")
+        self.assertIn("fleet-tags-create", out)
+        self.assertEqual(out.count("\n"), 1)  # one annotation line, no traceback
+
+    def test_a_branch_deletion_github_refuses_is_an_error(self):
+        pulls = [pull(20, "bot/pin-ai-tc-0.9.15", state="closed", merged=True)]
+        gh = FakeGitHub({("GET", R("pulls")): pulls_route(pulls),
+                         ("GET", R("git/matching-refs/heads/bot/")): [{"ref": "refs/heads/bot/pin-ai-tc-0.9.15"}],
+                         ("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15")): refused(R("git/refs/heads/bot/pin-ai-tc-0.9.15"))})
+        code, out = run_main("cleanup-branches", FakeGit(chain=[]), gh)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^::error::GitHub refused to delete bot/pin-ai-tc-0\.9\.15 \(HTTP 422")
+        self.assertIn("bot-branches", out)
+
+    def test_any_other_github_or_git_failure_is_an_error_annotation_too(self):
+        class Broken(FakeGit):
+            """A checkout whose `where` read raises `error`."""
+
+            def __init__(self, where, error, **kwargs):
+                super().__init__(**kwargs)
+                self.where, self.error = where, error
+
+            def fleet_tags(self):
+                if self.where == "fleet_tags":
+                    raise self.error
+                return super().fleet_tags()
+
+            def main(self):
+                if self.where == "main":
+                    raise self.error
+                return super().main()
+
+        def reads(path, status=502):
+            gh = sweep_github()
+            gh.routes[("GET", path)] = GitHubError(status, "GET", path, "Bad Gateway")
+            return gh
+
+        cases = {
+            "tag lookup": (history(chain=("t8", "b")), reads(R("git/ref/tags/fleet-v9"), 500)),
+            "pull request read": (history(chain=("t8", "b")), reads(R("pulls/13"))),
+            "git failure": (Broken("fleet_tags", GitError("git for-each-ref failed: bad object"), chain=["t8"]),
+                            sweep_github()),
+            "no main in the checkout": (Broken("main", InfraError("git", "no main ref"), chain=["t8"],
+                                               tags=[fleet_tag(8, "t8")]), sweep_github()),
+        }
+        for name, (git, gh) in cases.items():
+            with self.subTest(name):
+                code, out = run_main("sweep", git, gh)
+                self.assertEqual(code, 1)
+                self.assertTrue(out.startswith("::error::"), out)
+                self.assertEqual(out.count("\n"), 1)
 
 
 class TestCleanup(unittest.TestCase):
