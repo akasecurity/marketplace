@@ -147,7 +147,7 @@ def safety_versions(text, report: Report, *, label: str):
     try:
         doc = rc.parse_json(text)
     except ValueError as exc:
-        report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {exc}")
+        report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {_code(exc)}")
         return None
     problems = rc.safety_problems(doc)
     for problem in problems:
