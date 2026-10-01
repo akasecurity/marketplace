@@ -6,7 +6,11 @@ name: import-plugin-release
 # pinned, verifies it against the live registry with .github/scripts/release_checks.py
 # (exact x.y.z, registry dist, SLSA provenance bound to ai-tc's release workflow at
 # the version's own tag, and the attested commit on ai-tc's main), and opens a PR
-# moving the pin. It never takes npm `latest` on trust.
+# moving the pin. It never takes npm `latest` on trust. A candidate the checks
+# cannot reach a verdict on (a registry, network, npm or GitHub API failure) stops
+# the run red: it never falls back to a lower version while a higher one has no
+# verdict, and the next run tries again. A version that can never be verified is
+# stepped over by a dispatch naming a lower target that is still above every pin.
 #
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
 # marketplace-bot environment, whose deployment policy admits only main, and acts
@@ -86,9 +90,10 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      # npm 11 (node 24): on an older npm, `npm audit signatures --json` returns an
-      # empty verified set, which reads as "no attestation" and would refuse a good
-      # release. 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0.
+      # npm 11.12 or later: on an older npm, `npm audit signatures --include-attestations`
+      # prints no attestations at all, so release_checks stops with no verdict (a
+      # toolchain failure) rather than judge a release it cannot see.
+      # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
