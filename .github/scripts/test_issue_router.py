@@ -35,14 +35,21 @@ class RouterCase(unittest.TestCase):
     def setUp(self):
         self.issues = []
         self.gh = FakeGitHub({
-            ("GET", R("issues")): lambda body, params: [i for i in self.issues
-                                                        if any(l["name"] == params["labels"] for l in i["labels"])],
+            ("GET", R("issues")): self.listed,
             ("POST", R("issues")): {"number": 41},
             ("POST", R("issues/40/comments")): {"id": 1},
             ("PATCH", R("issues/40")): {"number": 40},
             ("POST", R("issues/40/assignees")): {"number": 40},
             ("POST", R("issues/40/labels")): [],
         })
+
+    def listed(self, body, params):
+        """GitHub's issue list as the router asks for it: filtered by state, creator and, when sent, label.
+        A fixture without a `state` is open and one without a `user` was filed by the workflow's token."""
+        return [issue for issue in self.issues
+                if issue.get("state", "open") == params["state"]
+                and issue.get("user", {"login": rt.ACTIONS_BOT})["login"] == params["creator"]
+                and ("labels" not in params or any(label["name"] == params["labels"] for label in issue["labels"]))]
 
     def router(self, escalation=None):
         return rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=escalation,
@@ -90,6 +97,25 @@ class TestRouter(RouterCase):
         self.issues[0] = dict(self.issues[0], body=noted)
         self.gh.calls.clear()
         self.assertEqual(self.router().apply(red()), "staleness-i: #40 unchanged")
+
+    def test_an_issue_whose_label_was_removed_is_still_found_and_relabelled(self):
+        self.issues.append(existing(labels=()))
+        self.assertEqual(self.router().apply(red()), "staleness-i: #40 labelled")
+        self.assertEqual(self.gh.called("POST", R("issues")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/40/labels"))[0][2], {"labels": ["staleness"]})
+
+    def test_only_issues_the_workflow_filed_are_listed(self):
+        self.router().apply(red())
+        sent = self.gh.called("GET", R("issues"))[0][3]
+        self.assertEqual((sent["state"], sent["creator"]), ("open", "github-actions[bot]"))
+        self.assertNotIn("labels", sent)
+
+    def test_an_issue_filed_by_a_person_is_never_taken_for_the_rules_issue(self):
+        copied = dict(existing(), user={"login": "some-writer"})
+        self.issues.append(copied)
+        self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+        self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/40/comments")), [])
 
     def test_a_missing_extra_label_is_added(self):
         self.issues.append(existing())

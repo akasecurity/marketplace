@@ -2,7 +2,7 @@
 
 staleness, tag-audit and main-audit evaluate their rules in a job that cannot
 write issues, and hand the results to a job that can do nothing else. Each
-rule has one issue, found by its label and a hidden rule marker; it is
+rule has one issue, found by a hidden rule marker among those the workflow's token filed; it is
 assigned to the release approvers in .github/release-approvers.json and
 mentions the code owners in .github/CODEOWNERS. A red rule comments only when
 its detail changes, or once a day; after 48 hours the escalation owner is
@@ -23,6 +23,9 @@ from dataclasses import asdict, dataclass, field
 
 from ghapi import GitHub
 
+# The login every router job files issues under (they all use the workflow's token). find looks only at
+# issues this login created, so an issue a person filed cannot stand in for a rule's.
+ACTIONS_BOT = "github-actions[bot]"
 APPROVERS_FILE = ".github/release-approvers.json"
 CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
@@ -102,7 +105,10 @@ class Router:
         self.run_url = run_url
 
     def find(self, result: Result) -> dict | None:
-        for issue in self.gh.paginate(self.gh.repo_path("issues"), {"state": "open", "labels": result.label}):
+        """The rule's open issue: one the workflow's own token filed (ACTIONS_BOT) that carries the rule's
+        hidden marker. The label is not part of the match, so taking it off an issue does not hide the issue
+        (_update puts it back), and an issue a person filed with the label and marker copied is not the rule's."""
+        for issue in self.gh.paginate(self.gh.repo_path("issues"), {"state": "open", "creator": ACTIONS_BOT}):
             if "pull_request" not in issue and read_marker(issue.get("body"), "rule") == result.rule:
                 return issue
         return None
