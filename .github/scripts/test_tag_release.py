@@ -73,6 +73,21 @@ class TestPending(unittest.TestCase):
     def test_nothing_to_tag_when_the_pin_did_not_change(self):
         self.assertEqual(tr.pending(history(chain=("t8", "a"))), [])
 
+    def test_the_walk_reads_main_by_its_full_ref(self):
+        # A tag named main resolves before the branch of that name, so a bare "main" can point anywhere.
+        class FullRefOnly(FakeGit):
+            def main(self):
+                return "refs/remotes/origin/main"
+
+            def rev_parse(self, rev):
+                if rev == "main":
+                    raise AssertionError("main was read by its bare name")
+                return self.chain[-1] if rev == "refs/remotes/origin/main" else rev
+
+        base = history()
+        git = FullRefOnly(chain=base.chain, files=base.files, tags=base.tags)
+        self.assertEqual(tr.pending(git), ["b", "c", "d"])
+
 
 class TestSweep(unittest.TestCase):
     def test_contiguous_annotated_tags_with_the_contract_message(self):
