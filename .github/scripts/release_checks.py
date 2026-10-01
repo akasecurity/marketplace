@@ -400,12 +400,14 @@ class _NotIndexedYet(Exception):
 
 
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
-    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read.
+    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry document.
 
-    Only a 404 that outlasts the read-replica lag is a verdict (the registry does not serve
-    this version), and so is a document that is not a dist for this version. Every other
-    answer that is not a 200 (a 429, a 403, a 5xx), and a 200 that is not a JSON object, says
-    nothing about the release: it is retried and then reported as no verdict."""
+    Any answer but a 200 is read again, ATTEMPTS times in all, because a new publish lags on
+    the read replicas. A 404 that outlasts them is a verdict (the registry does not serve
+    this version). Any other last answer (a 429, a 403, a 5xx) says nothing about the
+    release, so it is no verdict. A 200 is not read again: a body that is not a JSON object
+    is no verdict at once, while a JSON document that holds no dist for this version, or a
+    malformed integrity or shasum, is a verdict."""
     url = f"{packument_url()}/{version}"
     for attempt in range(1, ATTEMPTS + 1):
         status, body = fetch(url, {"Accept": "application/json"})
