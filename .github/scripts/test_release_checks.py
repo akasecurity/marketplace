@@ -1461,13 +1461,6 @@ class TestAuditTags(unittest.TestCase):
         self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
         self.assertEqual(self.audit(), [])
 
-    def test_the_previous_run_catches_a_later_move(self):
-        commit = self.cut("0.9.10", 4)
-        previous = self.scratch.write("previous.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
-        ts.git(self.repo.path, "tag", "-d", "fleet-v4")
-        self.tag_at(commit, "0.9.10", 4, pr=13)  # the same commit, a new tag object
-        self.assertTrue(any("fleet-v4 changed since the previous run" in p for p in self.audit(previous_path=previous)))
-
     def test_an_unreadable_frozen_list_is_a_problem(self):
         self.frozen = os.path.join(self.scratch.path, "absent.json")
         self.assertTrue(any("unreadable" in p for p in self.audit()))
@@ -1782,6 +1775,17 @@ class TestCli(unittest.TestCase):
         repo.tag("stray")
         code, out, _ = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--no-rulesets")
         self.assertEqual((code, json.loads(out)["problems"]), (1, ["tag 'stray' exists: no tag other than fleet-v<N> may exist"]))
+
+    def test_the_audit_has_no_previous_run_option(self):
+        # Comparing against the last run's snapshot is tag_audit.py's job. Here a missing
+        # file used to be skipped without a word, so an audit given one checked nothing.
+        repo = self.repo()
+        frozen = repo.write("frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        code, out, err = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--previous", "missing.json", "--no-rulesets")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--previous", err)
+        with self.assertRaises(TypeError):
+            rc.audit_tags(repo.path, frozen, previous_path="missing.json", check_rulesets=False)
 
     def test_snapshot_tags(self):
         repo = self.repo()
