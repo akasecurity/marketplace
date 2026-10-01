@@ -258,6 +258,42 @@ def _floor_crossed(target, highest, tip_safety, report: Report, what: str, *, pi
         )
 
 
+def _recorded_entry_rules(head_v, recorded, pinned, report: Report, *, verify, classify) -> None:
+    """A forward PR for a version the base already records. The recorded entry is recomputed,
+    never taken on trust: an entry typed in by hand for a release nobody classified would
+    otherwise stand as evidence the release is rollback-safe.
+
+    The commit the entry runs up to is the release's attested commit, which cannot change, so
+    a different one is wrong. A recorded class weaker than the computed one is wrong. A
+    stronger one is kept (fail-safe). A different starting commit is only noted: the highest
+    pinned version below a release moves legitimately after a re-import of a lower version."""
+    try:
+        expected = rc.safety_entry(head_v, pinned, verify=verify, classify=classify)
+    except rc.InfraError:
+        raise
+    except rc.ReleaseCheckError as exc:
+        report.fail(f"could not compute {head_v}'s store-migration entry ({exc.check}): {exc.detail}")
+        return
+    if recorded["to"] != expected["to"]:
+        report.fail(
+            f"{rc.SAFETY_FILE} records {head_v} up to commit {_code(recorded['to'])}, but {head_v}'s "
+            f"attested commit is {_code(expected['to'])}: the entry was not computed for this release"
+        )
+    if recorded["classification"] == "additive" and expected["classification"] == "not-rollback-safe":
+        report.fail(
+            f"{rc.SAFETY_FILE} records {head_v} as additive, but validate computes not-rollback-safe "
+            f"({', '.join(expected['migrations']) or 'none'}); a code owner corrects the entry in a "
+            "reviewed PR before this pin can merge"
+        )
+    if recorded["from"] != expected["from"]:
+        report.note(
+            f"{rc.SAFETY_FILE} records {head_v} from commit {_code(recorded['from'])}, but the highest "
+            f"pinned version below it is now at {_code(expected['from'])}; only the commit it runs up to "
+            "and its class are checked"
+        )
+    report.row("Store migration", f"{recorded['classification']} (recorded; validate computes {expected['classification']})")
+
+
 def _advance_rules(head_v, pinned, highest, base_safety, head_safety, report: Report, *, verify, classify) -> None:
     if highest is not None and rc.vkey(head_v) <= rc.vkey(highest):
         report.note(
@@ -271,7 +307,7 @@ def _advance_rules(head_v, pinned, highest, base_safety, head_safety, report: Re
     if head_v in base_safety:
         if head_safety != base_safety:
             report.fail(f"{rc.SAFETY_FILE} already records {head_v}; a forward PR for it must leave the file unchanged")
-        report.row("Store migration", f"{base_safety[head_v]['classification']} (recorded)")
+        _recorded_entry_rules(head_v, base_safety[head_v], pinned, report, verify=verify, classify=classify)
         return
     added = sorted(set(head_safety) - set(base_safety), key=rc.vkey)
     unchanged = all(head_safety.get(v) == e for v, e in base_safety.items())
