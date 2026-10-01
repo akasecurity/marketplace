@@ -466,6 +466,15 @@ SIGNER_FIELDS = {
 # ones that carry the ref, and how the run was triggered.
 REF_FIELDS = frozenset({"san", "build_signer", "build_config", "ref", "trigger"})
 
+# How a run on a branch is told to the people who must act on it, by the trigger the
+# certificate records. Only these two are known to be what they say. Any other trigger
+# (a schedule, a call from another workflow) gets the plain refusal, with no account of
+# what happened and no assurance that nothing was stolen.
+BRANCH_RUNS = {
+    "workflow_dispatch": "an older copy of it was dispatched on a branch",
+    "push": "a copy of it that publishes from a branch was pushed on that branch",
+}
+
 
 def _field_label(name: str) -> str:
     if name == "san":
@@ -753,13 +762,16 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     if builder != GITHUB_HOSTED_BUILDER:
         disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
     if wrong:
-        # The fields that carry the ref are the only ones a workflow dispatched on a branch
-        # changes, so only a difference confined to them, in a certificate that is otherwise
-        # consistent and that the statement agrees with, is said to be an off-tag publish.
+        # The fields that carry the ref are the only ones a workflow run on a branch changes
+        # (a dispatch changes the trigger too), so only a difference confined to them, in a
+        # certificate that is otherwise consistent, that the statement agrees with, and whose
+        # trigger BRANCH_RUNS can tell, is said to be an off-tag publish.
         branch = signer["ref"]
         at_branch = f"{PROV_REPO}/{pipeline['workflow']}@{branch}"
+        happened = BRANCH_RUNS.get(signer["trigger"])
         if (
-            set(wrong) <= REF_FIELDS
+            happened is not None
+            and set(wrong) <= REF_FIELDS
             and branch.startswith("refs/heads/")
             and all(signer[name] == at_branch for name in ("san", "build_signer", "build_config"))
             and not disagree
@@ -768,10 +780,10 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
                 "provenance",
                 f"{PACKAGE}@{version} was signed by {PROV_REPO} :: {pipeline['workflow']} at the branch "
                 f"{branch!r}, not at its tag {required_signer(version)['ref']!r}. ai-tc's release "
-                "workflow publishes only from a tag push, so an older copy of it was dispatched on a "
-                "branch. An attestation is immutable, so this version can never be imported. This is "
-                "not a stolen npm credential: the signing certificate names ai-tc's own workflow. "
-                "Tell ai-tc's maintainers.",
+                f"workflow publishes only from a tag push, so {happened}. An attestation is "
+                "immutable, so this version can never be imported. This is not a stolen npm "
+                "credential: the signing certificate names ai-tc's own workflow. Tell ai-tc's "
+                "maintainers.",
             )
         raise ReleaseCheckError(
             "provenance",
