@@ -44,11 +44,12 @@ class RouterCase(unittest.TestCase):
         })
 
     def listed(self, body, params):
-        """GitHub's issue list as the router asks for it: filtered by state, creator and, when sent, label.
-        A fixture without a `state` is open and one without a `user` was filed by the workflow's token."""
+        """GitHub's issue list as the router asks for it: a filter that is not sent filters nothing, the state
+        defaults to open, and a fixture without a `state` is open and one without a `user` was filed by the
+        workflow's token."""
         return [issue for issue in self.issues
-                if issue.get("state", "open") == params["state"]
-                and issue.get("user", {"login": rt.ACTIONS_BOT})["login"] == params["creator"]
+                if issue.get("state", "open") == params.get("state", "open")
+                and ("creator" not in params or issue.get("user", {"login": rt.ACTIONS_BOT})["login"] == params["creator"])
                 and ("labels" not in params or any(label["name"] == params["labels"] for label in issue["labels"]))]
 
     def router(self, escalation=None):
@@ -107,7 +108,7 @@ class TestRouter(RouterCase):
     def test_only_issues_the_workflow_filed_are_listed(self):
         self.router().apply(red())
         sent = self.gh.called("GET", R("issues"))[0][3]
-        self.assertEqual((sent["state"], sent["creator"]), ("open", "github-actions[bot]"))
+        self.assertEqual((sent.get("state"), sent.get("creator")), ("open", "github-actions[bot]"))
         self.assertNotIn("labels", sent)
 
     def test_an_issue_filed_by_a_person_is_never_taken_for_the_rules_issue(self):
