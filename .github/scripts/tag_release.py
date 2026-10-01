@@ -108,6 +108,23 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return None
 
 
+def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
+    """The code owners whose latest review that takes a position approves `head`, the one who approved
+    last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review decides (a comment
+    or a pending review changes nothing, and `reviews` is in the API's chronological order), so an approval
+    its owner later withdrew, or that was dismissed, does not count. `exclude` names reviewers whose
+    approval is not allowed to count, such as the last pusher."""
+    latest: dict[str, dict] = {}
+    for review in reviews:
+        login = (review.get("user") or {}).get("login")
+        if login and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest.pop(login, None)
+            latest[login] = review
+    return [login for login, review in latest.items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and login in owners and login not in exclude]
+
+
 def pr_facts(gh: GitHub, sha: str, owners: list[str], sleep: Callable[[float], None] = time.sleep) -> dict:
     pull = merged_pull(gh, sha, sleep)
     if pull is None:
@@ -115,12 +132,10 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str], sleep: Callable[[float], N
     number = pull["number"]
     full = gh.get(gh.repo_path(f"pulls/{number}"))
     head = full["head"]["sha"]
-    approvals = [review for review in gh.paginate(gh.repo_path(f"pulls/{number}/reviews"))
-                 if review.get("state") == "APPROVED" and review.get("commit_id") == head
-                 and (review.get("user") or {}).get("login") in owners]
+    approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
-    if approvals:
-        return {"pr": str(number), "approver": approvals[-1]["user"]["login"], "note": None, "drill": drill}
+    if approvers:
+        return {"pr": str(number), "approver": approvers[-1], "note": None, "drill": drill}
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
     return {"pr": str(number), "approver": "none", "note": f"ruleset bypass by {merger}", "drill": drill}
 
