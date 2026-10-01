@@ -195,13 +195,21 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
 
 
 def cleanup_branches(gh: GitHub) -> list[str]:
-    """Delete bot/** branches whose PRs are all closed; keep any with an open PR or with no PR at all."""
+    """Delete a bot/** branch only while it still points at the head a closed PR of that name closed on, and
+    no open PR uses the name. Keep a branch with an open PR, one with no PR at all, and one re-created after its
+    PR closed: a reimport or a repeated rollback reuses a branch name, and a re-created branch is a new commit,
+    so its tip matches no closed PR's head. The REST API has no delete that compares the tip, so a branch
+    re-created between reading the refs and deleting this one would still go; the tip check closes the wider
+    gap between reading the pull requests and the refs."""
     open_heads = {p["head"] for p in list_pulls(gh, "open")}
-    closed_heads = {p["head"] for p in list_pulls(gh, "closed")}
+    closed_tips: dict[str, set[str]] = {}
+    for closed in list_pulls(gh, "closed"):
+        closed_tips.setdefault(closed["head"], set()).add(closed["head_sha"])
     deleted = []
     for ref in gh.get(gh.repo_path("git/matching-refs/heads/bot/")):
         branch = ref["ref"][len("refs/heads/"):]
-        if branch in open_heads or branch not in closed_heads:
+        tip = (ref.get("object") or {}).get("sha")
+        if branch in open_heads or not tip or tip not in closed_tips.get(branch, set()):
             continue
         try:
             gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
