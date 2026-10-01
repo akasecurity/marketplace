@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import base64
 import dataclasses
+import http.client
 import json
 import os
 import re
@@ -324,14 +325,18 @@ def _headers_for(url: str, extra: dict) -> dict:
 
 
 def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError."""
+    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError,
+    and so is an answer that stops partway: http.client raises its own errors from the status
+    line and the body, which urllib does not wrap, and reading an error status's body can
+    fail the same way."""
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
-    except (urllib.error.URLError, OSError) as exc:
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
@@ -360,7 +365,7 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
         raise InfraError("npm", f"{REGISTRY} answered {status} for {PACKAGE}")
     try:
         document = parse_json(body.decode("utf-8"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("npm", f"{REGISTRY} answered non-JSON for {PACKAGE}: {exc}") from exc
     versions = document.get("versions") if isinstance(document, dict) else None
     if not isinstance(versions, dict):
@@ -417,7 +422,7 @@ def _npm_report(stdout: str) -> dict:
     """npm audit's JSON report, or InfraError when what it printed is not one."""
     try:
         report = json.loads(stdout)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {stdout[:500]}") from exc
     # A report from an npm that honours --include-attestations always carries an "invalid" list
     # and a "verified" list (empty when nothing verified). npm prints its own failures
@@ -517,12 +522,14 @@ class VerifiedRelease:
 
 
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
-    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry read.
+    """(integrity, shasum) npmjs serves for PACKAGE@version, from ONE registry document.
 
-    Only a 404 that outlasts the read-replica lag is a verdict (the registry does not serve
-    this version), and so is a document that is not a dist for this version. Every other
-    answer that is not a 200 (a 429, a 403, a 5xx), and a 200 that is not a JSON object, says
-    nothing about the release: it is retried and then reported as no verdict."""
+    Any answer but a 200 is read again, ATTEMPTS times in all, because a new publish lags on
+    the read replicas. A 404 that outlasts them is a verdict (the registry does not serve
+    this version). Any other last answer (a 429, a 403, a 5xx) says nothing about the
+    release, so it is no verdict. A 200 is not read again: a body that is not a JSON object
+    is no verdict at once, while a JSON document that holds no dist for this version, or a
+    malformed integrity or shasum, is a verdict."""
     url = f"{packument_url()}/{version}"
     for attempt in range(1, ATTEMPTS + 1):
         status, body = fetch(url, {"Accept": "application/json"})
@@ -582,6 +589,15 @@ SIGNER_FIELDS = {
 # The required fields a workflow run on a branch instead of the version's tag changes: the
 # ones that carry the ref, and how the run was triggered.
 REF_FIELDS = frozenset({"san", "build_signer", "build_config", "ref", "trigger"})
+
+# How a run on a branch is told to the people who must act on it, by the trigger the
+# certificate records. Only these two are known to be what they say. Any other trigger
+# (a schedule, a call from another workflow) gets the plain refusal, with no account of
+# what happened and no assurance that nothing was stolen.
+BRANCH_RUNS = {
+    "workflow_dispatch": "an older copy of it was dispatched on a branch",
+    "push": "a copy of it that publishes from a branch was pushed on that branch",
+}
 
 
 def _field_label(name: str) -> str:
@@ -870,13 +886,16 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     if builder != GITHUB_HOSTED_BUILDER:
         disagree.append(f"builder {builder!r} != {GITHUB_HOSTED_BUILDER!r}, the github-hosted runner")
     if wrong:
-        # The fields that carry the ref are the only ones a workflow dispatched on a branch
-        # changes, so only a difference confined to them, in a certificate that is otherwise
-        # consistent and that the statement agrees with, is said to be an off-tag publish.
+        # The fields that carry the ref are the only ones a workflow run on a branch changes
+        # (a dispatch changes the trigger too), so only a difference confined to them, in a
+        # certificate that is otherwise consistent, that the statement agrees with, and whose
+        # trigger BRANCH_RUNS can tell, is said to be an off-tag publish.
         branch = signer["ref"]
         at_branch = f"{PROV_REPO}/{pipeline['workflow']}@{branch}"
+        happened = BRANCH_RUNS.get(signer["trigger"])
         if (
-            set(wrong) <= REF_FIELDS
+            happened is not None
+            and set(wrong) <= REF_FIELDS
             and branch.startswith("refs/heads/")
             and all(signer[name] == at_branch for name in ("san", "build_signer", "build_config"))
             and not disagree
@@ -885,10 +904,10 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
                 "provenance",
                 f"{PACKAGE}@{version} was signed by {PROV_REPO} :: {pipeline['workflow']} at the branch "
                 f"{branch!r}, not at its tag {required_signer(version)['ref']!r}. ai-tc's release "
-                "workflow publishes only from a tag push, so an older copy of it was dispatched on a "
-                "branch. An attestation is immutable, so this version can never be imported. This is "
-                "not a stolen npm credential: the signing certificate names ai-tc's own workflow. "
-                "Tell ai-tc's maintainers.",
+                f"workflow publishes only from a tag push, so {happened}. An attestation is "
+                "immutable, so this version can never be imported. This is not a stolen npm "
+                "credential: the signing certificate names ai-tc's own workflow. Tell ai-tc's "
+                "maintainers.",
             )
         raise ReleaseCheckError(
             "provenance",
@@ -970,9 +989,12 @@ def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
 
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
     """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
-    against main's head as resolved from its full ref. Refuses behind (built on main's tip,
-    never merged), diverged and 404. Every other error, and an answer that is not the
-    comparison document, is no verdict."""
+    against main's head as resolved from its full ref.
+
+    These are verdicts: behind (built on main's tip, never merged), diverged, a 404 or a 422
+    (GitHub cannot compare the two), and a JSON object whose status is neither 'ahead' nor
+    'identical', whatever else it holds. These are no verdict: any other HTTP status, and a
+    body that is not a JSON object."""
     head = ai_tc_main_head(fetch=fetch)
     url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
