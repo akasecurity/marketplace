@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -36,6 +37,31 @@ class TestJsonHelpers(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError) as caught:
             rc.load_round_trip(compact)
         self.assertEqual(caught.exception.check, "round-trip")
+
+
+class TestErrorClasses(unittest.TestCase):
+    def test_no_verdict_is_never_caught_as_a_verdict(self):
+        self.assertFalse(issubclass(rc.InfraError, rc.ReleaseCheckError))
+        self.assertFalse(issubclass(rc.ReleaseCheckError, rc.InfraError))
+
+    def test_both_carry_the_check_and_the_detail(self):
+        for cls in (rc.ReleaseCheckError, rc.InfraError):
+            with self.subTest(cls=cls.__name__):
+                error = cls("npm", "the registry is down")
+                self.assertEqual(error.check, "npm")
+                self.assertEqual(error.detail, "the registry is down")
+                self.assertEqual(str(error), "npm: the registry is down")
+
+    def test_a_handler_written_for_a_verdict_lets_an_outage_through(self):
+        # _tag_pin is lenient about what a tag's manifest says, so every verdict-shaped
+        # failure pins nothing. A failed read is no verdict and must not be dropped with them.
+        with mock.patch.object(rc, "_manifest_at", side_effect=rc.InfraError("git", "show failed")):
+            with self.assertRaises(rc.InfraError):
+                rc._tag_pin("unused", "fleet-v1")
+        for verdict in (rc.ReleaseCheckError("manifest", "no plugins list"), ValueError("does not parse")):
+            with self.subTest(verdict=repr(verdict)):
+                with mock.patch.object(rc, "_manifest_at", side_effect=verdict):
+                    self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
 
 
 class TestSelectEntry(unittest.TestCase):
@@ -178,13 +204,21 @@ class TestPinnedVersionsReadFailures(unittest.TestCase):
                 call(repo.path)
             self.assertEqual(caught.exception.check, "git")
 
-    def test_a_tag_without_the_manifest_file_is_infrastructure(self):
+    def test_a_tag_at_a_commit_without_the_manifest_file_pins_nothing(self):
+        # tag-release cuts such a tag as "entry removed", and a tag is immutable, so reading
+        # it as a failed git read would be a permanent outage. The file is not there: the
+        # tag pins nothing, and every other tag keeps its pin.
         repo = self.ledger()
         ts.git(repo.path, "rm", "-q", rc.MANIFEST)
         ts.git(repo.path, "commit", "-q", "-m", "drop the manifest")
         repo.tag("fleet-v5")
-        with self.assertRaises(rc.InfraError):
-            rc.pinned_versions(repo.path)
+        repo.commit(ts.manifest("0.9.15"))  # main holds its manifest again: only the tag lacks one
+        pins = rc.pins_by_ref(repo.path)
+        self.assertEqual(pins["main"], "0.9.15")
+        self.assertIsNone(pins["fleet-v5"])
+        self.assertEqual([pins[f"fleet-v{n}"] for n in (1, 2, 3, 4)], ["0.9.12", "0.9.13", "0.9.14", "0.9.15"])
+        self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+        self.assertEqual(rc.tag_pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
 
     def test_a_manifest_that_does_not_parse_still_pins_nothing(self):
         repo = self.ledger()
@@ -252,9 +286,30 @@ class TestNpmCandidates(unittest.TestCase):
     def test_nothing_above_the_pin_is_an_empty_list(self):
         self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=self.fetch({"0.9.13": {}, "0.9.14": {}})), [])
 
-    def test_a_single_version_string_is_accepted(self):
-        fetch = ts.FakeFetch({rc.packument_url(): (200, {"versions": "0.9.15"})})
-        self.assertEqual(rc.npm_candidates({"0.9.14"}, fetch=fetch), ["0.9.15"])
+    def test_a_registry_document_that_is_not_a_versions_object_is_no_verdict(self):
+        # The registry's packument always holds "versions" as an object keyed by version.
+        # The list and string shapes belong to `npm view ... versions --json`, which this
+        # module never reads, so they are a wrong answer and not a second accepted format.
+        not_json = "answered non-JSON"
+        no_object = "no versions object"
+        for label, body, expected in (
+            ("an array", b"[]", no_object),
+            ("a string", b'"0.9.15"', no_object),
+            ("null", b"null", no_object),
+            ("no versions key", {"dist-tags": {"latest": "0.9.14"}}, no_object),
+            ("a null versions", {"versions": None}, no_object),
+            ("a versions list", {"versions": ["0.9.15"]}, no_object),
+            ("a versions string", {"versions": "0.9.15"}, no_object),
+            ("text that is not JSON", b"not json", not_json),
+            ("bytes that are not UTF-8", b"\xff", not_json),
+            ("a duplicated key", b'{"versions": {"0.9.15": {}}, "versions": {"0.9.16": {}}}', not_json),
+        ):
+            with self.subTest(label):
+                fetch = ts.FakeFetch({rc.packument_url(): (200, body)})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(expected, caught.exception.detail)
 
     def test_npm_latest_is_never_consulted(self):
         self.assertEqual(
@@ -274,14 +329,20 @@ class TestNpmCandidates(unittest.TestCase):
 class FakeRun:
     """Stands in for subprocess.run, answering by npm sub-command."""
 
-    def __init__(self, *, install=(0,), audit=(1, "{}"), npm_version="11.19.0"):
+    def __init__(self, *, install=(0,), audit=(1, "{}"), audits=None, npm_version="11.19.0", hang=None):
         self.install = list(install)
         self.audit = audit
+        self.audits = None if audits is None else list(audits)  # (code, stdout) per audit; the last repeats
         self.npm_version = npm_version
+        self.hang = hang
         self.calls = []
+        self.timeouts = []  # (sub-command, the timeout the call carried), one per call
 
     def __call__(self, args, **kwargs):
         self.calls.append((list(args), kwargs.get("cwd")))
+        self.timeouts.append((args[1], kwargs.get("timeout")))
+        if args[1] == self.hang:
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
         if args[:2] == ["npm", "init"]:
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:2] == ["npm", "--version"]:
@@ -289,8 +350,14 @@ class FakeRun:
         if args[:2] == ["npm", "install"]:
             code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
             return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
-        code, out = self.audit
+        if self.audits is not None:
+            code, out = self.audits.pop(0) if len(self.audits) > 1 else self.audits[0]
+        else:
+            code, out = self.audit
         return subprocess.CompletedProcess(args, code, out, "")
+
+    def count(self, command):
+        return sum(1 for args, _ in self.calls if args[1] == command)
 
 
 class TestNpmAuditSignatures(unittest.TestCase):
@@ -306,10 +373,143 @@ class TestNpmAuditSignatures(unittest.TestCase):
         self.assertEqual(len(cwds), 1)
         self.assertNotEqual(cwds.pop(), os.getcwd())
 
-    def test_the_audit_asks_for_attestations(self):
+    def test_the_audit_asks_for_attestations_and_a_fresh_read_of_the_registry(self):
         run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
         rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
-        self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+        self.assertEqual(
+            run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations", "--prefer-online"]
+        )
+
+    def test_the_audit_is_the_part_that_is_repeated(self):
+        # Registry lag is waited out by auditing again, not by installing again: one scratch
+        # directory, one init, one version read and one install serve every audit.
+        good = (1, json.dumps(ts.audit_output("0.9.14")))
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        calls = []
+
+        def judge(report):
+            calls.append(report)
+            if len(calls) < 4:
+                raise rc._NotIndexedYet("not yet")
+            return "judged"
+
+        run, sleeps = FakeRun(audits=[unindexed, unindexed, unindexed, good]), []
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=judge)
+        self.assertEqual(result, "judged")
+        self.assertEqual([run.count(c) for c in ("init", "--version", "install", "audit")], [1, 1, 1, 4])
+        self.assertEqual(sleeps, [20, 20, 20])
+        self.assertEqual(len({cwd for _, cwd in run.calls}), 1)
+        self.assertEqual(calls[-1]["verified"][0]["version"], "0.9.14")
+
+    def test_every_audit_revalidates_npms_cache(self):
+        # The registry's packument is cacheable for five minutes, so an audit repeated 20 s later
+        # would read the same cached answer. --prefer-online makes each one ask the registry.
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        run = FakeRun(audits=[unindexed])
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None, judge=never)
+        audits = [args for args, _ in run.calls if args[1] == "audit"]
+        self.assertEqual(len(audits), 5)
+        self.assertTrue(all("--prefer-online" in args for args in audits))
+
+    def test_a_report_that_is_never_indexed_is_given_up_on_after_five_audits(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_nothing_printed_and_not_indexed_yet_share_one_budget_of_five_audits(self):
+        nothing = (1, "")
+        report = (1, json.dumps(ts.audit_output("0.9.14")))
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        for label, audits, expected in (
+            ("ends on a report", [nothing, report, nothing, report, report], rc._NotIndexedYet),
+            ("ends on nothing", [report, nothing, report, nothing, nothing], rc.InfraError),
+        ):
+            with self.subTest(label):
+                run, sleeps = FakeRun(audits=audits), []
+                with self.assertRaises(expected):
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+                self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_a_judgement_that_is_not_waiting_for_the_index_is_final(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def refuse(report):
+            raise rc.ReleaseCheckError("provenance", "no")
+
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=refuse)
+        self.assertEqual((run.count("audit"), sleeps), (1, []))
+
+    def test_verify_release_retries_through_one_install(self):
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        release = rc.verify_release(
+            "0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append
+        )
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
+    def test_the_default_audit_takes_the_judge_verify_release_hands_it(self):
+        # Every other test passes its own `audit`, so none of them reaches the function verify_release
+        # uses when it is given none. Its keyword-only defaults (the npm runner and the wait) are
+        # swapped for fakes, which leaves the call from verify_release to the real function as it is.
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+        with mock.patch.dict(rc.npm_audit_signatures.__kwdefaults__, {"run": run, "sleep": sleeps.append}):
+            release = rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), sleep=sleeps.append)
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
+    def test_verify_release_refuses_a_release_that_is_never_indexed_after_one_install(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False)))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "provenance")
+        self.assertIn("did not come from the release pipeline", caught.exception.detail)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_every_npm_call_carries_a_timeout(self):
+        # install gets the longest: it fetches the tarball and its dependencies.
+        run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(
+            run.timeouts, [("init", 120), ("--version", 120), ("install", 300), ("audit", 120)]
+        )
+        self.assertEqual(len(run.timeouts), len(run.calls))
+
+    def test_a_hung_npm_is_toolchain_and_is_not_retried(self):
+        # A hang is not lag: waiting it out again would only push the run toward its job's timeout.
+        for command, seconds in (("init", 120), ("--version", 120), ("install", 300), ("audit", 120)):
+            with self.subTest(command=command):
+                run, sleeps = FakeRun(hang=command, audit=(1, json.dumps(ts.audit_output("0.9.14")))), []
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
+                self.assertEqual(caught.exception.check, "toolchain")
+                self.assertIn(f"npm {command} did not finish within {seconds} s", caught.exception.detail)
+                self.assertIn("NOT a signature result", caught.exception.detail)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(sum(1 for args, _ in run.calls if args[1] == command), 1)
 
     def test_install_is_retried_then_reported_as_toolchain(self):
         sleeps = []
@@ -333,11 +533,12 @@ class TestNpmAuditSignatures(unittest.TestCase):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
 
     def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
-        sleeps = []
+        sleeps, run = [], FakeRun(audit=(1, ""))
         with self.assertRaises(rc.InfraError) as caught:
-            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "")), sleep=sleeps.append)
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
         self.assertEqual(caught.exception.check, "toolchain")
         self.assertEqual(sleeps, [20, 20, 20, 20])
+        self.assertEqual((run.count("install"), run.count("audit")), (1, 5))
 
     def test_a_late_audit_answer_is_used(self):
         answers = ["", "", json.dumps(ts.audit_output("0.9.14"))]
@@ -364,35 +565,69 @@ class TestNpmAuditSignatures(unittest.TestCase):
             rc.verify_release(
                 "0.9.14",
                 fetch=ts.FakeFetch(ts.release_routes("0.9.14")),
-                audit=lambda package, version: rc.npm_audit_signatures(
-                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None
+                audit=lambda package, version, judge: rc.npm_audit_signatures(
+                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None, judge=judge
                 ),
                 sleep=lambda s: None,
             )
 
     def test_output_that_is_not_a_report_object_is_toolchain(self):
-        for text in ("[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}'):
+        for text in (
+            "[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}',
+            '{"invalid": []}', '{"invalid": [], "missing": []}',
+        ):
             with self.subTest(text=text), self.assertRaises(rc.InfraError):
                 rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, text)), sleep=lambda s: None)
 
     def test_a_report_with_nothing_verified_is_still_a_verdict(self):
+        # An npm that honours --include-attestations prints the verified list even when it is empty.
         report = rc.npm_audit_signatures(
-            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=lambda s: None
+            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": [], "verified": []}))),
+            sleep=lambda s: None,
         )
-        self.assertEqual(report["invalid"], [])
+        self.assertEqual((report["invalid"], report["verified"]), ([], []))
 
-    def test_an_npm_older_than_11_is_toolchain(self):
-        for version in ("10.9.2", "9.0.0"):
+    def test_a_report_without_a_verified_list_is_toolchain_not_a_missing_attestation(self):
+        # No list at all is an npm that ignored the flag, and says nothing about the release.
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(
+                rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=sleeps.append
+            )
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+        self.assertEqual(sleeps, [], "a report npm cannot have meant is not waited out")
+
+    def test_an_npm_older_than_11_12_is_toolchain(self):
+        # --include-attestations first shipped in 11.12.0. An 11.0 to 11.11 npm takes the flag
+        # without an error and prints no attestations, so it must be refused as the toolchain.
+        for version in ("10.9.2", "9.0.0", "11.0.0", "11.5.1", "11.11.0", "11.11.9"):
             with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
                 rc.npm_audit_signatures(
                     rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
                     sleep=lambda s: None,
                 )
             self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("11.12.0", caught.exception.detail)
+            self.assertIn("NOT a signature result", caught.exception.detail)
+
+    def test_npm_11_12_and_later_is_accepted(self):
+        for version in ("11.12.0", "11.12.1", "11.16.0", "11.19.0", "12.0.0", "11.12.0-pre.1"):
+            with self.subTest(version=version):
+                run = FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+                report = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+                self.assertEqual(report["verified"][0]["version"], "0.9.14")
 
     def test_an_unreadable_npm_version_is_toolchain(self):
-        with self.assertRaises(rc.InfraError):
-            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(npm_version="banana"), sleep=lambda s: None)
+        # The audit itself would pass, so only the version gate can be what refuses.
+        for version in ("banana", "11", "11.12", ""):
+            with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
+                rc.npm_audit_signatures(
+                    rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
+                    sleep=lambda s: None,
+                )
+            self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("could not read npm's version", caught.exception.detail)
 
     def test_missing_npm_is_toolchain(self):
         def run(args, **kwargs):
@@ -405,13 +640,8 @@ class TestNpmAuditSignatures(unittest.TestCase):
 class TestVerifyRelease(unittest.TestCase):
     def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
         fetch = ts.FakeFetch(routes if routes is not None else ts.release_routes(version))
-        queue = list(audits if audits is not None else [ts.audit_output(version)])
-
-        def audit(package, v):
-            self.assertEqual((package, v), (rc.PACKAGE, version))
-            return queue.pop(0) if len(queue) > 1 else queue[0]
-
         recorded = sleeps if sleeps is not None else []
+        audit = ts.scripted_audit(self, version, audits if audits is not None else [ts.audit_output(version)], recorded.append)
         return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
 
     def refused(self, check, **kwargs):
@@ -465,6 +695,8 @@ class TestVerifyRelease(unittest.TestCase):
             ("uppercase sha", {"ref": "refs/heads/main", "object": {"sha": "E" * 40}}),
             ("sha not a string", {"ref": "refs/heads/main", "object": {"sha": 7}}),
             ("another ref", {**good, "ref": "refs/tags/main"}),
+            ("a duplicated key", b'{"ref": "refs/heads/main", "ref": "refs/heads/main", "object": {"sha": "' + b"e" * 40 + b'"}}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
         ):
             with self.subTest(label):
                 routes = ts.release_routes("0.9.14")
@@ -472,6 +704,26 @@ class TestVerifyRelease(unittest.TestCase):
                 with self.assertRaises(rc.InfraError) as caught:
                     self.verify(routes=routes)
                 self.assertEqual(caught.exception.check, "commit-on-main")
+
+    def test_a_compare_answer_that_is_not_a_json_object_is_no_verdict(self):
+        # A 200 whose body is not the comparison says nothing about the commit, so it is neither a
+        # refusal nor a crash.
+        for label, body in (
+            ("not json", b"<html>"),
+            ("empty", b""),
+            ("a list", b"[]"),
+            ("a string", b'"ahead"'),
+            ("null", b"null"),
+            ("a duplicated key", b'{"status": "behind", "status": "ahead"}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (200, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+                self.assertIn("compare", caught.exception.detail)
 
     def test_identical_to_main_passes(self):
         self.verify(routes=ts.release_routes("0.9.14", compare="identical"))
@@ -497,7 +749,7 @@ class TestVerifyRelease(unittest.TestCase):
     def test_a_non_exact_version_is_refused_before_any_request(self):
         fetch = ts.FakeFetch()
         with self.assertRaises(rc.ReleaseCheckError) as caught:
-            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v: {}, sleep=lambda s: None)
+            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v, judge: {}, sleep=lambda s: None)
         self.assertEqual((caught.exception.check, fetch.calls), ("version", []))
 
     def test_registry_lag_is_retried(self):
@@ -526,29 +778,40 @@ class TestVerifyRelease(unittest.TestCase):
     def test_no_attestation_after_five_tries_is_refused(self):
         sleeps = []
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", verified=False)], sleeps=sleeps)
-        self.assertIn("no registry signature", error.detail)
+        self.assertIn("no VERIFIED attestation", error.detail)
         self.assertEqual(sleeps, [20, 20, 20, 20])
 
     def test_npm_reporting_invalid_is_refused(self):
         self.refused("provenance", audits=[ts.audit_output("0.9.14", invalid=[{"code": "EINTEGRITYSIGNATURE"}])])
 
     def test_an_off_tag_branch_publish_is_refused_without_crying_theft(self):
-        stmt = ts.statement("0.9.14", ref="refs/heads/release/0.9.x")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
-        self.assertIn("NOT a stolen-token signal", error.detail)
+        # The certificate and the statement both say the workflow ran from a branch.
+        ref = "refs/heads/release/0.9.x"
+        uri = f"{rc.PROV_REPO}/{ts.WORKFLOW}@{ref}"
+        stmt = ts.statement("0.9.14", ref=ref)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+        self.assertIn("not a stolen npm credential", error.detail)
 
     def test_another_repository_is_refused(self):
-        stmt = ts.statement("0.9.14", repository="https://github.com/someone/ai-tc")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", repository=other)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("anyone can publish with provenance", error.detail)
 
     def test_another_workflow_is_refused(self):
-        stmt = ts.statement("0.9.14", path=".github/workflows/other.yml")
-        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        path = ".github/workflows/other.yml"
+        uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", path=path)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri)
+        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
 
     def test_a_self_hosted_builder_is_refused(self):
         stmt = ts.statement("0.9.14", builder="https://github.com/actions/runner/self-hosted")
-        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        cert = ts.signing_cert("0.9.14", runner="self-hosted")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("github-hosted", error.detail)
 
     def test_an_attestation_for_different_bytes_is_refused(self):
@@ -613,6 +876,37 @@ class TestMigrationKind(unittest.TestCase):
             "non-additive: a NOT NULL column without a default",
         )
 
+    def test_not_null_is_read_after_the_column_name_and_as_words(self):
+        no_default = "non-additive: a NOT NULL column without a default"
+        cases = {
+            "a name that ends in default": "ALTER TABLE `widgets` ADD `is_default` integer NOT NULL;",
+            "a quoted name that holds the word": "ALTER TABLE `widgets` ADD `x default` integer NOT NULL;",
+            "a double-quoted name that holds the word": 'ALTER TABLE `widgets` ADD "x default" integer NOT NULL;',
+            "a bracketed name that holds the word": "ALTER TABLE `widgets` ADD [x default] integer NOT NULL;",
+            "an unquoted name, COLUMN spelled out": "ALTER TABLE widgets ADD COLUMN x integer NOT NULL;",
+            "an unquoted name with a dollar before the word": "ALTER TABLE widgets ADD x$default integer NOT NULL;",
+            "the word in a string of a check": "ALTER TABLE `widgets` ADD `x` text NOT NULL CHECK (`x` <> 'DEFAULT');",
+            "the word as a quoted name in the definition": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES `default`(`id`);",
+            "a longer word that starts with it": "ALTER TABLE `widgets` ADD `x` integer NOT NULL REFERENCES defaults(id);",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), no_default)
+
+    def test_a_default_or_a_generated_expression_after_the_name_still_allows_not_null(self):
+        cases = [
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL DEFAULT 0;",
+            "ALTER TABLE `widgets` ADD `x default` integer DEFAULT 0 NOT NULL;",
+            "ALTER TABLE `widgets` ADD `x` text NOT NULL DEFAULT 'a';",
+            "ALTER TABLE `widgets` ADD `x` integer NOT NULL GENERATED ALWAYS AS (1) VIRTUAL;",
+            "ALTER TABLE `widgets` ADD `x` text;",
+            # The words are in a quoted name, not in the column's constraints.
+            "ALTER TABLE `widgets` ADD `x` integer REFERENCES `not null`(`id`);",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), "additive")
+
     def test_a_table_rebuild_is_not(self):
         self.assertEqual(rc.migration_kind(SQL_REBUILD), "non-additive: a table rebuild (drizzle's __new_ copy)")
 
@@ -633,6 +927,95 @@ class TestMigrationKind(unittest.TestCase):
     def test_an_empty_file_is_not_additive(self):
         self.assertEqual(rc.migration_kind("-- nothing\n"), "non-additive: no statements")
 
+    def test_dashes_inside_a_string_do_not_hide_the_rest_of_the_line(self):
+        sql = "CREATE TABLE `t` (`a` text DEFAULT '--');DROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_an_apostrophe_in_a_block_comment_does_not_open_a_string(self):
+        # A lexer that misses /* */ reads the apostrophe as the start of a string that
+        # runs to the next quote and blanks the DROP in between.
+        sql = "/* don't */ DROP TABLE `users`; CREATE TABLE `a` (`b` text DEFAULT 'x');"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_a_statement_breakpoint_ends_a_statement_with_no_semicolon(self):
+        sql = "CREATE TABLE `a` (`x` integer)\n--> statement-breakpoint\nDROP TABLE `users`;"
+        self.assertEqual(rc.migration_kind(sql), "non-additive: a drop (drop table)")
+
+    def test_ai_tc_splits_on_the_breakpoint_wherever_it_stands_so_the_rest_of_the_line_counts(self):
+        # ai-tc runs the text after each "-->\s*statement-breakpoint" as its own chunk, even
+        # when it follows a statement on the same line or sits inside a comment.
+        drop = "non-additive: a drop (drop table)"
+        cases = {
+            "after a statement on the same line": "CREATE TABLE `a` (`x` integer);--> statement-breakpoint DROP TABLE `users`;",
+            "inside a line comment": "CREATE TABLE `a` (`x` integer); -- why --> statement-breakpoint DROP TABLE `users`;",
+            "with a newline between the words": "CREATE TABLE `a` (`x` integer)-->\nstatement-breakpoint DROP TABLE `users`;",
+            "with no space at all": "CREATE TABLE `a` (`x` integer)-->statement-breakpoint DROP TABLE `users`;",
+            # JavaScript's \s counts U+FEFF as white space and Python's does not.
+            "split by a byte-order mark": f"CREATE TABLE `a` (`x` integer);-->{chr(0xFEFF)}statement-breakpoint DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), drop)
+
+    def test_a_breakpoint_inside_a_comment_cannot_hide_the_statement_after_it(self):
+        # The chunk before the breakpoint ends inside a block comment, which is refused.
+        sql = "CREATE TABLE `a` (`x` integer); /* --> statement-breakpoint DROP TABLE `users`; -- */"
+        self.assertTrue(rc.migration_kind(sql).startswith("non-additive"), rc.migration_kind(sql))
+
+    def test_a_semicolon_inside_a_string_does_not_end_the_statement(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT ';DROP TABLE x');"), "additive")
+
+    def test_a_doubled_quote_is_an_escape_not_the_end_of_the_literal(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'it''s; DROP TABLE x');"), "additive")
+        self.assertEqual(rc.migration_kind('CREATE TABLE "t""x;y" ("a" text);'), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t``x;y` (`a` text);"), "additive")
+
+    def test_quoted_names_keep_their_words_so_a_rebuild_is_still_seen(self):
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE `__new_widgets` (`id` text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+        self.assertEqual(
+            rc.migration_kind("CREATE TABLE [__new_widgets] (id text);"),
+            "non-additive: a table rebuild (drizzle's __new_ copy)",
+        )
+
+    def test_words_inside_a_string_or_a_comment_decide_nothing(self):
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text DEFAULT 'DROP TABLE __new_x');"), "additive")
+        self.assertEqual(rc.migration_kind("CREATE TABLE `t` (`a` text); /* DROP TABLE `users`; */ -- DROP TABLE `x`;"), "additive")
+
+    def test_only_the_foreign_keys_pragma_is_additive(self):
+        pragma = "non-additive: a PRAGMA other than foreign_keys=ON/OFF"
+        cases = {
+            "PRAGMA foreign_keys=OFF;": "additive",
+            "PRAGMA foreign_keys=ON;": "additive",
+            "pragma foreign_keys = off;": "additive",
+            "PRAGMA foreign_keys  =  On ;": "additive",
+            "PRAGMA user_version=9;": pragma,
+            "PRAGMA writable_schema=1;": pragma,
+            "PRAGMA journal_mode=DELETE;": pragma,
+            "PRAGMA foreign_keys;": pragma,
+            "PRAGMA foreign_keys=1;": pragma,
+            "PRAGMA main.foreign_keys=OFF;": pragma,
+            "PRAGMA foreign_keys=OFF AND 1;": pragma,
+        }
+        for sql, kind in cases.items():
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), kind)
+
+    def test_a_quote_or_comment_that_never_closes_is_not_additive(self):
+        unterminated = "non-additive: an unterminated quoted string or comment"
+        cases = {
+            "string": "CREATE TABLE `t` (`a` text DEFAULT 'x);",
+            "backtick name": "CREATE TABLE `t (`a` text);",
+            "double-quoted name": 'CREATE TABLE "t (a text);',
+            "bracketed name": "CREATE TABLE [t (a text);",
+            "block comment": "CREATE TABLE `t` (`a` text); /* DROP TABLE `users`;",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), unterminated)
+
 
 JOURNAL = f"{rc.MIGRATIONS_DIR}/meta/_journal.json"
 FROM, TO = ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"]
@@ -643,15 +1026,40 @@ def journal(*tags):
     return {"version": "7", "dialect": "sqlite", "entries": [{"idx": i, "tag": t} for i, t in enumerate(tags)]}
 
 
+def blob(tag, variant=""):
+    """A stable fake git blob sha for one migration file."""
+    return hashlib.sha1(f"{tag}{variant}".encode()).hexdigest()
+
+
+def directory(tags, edited=()):
+    """What the Contents API answers for the migrations directory: the meta folder, then
+    one file per tag, each with its git blob sha. A tag in `edited` has a different one."""
+    files = [
+        {
+            "name": f"{tag}.sql",
+            "path": f"{rc.MIGRATIONS_DIR}/{tag}.sql",
+            "sha": blob(tag, "edited" if tag in edited else ""),
+            "type": "file",
+        }
+        for tag in tags
+    ]
+    return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
+
+
 class TestClassifyMigrations(unittest.TestCase):
-    def fetch(self, from_tags, to_tags, sql):
-        routes = {
+    def fetch(self, from_tags, to_tags, sql, *, edited=(), routes=None):
+        """Journals, listings and added files for a pair of releases. `edited` tags carry a
+        different blob sha at TO; `routes` replaces any of the answers."""
+        answers = {
             ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
             ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, FROM): (200, directory(from_tags)),
+            ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(to_tags, edited)),
         }
         for tag, text in sql.items():
-            routes[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
-        return ts.FakeFetch(routes)
+            answers[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
+        answers.update(routes or {})
+        return ts.FakeFetch(answers)
 
     def test_no_new_migration_is_additive(self):
         result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}))
@@ -670,10 +1078,17 @@ class TestClassifyMigrations(unittest.TestCase):
             second = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (dropping,), {dropping: SQL_DROP_INDEX}))
         self.assertEqual((first.classification, second.classification), ("additive", "not-rollback-safe"))
 
-    def test_reads_use_the_raw_media_type(self):
-        fetch = self.fetch(BASE_TAGS, BASE_TAGS, {})
+    def test_file_reads_use_the_raw_media_type_and_listings_use_json(self):
+        tag = "0035_migration"
+        fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE})
         rc.classify_migrations(FROM, TO, fetch=fetch)
-        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in fetch.calls))
+        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(f"/contents/{rc.MIGRATIONS_DIR}")]
+        files = [(url, h) for url, h in fetch.calls if (url, h) not in listings]
+        # One listing per attested commit, however many migrations the journals hold.
+        self.assertEqual(sorted(url for url, _ in listings), sorted([ts.contents_url(rc.MIGRATIONS_DIR, c) for c in (FROM, TO)]))
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github+json" for _, h in listings))
+        self.assertEqual(len(files), 3)  # the two journals and the one added file
+        self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in files))
 
     def test_an_unreadable_journal_counts_as_not_rollback_safe(self):
         fetch = ts.FakeFetch({ts.contents_url(JOURNAL, TO): (200, journal(*BASE_TAGS))})
@@ -687,6 +1102,86 @@ class TestClassifyMigrations(unittest.TestCase):
             result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {}))
         self.assertEqual(result.classification, "not-rollback-safe")
         self.assertIn("cannot be read", result.kinds[tag])
+
+    def test_a_migration_edited_in_place_is_not_rollback_safe(self):
+        # A store that already applied the tag never re-runs an edit, so a fresh store and
+        # an old one diverge: the release is not safe to roll back across, whatever the edit.
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, edited=("0000_initial",)))
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", ["0000_initial"]))
+                self.assertTrue(result.kinds["0000_initial"].startswith("non-additive: modified in place"), result.kinds)
+                self.assertNotIn("0034_migration", result.kinds)
+
+    def test_an_edited_migration_is_listed_after_the_added_and_removed_ones(self):
+        added, removed = "0035_migration", "0033_migration"
+        result = rc.classify_migrations(
+            FROM,
+            TO,
+            fetch=self.fetch(BASE_TAGS + (removed,), BASE_TAGS + (added,), {added: SQL_NULLABLE}, edited=("0000_initial",)),
+        )
+        self.assertEqual(result.migrations, [added, removed, "0000_initial"])
+        self.assertEqual(result.kinds[added], "additive")
+
+    def test_a_shipped_migration_the_listing_does_not_hold_is_not_additive(self):
+        # The journal names it but the directory has no such file (or the directory cannot
+        # be listed at all): unreadable, which counts as not rollback-safe. Not an outage.
+        without = lambda tags: (200, [e for e in directory(tags) if e["name"] != "0000_initial.sql"])
+        cases = {
+            "missing at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): without(BASE_TAGS)}, ["0000_initial"]),
+            "missing at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): without(BASE_TAGS)}, ["0000_initial"]),
+            "no directory at the earlier commit": ({ts.contents_url(rc.MIGRATIONS_DIR, FROM): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+            "no directory at the later commit": ({ts.contents_url(rc.MIGRATIONS_DIR, TO): (404, {"message": "Not Found"})}, list(BASE_TAGS)),
+        }
+        for name, (routes, unreadable) in cases.items():
+            for counts in (True, False):
+                with self.subTest(name, every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                    result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+                    self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", unreadable))
+                    for tag in unreadable:
+                        self.assertEqual(result.kinds[tag], "non-additive: the migration file cannot be read")
+
+    def test_a_listing_error_is_no_verdict(self):
+        for commit in (FROM, TO):
+            for status in (403, 500, 502):
+                with self.subTest(commit=commit[:8], status=status):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): (status, b"")})
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+
+    def test_a_truncated_listing_is_no_verdict(self):
+        # The Contents API lists at most 1000 entries of a directory and does not say it stopped.
+        crowd = [{"name": f"x{i}.txt", "path": f"{rc.MIGRATIONS_DIR}/x{i}.txt", "sha": blob(f"x{i}"), "type": "file"} for i in range(1000)]
+        for size, raises in ((1000, True), (999, False)):
+            with self.subTest(entries=size):
+                routes = {ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(BASE_TAGS) + crowd[: size - len(directory(BASE_TAGS))])}
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes)
+                if raises:
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                else:
+                    self.assertEqual(rc.classify_migrations(FROM, TO, fetch=fetch).classification, "additive")
+
+    def test_a_listing_that_is_not_a_directory_listing_is_no_verdict(self):
+        good = directory(BASE_TAGS)
+        with_sha = lambda value: [dict(e, sha=value) if e["name"] == "0034_migration.sql" else e for e in good]
+        cases = {
+            "not JSON": (200, b"not json"),
+            "a single file, not a directory": (200, {"name": "0000_initial.sql", "type": "file", "sha": blob("x")}),
+            "null": (200, b"null"),
+            "an entry that is not an object": (200, [*good, "0035_migration.sql"]),
+            "a sha that is not 40 hex": (200, with_sha("not-a-sha")),
+            "a sha that is not a string": (200, with_sha(7)),
+            "an entry without a sha": (200, [{k: v for k, v in e.items() if k != "sha"} if e["name"] == "0034_migration.sql" else e for e in good]),
+            "a duplicated key": (200, b'[{"name": "a", "name": "b"}]'),
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.MIGRATIONS_DIR, commit): answer})
+                    with self.assertRaises(rc.InfraError):
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
 
     def test_a_tag_dropped_from_the_journal_is_not_rollback_safe(self):
         tag = "0035_migration"
@@ -704,6 +1199,41 @@ class TestClassifyMigrations(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.classify_migrations("a75532b9", TO, fetch=fetch)
         self.assertEqual(fetch.calls, [])
+
+    def test_a_malformed_journal_is_a_verdict_not_a_crash(self):
+        # The journal at an attested commit never changes, so a retry cannot help: refuse it.
+        cases = {
+            "not JSON": b"not json",
+            "a list, not an object": b"[]",
+            "null": b"null",
+            "entries that is not a list": b'{"entries": "0000_initial"}',
+            "an entry that is not an object": b'{"entries": [1]}',
+            "an entry whose tag is not a string": b'{"entries": [{"tag": 5}]}',
+            "a duplicated key": b'{"entries": [], "entries": []}',
+            "nested too deep to parse": b"[" * 100000 + b"]" * 100000,
+            "not UTF-8": b"\xff\xfe{}",
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(JOURNAL, commit): (200, answer)})
+                    with self.assertRaises(rc.ReleaseCheckError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
+                    self.assertIn(commit, caught.exception.detail)
+
+    def test_a_migration_file_that_is_not_utf8_is_a_verdict_not_a_crash(self):
+        tag = "0035_migration"
+        fetch = self.fetch(
+            BASE_TAGS,
+            BASE_TAGS + (tag,),
+            {},
+            routes={ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO): (200, b"CREATE TABLE \xff\xfe;")},
+        )
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.classify_migrations(FROM, TO, fetch=fetch)
+        self.assertEqual(caught.exception.check, "classify")
+        self.assertIn(f"{tag}.sql", caught.exception.detail)
 
     def test_a_journal_tag_that_is_not_a_migration_name_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
@@ -770,10 +1300,57 @@ class TestRollbackFloor(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
 
+    def test_only_a_well_formed_additive_entry_is_trusted(self):
+        # A version is safe to roll back across only on an entry that safety_problems accepts
+        # and that says "additive". One malformed entry flags its own version; it does not
+        # refuse the whole file, which would block every rollback (the incident path).
+        good = dict(ts.SEED["0.9.14"], classification="additive", migrations=[])
+        malformed = {
+            "only the classification": {"classification": "additive"},
+            "an extra key": {**good, "note": 1},
+            "keys out of order": {key: good[key] for key in ("from", "classification", "to", "migrations")},
+            "a commit that is not 40 hex": {**good, "from": "abc"},
+            "a migration that is not a tag": {**good, "migrations": ["../x"]},
+            "migrations that is not a list": {**good, "migrations": "0035_migration"},
+        }
+        for name, entry in malformed.items():
+            with self.subTest(name):
+                self.assertNotEqual(rc.safety_problems({"versions": {"0.9.14": entry}}), [])
+                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.safety_problems({"versions": {"0.9.14": good}}), [])
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14"))
+
+    def test_a_malformed_entry_flags_only_its_own_version(self):
+        versions = {"0.9.13": dict(ts.SEED["0.9.13"]), "0.9.14": {"classification": "additive"}}
+        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13"))
+        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14"), "0.9.14")
+
 
 class TestSafetyProblems(unittest.TestCase):
     def test_the_seed_is_well_formed(self):
         self.assertEqual(rc.safety_problems({"versions": ts.SEED}), [])
+
+    def test_each_problem_names_its_version_and_field(self):
+        good = dict(ts.SEED["0.9.14"])
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good}}),
+            ["rollback-safety.json '0.9': not an exact x.y.z"],
+        )
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9.14": {**good, "classification": "safe", "from": "abc"}}}),
+            [
+                "rollback-safety.json '0.9.14': classification must be additive or not-rollback-safe",
+                "rollback-safety.json '0.9.14': from must be a 40-hex commit id",
+            ],
+        )
+        # Every entry is read, not just the first one with a problem.
+        self.assertEqual(
+            rc.safety_problems({"versions": {"0.9": good, "0.9.14": good, "0.9.15": {}}}),
+            [
+                "rollback-safety.json '0.9': not an exact x.y.z",
+                f"rollback-safety.json '0.9.15': keys must be exactly {rc.SAFETY_KEYS}, in that order",
+            ],
+        )
 
     def test_each_malformation_is_named(self):
         good = dict(ts.SEED["0.9.14"])
@@ -978,6 +1555,35 @@ class TestAuditTags(unittest.TestCase):
         self.tag_at(self.repo.commit(doc), "entry removed", 4)
         self.assertEqual(self.audit(), [])
 
+    def drop_the_manifest(self):
+        ts.git(self.repo.path, "rm", "-q", rc.MANIFEST)
+        ts.git(self.repo.path, "commit", "-q", "-m", "drop the manifest")
+        return self.repo.head()
+
+    def test_a_tag_at_a_commit_without_the_manifest_records_entry_removed(self):
+        # tag-release cuts a tag at a commit that holds no manifest as "entry removed", so the
+        # audit reads that commit the same way. It is not a failure of git.
+        self.tag_at(self.drop_the_manifest(), "entry removed", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_tag_at_a_commit_without_the_manifest_must_still_record_entry_removed(self):
+        self.tag_at(self.drop_the_manifest(), "0.9.10", 4)
+        self.assertEqual(
+            self.audit(),
+            ["fleet-v4 records version '0.9.10', but the manifest at its commit pins 'entry removed'"],
+        )
+
+    def test_a_manifest_object_git_cannot_read_is_no_verdict_not_drift(self):
+        # The tree lists the file and the blob is gone: git failed, which says nothing about the tag.
+        commit = self.cut("0.9.10", 4)
+        blob = ts.git(self.repo.path, "rev-parse", f"{commit}:{rc.MANIFEST}").strip()
+        loose = os.path.join(self.repo.path, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
     def test_a_tag_that_misstates_the_version_is_caught(self):
         self.cut("0.9.10", 4, recorded="0.9.11")
         self.assertTrue(any("records version '0.9.11'" in p for p in self.audit()))
@@ -1011,6 +1617,45 @@ class TestAuditTags(unittest.TestCase):
         self.cut("0.9.10", 4, merge_commit="d" * 40)
         self.assertTrue(any("is not merged with" in p for p in self.audit()))
 
+    def pull_answer(self, answer, number=12):
+        self.fetch.routes[f"{rc.MARKETPLACE_API}/pulls/{number}"] = answer
+
+    def test_a_tag_naming_a_pull_request_that_does_not_exist_is_caught(self):
+        self.cut("0.9.10", 4)
+        self.pull_answer((404, {"message": "Not Found"}))
+        self.assertEqual(self.audit(), ["fleet-v4 names PR #12, which does not exist"])
+
+    def test_a_pull_request_read_that_fails_is_no_verdict_not_drift(self):
+        self.cut("0.9.10", 4)
+        for status in (401, 403, 429, 500, 502):
+            with self.subTest(status=status):
+                self.pull_answer((status, {"message": "no"}))
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+                self.assertIn(str(status), caught.exception.detail)
+
+    def test_a_pull_request_answer_that_is_not_a_json_object_is_no_verdict(self):
+        self.cut("0.9.10", 4)
+        for label, answer in (
+            ("not JSON", (200, b"<html>")),
+            ("a list", (200, [])),
+            ("a string", (200, b'"merged"')),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'{"merged_at": null, "merged_at": "2026-10-01T00:00:00Z"}')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+        ):
+            with self.subTest(answer=label):
+                self.pull_answer(answer)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+
+    def test_a_pull_request_whose_author_is_not_an_object_is_not_the_bot(self):
+        commit = self.cut("0.9.10", 4)
+        self.pull_answer((200, {"user": "the-bot", "merged_at": "2026-10-01T00:00:00Z", "merge_commit_sha": commit}))
+        self.assertTrue(any("was opened by None, not the bot App" in p for p in self.audit()))
+
     def test_no_bot_identity_confirms_no_new_tag(self):
         self.cut("0.9.10", 4)
         with mock.patch.object(rc, "BOT_LOGIN", None):
@@ -1021,13 +1666,6 @@ class TestAuditTags(unittest.TestCase):
         self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
         self.assertEqual(self.audit(), [])
 
-    def test_the_previous_run_catches_a_later_move(self):
-        commit = self.cut("0.9.10", 4)
-        previous = self.scratch.write("previous.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
-        ts.git(self.repo.path, "tag", "-d", "fleet-v4")
-        self.tag_at(commit, "0.9.10", 4, pr=13)  # the same commit, a new tag object
-        self.assertTrue(any("fleet-v4 changed since the previous run" in p for p in self.audit(previous_path=previous)))
-
     def test_an_unreadable_frozen_list_is_a_problem(self):
         self.frozen = os.path.join(self.scratch.path, "absent.json")
         self.assertTrue(any("unreadable" in p for p in self.audit()))
@@ -1035,6 +1673,10 @@ class TestAuditTags(unittest.TestCase):
     def test_the_rulesets_are_audited_when_asked(self):
         self.fetch.routes.update(ruleset_routes())
         self.assertEqual(rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch), [])
+
+
+# Only this repository's own rulesets: includes_parents=false leaves out the organisation's and the enterprise's.
+RULESET_LISTING = f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
 
 
 def ruleset_routes(overrides=None, missing=()):
@@ -1078,7 +1720,7 @@ def ruleset_routes(overrides=None, missing=()):
         }
         body.update((overrides or {}).get(name, {}))
         routes[f"{rc.MARKETPLACE_API}/rulesets/{number}"] = (200, body)
-    routes[f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100"] = (200, listing)
+    routes[RULESET_LISTING] = (200, listing)
     return routes
 
 
@@ -1103,6 +1745,38 @@ class TestAuditRulesets(unittest.TestCase):
     def test_a_missing_ruleset_is_caught(self):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(missing=("x4-tags",))))
         self.assertEqual(problems, ["ruleset 'x4-tags' does not exist"])
+
+    def test_a_duplicated_ruleset_name_is_flagged(self):
+        # Two rulesets named "main" cannot both be the one audited, and the last must not win
+        # silently: an inherited or stray ruleset of the same name would hide the real one.
+        routes = ruleset_routes()
+        listing = routes[RULESET_LISTING][1]
+        # The stray one comes first: neither copy is audited, so it is never fetched.
+        routes[RULESET_LISTING] = (200, [{"id": 99, "name": "main"}] + listing)
+        fetch = ts.FakeFetch(routes)
+        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["ruleset 'main': expected exactly one, found 2"])
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/99", fetch.urls())
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/1", fetch.urls())
+
+    def test_every_duplicated_name_is_flagged_once_and_the_others_are_still_audited(self):
+        routes = ruleset_routes({"bot-branches": {"enforcement": "disabled"}})
+        listing = routes[RULESET_LISTING][1]
+        extra = [{"id": 90 + n, "name": name} for n, name in enumerate(("x4-tags", "x4-tags", "tags-locked"))]
+        routes[RULESET_LISTING] = (200, listing + extra)
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            [
+                "ruleset 'tags-locked': expected exactly one, found 2",
+                "ruleset 'bot-branches' is 'disabled', not active",
+                "ruleset 'x4-tags': expected exactly one, found 3",
+            ],
+        )
+
+    def test_only_the_repositorys_own_rulesets_are_listed(self):
+        fetch = ts.FakeFetch(ruleset_routes())
+        rc.audit_rulesets(fetch=fetch)
+        self.assertIn("includes_parents=false", fetch.urls()[0])
+        self.assertIn("per_page=100", fetch.urls()[0])
 
     def test_a_disabled_ruleset_is_caught(self):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"enforcement": "disabled"}})))
@@ -1141,9 +1815,47 @@ class TestAuditRulesets(unittest.TestCase):
             ],
         )
 
-    def test_an_unlistable_repository_is_a_problem(self):
-        fetch = ts.FakeFetch({f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&per_page=100": (403, b"")})
-        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["could not list the repository's rulesets (HTTP 403)"])
+    LISTING = RULESET_LISTING
+
+    def no_verdict(self, routes):
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+        self.assertEqual(caught.exception.check, "api")
+        return caught.exception
+
+    def test_a_listing_that_fails_is_no_verdict_not_drift(self):
+        # A 403 or a 502 says nothing about the rulesets, so it must not read as "every ruleset is missing".
+        for status in (401, 403, 404, 429, 500, 502):
+            with self.subTest(status=status):
+                error = self.no_verdict({self.LISTING: (status, b"")})
+                self.assertIn(str(status), error.detail)
+
+    def test_a_listing_that_is_not_a_json_list_is_no_verdict(self):
+        # Iterating a JSON object visits its keys, so every ruleset used to read as missing.
+        for label, answer in (
+            ("an object", (200, {})),
+            ("an object with a message", (200, {"message": "Server Error"})),
+            ("not JSON", (200, b"<html>")),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'[{"name": "main", "name": "other"}]')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+            ("entries that are not objects", (200, ["main", 3])),
+        ):
+            with self.subTest(listing=label):
+                self.no_verdict(ruleset_routes() | {self.LISTING: answer})
+
+    def test_a_ruleset_read_that_fails_is_no_verdict_not_drift(self):
+        for status in (403, 404, 500, 502):
+            with self.subTest(status=status):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/3"] = (status, b"")
+                error = self.no_verdict(routes)
+                self.assertIn(str(status), error.detail)
+
+    def test_a_ruleset_answer_that_is_not_a_json_object_is_no_verdict(self):
+        for label, answer in (("a list", (200, [])), ("not JSON", (200, b"<html>")), ("null", (200, b"null"))):
+            with self.subTest(ruleset=label):
+                self.no_verdict(ruleset_routes() | {f"{rc.MARKETPLACE_API}/rulesets/3": answer})
 
 
 def cli(*argv):
@@ -1180,6 +1892,28 @@ class TestCli(unittest.TestCase):
     def test_usage_errors_exit_2(self):
         self.assertEqual(cli("no-such-command")[0], 2)
         self.assertEqual(cli("floor")[0], 2)
+
+    def test_an_unexpected_error_exits_2_as_internal(self):
+        # Only a verdict exits 1. A bug in this tool, or a document shaped in a way it did
+        # not expect, reaches no verdict, so a caller that fails on any non-zero status
+        # never reads a traceback (exit 1) as "the release failed its checks".
+        before, after = "a" * 40, "b" * 40
+        for error in (AttributeError("'list' object has no attribute 'get'"), TypeError("not subscriptable"), KeyError("status")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    code, out, err = cli("classify", before, after)
+                self.assertEqual(code, 2)
+                document = json.loads(out)["error"]
+                self.assertEqual(document["check"], "internal")
+                self.assertIn(type(error).__name__, document["detail"])
+                self.assertIn("::error::internal: " + type(error).__name__, err)
+
+    def test_an_interrupt_is_not_reported_as_an_internal_error(self):
+        for error in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        cli("classify", "a" * 40, "b" * 40)
 
     def test_candidates(self):
         repo = self.repo()
@@ -1246,6 +1980,17 @@ class TestCli(unittest.TestCase):
         repo.tag("stray")
         code, out, _ = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--no-rulesets")
         self.assertEqual((code, json.loads(out)["problems"]), (1, ["tag 'stray' exists: no tag other than fleet-v<N> may exist"]))
+
+    def test_the_audit_has_no_previous_run_option(self):
+        # Comparing against the last run's snapshot is tag_audit.py's job. Here a missing
+        # file used to be skipped without a word, so an audit given one checked nothing.
+        repo = self.repo()
+        frozen = repo.write("frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        code, out, err = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--previous", "missing.json", "--no-rulesets")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--previous", err)
+        with self.assertRaises(TypeError):
+            rc.audit_tags(repo.path, frozen, previous_path="missing.json", check_rulesets=False)
 
     def test_snapshot_tags(self):
         repo = self.repo()
