@@ -96,6 +96,25 @@ class TestRouter(RouterCase):
         self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
         self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["org-owner-example"]})
 
+    def test_the_escalation_owner_is_assigned_once_even_if_unassigned(self):
+        self.issues.append(existing(created="2026-09-29T11:00:00Z"))
+        self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
+        noted = self.gh.called("PATCH", R("issues/40"))[0][2]["body"]
+        self.assertEqual(rt.read_marker(noted, "escalated"), "org-owner-example")
+        # The owner takes themselves off the issue. The next run must neither assign nor comment again.
+        self.issues[0] = dict(self.issues[0], body=noted)
+        self.gh.calls.clear()
+        self.assertEqual(self.router(escalation="org-owner-example").apply(red()), "staleness-i: #40 unchanged")
+        self.assertEqual(self.gh.writes(), [])
+
+    def test_a_new_escalation_owner_is_assigned_in_turn(self):
+        self.issues.append(existing(created="2026-09-29T11:00:00Z"))
+        self.router(escalation="org-owner-example").apply(red())
+        self.issues[0] = dict(self.issues[0], body=self.gh.called("PATCH", R("issues/40"))[0][2]["body"])
+        self.gh.calls.clear()
+        self.assertIn("escalated", self.router(escalation="next-owner-example").apply(red()))
+        self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["next-owner-example"]})
+
     def test_without_an_escalation_owner_the_gap_is_noted_once(self):
         self.issues.append(existing(created="2026-09-29T11:00:00Z"))
         self.router().apply(red())
