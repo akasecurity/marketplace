@@ -422,7 +422,7 @@ def _npm_report(stdout: str) -> dict:
     """npm audit's JSON report, or InfraError when what it printed is not one."""
     try:
         report = json.loads(stdout)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {stdout[:500]}") from exc
     # A report from an npm that honours --include-attestations always carries an "invalid" list
     # and a "verified" list (empty when nothing verified). npm prints its own failures
