@@ -20,7 +20,7 @@ SHA512_HEX = hashlib.sha512(TARBALL).hexdigest()
 SHASUM = hashlib.sha1(TARBALL).hexdigest()
 OTHER_INTEGRITY = "sha512-" + base64.b64encode(hashlib.sha512(b"other bytes").digest()).decode()
 
-# Real values, read from npmjs and akasecurity/ai-tc on 2026-09-29 (0.9.15's on 2026-10-02).
+# Real values, read from npmjs and akasecurity/ai-tc on 2026-09-29.
 REAL_INTEGRITY_0_9_14 = (
     "sha512-jdUG6HKR+SdhBi0+7jguLGuGjtFOkxLpTJu3/zBZ3wpN+t9XckzykjzV37YVhWBiQjGDGz8BbMquDwajG4rb7Q=="
 )
@@ -32,7 +32,6 @@ ATTESTED = {
     "0.9.12": "1d69b0e82602a64da4bc8aee0c48916774e65f15",
     "0.9.13": "1cef4ad151acee9a6d6df745060378b75a744262",
     "0.9.14": "a75532b98a70546d3825cbc237769aefe4dcc074",
-    "0.9.15": "b65d0ab867e7827e21d0532ae2e1845885933449",
 }
 RUN_URL = "https://github.com/akasecurity/ai-tc/actions/runs/36005098741/attempts/1"
 WORKFLOW = ".github/workflows/release-plugin-claude.yml"
