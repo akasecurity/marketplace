@@ -31,18 +31,33 @@ def existing(detail="npm has 0.9.15, unpinned for 25 hours", *, last="2026-10-01
             "assignees": [{"login": login} for login in assignees]}
 
 
+def cleared_issue(cleared="2026-10-01T09:00:00Z", **kwargs):
+    """An issue the router closed at `cleared`: closed, last updated then, and carrying the marker it leaves."""
+    return dict(existing(extra=rt.marker("cleared", cleared), **kwargs), state="closed", updated_at=cleared)
+
+
 class RouterCase(unittest.TestCase):
     def setUp(self):
         self.issues = []
         self.gh = FakeGitHub({
-            ("GET", R("issues")): lambda body, params: [i for i in self.issues
-                                                        if any(l["name"] == params["labels"] for l in i["labels"])],
+            ("GET", R("issues")): self.listed,
             ("POST", R("issues")): {"number": 41},
             ("POST", R("issues/40/comments")): {"id": 1},
             ("PATCH", R("issues/40")): {"number": 40},
             ("POST", R("issues/40/assignees")): {"number": 40},
             ("POST", R("issues/40/labels")): [],
         })
+
+    def listed(self, body, params):
+        """GitHub's issue list as the router asks for it: a filter that is not sent filters nothing, the state
+        defaults to open, `since` keeps the issues updated after it (a fixture with no `updated_at` always
+        qualifies), and a fixture without a `state` is open and one without a `user` was filed by the
+        workflow's token."""
+        return [issue for issue in self.issues
+                if issue.get("state", "open") == params.get("state", "open")
+                and issue.get("updated_at", params.get("since", "")) >= params.get("since", "")
+                and ("creator" not in params or issue.get("user", {"login": rt.ACTIONS_BOT})["login"] == params["creator"])
+                and ("labels" not in params or any(label["name"] == params["labels"] for label in issue["labels"]))]
 
     def router(self, escalation=None):
         return rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=escalation,
@@ -81,6 +96,28 @@ class TestRouter(RouterCase):
         self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
         self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["org-owner-example"]})
 
+    def carry_edits_to_the_issue(self):
+        """What GitHub keeps between two runs: the issue's body as the router last edited it. Nobody is
+        assigned in the fake, which is the owner having taken themselves off the issue."""
+        for call in self.gh.called("PATCH", R("issues/40")):
+            self.issues[0] = dict(self.issues[0], body=call[2].get("body", self.issues[0]["body"]))
+        self.gh.calls.clear()
+
+    def test_the_escalation_owner_is_assigned_once_even_if_unassigned(self):
+        self.issues.append(existing(created="2026-09-29T11:00:00Z"))
+        self.assertIn("escalated", self.router(escalation="org-owner-example").apply(red()))
+        self.carry_edits_to_the_issue()
+        self.assertEqual(self.router(escalation="org-owner-example").apply(red()), "staleness-i: #40 unchanged")
+        self.assertEqual(self.gh.writes(), [])
+        self.assertEqual(rt.read_marker(self.issues[0]["body"], "escalated"), "org-owner-example")
+
+    def test_a_new_escalation_owner_is_assigned_in_turn(self):
+        self.issues.append(existing(created="2026-09-29T11:00:00Z"))
+        self.router(escalation="org-owner-example").apply(red())
+        self.carry_edits_to_the_issue()
+        self.assertIn("escalated", self.router(escalation="next-owner-example").apply(red()))
+        self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["next-owner-example"]})
+
     def test_without_an_escalation_owner_the_gap_is_noted_once(self):
         self.issues.append(existing(created="2026-09-29T11:00:00Z"))
         self.router().apply(red())
@@ -91,6 +128,25 @@ class TestRouter(RouterCase):
         self.gh.calls.clear()
         self.assertEqual(self.router().apply(red()), "staleness-i: #40 unchanged")
 
+    def test_an_issue_whose_label_was_removed_is_still_found_and_relabelled(self):
+        self.issues.append(existing(labels=()))
+        self.assertEqual(self.router().apply(red()), "staleness-i: #40 labelled")
+        self.assertEqual(self.gh.called("POST", R("issues")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/40/labels"))[0][2], {"labels": ["staleness"]})
+
+    def test_only_issues_the_workflow_filed_are_listed(self):
+        self.router().apply(red())
+        sent = self.gh.called("GET", R("issues"))[0][3]
+        self.assertEqual((sent.get("state"), sent.get("creator")), ("open", "github-actions[bot]"))
+        self.assertNotIn("labels", sent)
+
+    def test_an_issue_filed_by_a_person_is_never_taken_for_the_rules_issue(self):
+        copied = dict(existing(), user={"login": "some-writer"})
+        self.issues.append(copied)
+        self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+        self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+        self.assertEqual(self.gh.called("POST", R("issues/40/comments")), [])
+
     def test_a_missing_extra_label_is_added(self):
         self.issues.append(existing())
         self.router().apply(red(extra_labels=["rollback-hold"]))
@@ -100,7 +156,80 @@ class TestRouter(RouterCase):
         self.issues.append(existing())
         cleared = rt.Result(rule="staleness-i", label="staleness", title="t", red=False)
         self.assertEqual(self.router().apply(cleared), "staleness-i: cleared; closed #40")
-        self.assertEqual(self.gh.called("PATCH", R("issues/40"))[0][2], {"state": "closed", "state_reason": "completed"})
+        patches = self.gh.called("PATCH", R("issues/40"))
+        self.assertEqual(len(patches), 1)
+        closed = patches[0][2]
+        self.assertEqual((closed["state"], closed["state_reason"]), ("closed", "completed"))
+        # The marker goes in the same edit as the close, and the rest of the body is as it was.
+        self.assertEqual(rt.read_marker(closed["body"], "cleared"), "2026-10-01T12:00:00Z")
+        self.assertEqual(rt.drop_marker(closed["body"], "cleared"), self.issues[0]["body"])
+
+    def test_a_rule_red_again_within_48_hours_reopens_its_issue(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+        self.assertEqual(self.gh.called("POST", R("issues")), [])
+        looked = self.gh.called("GET", R("issues"))[-1][3]
+        self.assertEqual((looked["state"], looked["creator"], looked["since"]),
+                         ("closed", "github-actions[bot]", "2026-09-29T12:00:00Z"))
+        patched = self.gh.called("PATCH", R("issues/40"))[0][2]
+        self.assertEqual((patched["state"], patched["state_reason"]), ("open", "reopened"))
+        self.assertEqual(rt.read_marker(patched["body"], "state"), rt.digest(red().detail))
+        self.assertEqual(rt.read_marker(patched["body"], "last-comment"), "2026-10-01T12:00:00Z")
+        self.assertEqual(rt.read_marker(patched["body"], "rule"), "staleness-i")
+        comments = self.gh.called("POST", R("issues/40/comments"))
+        self.assertEqual(len(comments), 1)
+        self.assertIn("Red again at 2026-10-01T12:00:00Z (cleared at 2026-10-01T09:00:00Z)", comments[0][2]["body"])
+        self.assertIn("npm has 0.9.15", comments[0][2]["body"])
+        self.assertIn(RUN, comments[0][2]["body"])
+
+    def test_a_rule_red_again_after_48_hours_opens_a_new_issue(self):
+        # 49 hours ago. The listing may still return the issue (a comment since then moves its update time),
+        # so the marker, not only the listing's window, rules it out.
+        for label, updated in (("untouched since", "2026-09-29T11:00:00Z"), ("commented on since", "2026-10-01T08:00:00Z")):
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [dict(cleared_issue("2026-09-29T11:00:00Z"), updated_at=updated)]
+                self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+                self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+
+    def test_an_issue_a_person_closed_is_not_reopened(self):
+        person_closed = dict(existing(), state="closed", updated_at="2026-10-01T11:00:00Z")
+        cases = {
+            "no cleared marker": person_closed,
+            "an unreadable one": dict(cleared_issue("not a time")),
+            "one without a zone": dict(cleared_issue("2026-10-01T09:00:00")),
+            "filed by a person": dict(cleared_issue(), user={"login": "some-writer"}),
+        }
+        for label, issue in cases.items():
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [issue]
+                self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+                self.assertEqual(self.gh.called("PATCH", R("issues/40")), [])
+
+    def test_a_reopened_issue_a_person_then_closes_stays_closed(self):
+        self.issues.append(cleared_issue())
+        self.router().apply(red())
+        reopened = self.gh.called("PATCH", R("issues/40"))[0][2]["body"]
+        self.assertIsNone(rt.read_marker(reopened, "cleared"))
+        self.gh.calls.clear()
+        self.issues[:] = [dict(existing(), body=reopened, state="closed", updated_at="2026-10-01T11:30:00Z")]
+        self.assertEqual(self.router().apply(red()), "staleness-i: opened #41")
+
+    def test_a_result_the_router_never_closes_does_not_look_for_a_cleared_issue(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red(auto_close=False)), "staleness-i: opened #41")
+        self.assertEqual([call[3]["state"] for call in self.gh.called("GET", R("issues"))], ["open"])
+
+    def test_the_issue_cleared_last_is_the_one_reopened(self):
+        self.issues[:] = [dict(cleared_issue("2026-09-30T16:00:00Z"), number=39), cleared_issue("2026-10-01T09:00:00Z")]
+        self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+
+    def test_the_original_creation_time_still_drives_escalation_after_a_reopen(self):
+        self.issues.append(cleared_issue(created="2026-09-28T10:00:00Z"))
+        outcome = self.router(escalation="org-owner-example").apply(red())
+        self.assertEqual(outcome, "staleness-i: red again; reopened #40, escalated")
+        self.assertEqual(self.gh.called("POST", R("issues/40/assignees"))[0][2], {"assignees": ["org-owner-example"]})
 
     def test_a_rule_a_person_closes_is_never_closed_by_the_router(self):
         self.issues.append(existing())
@@ -195,14 +324,14 @@ class TestNoResults(RouterCase):
 class TestWorkflowIssueLifetime(RouterCase):
     """The issue for an evaluation job that did not finish closes only where the next run re-checks everything."""
 
-    def open_workflow_issue(self, label):
-        self.issues = [{"number": 40, "body": rt.marker("rule", f"{label}-workflow"), "created_at": "2026-10-01T10:00:00Z",
-                        "labels": [{"name": label}], "assignees": []}]
+    def open_workflow_issue(self, label, rule=None):
+        self.issues = [{"number": 40, "body": rt.marker("rule", rule or f"{label}-workflow"),
+                        "created_at": "2026-10-01T10:00:00Z", "labels": [{"name": label}], "assignees": []}]
 
-    def clean_run(self, label):
+    def clean_run(self, label, push=None):
         green = rt.Result(rule=label, label=label, title="t", red=False, auto_close=False)
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            code = rt.route([green], label=label, job_result="success", router=self.router())
+            code = rt.route([green], label=label, job_result="success", router=self.router(), push=push)
         return code, out.getvalue()
 
     def test_a_state_based_rule_closes_it_when_the_next_run_is_clean(self):
@@ -213,28 +342,61 @@ class TestWorkflowIssueLifetime(RouterCase):
         self.assertEqual(len(self.gh.called("PATCH", R("issues/40"))), 1)
 
     def test_main_audit_leaves_it_for_a_person_because_a_run_audits_only_its_own_push(self):
-        self.open_workflow_issue("main-audit")
-        code, out = self.clean_run("main-audit")
-        self.assertEqual(code, 0)
-        self.assertIn("main-audit-workflow: clear", out)
-        self.assertNotIn("closed", out)
-        self.assertEqual(self.gh.writes(), [])
+        self.open_workflow_issue("main-audit", f"main-audit-workflow-{'a' * 12}")
+        # A clean run for the same push cannot happen (a push is audited once), but a clean run for the next
+        # one says nothing about this push, and neither run closes its issue.
+        for push in ("a" * 40, "b" * 40):
+            with self.subTest(push=push[:1]):
+                code, out = self.clean_run("main-audit", push)
+                self.assertEqual(code, 0)
+                self.assertIn(f"main-audit-workflow-{push[:12]}: ", out)
+                self.assertNotIn("closed", out)
+                self.assertEqual(self.gh.writes(), [])
 
     def test_main_audit_files_it_saying_a_person_closes_it(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
-            rt.route([], label="main-audit", job_result="failure", router=self.router())
+            rt.route([], label="main-audit", job_result="failure", router=self.router(), push="a" * 40)
         body = self.gh.called("POST", R("issues"))[0][2]["body"]
         self.assertIn("A person closes it once it is explained.", body)
         self.assertNotIn("closes by itself", body)
+
+    def test_main_audit_files_a_failed_job_against_its_own_push(self):
+        for job_result, ending in (("failure", "did not finish"), ("success", "reported no results")):
+            with self.subTest(job_result):
+                gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+                router = rt.Router(gh, approvers=["Vaishnav-OM"], escalation=None, owners=["Vaishnav-OM"], now=NOW,
+                                   run_url=RUN)
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    rt.route(None if job_result == "success" else [], label="main-audit", job_result=job_result,
+                             router=router, push="c" * 40)
+                opened = gh.called("POST", R("issues"))[0][2]
+                self.assertEqual(opened["title"], f"main-audit: the evaluation job for the push to {'c' * 12} {ending}")
+                self.assertEqual(rt.read_marker(opened["body"], "rule"), f"main-audit-workflow-{'c' * 12}")
+                self.assertIn(f"`{'c' * 12}`", opened["body"])
+
+    def test_a_label_that_audits_everything_each_run_keeps_one_issue_whatever_push_it_is_given(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="staleness", job_result="failure", router=self.router(), push="d" * 40)
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(opened["title"], "staleness: the evaluation job did not finish")
+        self.assertEqual(rt.read_marker(opened["body"], "rule"), "staleness-workflow")
+
+    def test_main_audit_without_a_push_keeps_the_one_shared_issue(self):
+        # No AFTER means no key to file it under; the shared rule fails closed rather than going unrecorded.
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="main-audit", job_result="failure", router=self.router())
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(opened["title"], "main-audit: the evaluation job did not finish")
+        self.assertEqual(rt.read_marker(opened["body"], "rule"), "main-audit-workflow")
 
 
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 
-    def run_main(self, *, job_result, results_json=None, label="staleness"):
-        gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+    def run_main(self, *, job_result, results_json=None, label="staleness", gh=None, extra_env=None):
+        gh = gh or FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
         env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "9",
-               "JOB_RESULT": job_result}
+               "JOB_RESULT": job_result, **(extra_env or {})}
         if results_json is not None:
             env["RESULTS_JSON"] = results_json
         with tempfile.TemporaryDirectory() as root:
@@ -271,6 +433,21 @@ class TestMain(unittest.TestCase):
     def test_main_audit_with_no_output_is_red(self):
         self.assertEqual(self.run_main(job_result="success", label="main-audit"),
                          (1, ["main-audit: the evaluation job reported no results"]))
+
+    def test_a_second_failed_main_audit_run_files_its_own_issue(self):
+        filed = []
+
+        def post(body, params):
+            filed.append({"number": 40 + len(filed), "body": body["body"], "created_at": "2026-10-01T10:00:00Z",
+                          "labels": [{"name": label} for label in body["labels"]], "assignees": []})
+            return filed[-1]
+
+        gh = FakeGitHub({("GET", R("issues")): lambda body, params: list(filed), ("POST", R("issues")): post})
+        for after in ("a" * 40, "b" * 40):
+            self.run_main(job_result="failure", label="main-audit", gh=gh, extra_env={"AFTER": after})
+        self.assertEqual([call[2]["title"] for call in gh.called("POST", R("issues"))],
+                         [f"main-audit: the evaluation job for the push to {sha * 12} did not finish" for sha in "ab"])
+        self.assertEqual(gh.called("POST", R("issues/40/comments")), [])
 
     def test_a_success_with_unparsable_results_files_an_issue_instead_of_crashing(self):
         self.assertEqual(self.run_main(job_result="success", results_json="{not json"),

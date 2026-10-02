@@ -1,15 +1,24 @@
-"""main-audit: every commit a push adds to main must be the merge of a code-owner-approved PR.
+"""main-audit: every commit a push adds to main's first-parent line must be the merge of a code-owner-approved PR that passed validate.
 
-Red unless each commit is the merge commit of a PR with an approving review,
-on the PR's final head, from a code owner (CODEOWNERS at the commit's parent)
-who is not its last pusher. REST names no pusher, so the head commit's author
-and committer stand in for the last pusher (web-flow, GitHub's committer for
-web edits, is skipped); the main ruleset's "most recent push approved by
-someone else" is what enforces the rule, and this records when it was
-bypassed. Detective only: it runs from the pushed commit's own file, so a
-bypass push can change it in the same push. Every red result is keyed to its
-push and closed only by a person; a push the audit could not finish, or one
-that moved main without extending it, gets its own such result.
+Red unless each commit is the merge commit of a PR with an approving review, on
+the PR's final head, from a code owner (CODEOWNERS at the commit's parent, read
+strictly: one `*` line of users, as tag-release reads it, and any other shape
+is that commit's problem rather than a guess) who is not its last pusher and has
+not since withdrawn it (an owner's latest approving or change-requesting review
+decides), and whose final head has a passing `validate` check from GitHub
+Actions (its latest run decides). A commit that fails more than one of these
+gets one result. The head commit's author and committer stand in for the last
+pusher (web-flow, GitHub's committer for web edits, is skipped), and a head for
+which they name nobody is red, since an approval could then be the pusher's own.
+GitHub's activity API does record who pushed, but it is not used here yet: what
+it records for a push made by the App or by auto-merge has not been verified.
+The stand-in can still name the wrong person (a force-push by someone who did
+not write the commit); the main ruleset's "most recent push approved by someone
+else" is what enforces the rule, and this records when it was bypassed.
+Detective only: it runs from the pushed commit's own file, so a bypass push can
+change it in the same push. Every red result is keyed to its push and closed
+only by a person; a push the audit could not finish, or one that moved main
+without extending it, gets its own such result.
 """
 from __future__ import annotations
 
@@ -22,9 +31,10 @@ from typing import Callable
 
 from ghapi import GitHub
 from gitrepo import Git
-from import_release import write_output
-from issue_router import CODEOWNERS_FILE, Result, parse_codeowners, results_to_json
-from tag_release import merged_pull
+from import_release import Refused, write_output
+from issue_router import Result, results_to_json
+from release_checks import GITHUB_ACTIONS_APP_ID
+from tag_release import code_owners, merged_pull, owner_approvals
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -32,42 +42,88 @@ REWRITE_RULE = "main-audit-rewrite-"
 UNAUDITED_RULE = "main-audit-unaudited-"
 ZERO = re.compile(r"0{40}")
 NOT_A_PUSHER = {"web-flow"}
+# The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
+VALIDATE_CHECK = "validate"
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
+    """The commits a push put on main's first-parent line, oldest first: the squash commit of a squash merge,
+    the merge commit of a merge commit. The branch commits a merge commit brings in are on no pull request of
+    their own, so counting them would report each as pushed directly."""
     if not before or ZERO.fullmatch(before):
         return [after]
-    return git.commits_between(before, after)
+    return git.first_parent_after(before, after)
 
 
-def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
-    pull = merged_pull(gh, sha, sleep)
-    if pull is None:
-        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
-    number = pull["number"]
-    head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
+def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> str | None:
     parent = git.first_parent(sha)
-    owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
+    try:
+        owners = code_owners(git, parent) if parent else []
+    except Refused as refusal:
+        # A CODEOWNERS this audit cannot read exactly (a team, a path rule, no file) must not decide who counts as
+        # an owner either way, so the commit is reported with the reason and the rest of the push is still audited.
+        return f"`{sha}` merged PR #{number}, but its approval could not be checked: {refusal}"
     head_commit = gh.get(gh.repo_path(f"commits/{head}"))
     pushers = {login for login in ((head_commit.get("author") or {}).get("login"),
                                    (head_commit.get("committer") or {}).get("login"))
                if login and login not in NOT_A_PUSHER}
-    approvals = [review for review in gh.paginate(gh.repo_path(f"pulls/{number}/reviews"))
-                 if review.get("state") == "APPROVED" and review.get("commit_id") == head
-                 and (review.get("user") or {}).get("login") in owners
-                 and review["user"]["login"] not in pushers]
-    if approvals:
+    if not pushers:
+        # With no login for either field the stand-in names nobody, and an empty set would let every owner's
+        # approval through, the pusher's own included. Not knowing who pushed is not a pass.
+        return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
+                "(neither its author nor its committer is a GitHub account other than web-flow), so an approval "
+                "could not be told from the pusher's own.")
+    # Each owner's latest approving or change-requesting review decides, the same rule that names the approver in
+    # a fleet tag: an approval its owner later withdrew, or that was dismissed, does not count.
+    if owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners, exclude=pushers):
         return None
     return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
             f"({', '.join(owners) or 'none listed'}) on its final head `{head}` by someone other than its last "
             f"pusher ({', '.join(sorted(pushers)) or 'unknown'}).")
 
 
-def rewrite_problem(git: Git, before: str, after: str) -> str | None:
-    """Why this push moved main other than by adding commits on top of the old tip, or None when it did not.
+def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
+    """Why `head` has no passing `validate` check from GitHub Actions, or None when its latest run succeeded.
 
-    An old tip that only main held is not fetched once main has moved off it, so an unknown `before` is the
-    ordinary shape of a reset or force-push and reads as one."""
+    The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
+    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that
+    failed after an earlier pass leaves the head unvalidated."""
+    runs = [run for run in gh.paginate(gh.repo_path(f"commits/{head}/check-runs"),
+                                       {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID, "filter": "all"})
+            if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    lead = (f"`{sha}` merged PR #{number} without a passing `{VALIDATE_CHECK}` check from GitHub Actions on its "
+            f"final head `{head}`: ")
+    if not runs:
+        return lead + "none ran."
+    latest = max(runs, key=lambda run: run.get("id") or 0)
+    if latest.get("status") != "completed":
+        return lead + f"the latest run is {latest.get('status') or 'unfinished'}."
+    if latest.get("conclusion") != "success":
+        return lead + f"the latest run ended {latest.get('conclusion') or 'without a result'}."
+    return None
+
+
+def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
+    """What is wrong with how `sha` reached main, or None. A commit with both problems gets one description."""
+    pull = merged_pull(gh, sha, sleep)
+    if pull is None:
+        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
+    number = pull["number"]
+    head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
+    problems = [problem for problem in (approval_problem(gh, git, sha, number, head),
+                                        validate_problem(gh, sha, number, head)) if problem]
+    return " ".join(problems) or None
+
+
+def rewrite_of(git: Git, before: str, after: str) -> tuple[str, list[str]] | None:
+    """How this push moved main other than by adding commits on top of the old tip, as (why, the commits to
+    audit), or None when it did not.
+
+    The commits to audit are the first-parent commits after the merge base of the old and new tips: what the
+    rewrite put on main that its predecessor did not hold. Where that cannot be known, the new tip alone is
+    audited and the text says so: an old tip that only main held is not fetched once main has moved off it,
+    so an unknown `before` is the ordinary shape of a reset or force-push, and two tips with no common history
+    have no base. A rewrite that adds nothing past the base (a reset back to an ancestor) audits its tip too."""
     if not before or ZERO.fullmatch(before):
         return None
     ancestor = git.is_ancestor(before, after)
@@ -75,8 +131,17 @@ def rewrite_problem(git: Git, before: str, after: str) -> str | None:
         return None
     if ancestor is None:
         return (f"main moved from `{before}` to `{after}` and the old tip is not in the checkout, so it is no "
-                "longer reachable from any branch or tag: history was rewritten or reset.")
-    return f"main moved from `{before}` to `{after}` and the old tip is not an ancestor of the new one: history was rewritten or reset."
+                "longer reachable from any branch or tag: history was rewritten or reset. There is no merge base "
+                "to start from, so only the new tip was audited.", [after])
+    moved = f"main moved from `{before}` to `{after}` and the old tip is not an ancestor of the new one: history was rewritten or reset."
+    base = git.merge_base(before, after)
+    if base is None:
+        return moved + " The old and new tips share no history, so only the new tip was audited.", [after]
+    added = git.first_parent_after(base, after)
+    if not added:
+        return (moved + f" The new tip adds nothing after their merge base `{base[:12]}`, so only the new tip was "
+                "audited.", [after])
+    return moved + f" The {len(added)} commit(s) after their merge base `{base[:12]}` were audited.", added
 
 
 def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float], None] = time.sleep) -> list[Result]:
@@ -86,15 +151,16 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
     the router files nothing and closes nothing for it; it records the number of commits it set out to audit and the
     number of red results. Every red result is keyed to this push and never closes by itself (auto_close is
     off), so a push the audit could not finish is recorded too: an error part-way through keeps what was
-    found so far and adds an unaudited result, rather than failing the job into the shared workflow issue.
-    A moved-not-extended main audits the new tip only.
+    found so far and adds an unaudited result, rather than failing the job (a failed job is filed against its
+    push too, by the router).
+    A main that was moved rather than extended audits what the rewrite added (rewrite_of).
     """
     results: list[Result] = []
     commits: list[str] = []
     try:
-        moved = rewrite_problem(git, before, after)
-        if moved:
-            commits = [after]
+        rewrite = rewrite_of(git, before, after)
+        if rewrite:
+            moved, commits = rewrite
             results.append(Result(
                 rule=f"{REWRITE_RULE}{after[:12]}", label=LABEL, red=True, auto_close=False,
                 title=f"main-audit: main moved from {before[:12]} to {after[:12]} without extending it",
@@ -108,7 +174,8 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
             if problem:
                 results.append(Result(
                     rule=f"main-audit-{sha[:12]}", label=LABEL,
-                    title=f"main-audit: {sha[:12]} reached main without a code-owner-approved PR", red=True,
+                    title=f"main-audit: {sha[:12]} reached main without a code-owner-approved PR that passed validate",
+                    red=True,
                     auto_close=False,
                     detail=problem + "\n\nIf this was a break-glass merge, record the incident and who merged it "
                                      "here; a person closes this issue once it is explained."))
@@ -139,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     for item in flagged:
         print(f"::error::{item.detail.splitlines()[0]}")
     commits = [item for item in flagged if not item.rule.startswith((REWRITE_RULE, UNAUDITED_RULE))]
-    print(f"{len(commits)} commit(s) in this push reached main without a code-owner-approved PR")
+    print(f"{len(commits)} commit(s) in this push reached main without a code-owner-approved PR that passed validate")
     print(f"{len(flagged) - len(commits)} other problem(s) with this push: main rewritten, or the audit unfinished")
     write_output("results", results_to_json(results))
     return 0

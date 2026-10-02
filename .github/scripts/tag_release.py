@@ -7,28 +7,43 @@ that carries no fleet-v tag yet. GitHub keeps one pending run per concurrency
 group and drops the rest, so a dropped run loses nothing: the next one tags
 what it missed, in commit order. Each tag is annotated, and its message
 records the version, integrity, PR, approver and store-migration class, plus
-rollback-from, drill and approver-note when they apply. The run also deletes
-the bot's own branches whose PRs are closed, since only the bot may delete
-bot/** branches.
+rollback-from, drill and approver-note when they apply. A commit that GitHub
+links to no merged PR is left untagged, and so is everything after it, until
+it is an hour old: a slow link must not become a permanent `pr: none` tag.
+After that hour it is tagged as a push without a PR. The owners that decide
+whether a PR was approved come from CODEOWNERS at the merged commit's parent,
+read strictly: one `*` line of user owners. That file is fixed history, which
+no later pull request can change, so a parent whose file is anything else never
+stops the sweep (it would stop tagging for good): the commit is tagged with
+`approver: unknown` and an approver-note saying why, rather than a guess at who
+counts.
+The run also deletes the bot's own branches that still point at the head a
+closed PR closed on, since only the bot may delete bot/** branches.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable
 
 from ghapi import GitHub, GitHubError
-from gitrepo import Git
+from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
-from issue_router import CODEOWNERS_FILE, parse_codeowners
-from release_checks import MANIFEST, SAFETY_FILE, SEMVER, vkey
+from issue_router import CODEOWNERS_FILE
+from release_checks import MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
 
 ABSENT = "entry removed"
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
+# How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
+# hour staleness waits before it reports an untagged pin change).
+UNLINKED_GRACE = 3600
+# A user owner in CODEOWNERS: "@" and a login. A team ("@org/team") or an email address matches no reviewer's login.
+USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 def version_at(git: Git, sha: str | None) -> str:
@@ -45,6 +60,41 @@ def version_at(git: Git, sha: str | None) -> str:
     return version if isinstance(version, str) and version else "unpinned"
 
 
+def last_pinned(git: Git, sha: str | None) -> str:
+    """The version main last pinned at or before `sha`: its own, or the nearest first-parent ancestor's
+    when the entry is removed there. ABSENT only when nothing back to the root pins one."""
+    while sha is not None:
+        version = version_at(git, sha)
+        if version != ABSENT:
+            return version
+        sha = git.first_parent(sha)
+    return ABSENT
+
+
+def code_owners(git: Git, sha: str) -> list[str]:
+    """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
+    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule
+    or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
+    shape would turn a real approval into a recorded bypass. What a caller does with the Refused is its own
+    call: the sweep tags with an unknown approver, because the file it reads is fixed history."""
+    raw = git.show(sha, CODEOWNERS_FILE)
+    where = f"{CODEOWNERS_FILE} at {sha[:12]}"
+    if raw is None:
+        raise Refused(f"{where} is missing; code owners can only be read from a file of one `*` line naming users.")
+    rules = [fields for fields in (line.split("#", 1)[0].split() for line in raw.splitlines()) if fields]
+    if len(rules) != 1 or rules[0][0] != "*":
+        raise Refused(f"{where} does not hold exactly one rule, a `*` line; code owners can only be read from a "
+                      "file of one `*` line naming users, with no path rules.")
+    owners = rules[0][1:]
+    if not owners:
+        raise Refused(f"{where} names no owner on its `*` line.")
+    unusable = [owner for owner in owners if not USER_OWNER.fullmatch(owner)]
+    if unusable:
+        raise Refused(f"{where} names {', '.join(f'`{owner}`' for owner in unusable)}, which is not a user "
+                      "(`@login`); a team or an email address cannot be matched to a reviewer.")
+    return [owner[1:] for owner in owners]
+
+
 def integrity_at(git: Git, sha: str) -> str:
     raw = git.show(sha, MANIFEST)
     entry = entry_of(json.loads(raw)) if raw else None
@@ -57,7 +107,8 @@ def pending(git: Git) -> list[str]:
     if not tags:
         raise Refused("no fleet-v tag exists to sweep from")
     tagged = {tag["commit"] for tag in tags}
-    return [sha for sha in git.first_parent_after(tags[-1]["commit"], "main")
+    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
+    return [sha for sha in git.first_parent_after(tags[-1]["commit"], git.main())
             if sha not in tagged and version_at(git, sha) != version_at(git, git.first_parent(sha))]
 
 
@@ -76,11 +127,13 @@ def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
 
 
 def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep) -> dict | None:
-    """The PR whose merge commit is `sha`, or None. The association can lag a merge by seconds, so an
+    """The PR into main whose merge commit is `sha`, or None. A PR merged into another branch whose merge
+    commit later reached main is not main's merge. The association can lag a merge by seconds, so an
     empty answer is asked again before it stands."""
     for attempt in range(ASSOCIATION_ATTEMPTS):
         pulls = gh.get(gh.repo_path(f"commits/{sha}/pulls"))
-        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")]
+        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")
+                  and (p.get("base") or {}).get("ref") == "main"]
         if merged:
             return merged[0]
         if attempt < ASSOCIATION_ATTEMPTS - 1:
@@ -88,19 +141,42 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return None
 
 
-def pr_facts(gh: GitHub, sha: str, owners: list[str], sleep: Callable[[float], None] = time.sleep) -> dict:
+def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
+    """The code owners whose latest review that takes a position approves `head`, the one who approved
+    last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review decides (a comment
+    or a pending review changes nothing, and `reviews` is in the API's chronological order), so an approval
+    its owner later withdrew, or that was dismissed, does not count. `exclude` names reviewers whose
+    approval is not allowed to count, such as the last pusher."""
+    latest: dict[str, dict] = {}
+    for review in reviews:
+        login = (review.get("user") or {}).get("login")
+        if login and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest.pop(login, None)
+            latest[login] = review
+    return [login for login, review in latest.items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and login in owners and login not in exclude]
+
+
+def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
+             unreadable: str = "") -> dict:
+    """What the tag records about the PR that merged `sha`. `owners` is None when CODEOWNERS could not be read
+    at the commit's parent, and `unreadable` says why: the PR is still named, but nobody can be matched to an
+    approval, so the approver is unknown and no bypass is claimed. With no PR there is no approval to match,
+    so the owners do not matter."""
     pull = merged_pull(gh, sha, sleep)
     if pull is None:
         return {"pr": "none", "approver": "none", "note": "no pull request merged this commit", "drill": False}
     number = pull["number"]
     full = gh.get(gh.repo_path(f"pulls/{number}"))
     head = full["head"]["sha"]
-    approvals = [review for review in gh.paginate(gh.repo_path(f"pulls/{number}/reviews"))
-                 if review.get("state") == "APPROVED" and review.get("commit_id") == head
-                 and (review.get("user") or {}).get("login") in owners]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
-    if approvals:
-        return {"pr": str(number), "approver": approvals[-1]["user"]["login"], "note": None, "drill": drill}
+    if owners is None:
+        return {"pr": str(number), "approver": "unknown", "drill": drill,
+                "note": f"code owners could not be read: {unreadable or 'CODEOWNERS is not one line of users'}"}
+    approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
+    if approvers:
+        return {"pr": str(number), "approver": approvers[-1], "note": None, "drill": drill}
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
     return {"pr": str(number), "approver": "none", "note": f"ruleset bypass by {merger}", "drill": drill}
 
@@ -117,6 +193,14 @@ def message(n: int, version: str, previous: str, integrity: str, facts: dict, mi
     return "\n".join(lines) + "\n"
 
 
+def refused_by_github(what: str, error: GitHubError, cause: str, done: list[str]) -> Refused:
+    """A write GitHub refused, as the one-line refusal the workflow annotates: what was refused, GitHub's answer,
+    the likely cause, and what this run had already done (it is not undone)."""
+    answer = " ".join(error.body.split())[:300]
+    already = f" Already done in this run: {', '.join(done)}." if done else ""
+    return Refused(f"GitHub refused {what} (HTTP {error.status}: {answer}). {cause}{already}")
+
+
 def tag_exists(gh: GitHub, name: str) -> bool:
     try:
         gh.get(gh.repo_path(f"git/ref/tags/{name}"))
@@ -127,7 +211,8 @@ def tag_exists(gh: GitHub, name: str) -> bool:
     return True
 
 
-def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep) -> list[str]:
+def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
+          now: Callable[[], float] = time.time) -> list[str]:
     todo = pending(git)
     number = git.fleet_tags()[-1]["n"]
     created = []
@@ -138,27 +223,62 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep) -> 
             raise Refused(f"{name} already exists on GitHub but not in this checkout; re-run the sweep")
         parent = git.first_parent(sha)
         version, previous = version_at(git, sha), version_at(git, parent)
-        owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
-        text = message(number, version, previous, integrity_at(git, sha), pr_facts(gh, sha, owners, sleep),
+        if previous == ABSENT:
+            # A restore after a removal moves the Macs from the last version pinned before the removal.
+            previous = last_pinned(git, parent)
+        # The parent's file is fixed history: refusing here would keep every later commit untagged for good, as no
+        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag.
+        try:
+            owners, unreadable = (code_owners(git, parent) if parent else []), ""
+        except Refused as refusal:
+            owners, unreadable = None, " ".join(str(refusal).split())
+        facts = pr_facts(gh, sha, owners, sleep, unreadable)
+        if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
+            raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
+                          "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
+                          "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
+                          "dispatch of tag-release asks again, and from an hour after the commit an unlinked commit "
+                          "is tagged as a push without a pull request.")
+        text = message(number, version, previous, integrity_at(git, sha), facts,
                        store_migration(git, sha, version, previous))
-        tag_object = gh.post(gh.repo_path("git/tags"),
-                             {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
-        gh.post(gh.repo_path("git/refs"), {"ref": f"refs/tags/{name}", "sha": tag_object})
+        try:
+            tag_object = gh.post(gh.repo_path("git/tags"),
+                                 {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]
+            gh.post(gh.repo_path("git/refs"), {"ref": f"refs/tags/{name}", "sha": tag_object})
+        except GitHubError as error:
+            raise refused_by_github(
+                f"to create {name} at {sha[:12]}", error,
+                "The release bot App must be a bypass actor of the fleet-tags-create ruleset, the only way a "
+                "fleet-v tag can be created, and have contents: write.", created) from error
         created.append(f"{name} -> {sha} (ai-tc {version})")
         print(f"created {created[-1]}")
     return created
 
 
 def cleanup_branches(gh: GitHub) -> list[str]:
-    """Delete bot/** branches whose PRs are all closed; keep any with an open PR or with no PR at all."""
+    """Delete a bot/** branch only while it still points at the head a closed PR of that name closed on, and
+    no open PR uses the name. Keep a branch with an open PR, one with no PR at all, and one re-created after its
+    PR closed: a reimport or a repeated rollback reuses a branch name, and a re-created branch is a new commit,
+    so its tip matches no closed PR's head. The REST API has no delete that compares the tip, so a branch
+    re-created between reading the refs and deleting this one would still go; the tip check closes the wider
+    gap between reading the pull requests and the refs."""
     open_heads = {p["head"] for p in list_pulls(gh, "open")}
-    closed_heads = {p["head"] for p in list_pulls(gh, "closed")}
+    closed_tips: dict[str, set[str]] = {}
+    for closed in list_pulls(gh, "closed"):
+        closed_tips.setdefault(closed["head"], set()).add(closed["head_sha"])
     deleted = []
     for ref in gh.get(gh.repo_path("git/matching-refs/heads/bot/")):
         branch = ref["ref"][len("refs/heads/"):]
-        if branch in open_heads or branch not in closed_heads:
+        tip = (ref.get("object") or {}).get("sha")
+        if branch in open_heads or not tip or tip not in closed_tips.get(branch, set()):
             continue
-        gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        try:
+            gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
+        except GitHubError as error:
+            raise refused_by_github(
+                f"to delete {branch}", error,
+                "The release bot App must be a bypass actor of the bot-branches ruleset, which restricts "
+                "deleting bot/** branches, and have contents: write.", deleted) from error
         deleted.append(branch)
     return deleted
 
@@ -179,6 +299,10 @@ def main(argv: list[str] | None = None) -> int:
             print("deleted " + (", ".join(deleted) if deleted else "no branch"))
     except Refused as refusal:
         print(f"::error::{refusal}")
+        return 1
+    except (GitHubError, GitError, InfraError) as error:
+        # A failed read or write, or a checkout without main: one annotation, not a traceback.
+        print(f"::error::{' '.join(str(error).split())}")
         return 1
     return 0
 

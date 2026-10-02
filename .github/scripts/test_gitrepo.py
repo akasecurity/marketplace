@@ -88,8 +88,35 @@ class TestGit(Scratch):
         self.assertEqual(self.git.first_parent_after(base, "main"), [second, merge])
         self.assertEqual(self.git.first_parent(merge), second)
         self.assertIsNone(self.git.first_parent(base))
-        self.assertEqual(len(self.git.commits_between(base, merge)), 3)
         self.assertEqual(self.git.rev_parse("main"), merge)
+
+    def test_merge_base_is_the_last_common_commit_and_none_without_one(self):
+        base = self.commit("a.txt", "base\n")
+        self.sh("switch", "-q", "-c", "side")
+        side = self.commit("b.txt", "side\n")
+        self.sh("switch", "-q", "main")
+        main = self.commit("a.txt", "two\n")
+        self.assertEqual(self.git.merge_base(side, main), base)
+        self.assertEqual(self.git.merge_base(base, main), base)  # an ancestor is its own base with its descendant
+        self.sh("switch", "-q", "--orphan", "other")
+        other = self.commit("c.txt", "unrelated\n")
+        self.assertIsNone(self.git.merge_base(other, main))
+        with self.assertRaises(GitError):
+            self.git.merge_base("0" * 40, main)
+
+    def test_main_is_the_branch_when_a_tag_is_named_main(self):
+        first = self.commit("a.txt", "1\n")
+        second = self.commit("a.txt", "2\n")
+        self.sh("tag", "main", first)
+        # The hazard: git resolves a bare name to the tag before the branch.
+        self.assertEqual(self.git.rev_parse("main"), first)
+        self.assertEqual(self.git.main(), "refs/heads/main")
+        self.assertEqual(self.git.rev_parse(self.git.main()), second)
+        # With origin's main fetched, that is the one read, whatever the local branch has since moved to.
+        self.commit("a.txt", "3\n")
+        self.sh("update-ref", "refs/remotes/origin/main", second)
+        self.assertEqual(self.git.main(), "refs/remotes/origin/main")
+        self.assertEqual(self.git.rev_parse(self.git.main()), second)
 
     def test_commit_time_and_ls_remote(self):
         sha = self.commit("a.txt", "1\n", when="2026-09-02T03:04:05+00:00")
