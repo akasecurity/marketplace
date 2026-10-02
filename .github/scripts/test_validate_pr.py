@@ -234,6 +234,51 @@ class TestHumanRules(unittest.TestCase):
         )
         self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
 
+    def edited_safety_entry(self, version, **changes):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety[version].update(changes)
+        return human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+
+    def test_an_edit_that_keeps_the_class_names_the_fields_it_changes(self):
+        other = "c" * 40
+        for changes, fields in (
+            ({"migrations": []}, "migrations"),
+            ({"from": other}, "from"),
+            ({"to": other}, "to"),
+            ({"from": other, "to": other, "migrations": ["0001_other"]}, "from, to, migrations"),
+        ):
+            with self.subTest(fields=fields):
+                report = self.edited_safety_entry("0.9.14", **changes)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+                self.assertIn(
+                    f"HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> not-rollback-safe "
+                    f"(class unchanged; changes {fields}); the approving code owner owns this classification",
+                    report.notes,
+                )
+
+    def test_an_edit_that_changes_the_class_and_more_names_the_rest(self):
+        report = self.edited_safety_entry("0.9.14", classification="additive", migrations=[])
+        self.assertEqual(report.failures, [])
+        self.assertIn(
+            "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive "
+            "(also changes migrations); the approving code owner owns this classification",
+            report.notes,
+        )
+
+    def test_an_edit_that_only_moves_the_class_names_no_other_field(self):
+        report = self.edited_safety_entry("0.9.14", classification="additive")
+        self.assertFalse(any("changes" in n for n in report.notes), report.notes)
+
+    def test_an_entry_added_or_removed_names_no_field(self):
+        head_safety = {"0.9.8": copy.deepcopy(NEXT_ENTRY), **copy.deepcopy(ts.SEED)}
+        added = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        removed_safety = copy.deepcopy(ts.SEED)
+        del removed_safety["0.9.9"]
+        removed = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=removed_safety)
+        for report in (added, removed):
+            self.assertTrue(any("HUMAN EDIT" in n for n in report.notes), report.notes)
+            self.assertFalse(any("changes" in n for n in report.notes), report.notes)
+
     def test_a_hand_added_entry_for_a_version_nothing_pins_fails(self):
         head_safety = copy.deepcopy(ts.SEED)
         head_safety["0.9.15"] = copy.deepcopy(NEXT_ENTRY)

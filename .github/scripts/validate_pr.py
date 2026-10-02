@@ -167,6 +167,19 @@ def bot_hint(pr: PullRequest, bot_login) -> str:
     return f" Its author {pr.author} is not the marketplace bot App ({bot_login})."
 
 
+def _other_fields(before, after, class_unchanged: bool) -> str:
+    """For an entry edited in place, the fields it changes besides its class, so that an edit
+    which leaves the class alone does not read as "not-rollback-safe -> not-rollback-safe" and
+    nothing else. Empty when the entry was added or removed, or only its class moved."""
+    if not before or not after:
+        return ""
+    fields = [key for key in rc.SAFETY_KEYS if key != "classification" and before.get(key) != after.get(key)]
+    if not fields:
+        return ""
+    names = ", ".join(fields)
+    return f" (class unchanged; changes {names})" if class_unchanged else f" (also changes {names})"
+
+
 def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
     """A person may correct or remove an entry in a reviewed PR, and validate calls each change
     out. Adding one is different: the file holds one entry per pinned version, computed by the
@@ -191,7 +204,7 @@ def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
         new = after["classification"] if after else "removed"
         lowers = "LOWERS THE ROLLBACK FLOOR: " if new == "additive" and old != "additive" else ""
         report.note(
-            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
+            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}{_other_fields(before, after, old == new)}; "
             "the approving code owner owns this classification"
         )
 
