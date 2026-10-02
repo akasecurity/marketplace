@@ -1319,12 +1319,13 @@ def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=c
     return {"classification": result.classification, "from": start, "to": end, "migrations": list(result.migrations)}
 
 
-def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
+def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned) -> str | None:
     """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
     or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
     so does a version in `pinned` with no entry at all: a pin that reached main without a
     computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
-    safety. An entry is judged on its own: one malformed entry flags its own version and
+    safety. `pinned` has no default: leaving it out would drop that rule without saying so.
+    An entry is judged on its own: one malformed entry flags its own version and
     does not stop the others being read, because refusing the file would block every
     rollback."""
     versions = safety.get("versions") if isinstance(safety, dict) else None
