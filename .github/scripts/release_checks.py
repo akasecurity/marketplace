@@ -12,8 +12,11 @@ nothing outside this reviewed file can change a verdict.
     python3 .github/scripts/release_checks.py <command> [args]
 
 prints one JSON document on stdout. The exit status is 0 when the check passes, 1 when
-it fails, and 2 on a usage error or when no verdict could be reached (network, npm, git
-or GitHub API trouble). Human-readable detail goes to stderr.
+it fails, and 2 on a usage error, when no verdict could be reached (network, npm, git or
+GitHub API trouble), or on any unexpected error (reported as the check "internal"). Only
+a verdict exits 1, so a caller that fails on any non-zero status never reads a defect in
+this tool as a release that failed its checks. The argument parser reports its own usage
+errors on stderr alone, with no JSON. Human-readable detail goes to stderr.
 """
 
 from __future__ import annotations
@@ -247,14 +250,30 @@ def _read_manifest(repo_dir: str, rev: str):
     return parse_json(_git(repo_dir, "show", f"{rev}:{MANIFEST}"))
 
 
+def _manifest_at(repo_dir: str, rev: str):
+    """The manifest at rev, or None when rev's tree holds no such file. The tree is listed
+    first so that "the file is not there" (a commit that removed it, which tag-release
+    records as "entry removed") is told apart from "git could not read it" (a missing
+    object, an unfetched blob), which is InfraError. ls-tree exits 0 with no output for an
+    absent path and non-zero for a revision it cannot find."""
+    if not _git(repo_dir, "ls-tree", "--name-only", rev, "--", MANIFEST).strip():
+        return None
+    return _read_manifest(repo_dir, rev)
+
+
 def _tag_pin(repo_dir: str, tag: str) -> str | None:
-    """What a historical tag pins. Lenient about content: a tag whose manifest does not
-    parse, or does not pin the package exactly once, pins nothing. NOT lenient about the
-    read itself: a git failure (a missing object, an unfetched blob) is InfraError, since
-    dropping that tag's pin would hide a version from the candidate and rollback floors."""
+    """What a historical tag pins. Lenient about content: a tag at a commit with no manifest
+    file (tag-release cuts those as "entry removed"), or whose manifest does not parse, or
+    does not pin the package exactly once, pins nothing. NOT lenient about the read itself:
+    a git failure (a missing object, an unfetched blob) is InfraError, since dropping that
+    tag's pin would hide a version from the candidate and rollback floors."""
     try:
-        doc = _read_manifest(repo_dir, f"refs/tags/{tag}")
+        doc = _manifest_at(repo_dir, f"refs/tags/{tag}")
+        if doc is None:
+            return None
         pins = [p for p in _plugins(doc) if pinned_package(p) == PACKAGE]
+    except InfraError:
+        raise
     except (ReleaseCheckError, ValueError):
         return None
     return entry_version(pins[0]) if len(pins) == 1 else None
@@ -267,7 +286,12 @@ def pins_by_ref(repo_dir: str) -> dict:
     except ValueError as exc:
         raise ReleaseCheckError("manifest", f"main's {MANIFEST} does not parse: {exc}") from exc
     pins = {"main": entry_version(find_ai_tc_entry(main_doc))}
-    for tag in fleet_tags(repo_dir):
+    tags = fleet_tags(repo_dir)
+    if not tags:
+        # fleet-v1.. can never be deleted, so an empty list means a checkout that did not
+        # fetch tags, and main's pin alone would silently stand for the whole history.
+        raise InfraError("git", f"{repo_dir} holds no fleet-v<N> tag (was the checkout fetched with tags?)")
+    for tag in tags:
         pins[tag] = _tag_pin(repo_dir, tag)
     return pins
 
@@ -316,6 +340,19 @@ def http_fetch(url: str, headers: dict) -> tuple:
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
+def _github_json(url: str, body: bytes, kind: type, check: str = "api"):
+    """The JSON document a 200 answer from GitHub carries, which must be a `kind` (dict or
+    list). GitHub answered, but not with this document: that is no verdict about the
+    repository or the release, never a finding in it, and never a crash."""
+    try:
+        document = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError(check, f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(document, kind):
+        raise InfraError(check, f"GET {url} did not answer a JSON {'object' if kind is dict else 'list'}")
+    return document
+
+
 def packument_url() -> str:
     return f"{REGISTRY}/{urllib.parse.quote(PACKAGE, safe='@')}"
 
@@ -340,26 +377,116 @@ def npm_candidates(pinned: set, *, fetch: Fetch = http_fetch) -> list:
     return sorted((v for v in exact if floor is None or vkey(v) > floor), key=vkey)
 
 
+# How long one npm call may run before it is reported as hung, by npm sub-command. install
+# fetches the tarball and its dependencies. A hang is not lag, so it is not retried: waiting
+# it out again would only push the run toward its job's own timeout.
+NPM_TIMEOUT = {"init": 120, "--version": 120, "install": 300, "audit": 120}
+
+
 def _npm(run, args: list, work: str):
+    seconds = NPM_TIMEOUT[args[0]]
     try:
-        return run(["npm", *args], cwd=work, capture_output=True, text=True)
+        return run(["npm", *args], cwd=work, capture_output=True, text=True, timeout=seconds)
+    except subprocess.TimeoutExpired as exc:
+        raise InfraError("toolchain", f"npm {args[0]} did not finish within {seconds} s (NOT a signature result)") from exc
     except OSError as exc:
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
 
 
-def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, sleep=time.sleep) -> dict:
-    """Run `npm audit signatures --json --include-attestations` over a scratch,
-    --ignore-scripts install of exactly package@version from npmjs.
+# The first npm whose `audit signatures` honours --include-attestations and prints the verified
+# attestation bundles. An older npm (11.0 to 11.11 as well as 10.x) takes the flag with only a
+# warning and prints no `verified` list, which would read as a release with no provenance.
+MIN_NPM = (11, 12, 0)
 
-    npm does the cryptography (the registry signature and the sigstore bundle); the
-    caller judges what the attestation binds. Needs an npm that honours
-    --include-attestations (11.12 or later). An older one prints no `verified` list at all,
-    which provenance_verdict reports as a toolchain failure, not as a missing attestation."""
+
+def _require_npm_attestations(result) -> None:
+    """The npm on PATH must be 11.12.0 or later."""
+    match = (
+        re.match(r"(\d+)\.(\d+)\.(\d+)", (result.stdout or "").strip()) if result.returncode == 0 else None
+    )
+    if match is None:
+        raise InfraError("toolchain", f"could not read npm's version: {(result.stdout or result.stderr or '')[:200]}")
+    if tuple(int(part) for part in match.groups()) < MIN_NPM:
+        raise InfraError(
+            "toolchain",
+            f"npm {result.stdout.strip()} is older than {'.'.join(map(str, MIN_NPM))}, the first release whose "
+            "audit prints attestation bundles (NOT a signature result)",
+        )
+
+
+class _NotIndexedYet(Exception):
+    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
+
+
+def _npm_report(stdout: str) -> dict:
+    """npm audit's JSON report, or InfraError when what it printed is not one."""
+    try:
+        report = json.loads(stdout)
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {stdout[:500]}") from exc
+    # A report from an npm that honours --include-attestations always carries an "invalid" list
+    # and a "verified" list (empty when nothing verified). npm prints its own failures
+    # ({"error": {...}}) on the same stream with the same exit status, and those are not a
+    # statement about the package.
+    if (
+        not isinstance(report, dict)
+        or "error" in report
+        or not isinstance(report.get("invalid"), list)
+        or not isinstance(report.get("verified"), list)
+    ):
+        raise InfraError(
+            "toolchain",
+            f"npm audit signatures did not print a verified/invalid report (NOT a signature result): {stdout[:500]}",
+        )
+    return report
+
+
+def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
+    """Audit and judge, ATTEMPTS audits in all, with RETRY_SECONDS between them.
+
+    audit_once() returns npm's report, or None when npm printed nothing. judge(report)
+    returns the result, or raises _NotIndexedYet when the release has no verified attestation
+    YET. Nothing printed and not-yet-indexed are waited out alike, from one budget: on the
+    last audit each ends as its own error (InfraError, or _NotIndexedYet for the caller to
+    turn into a verdict). Any other outcome of judge is final."""
+    for attempt in range(1, ATTEMPTS + 1):
+        report = audit_once()
+        if report is None:
+            if attempt == ATTEMPTS:
+                raise InfraError(
+                    "toolchain",
+                    f"npm audit signatures printed nothing after {ATTEMPTS} attempts (NOT a signature result)",
+                )
+        else:
+            try:
+                return judge(report)
+            except _NotIndexedYet:
+                if attempt == ATTEMPTS:
+                    raise
+        sleep(RETRY_SECONDS)
+
+
+def npm_audit_signatures(
+    package: str, version: str, judge: Callable = lambda report: report, *, run=subprocess.run, sleep=time.sleep
+):
+    """Run `npm audit signatures --json --include-attestations` over a scratch,
+    --ignore-scripts install of exactly package@version from npmjs, and return judge(report).
+    verify_release calls this as audit(package, version, judge), so judge is positional.
+
+    npm does the cryptography (the registry signature and the sigstore bundle); judge decides
+    what the attestation binds, and raises _NotIndexedYet while the registry has not indexed
+    it. The install happens ONCE: a lagging registry is waited out by auditing again, and each
+    audit passes --prefer-online so that it asks the registry instead of reading npm's cached
+    copy of the packument (cacheable for five minutes, which would make the retries pointless).
+    Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
+    `verified` list at all, which is reported as a toolchain failure, not as a missing
+    attestation."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
         if init.returncode != 0:
             raise InfraError("toolchain", f"npm init failed: {init.stderr[:2000]}")
+        _require_npm_attestations(_npm(run, ["--version"], work))
         for attempt in range(1, ATTEMPTS + 1):
             install = _npm(
                 run,
@@ -375,15 +502,14 @@ def npm_audit_signatures(package: str, version: str, *, run=subprocess.run, slee
                     f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
                 )
             sleep(RETRY_SECONDS)
-        # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
-        # exit status is not.
-        audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations"], work)
-    if not audit.stdout.strip():
-        raise InfraError("toolchain", "npm audit signatures printed nothing (NOT a signature result)")
-    try:
-        return json.loads(audit.stdout)
-    except ValueError as exc:
-        raise InfraError("toolchain", f"npm audit signatures printed non-JSON: {audit.stdout[:500]}") from exc
+
+        def audit_once():
+            # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
+            # exit status is not.
+            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations", "--prefer-online"], work)
+            return _npm_report(audit.stdout) if audit.stdout.strip() else None
+
+        return _audit_until_judged(audit_once, judge, sleep)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -393,10 +519,6 @@ class VerifiedRelease:
     shasum: str
     git_commit: str
     run_url: str
-
-
-class _NotIndexedYet(Exception):
-    """No verified attestation yet: indexing lags a publish, so this verdict is retried."""
 
 
 def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) -> tuple:
@@ -849,20 +971,42 @@ def release_run_url(statement: SignedStatement) -> str:
     return url
 
 
+def ai_tc_main_head(*, fetch: Fetch = http_fetch) -> str:
+    """The commit ai-tc's main branch points at, read by the fully qualified ref. The short
+    name `main` is ambiguous where a tag of that name exists, and ai-tc forbids no such tag,
+    so nothing here compares against the name. A failed or malformed read is no verdict."""
+    url = f"{AI_TC_API}/git/ref/heads/main"
+    status, body = fetch(url, {})
+    if status != 200:
+        raise InfraError("commit-on-main", f"GET {url} answered {status}")
+    ref = _github_json(url, body, dict, "commit-on-main")
+    obj = ref.get("object")
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if ref.get("ref") != "refs/heads/main" or not isinstance(sha, str) or not SHA40.fullmatch(sha):
+        raise InfraError("commit-on-main", f"GET {url} answered a body that names no commit for refs/heads/main")
+    return sha
+
+
 def commit_on_ai_tc_main(git_commit: str, *, fetch: Fetch = http_fetch) -> str:
-    """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main. Refuses
-    behind (built on main's tip, never merged), diverged, 404 and every error."""
-    url = f"{AI_TC_API}/compare/{git_commit}...main?per_page=1"
+    """Returns 'ahead' or 'identical' when the attested commit is on ai-tc main, compared
+    against main's head as resolved from its full ref.
+
+    These are verdicts: behind (built on main's tip, never merged), diverged, a 404 or a 422
+    (GitHub cannot compare the two), and a JSON object whose status is neither 'ahead' nor
+    'identical', whatever else it holds. These are no verdict: any other HTTP status, and a
+    body that is not a JSON object."""
+    head = ai_tc_main_head(fetch=fetch)
+    url = f"{AI_TC_API}/compare/{git_commit}...{head}?per_page=1"
     status, body = fetch(url, {})
     if status in (404, 422):
         raise ReleaseCheckError("commit-on-main", f"GitHub cannot compare {git_commit} with ai-tc main ({status})")
     if status != 200:
         raise InfraError("commit-on-main", f"GET {url} answered {status}")
-    result = json.loads(body).get("status")
+    result = _github_json(url, body, dict, "commit-on-main").get("status")
     if result not in ("ahead", "identical"):
         raise ReleaseCheckError(
             "commit-on-main",
-            f"compare {git_commit}...main is {result!r}: the attested commit is not on ai-tc main",
+            f"compare {git_commit}...{head} is {result!r}: the attested commit is not on ai-tc main",
         )
     return result
 
@@ -875,19 +1019,15 @@ def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_s
     if not isinstance(version, str) or not SEMVER.fullmatch(version):
         raise ReleaseCheckError("version", f"{version!r} is not an exact x.y.z (pre-releases are never pinned)")
     integrity, shasum = registry_dist(version, fetch=fetch, sleep=sleep)
-    for attempt in range(1, ATTEMPTS + 1):
-        try:
-            statement = provenance_verdict(audit(PACKAGE, version), version, integrity)
-            break
-        except _NotIndexedYet as exc:
-            if attempt == ATTEMPTS:
-                raise ReleaseCheckError(
-                    "provenance",
-                    f"{exc}. Every release of this package is published by GitHub Actions with "
-                    f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
-                    "release pipeline.",
-                ) from None
-            sleep(RETRY_SECONDS)
+    try:
+        statement = audit(PACKAGE, version, lambda report: provenance_verdict(report, version, integrity))
+    except _NotIndexedYet as exc:
+        raise ReleaseCheckError(
+            "provenance",
+            f"{exc}. Every release of this package is published by GitHub Actions with "
+            f"provenance; one without it after {ATTEMPTS} attempts did not come from the "
+            "release pipeline.",
+        ) from None
     git_commit = attested_commit(statement, version)
     run_url = release_run_url(statement)
     commit_on_ai_tc_main(git_commit, fetch=fetch)
@@ -1302,3 +1442,356 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     if "metadata" in base and not _integrity_only(base["metadata"]):
         return "human"
     return "advance" if vkey(new) > vkey(old) else "rollback"
+
+
+# The rulesets this repository must carry: name -> (target, rule types). Bypass lists are
+# visible only to admins, so they are proven by probe when the rulesets are created.
+EXPECTED_RULESETS = {
+    "main": ("branch", {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}),
+    "tags-locked": ("tag", {"creation", "update", "deletion"}),
+    "fleet-tags-create": ("tag", {"creation"}),
+    "fleet-tags-immutable": ("tag", {"update", "deletion", "non_fast_forward"}),
+    "bot-branches": ("branch", {"creation", "update", "deletion"}),
+    "x4-branches": ("branch", {"creation", "update", "deletion"}),
+    "x4-tags": ("tag", {"creation", "update", "deletion"}),
+}
+
+# name -> (the accepted conditions.ref_name include lists, the exclude list). A ruleset
+# retargeted away from its refs keeps rules that still read correctly while it protects
+# nothing, so the patterns are audited too. main is named, never ~DEFAULT_BRANCH: a
+# default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
+# `/`), so bot-branches and tags-locked each list both depths. tags-locked never uses ~ALL:
+# GitHub documents it as every branch, and on a tag ruleset it could lock no tag.
+# x4 is one level on purpose: the branches it protects are named x4/<name>, and a tag that
+# shadows one carries the same name. Any deeper tag is covered by tags-locked.
+EXPECTED_REF_PATTERNS = {
+    "main": ([["refs/heads/main"]], []),
+    "tags-locked": ([["refs/tags/*", "refs/tags/**/*"]], ["refs/tags/fleet-v*"]),
+    "fleet-tags-create": ([["refs/tags/fleet-v*"]], []),
+    "fleet-tags-immutable": ([["refs/tags/fleet-v*"]], []),
+    "bot-branches": ([["refs/heads/bot/*", "refs/heads/bot/**/*"]], []),
+    "x4-branches": ([["refs/heads/x4/*"]], []),
+    "x4-tags": ([["refs/tags/x4/*"]], []),
+}
+
+
+def snapshot_tags(repo_dir: str) -> list:
+    """[{tag, object, commit}] for every fleet-v tag: the frozen list's shape."""
+    return [
+        {
+            "tag": tag,
+            "object": _git(repo_dir, "rev-parse", f"refs/tags/{tag}").strip(),
+            "commit": _git(repo_dir, "rev-parse", f"refs/tags/{tag}^{{commit}}").strip(),
+        }
+        for tag in fleet_tags(repo_dir)
+    ]
+
+
+def parse_tag_message(text: str) -> dict:
+    """A fleet-v tag message: the subject line, then `key: value` lines (the first one wins)."""
+    lines = text.splitlines()
+    fields = {"subject": lines[0].strip() if lines else ""}
+    for line in lines[1:]:
+        match = re.fullmatch(r"([a-z][a-z-]*): (.+)", line.strip())
+        if match and match.group(1) not in fields:
+            fields[match.group(1)] = match.group(2).strip()
+    return fields
+
+
+def _tag_rows(path: str, label: str, problems: list):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            rows = parse_json(handle.read())
+    except (OSError, ValueError) as exc:
+        problems.append(f"the {label} {path} is unreadable: {exc}")
+        return None
+    well_formed = isinstance(rows, list) and all(
+        isinstance(r, dict)
+        and set(r) == {"tag", "object", "commit"}
+        and isinstance(r["tag"], str)
+        and FLEET_TAG.fullmatch(r["tag"])
+        and isinstance(r["object"], str)
+        and SHA40.fullmatch(r["object"])
+        and isinstance(r["commit"], str)
+        and SHA40.fullmatch(r["commit"])
+        for r in rows
+    )
+    if not well_formed:
+        problems.append(f"the {label} {path} must be a list of {{tag, object, commit}} rows")
+        return None
+    return rows
+
+
+def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
+    """The checks for a tag cut after the frozen list, i.e. by tag-release."""
+    problems = []
+    commit = row["commit"]
+    if here is None:
+        problems.append(f"{name}'s commit {commit} is not on main's first-parent history")
+    elif previous[0] is not None and here <= previous[0]:
+        problems.append(f"{name}'s commit is not later on main than {previous[1]}'s")
+    message = parse_tag_message(_git(repo_dir, "for-each-ref", "--format=%(contents)", f"refs/tags/{name}"))
+    recorded = message.get("version", "")
+    if message["subject"] != f"{name}: ai-tc {recorded}":
+        problems.append(f"{name}'s subject {message['subject']!r} is not '{name}: ai-tc <version>'")
+    try:
+        manifest = _manifest_at(repo_dir, commit)
+        entry = None if manifest is None else find_ai_tc_entry(manifest)
+        expected = "entry removed" if entry is None else entry_version(entry)
+    except (ReleaseCheckError, ValueError) as exc:
+        expected = f"an unreadable manifest ({exc})"
+    if recorded != expected:
+        problems.append(f"{name} records version {recorded!r}, but the manifest at its commit pins {expected!r}")
+    number = re.fullmatch(r"#?([1-9][0-9]*)", message.get("pr", ""))
+    if number is None:
+        problems.append(f"{name} names no PR (a 'pr: <number>' line)")
+        return problems
+    url = f"{MARKETPLACE_API}/pulls/{number.group(1)}"
+    status, body = fetch(url, {})
+    if status == 404:
+        # The one answer that is a finding: a tag naming a PR that is not there was cut outside tag-release.
+        problems.append(f"{name} names PR #{number.group(1)}, which does not exist")
+        return problems
+    if status != 200:
+        raise InfraError("api", f"GET {url} answered {status}")
+    pull = _github_json(url, body, dict)
+    user = pull.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    if BOT_LOGIN is None:
+        problems.append(f"{name}: no bot identity is configured (release_checks.BOT_LOGIN), so no tag after the frozen list can be confirmed")
+    elif author != BOT_LOGIN:
+        problems.append(
+            f"{name}: PR #{number.group(1)} was opened by {author}, not the bot App ({BOT_LOGIN}); "
+            f"a break-glass PR's tag stays red until a reviewed PR adds it to {FROZEN_TAGS_FILE}"
+        )
+    if not pull.get("merged_at") or pull.get("merge_commit_sha") != commit:
+        problems.append(f"{name}: PR #{number.group(1)} is not merged with {commit} as its merge commit")
+    return problems
+
+
+def _main_ruleset_problems(rules: dict) -> list:
+    problems = []
+    review = rules.get("pull_request") or {}
+    count = review.get("required_approving_review_count")
+    if not isinstance(count, int) or count < 1:
+        problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
+    for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+        if review.get(key) is not True:
+            problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
+    if review.get("allowed_merge_methods") != ["squash"]:
+        problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
+    checks = (rules.get("required_status_checks") or {}).get("required_status_checks") or []
+    if not any(
+        isinstance(c, dict) and c.get("context") == "validate" and c.get("integration_id") == GITHUB_ACTIONS_APP_ID
+        for c in checks
+    ):
+        problems.append("ruleset 'main' does not require the validate check from the GitHub Actions app")
+    return problems
+
+
+def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
+    """Every expected ruleset exists, is active, targets the right refs and has its rules.
+    A read of GitHub that fails, or that answers something other than the document asked
+    for, is InfraError: no verdict. It is never reported as a ruleset that is missing."""
+    # includes_parents=false leaves out the organisation's and the enterprise's rulesets: a
+    # ruleset this repository does not own is not one it can be said to carry.
+    url = f"{MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
+    status, body = fetch(url, {})
+    if status != 200:
+        raise InfraError("api", f"GET {url} answered {status}")
+    listing = _github_json(url, body, list)
+    if not all(isinstance(r, dict) for r in listing):
+        raise InfraError("api", f"GET {url} listed an entry that is not a ruleset")
+    problems = []
+    for name, (target, rule_types) in EXPECTED_RULESETS.items():
+        found = [r for r in listing if r.get("name") == name]
+        if not found:
+            problems.append(f"ruleset {name!r} does not exist")
+            continue
+        if len(found) != 1:
+            # Which of them is the one in force is not for this audit to guess.
+            problems.append(f"ruleset {name!r}: expected exactly one, found {len(found)}")
+            continue
+        summary = found[0]
+        url = f"{MARKETPLACE_API}/rulesets/{summary.get('id')}"
+        status, body = fetch(url, {})
+        if status != 200:
+            raise InfraError("api", f"GET {url} answered {status}")
+        ruleset = _github_json(url, body, dict)
+        if ruleset.get("enforcement") != "active":
+            problems.append(f"ruleset {name!r} is {ruleset.get('enforcement')!r}, not active")
+        if ruleset.get("target") != target:
+            problems.append(f"ruleset {name!r} targets {ruleset.get('target')!r}, not {target!r}")
+        includes, exclude = EXPECTED_REF_PATTERNS[name]
+        ref_name = (ruleset.get("conditions") or {}).get("ref_name") or {}
+        got_include, got_exclude = sorted(ref_name.get("include") or []), sorted(ref_name.get("exclude") or [])
+        if got_include not in [sorted(option) for option in includes] or got_exclude != sorted(exclude):
+            wanted = " or ".join(str(sorted(option)) for option in includes)
+            problems.append(
+                f"ruleset {name!r} covers include {got_include} exclude {got_exclude}, "
+                f"not include {wanted} exclude {sorted(exclude)}"
+            )
+        rules = {r.get("type"): r.get("parameters") or {} for r in ruleset.get("rules") or [] if isinstance(r, dict)}
+        missing = sorted(rule_types - set(rules))
+        if missing:
+            problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")
+        if name == "main":
+            problems.extend(_main_ruleset_problems(rules))
+    return problems
+
+
+def audit_tags(repo_dir: str, frozen_path: str, *, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
+    """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
+    detection, not prevention: the rulesets prevent, and this notices when one was edited.
+    A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
+    verdict, and a problem would file a drift that did not happen."""
+    problems = []
+    current = {row["tag"]: row for row in snapshot_tags(repo_dir)}
+    for name in _git(repo_dir, "for-each-ref", "--format=%(refname:strip=2)", "refs/tags").split():
+        if not FLEET_TAG.fullmatch(name):
+            problems.append(f"tag {name!r} exists: no tag other than fleet-v<N> may exist")
+    frozen = _tag_rows(frozen_path, "frozen tag list", problems)
+    if frozen is None:
+        return problems
+    for row in frozen:
+        now = current.get(row["tag"])
+        if now is None:
+            problems.append(f"{row['tag']} is in the frozen list but no longer exists")
+        elif now != row:
+            problems.append(
+                f"{row['tag']} changed since the frozen list: {row['object']} -> {row['commit']} "
+                f"is now {now['object']} -> {now['commit']}"
+            )
+    for name, row in current.items():
+        if _git(repo_dir, "cat-file", "-t", row["object"]).strip() != "tag":
+            problems.append(f"{name} is a lightweight tag; every fleet-v tag is annotated")
+    numbers = sorted(int(name[len("fleet-v"):]) for name in current)
+    if numbers != list(range(1, len(numbers) + 1)):
+        problems.append(f"fleet-v numbering is not contiguous from 1: {numbers}")
+    frozen_names = {row["tag"] for row in frozen}
+    order = _git(repo_dir, "rev-list", "--first-parent", "--reverse", main_ref(repo_dir)).split()
+    position = {commit: index for index, commit in enumerate(order)}
+    previous = (None, None)
+    for name in fleet_tags(repo_dir):
+        row = current[name]
+        here = position.get(row["commit"])
+        if name not in frozen_names:
+            problems.extend(_audit_new_tag(repo_dir, name, row, here, previous, fetch))
+        previous = (here, name)
+    if check_rulesets:
+        problems.extend(audit_rulesets(fetch=fetch))
+    return problems
+
+
+def _emit(document, code: int) -> int:
+    print(json.dumps(document, indent=2, ensure_ascii=False))
+    return code
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="release_checks.py", description="Release checks for the ai-tc pin.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version")
+    candidates = sub.add_parser("candidates", help="exact npm versions above everything pinned")
+    candidates.add_argument("--repo", default=".")
+    classify = sub.add_parser("classify", help="classify ai-tc's store migrations between two commits")
+    classify.add_argument("from_commit")
+    classify.add_argument("to_commit")
+    entry = sub.add_parser("safety-entry", help="the rollback-safety.json entry for a version")
+    entry.add_argument("version")
+    entry.add_argument("--repo", default=".")
+    floor = sub.add_parser("floor", help="the rollback floor a target would cross")
+    floor.add_argument("target")
+    floor.add_argument("--repo", default=".")
+    floor.add_argument("--safety", default=SAFETY_FILE)
+    audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
+    audit.add_argument("--repo", default=".")
+    audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
+    audit.add_argument("--no-rulesets", action="store_true")
+    sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
+    mode = sub.add_parser("diff-mode", help="classify a manifest change")
+    mode.add_argument("base")
+    mode.add_argument("head")
+    return parser
+
+
+def _load(path: str):
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    try:
+        return parse_json(text)
+    except ValueError as exc:
+        raise ReleaseCheckError("parse", f"{path} does not parse: {exc}") from exc
+
+
+def _command(args) -> int:
+    if args.command == "verify-version":
+        release = verify_release(args.version)
+        print(f"OK: {PACKAGE}@{release.version} built from {release.git_commit} on ai-tc main", file=sys.stderr)
+        return _emit(dataclasses.asdict(release), 0)
+    if args.command == "candidates":
+        pinned = pinned_versions(args.repo)
+        return _emit({"pinned": sorted(pinned, key=vkey), "candidates": npm_candidates(pinned)}, 0)
+    if args.command == "classify":
+        result = classify_migrations(args.from_commit, args.to_commit)
+        for tag, kind in result.kinds.items():
+            print(f"{tag}: {kind}", file=sys.stderr)
+        if result.note:
+            print(result.note, file=sys.stderr)
+        return _emit(
+            {"classification": result.classification, "from": args.from_commit, "to": args.to_commit, "migrations": result.migrations},
+            0,
+        )
+    if args.command == "safety-entry":
+        return _emit({"version": args.version, "entry": safety_entry(args.version, pinned_versions(args.repo))}, 0)
+    if args.command == "floor":
+        safety = _load(args.safety)
+        pinned = pinned_versions(args.repo)
+        if not pinned:
+            raise ReleaseCheckError("floor", "nothing is pinned, so there is no rollback to judge")
+        highest = max(pinned, key=vkey)
+        floor = rollback_floor(safety, args.target, highest, pinned=pinned)
+        result = {"target": args.target, "highest_pinned": highest, "floor": floor}
+        if floor is None:
+            return _emit(result, 0)
+        detail = f"{args.target} is below {floor}, which is flagged not rollback-safe"
+        print(f"::error::floor: {detail}", file=sys.stderr)
+        result["error"] = {"check": "floor", "detail": detail}
+        return _emit(result, 1)
+    if args.command == "audit-tags":
+        problems = audit_tags(args.repo, args.frozen, check_rulesets=not args.no_rulesets)
+        for problem in problems:
+            print(f"::error::{problem}", file=sys.stderr)
+        return _emit({"problems": problems}, 1 if problems else 0)
+    if args.command == "snapshot-tags":
+        return _emit(snapshot_tags(args.repo), 0)
+    return _emit({"mode": diff_mode(_load(args.base), _load(args.head))}, 0)
+
+
+def main(argv=None) -> int:
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    try:
+        return _command(args)
+    except InfraError as exc:
+        print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
+        return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 2)
+    except ReleaseCheckError as exc:
+        print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
+        return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 1)
+    except (OSError, ValueError) as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
+    except Exception as exc:
+        # Neither a verdict nor a known failure: a defect in this tool, or a document shaped in
+        # a way it did not expect. It reached no verdict, so it must not exit 1 (a verdict).
+        # KeyboardInterrupt and SystemExit are not Exceptions and pass through.
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"::error::internal: {detail}", file=sys.stderr)
+        return _emit({"error": {"check": "internal", "detail": detail}}, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
