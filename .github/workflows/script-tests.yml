@@ -3,14 +3,13 @@ name: script-tests
 # Runs the release-check unit tests on the PR's own code. This is safe on pull_request:
 # the token is read-only and no secret is in scope. It is not a required check; a red run
 # here means the module every release workflow runs has regressed.
+#
+# It runs on every pull request, with no path filter. The suite takes about a minute, and a
+# filter has to name every file a test reads: one did not, and a change to a workflow file
+# alone ran no tests, though a test reads the workflow.
 
 on:
   pull_request:
-    paths:
-      - ".github/scripts/**"
-      - ".github/workflows/script-tests.yml"
-      - ".claude-plugin/marketplace.json"
-      - "rollback-safety.json"
   push:
     branches: [main]
 

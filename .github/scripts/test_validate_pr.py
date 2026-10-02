@@ -679,6 +679,49 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn("npm 11.12", text)
 
 
+class TestScriptTestsWorkflow(unittest.TestCase):
+    """The unit tests read workflow files, so a change to one must run them."""
+
+    WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / "workflows" / "script-tests.yml"
+
+    @staticmethod
+    def under_pull_request(text):
+        """What script-tests.yml nests under `on: pull_request:` (comments left out); the
+        standard library has no YAML reader, and this file's `on:` block is plain."""
+        lines = text.splitlines()
+        block = []
+        for line in lines[lines.index("on:") + 1:]:
+            if line.strip() and not line.startswith(" "):
+                break
+            block.append(line)
+        keys = [i for i, line in enumerate(block) if re.fullmatch(r"  pull_request:\s*(#.*)?", line)]
+        if len(keys) != 1:
+            return None
+        nested = []
+        for line in block[keys[0] + 1:]:
+            if line.strip() and not line.startswith("    "):
+                break
+            if line.strip() and not line.strip().startswith("#"):
+                nested.append(line.strip())
+        return nested
+
+    def test_the_unit_tests_run_on_every_pull_request(self):
+        nested = self.under_pull_request(self.WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIsNotNone(nested, "script-tests.yml must declare pull_request exactly once, under on:")
+        self.assertEqual(nested, [], "a path, branch or type filter on pull_request leaves some changes untested")
+
+    def test_the_reader_sees_a_filter_wherever_it_is_written(self):
+        for text, expected in (
+            ("on:\n  pull_request:\n  push:\n    branches: [main]\n", []),
+            ("on:\n  pull_request:   # every PR\n  push:\n", []),
+            ("on:\n  pull_request:\n    paths:\n      - 'a'\n  push:\n", ["paths:", "- 'a'"]),
+            ("on:\n  pull_request:\n    branches: [main]\n", ["branches: [main]"]),
+            ("on:\n  push:\n    branches: [main]\n", None),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.under_pull_request(text), expected)
+
+
 class TestSummary(unittest.TestCase):
     def test_pull_request_text_is_inert_in_the_summary(self):
         # Every name a pull request supplies reaches the summary, which renders as markdown.
