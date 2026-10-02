@@ -324,14 +324,14 @@ class TestNoResults(RouterCase):
 class TestWorkflowIssueLifetime(RouterCase):
     """The issue for an evaluation job that did not finish closes only where the next run re-checks everything."""
 
-    def open_workflow_issue(self, label):
-        self.issues = [{"number": 40, "body": rt.marker("rule", f"{label}-workflow"), "created_at": "2026-10-01T10:00:00Z",
-                        "labels": [{"name": label}], "assignees": []}]
+    def open_workflow_issue(self, label, rule=None):
+        self.issues = [{"number": 40, "body": rt.marker("rule", rule or f"{label}-workflow"),
+                        "created_at": "2026-10-01T10:00:00Z", "labels": [{"name": label}], "assignees": []}]
 
-    def clean_run(self, label):
+    def clean_run(self, label, push=None):
         green = rt.Result(rule=label, label=label, title="t", red=False, auto_close=False)
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            code = rt.route([green], label=label, job_result="success", router=self.router())
+            code = rt.route([green], label=label, job_result="success", router=self.router(), push=push)
         return code, out.getvalue()
 
     def test_a_state_based_rule_closes_it_when_the_next_run_is_clean(self):
@@ -342,28 +342,61 @@ class TestWorkflowIssueLifetime(RouterCase):
         self.assertEqual(len(self.gh.called("PATCH", R("issues/40"))), 1)
 
     def test_main_audit_leaves_it_for_a_person_because_a_run_audits_only_its_own_push(self):
-        self.open_workflow_issue("main-audit")
-        code, out = self.clean_run("main-audit")
-        self.assertEqual(code, 0)
-        self.assertIn("main-audit-workflow: clear", out)
-        self.assertNotIn("closed", out)
-        self.assertEqual(self.gh.writes(), [])
+        self.open_workflow_issue("main-audit", f"main-audit-workflow-{'a' * 12}")
+        # A clean run for the same push cannot happen (a push is audited once), but a clean run for the next
+        # one says nothing about this push, and neither run closes its issue.
+        for push in ("a" * 40, "b" * 40):
+            with self.subTest(push=push[:1]):
+                code, out = self.clean_run("main-audit", push)
+                self.assertEqual(code, 0)
+                self.assertIn(f"main-audit-workflow-{push[:12]}: ", out)
+                self.assertNotIn("closed", out)
+                self.assertEqual(self.gh.writes(), [])
 
     def test_main_audit_files_it_saying_a_person_closes_it(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
-            rt.route([], label="main-audit", job_result="failure", router=self.router())
+            rt.route([], label="main-audit", job_result="failure", router=self.router(), push="a" * 40)
         body = self.gh.called("POST", R("issues"))[0][2]["body"]
         self.assertIn("A person closes it once it is explained.", body)
         self.assertNotIn("closes by itself", body)
+
+    def test_main_audit_files_a_failed_job_against_its_own_push(self):
+        for job_result, ending in (("failure", "did not finish"), ("success", "reported no results")):
+            with self.subTest(job_result):
+                gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+                router = rt.Router(gh, approvers=["Vaishnav-OM"], escalation=None, owners=["Vaishnav-OM"], now=NOW,
+                                   run_url=RUN)
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    rt.route(None if job_result == "success" else [], label="main-audit", job_result=job_result,
+                             router=router, push="c" * 40)
+                opened = gh.called("POST", R("issues"))[0][2]
+                self.assertEqual(opened["title"], f"main-audit: the evaluation job for the push to {'c' * 12} {ending}")
+                self.assertEqual(rt.read_marker(opened["body"], "rule"), f"main-audit-workflow-{'c' * 12}")
+                self.assertIn(f"`{'c' * 12}`", opened["body"])
+
+    def test_a_label_that_audits_everything_each_run_keeps_one_issue_whatever_push_it_is_given(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="staleness", job_result="failure", router=self.router(), push="d" * 40)
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(opened["title"], "staleness: the evaluation job did not finish")
+        self.assertEqual(rt.read_marker(opened["body"], "rule"), "staleness-workflow")
+
+    def test_main_audit_without_a_push_keeps_the_one_shared_issue(self):
+        # No AFTER means no key to file it under; the shared rule fails closed rather than going unrecorded.
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            rt.route([], label="main-audit", job_result="failure", router=self.router())
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(opened["title"], "main-audit: the evaluation job did not finish")
+        self.assertEqual(rt.read_marker(opened["body"], "rule"), "main-audit-workflow")
 
 
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 
-    def run_main(self, *, job_result, results_json=None, label="staleness"):
-        gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+    def run_main(self, *, job_result, results_json=None, label="staleness", gh=None, extra_env=None):
+        gh = gh or FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
         env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "9",
-               "JOB_RESULT": job_result}
+               "JOB_RESULT": job_result, **(extra_env or {})}
         if results_json is not None:
             env["RESULTS_JSON"] = results_json
         with tempfile.TemporaryDirectory() as root:
@@ -400,6 +433,21 @@ class TestMain(unittest.TestCase):
     def test_main_audit_with_no_output_is_red(self):
         self.assertEqual(self.run_main(job_result="success", label="main-audit"),
                          (1, ["main-audit: the evaluation job reported no results"]))
+
+    def test_a_second_failed_main_audit_run_files_its_own_issue(self):
+        filed = []
+
+        def post(body, params):
+            filed.append({"number": 40 + len(filed), "body": body["body"], "created_at": "2026-10-01T10:00:00Z",
+                          "labels": [{"name": label} for label in body["labels"]], "assignees": []})
+            return filed[-1]
+
+        gh = FakeGitHub({("GET", R("issues")): lambda body, params: list(filed), ("POST", R("issues")): post})
+        for after in ("a" * 40, "b" * 40):
+            self.run_main(job_result="failure", label="main-audit", gh=gh, extra_env={"AFTER": after})
+        self.assertEqual([call[2]["title"] for call in gh.called("POST", R("issues"))],
+                         [f"main-audit: the evaluation job for the push to {sha * 12} did not finish" for sha in "ab"])
+        self.assertEqual(gh.called("POST", R("issues/40/comments")), [])
 
     def test_a_success_with_unparsable_results_files_an_issue_instead_of_crashing(self):
         self.assertEqual(self.run_main(job_result="success", results_json="{not json"),

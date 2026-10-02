@@ -7,8 +7,8 @@ assigned to the release approvers in .github/release-approvers.json and
 mentions the code owners in .github/CODEOWNERS. A red rule comments only when
 its detail changes, or once a day; after 48 hours the escalation owner is
 assigned; a rule that clears closes its issue, unless its result says
-otherwise (main-audit's per-push results never do: the next run audits only its
-own push, so a person closes them). GitHub mails a failed scheduled run only to whoever last edited
+otherwise (main-audit's results never do: the next run audits only its own push, so
+a person closes them; its failed-job result is keyed to the push as well). GitHub mails a failed scheduled run only to whoever last edited
 its cron line, which is why red goes to an issue.
 """
 from __future__ import annotations
@@ -33,6 +33,8 @@ APPROVERS_FILE = ".github/release-approvers.json"
 CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
 ESCALATE_AFTER = dt.timedelta(hours=48)
+# The labels whose run audits only its own push: their results do not auto-close, and a failed job is filed under
+# the push it failed on (route), so a later run neither reuses nor closes it.
 PER_PUSH_LABELS = {"main-audit"}
 
 
@@ -237,7 +239,7 @@ class Router:
         self.gh.post(self.gh.repo_path(f"issues/{number}/comments"), {"body": text})
 
 
-def route(results: list[Result] | None, *, label: str, job_result: str, router: Router) -> int:
+def route(results: list[Result] | None, *, label: str, job_result: str, router: Router, push: str | None = None) -> int:
     """Apply every result. Returns the exit code.
 
     An evaluation job that did not finish is itself a red result, and so is one that finished but handed
@@ -250,24 +252,31 @@ def route(results: list[Result] | None, *, label: str, job_result: str, router: 
     closes that rule's issue. It says nothing about which evaluator sends it: an evaluator that always
     appends a clear result of its own never sends one. The detail names no run URL: it is digested to decide
     whether anything changed, and every run has its own URL, while the comment appends it.
+
+    A per-push label (main-audit) files this result under `push`, the sha the run was for: a failed job
+    leaves its push unaudited, and a second failed run would otherwise find the first one's issue, see the
+    same detail inside a day, and write nothing. Without a push the rule stays the shared one, so a missing
+    key fails closed.
     """
     finished = job_result == "success"
     reported = finished and results is not None
+    # main-audit checks one push per run, so a later clean run says nothing about the push whose job did
+    # not finish: its workflow issue stays open for a person. The other rules re-check all state every run.
+    key = push[:12] if push and label in PER_PUSH_LABELS else None
+    job = f"{label} evaluation job" + (f" for the push to `{key}`" if key else "")
     if reported:
         problem = None
     elif finished:
-        problem = (f"The {label} evaluation job finished but reported no results that could be read, so none of "
+        problem = (f"The {job} finished but reported no results that could be read, so none of "
                    "its checks ran and their issues were left as they were.")
     else:
-        problem = (f"The {label} evaluation job ended `{job_result or 'unknown'}`; its checks did not run, so "
+        problem = (f"The {job} ended `{job_result or 'unknown'}`; its checks did not run, so "
                    "their issues were left as they were.")
     results = list(results or []) if reported else []
-    # main-audit checks one push per run, so a later clean run says nothing about the push whose job did
-    # not finish: its workflow issue stays open for a person. The other rules re-check all state every run.
     results.append(Result(
-        rule=f"{label}-workflow", label=label, red=problem is not None, detail=problem or "",
-        auto_close=label not in PER_PUSH_LABELS,
-        title=f"{label}: the evaluation job "
+        rule=f"{label}-workflow" + (f"-{key}" if key else ""), label=label, red=problem is not None,
+        detail=problem or "", auto_close=label not in PER_PUSH_LABELS,
+        title=f"{label}: the evaluation job" + (f" for the push to {key}" if key else "") + " "
               + ("reported no results" if finished else "did not finish")))
     red = False
     for result in results:
@@ -302,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
             results = results_from_json(raw) if raw.strip() else None
         except (ValueError, TypeError):
             results = None
-    return route(results, label=args.label, job_result=job_result, router=router)
+    return route(results, label=args.label, job_result=job_result, router=router, push=env.get("AFTER") or None)
 
 
 if __name__ == "__main__":
