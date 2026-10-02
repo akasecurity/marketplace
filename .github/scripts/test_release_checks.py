@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -2418,6 +2419,79 @@ class TestCli(unittest.TestCase):
     def test_usage_errors_exit_2(self):
         self.assertEqual(cli("no-such-command")[0], 2)
         self.assertEqual(cli("floor")[0], 2)
+
+    def test_a_malformed_version_argument_is_a_usage_error_not_a_verdict(self):
+        # Only a verdict exits 1. These used to reach the check, which refused the text as a
+        # failed check named "version", so a caller read a typo as a release that failed.
+        repo = self.repo()
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        for verb in (
+            ["verify-version"],
+            ["safety-entry", "--repo", repo.path],
+            ["floor", "--repo", repo.path, "--safety", safety],
+        ):
+            for bad in ("0.9.x", "0.9", "v0.9.14", "0.9.09", "0.9.14-rc.1", ""):
+                with self.subTest(verb=verb[0], version=bad):
+                    argv = [verb[0], bad, *verb[1:]]
+                    code, out, err = cli(*argv)
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertIn("is not an exact x.y.z", err)
+
+    def test_a_well_formed_version_argument_still_reaches_its_check(self):
+        repo = self.repo()
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        with mock.patch.object(rc, "verify_release", return_value=fake_verify("0.9.14")) as verify:
+            self.assertEqual(cli("verify-version", "0.9.14")[0], 0)
+        verify.assert_called_once_with("0.9.14")
+        self.assertEqual(cli("floor", "0.9.13", "--repo", repo.path, "--safety", safety)[0], 1)
+
+    def test_a_malformed_commit_id_is_a_usage_error_not_a_verdict(self):
+        good = "a" * 40
+        for argv in (
+            ("abc", "def"),
+            (good, "b" * 39),
+            ("b" * 41, good),
+            (good.upper(), good),
+            (good, "g" * 40),
+            ("", good),
+        ):
+            with self.subTest(argv=argv):
+                code, out, err = cli("classify", *argv)
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("is not a 40-hex commit id", err)
+
+    def elsewhere(self):
+        """Run from a directory that holds none of the repository's files."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        previous = os.getcwd()
+        os.chdir(holder.name)
+        self.addCleanup(os.chdir, previous)
+        return holder.name
+
+    def test_the_audit_reads_the_frozen_list_from_the_repo_it_was_pointed_at(self):
+        # The default used to be relative to the current directory, so `--repo ./clone` run from
+        # anywhere else reported the list as unreadable, which reads as tag drift (exit 1).
+        repo = self.repo()
+        repo.write(rc.FROZEN_TAGS_FILE, rc.dump_json(rc.snapshot_tags(repo.path)))
+        self.elsewhere()
+        code, out, _ = cli("audit-tags", "--repo", repo.path, "--no-rulesets")
+        self.assertEqual((code, json.loads(out)), (0, {"problems": []}))
+
+    def test_floor_reads_the_safety_file_from_the_repo_it_was_pointed_at(self):
+        repo = self.repo()
+        repo.write(rc.SAFETY_FILE, rc.dump_json({"versions": ts.SEED}))
+        self.elsewhere()
+        code, out, _ = cli("floor", "0.9.13", "--repo", repo.path)
+        result = json.loads(out)
+        self.assertEqual((code, result["floor"], result["highest_pinned"]), (1, "0.9.14", "0.9.14"))
+
+    def test_a_path_given_on_the_command_line_is_used_as_given(self):
+        repo = self.repo()
+        frozen = repo.write("elsewhere/frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        repo.tag("stray")
+        code, out, _ = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--no-rulesets")
+        self.assertEqual((code, json.loads(out)["problems"]), (1, ["tag 'stray' exists: no tag other than fleet-v<N> may exist"]))
 
     def test_an_unexpected_error_exits_2_as_internal(self):
         # Only a verdict exits 1. A bug in this tool, or a document shaped in a way it did

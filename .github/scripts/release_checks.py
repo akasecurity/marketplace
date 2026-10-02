@@ -16,7 +16,8 @@ it fails, and 2 on a usage error, when no verdict could be reached (network, npm
 GitHub API trouble), or on any unexpected error (reported as the check "internal"). Only
 a verdict exits 1, so a caller that fails on any non-zero status never reads a defect in
 this tool as a release that failed its checks. The argument parser reports its own usage
-errors on stderr alone, with no JSON. Human-readable detail goes to stderr.
+errors on stderr alone, with no JSON; a version that is not an exact x.y.z, or a commit id
+that is not 40 lower-case hex, is one of them. Human-readable detail goes to stderr.
 """
 
 from __future__ import annotations
@@ -1809,25 +1810,46 @@ def _emit(document, code: int) -> int:
     return code
 
 
+def _version(text: str) -> str:
+    """An argument that must be an exact x.y.z. Malformed is a usage error (exit 2, reported by
+    the argument parser on stderr alone), not a verdict about any release."""
+    if not SEMVER.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not an exact x.y.z")
+    return text
+
+
+def _commit_id(text: str) -> str:
+    """An argument that must be a full lower-case commit id, with the same usage-error status."""
+    if not SHA40.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a 40-hex commit id")
+    return text
+
+
+def _in_repo(repo: str, given: str | None, default: str) -> str:
+    """The path the caller gave, else `default` inside the repository --repo names. Never a
+    path relative to whatever directory the command was started from."""
+    return given if given is not None else os.path.join(repo, default)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="release_checks.py", description="Release checks for the ai-tc pin.")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version")
+    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version", type=_version)
     candidates = sub.add_parser("candidates", help="exact npm versions above everything pinned")
     candidates.add_argument("--repo", default=".")
     classify = sub.add_parser("classify", help="classify ai-tc's store migrations between two commits")
-    classify.add_argument("from_commit")
-    classify.add_argument("to_commit")
+    classify.add_argument("from_commit", type=_commit_id)
+    classify.add_argument("to_commit", type=_commit_id)
     entry = sub.add_parser("safety-entry", help="the rollback-safety.json entry for a version")
-    entry.add_argument("version")
+    entry.add_argument("version", type=_version)
     entry.add_argument("--repo", default=".")
     floor = sub.add_parser("floor", help="the rollback floor a target would cross")
-    floor.add_argument("target")
+    floor.add_argument("target", type=_version)
     floor.add_argument("--repo", default=".")
-    floor.add_argument("--safety", default=SAFETY_FILE)
+    floor.add_argument("--safety", default=None, help=f"default: {SAFETY_FILE} in --repo")
     audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
     audit.add_argument("--repo", default=".")
-    audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
+    audit.add_argument("--frozen", default=None, help=f"default: {FROZEN_TAGS_FILE} in --repo")
     audit.add_argument("--no-rulesets", action="store_true")
     sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
     mode = sub.add_parser("diff-mode", help="classify a manifest change")
@@ -1866,7 +1888,7 @@ def _command(args) -> int:
     if args.command == "safety-entry":
         return _emit({"version": args.version, "entry": safety_entry(args.version, pinned_versions(args.repo))}, 0)
     if args.command == "floor":
-        safety = _load(args.safety)
+        safety = _load(_in_repo(args.repo, args.safety, SAFETY_FILE))
         pinned = pinned_versions(args.repo)
         if not pinned:
             raise ReleaseCheckError("floor", "nothing is pinned, so there is no rollback to judge")
@@ -1880,7 +1902,9 @@ def _command(args) -> int:
         result["error"] = {"check": "floor", "detail": detail}
         return _emit(result, 1)
     if args.command == "audit-tags":
-        problems = audit_tags(args.repo, args.frozen, check_rulesets=not args.no_rulesets)
+        problems = audit_tags(
+            args.repo, _in_repo(args.repo, args.frozen, FROZEN_TAGS_FILE), check_rulesets=not args.no_rulesets
+        )
         for problem in problems:
             print(f"::error::{problem}", file=sys.stderr)
         return _emit({"problems": problems}, 1 if problems else 0)
