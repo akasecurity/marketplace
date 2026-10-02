@@ -331,8 +331,8 @@ class ScriptTestsWorkflow(WorkflowCase):
     def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
         # tag-release reads that file strictly, and a tag cut for a commit whose parent holds a shape it cannot read
         # records an unknown approver. validate, the required check, does not read it, so the unit test that reads
-        # the repository's own copy is the only check on the PR, and the last chance to fix the file before it
-        # becomes history that no pull request can change.
+        # the repository's own copy is the only check on the PR: once a commit is merged, the file at its parent can
+        # no longer change.
         self.assertIn(".github/CODEOWNERS", self.pull_request_paths())
 
     def test_the_test_that_reads_the_code_owners_file_is_still_there_for_that_path_to_run(self):
