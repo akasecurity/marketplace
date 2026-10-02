@@ -1,4 +1,4 @@
-"""Tests for main_audit.py: every commit a push adds must be a code-owner-approved PR merge."""
+"""Tests for main_audit.py: every first-parent commit a push adds must be a code-owner-approved PR merge that passed validate."""
 import contextlib
 import io
 import os
