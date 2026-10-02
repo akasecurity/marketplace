@@ -3,6 +3,8 @@ import contextlib
 import io
 import os
 import re
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -10,7 +12,7 @@ import tag_release as tr
 from fakes import (CODEOWNERS, INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, not_found, pull,
                    pulls_route, safety, safety_entry)
 from ghapi import GitHubError
-from gitrepo import GitError
+from gitrepo import Git, GitError
 from import_release import Refused
 from release_checks import MANIFEST, SAFETY_FILE, InfraError
 
@@ -413,6 +415,36 @@ class TestCodeOwners(unittest.TestCase):
                 self.assertIn(".github/CODEOWNERS at x", str(caught.exception))
                 self.assertIn(expected, str(caught.exception))
 
+    def test_a_file_that_is_not_utf8_text_is_a_refusal_that_names_the_file(self):
+        # Read through the real Git, which decodes what it shows as UTF-8 and raises on a byte that is not: the
+        # strict reader must turn that into its refusal, and only for bytes that are not text (a UTF-8 comment is fine).
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
+                       GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+
+            def sh(*args):
+                return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            def commit_owners(content: bytes) -> str:
+                with open(os.path.join(directory, ".github", "CODEOWNERS"), "wb") as handle:
+                    handle.write(content)
+                sh("add", "-A")
+                sh("commit", "-q", "-m", "owners")
+                return sh("rev-parse", "HEAD")
+
+            sh("init", "-q", "-b", "main")
+            os.makedirs(os.path.join(directory, ".github"))
+            git = Git(directory)
+            readable = commit_owners("# caf\u00e9 team\n* @a @b\n".encode("utf-8"))
+            self.assertEqual(tr.code_owners(git, readable), ["a", "b"])
+            unreadable = commit_owners(b"# caf\xe9 team\n* @a @b\n")  # one Latin-1 byte, in a comment
+            with self.assertRaises(Refused) as caught:
+                tr.code_owners(git, unreadable)
+            self.assertIn(f".github/CODEOWNERS at {unreadable[:12]}", str(caught.exception))
+            self.assertIn("not valid UTF-8", str(caught.exception))
+
 
 class TestSweepOwners(unittest.TestCase):
     """The owners come from the merged commit's parent, which is fixed history: no later pull request can change
@@ -424,6 +456,7 @@ class TestSweepOwners(unittest.TestCase):
             "a team owner": "* @akasecurity/maintainers\n",
             "a path rule": "* @Vaishnav-OM @venuverse\n/docs @venuverse\n",
             "no file": None,
+            "bytes that are not UTF-8": b"# caf\xe9 team\n* @Vaishnav-OM @venuverse\n",
         }
         for label, text in cases.items():
             with self.subTest(label):

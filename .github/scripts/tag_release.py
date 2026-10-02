@@ -81,12 +81,17 @@ def last_pinned(git: Git, sha: str | None) -> str:
 
 def code_owners(git: Git, sha: str) -> list[str]:
     """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
-    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule
-    or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
+    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule,
+    a file that is not UTF-8 text or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
     shape would turn a real approval into a recorded bypass. What a caller does with the Refused is its own
     call: the sweep tags with an unknown approver, because the file it reads is fixed history."""
-    raw = git.show(sha, CODEOWNERS_FILE)
     where = f"{CODEOWNERS_FILE} at {sha[:12]}"
+    try:
+        raw = git.show(sha, CODEOWNERS_FILE)
+    except UnicodeDecodeError as error:
+        # Git.show decodes what it reads as UTF-8; a file that is not text is no more readable than a team owner.
+        raise Refused(f"{where} is not valid UTF-8 text (byte {error.start} is not); code owners can only be "
+                      "read from a file of one `*` line naming users.") from error
     if raw is None:
         raise Refused(f"{where} is missing; code owners can only be read from a file of one `*` line naming users.")
     rules = [fields for fields in (line.split("#", 1)[0].split() for line in raw.splitlines()) if fields]
