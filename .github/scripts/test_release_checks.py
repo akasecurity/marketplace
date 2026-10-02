@@ -2199,6 +2199,25 @@ class TestDiffMode(unittest.TestCase):
     def test_a_restore_without_the_registry_is_human(self):
         self.assertEqual(rc.diff_mode(self.removed(), ts.manifest("0.9.14", registry=False)), "human")
 
+    def test_a_restore_with_a_description_that_is_not_a_non_empty_string_is_human(self):
+        for bad in (None, 123, "", "   ", ["x"]):
+            with self.subTest(description=bad):
+                head = ts.manifest("0.9.14")
+                ts.ai_tc(head)["description"] = bad
+                self.assertEqual(rc.diff_mode(self.removed(), head), "human")
+
+    def test_description_ok_wants_a_string_with_a_visible_character(self):
+        entry = {}
+        self.assertFalse(rc.description_ok(entry))
+        self.assertFalse(rc.description_ok(None))
+        self.assertFalse(rc.description_ok("a string, not an entry"))
+        for bad in (None, 1, 1.5, True, "", " \t\n", [], ["x"], {}):
+            with self.subTest(description=bad):
+                self.assertFalse(rc.description_ok({"description": bad}))
+        for good in ("x", " x ", "Clearer words."):
+            with self.subTest(description=good):
+                self.assertTrue(rc.description_ok({"description": good}))
+
     def test_a_restore_with_an_extra_key_is_human(self):
         head = ts.manifest("0.9.14")
         ts.ai_tc(head)["strict"] = False

@@ -1616,14 +1616,22 @@ def _integrity_only(metadata) -> bool:
     )
 
 
+def description_ok(entry) -> bool:
+    """An entry's description is a non-empty string. Claude Code refuses a manifest whose
+    plugin description is anything else, and a malformed manifest breaks `/plugin
+    marketplace add` for every user. One test, shared by the restore shape below and by
+    validate's check of a person's description edit, so the two cannot drift."""
+    description = entry.get("description") if isinstance(entry, dict) else None
+    return isinstance(description, str) and description.strip() != ""
+
+
 def _restore_shape(entry: dict) -> bool:
     """{name: ai-tc, source: {npm, PACKAGE, x.y.z, REGISTRY}, description, metadata: {integrity}}."""
     source = entry.get("source")
     return (
         set(entry) == {"name", "source", "description", "metadata"}
         and entry["name"] == ENTRY_NAME
-        and isinstance(entry["description"], str)
-        and entry["description"].strip() != ""
+        and description_ok(entry)
         and isinstance(source, dict)
         and set(source) == {"source", "package", "version", "registry"}
         and source["source"] == "npm"

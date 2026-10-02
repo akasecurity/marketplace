@@ -209,6 +209,12 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
         and _without(base_entry, "description") == _without(head_entry, "description")
     ):
         report.row("Mode", "HUMAN PR, ai-tc description edit")
+        if not rc.description_ok(head_entry):
+            report.fail(
+                "the ai-tc entry's description must be a non-empty string: Claude Code refuses a manifest "
+                "whose plugin description is anything else, and a malformed manifest breaks "
+                "`/plugin marketplace add` for every user"
+            )
         report.note("ai-tc description changed: change all four files (AGENTS.md, 'Four files, one set of facts')")
     else:
         report.row("Mode", f"HUMAN PR, refused ({mode})")
