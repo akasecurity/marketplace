@@ -577,8 +577,10 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
         if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
             raise rc.InfraError("input", "HEAD_SHA, BASE_REPO and PR_NUMBER must be a 40-hex sha, owner/name and a number")
         # The commit of main this run reads the pins and the rollback floor from, resolved once.
+        # The diff and the base files start at its merge base with the PR head, so nothing
+        # else, such as the work tree's HEAD, can move where the comparison starts.
         main_sha = _run_git(repo, "rev-parse", "--verify", f"{rc.main_ref(repo)}^{{commit}}").strip()
-        start = _run_git(repo, "merge-base", "HEAD", head_sha).strip()
+        start = _run_git(repo, "merge-base", main_sha, head_sha).strip()
         base = {path: read_at(repo, start, path) for path in WATCHED}
         head = {path: read_at(repo, head_sha, path) for path in WATCHED}
         pr = PullRequest(

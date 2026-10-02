@@ -846,6 +846,27 @@ class TestMain(unittest.TestCase):
         start = ts.git(self.repo.path, "merge-base", "HEAD", head).strip()
         self.assertEqual(vp.changed_files(self.repo.path, start, head), ["README.md"])
 
+    def test_the_diff_starts_at_the_merge_base_not_at_main(self):
+        # Main moves on after the PR branched. What main gained is not the PR's change, so the
+        # run must not report it as a touched workflow or ownership file.
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.repo.commit(files={".github/other.txt": "moved on main\n"})
+        self.assertEqual(self.main(head, self.commits(head)), 0)
+        text = self.summary_text()
+        self.assertNotIn("other.txt", text)
+        self.assertNotIn("touches automation", text)
+
+    def test_the_diff_starts_from_the_main_the_run_resolved_whatever_is_checked_out(self):
+        # The base is the merge base of the main commit the run resolved and the PR head. It is
+        # not whatever the work tree holds: with the PR head checked out, a base taken from the
+        # work tree would be the PR itself, and a pin edit would compare equal to itself.
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head = self.pr_commit(doc)
+        ts.git(self.repo.path, "checkout", "-q", "--detach", head)
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn("a human PR may change only", self.summary_text())
+
     def test_the_summary_names_the_main_commit_it_read(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
         self.repo.commit(files={"llms.txt": "moved on main\n"})
