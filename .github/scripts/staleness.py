@@ -81,7 +81,8 @@ def result(rule: str, red: bool | None, detail: str = "", **extra) -> Result:
 
 
 def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str, str]) -> list[Result]:
-    raw = git.show("main", MANIFEST)
+    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
+    raw = git.show(git.main(), MANIFEST)
     present = raw is not None and entry_of(json.loads(raw)) is not None
     entry = result("staleness-entry", not present,
                    "main's `.claude-plugin/marketplace.json` has no ai-tc entry. Nothing is imported, and the "
@@ -148,7 +149,7 @@ def rule_iii(git: Git, frozen: list[dict], now: dt.datetime) -> Result:
     last = max(frozen, key=lambda tag: int(tag["tag"][len("fleet-v"):]))
     tagged = {tag["commit"] for tag in git.fleet_tags()}
     missing = []
-    for sha in git.first_parent_after(last["commit"], "main"):
+    for sha in git.first_parent_after(last["commit"], git.main()):
         if sha in tagged:
             continue
         version = version_at(git, sha)
