@@ -1,18 +1,20 @@
 """main-audit: every commit a push adds to main must be the merge of a code-owner-approved PR that passed validate.
 
 Red unless each commit is the merge commit of a PR with an approving review, on
-the PR's final head, from a code owner (CODEOWNERS at the commit's parent) who
-is not its last pusher and has not since withdrawn it (an owner's latest
-approving or change-requesting review decides), and whose final head has a
-passing `validate` check from GitHub Actions (its latest run decides). A commit
-that fails both gets one result. REST names no pusher, so the head commit's
-author and committer stand in for the last pusher (web-flow, GitHub's committer
-for web edits, is skipped); the main ruleset's "most recent push approved by
-someone else" is what enforces the rule, and this records when it was
-bypassed. Detective only: it runs from the pushed commit's own file, so a
-bypass push can change it in the same push. Every red result is keyed to its
-push and closed only by a person; a push the audit could not finish, or one
-that moved main without extending it, gets its own such result.
+the PR's final head, from a code owner (CODEOWNERS at the commit's parent, read
+strictly: one `*` line of users, as tag-release reads it, and any other shape
+is that commit's problem rather than a guess) who is not its last pusher and has
+not since withdrawn it (an owner's latest approving or change-requesting review
+decides), and whose final head has a passing `validate` check from GitHub
+Actions (its latest run decides). A commit that fails more than one of these
+gets one result. REST names no pusher, so the head commit's author and
+committer stand in for the last pusher (web-flow, GitHub's committer for web
+edits, is skipped); the main ruleset's "most recent push approved by someone
+else" is what enforces the rule, and this records when it was bypassed.
+Detective only: it runs from the pushed commit's own file, so a bypass push can
+change it in the same push. Every red result is keyed to its push and closed
+only by a person; a push the audit could not finish, or one that moved main
+without extending it, gets its own such result.
 """
 from __future__ import annotations
 
@@ -25,10 +27,10 @@ from typing import Callable
 
 from ghapi import GitHub
 from gitrepo import Git
-from import_release import write_output
-from issue_router import CODEOWNERS_FILE, Result, parse_codeowners, results_to_json
+from import_release import Refused, write_output
+from issue_router import Result, results_to_json
 from release_checks import GITHUB_ACTIONS_APP_ID
-from tag_release import merged_pull, owner_approvals
+from tag_release import code_owners, merged_pull, owner_approvals
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -51,7 +53,12 @@ def added_commits(git: Git, before: str, after: str) -> list[str]:
 
 def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> str | None:
     parent = git.first_parent(sha)
-    owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
+    try:
+        owners = code_owners(git, parent) if parent else []
+    except Refused as refusal:
+        # A CODEOWNERS this audit cannot read exactly (a team, a path rule, no file) must not decide who counts as
+        # an owner either way, so the commit is reported with the reason and the rest of the push is still audited.
+        return f"`{sha}` merged PR #{number}, but its approval could not be checked: {refusal}"
     head_commit = gh.get(gh.repo_path(f"commits/{head}"))
     pushers = {login for login in ((head_commit.get("author") or {}).get("login"),
                                    (head_commit.get("committer") or {}).get("login"))
