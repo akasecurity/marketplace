@@ -55,7 +55,7 @@ RECORDED = {
     "0.9.15": {
         "classification": "not-rollback-safe",
         "from": ts.ATTESTED["0.9.14"],
-        "to": "b65d0ab867e7827e21d0532ae2e1845885933449",
+        "to": ts.ATTESTED["0.9.15"],
         "migrations": ["0036_secret_vault_identity_fingerprint"],
     },
 }
