@@ -64,6 +64,41 @@ class Report:
         return 1 if self.failures else 0
 
 
+# A real manifest nests under ten levels. The code that reads a pull request's JSON recurses one
+# frame per level (a comparison, json.dumps, the search for a renamed ai-tc), so JSON deeper than
+# this is refused before any of that runs, instead of ending in the interpreter's recursion limit.
+MAX_JSON_DEPTH = 64
+
+
+def _depth(value) -> int:
+    """How many containers deep `value` nests. Iterative, so measuring cannot hit the limit."""
+    deepest, pending = 0, [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            children = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        deepest = max(deepest, level)
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
+def parse_pr_json(text: str):
+    """rc.parse_json for a file the pull request supplies. JSON that nests too deeply to read
+    safely is a ValueError, like any other text that does not parse: the file is at fault, so
+    it is a failed check and not a missing verdict."""
+    try:
+        doc = rc.parse_json(text)
+    except RecursionError as exc:
+        raise ValueError("it nests deeper than the JSON parser can read") from exc
+    if _depth(doc) > MAX_JSON_DEPTH:
+        raise ValueError(f"it nests deeper than {MAX_JSON_DEPTH} levels")
+    return doc
+
+
 def _code(value) -> str:
     """Inline code for the summary: PR-controlled text cannot break out of it. Every value a
     pull request supplies (a plugin or key name, a path, a message quoting one) goes through
@@ -99,9 +134,12 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
             report.fail(f"{path} is missing at {label}")
             continue
         try:
-            doc = rc.parse_json(text)
+            doc = parse_pr_json(text)
         except ValueError as exc:
-            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {_code(exc)}")
+            report.fail(
+                f"{path} does not parse at {label} (duplicate keys, NaN and nesting deeper than "
+                f"{MAX_JSON_DEPTH} levels are refused): {_code(exc)}"
+            )
             continue
         plugins = doc.get("plugins") if isinstance(doc, dict) else None
         if not isinstance(plugins, list) or not all(isinstance(p, dict) and isinstance(p.get("name"), str) for p in plugins):
@@ -146,7 +184,7 @@ def safety_versions(text, report: Report, *, label: str):
     if text is None:
         return None
     try:
-        doc = rc.parse_json(text)
+        doc = parse_pr_json(text)
     except ValueError as exc:
         report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {_code(exc)}")
         return None
@@ -463,7 +501,7 @@ def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins,
     for path in (rc.MANIFEST, rc.SAFETY_FILE):
         text = head_files.get(path)
         try:
-            written = rc.dump_json(rc.parse_json(text)) if text is not None else text
+            written = rc.dump_json(parse_pr_json(text)) if text is not None else text
         except ValueError:
             continue  # a parse failure is reported on its own
         if written != text:

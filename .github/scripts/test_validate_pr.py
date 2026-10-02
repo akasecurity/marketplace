@@ -675,6 +675,58 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual((report.rows, report.exit_code), ([], 1))
 
 
+def nested(levels):
+    """JSON `levels` lists deep, built as text: json.dumps would recurse as deeply as it nests."""
+    return "[" * levels + "]" * levels
+
+
+class TestDeepJson(unittest.TestCase):
+    """A file a pull request supplies that nests too deeply is a file that does not parse: a failed
+    check with a summary, not a stack trace and not a missing verdict."""
+
+    def test_the_depth_limit_is_exact(self):
+        self.assertEqual(vp._depth(rc.parse_json(nested(vp.MAX_JSON_DEPTH))), vp.MAX_JSON_DEPTH)
+        self.assertEqual(vp._depth(rc.parse_json(nested(vp.MAX_JSON_DEPTH + 1))), vp.MAX_JSON_DEPTH + 1)
+        self.assertEqual(vp._depth({"a": [{"b": [1]}], "c": []}), 4)
+        self.assertEqual(vp._depth([]), 1)
+        self.assertEqual(vp._depth(7), 0)
+        vp.parse_pr_json(nested(vp.MAX_JSON_DEPTH))
+        with self.assertRaises(ValueError):
+            vp.parse_pr_json(nested(vp.MAX_JSON_DEPTH + 1))
+
+    def test_a_real_manifest_is_far_below_the_limit(self):
+        self.assertLess(vp._depth(ts.manifest()), vp.MAX_JSON_DEPTH // 4)
+
+    def test_nesting_past_the_parser_and_nesting_inside_it_both_fail_to_parse(self):
+        # 100,000 levels end the JSON parser itself in RecursionError. 2,000 parse, and would
+        # end the code that reads the parsed value (comparisons, the rename search) instead.
+        for levels in (vp.MAX_JSON_DEPTH + 1, 2000, 100_000):
+            with self.subTest(levels=levels):
+                deep = '{"renames": %s, "plugins": []}' % nested(levels)
+                for path in (rc.MANIFEST, ".agents/plugins/marketplace.json", "plugins.json"):
+                    head = files(ts.manifest())
+                    head[path] = deep
+                    report = run(pull(**HUMAN), files(ts.manifest()), head, [path])
+                    failed_with(self, report, f"{path} does not parse at the PR head")
+                    failed_with(self, report, "nests deeper")
+                    self.assertEqual((report.exit_code, report.infra), (1, ""))
+                head = files(ts.manifest())
+                head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(levels)
+                report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.SAFETY_FILE])
+                failed_with(self, report, "rollback-safety.json does not parse at the PR head")
+                self.assertEqual((report.exit_code, report.infra), (1, ""))
+
+    def test_a_deep_file_does_not_hide_a_second_problem(self):
+        head = files(ts.manifest())
+        head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(100_000)
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head[rc.MANIFEST] = rc.dump_json(doc)
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, rc.SAFETY_FILE])
+        failed_with(self, report, "rollback-safety.json does not parse at the PR head")
+        failed_with(self, report, "a human PR may change only")
+
+
 class TestWorkflow(unittest.TestCase):
     """validate.yml cannot run here, but what it promises the script can be read from it."""
 
@@ -1037,6 +1089,19 @@ class TestMain(unittest.TestCase):
                 text = self.summary_text()
                 self.assertIn("NO VERDICT", text)
                 self.assertIn("api: GET ", text)
+
+    def test_a_manifest_that_nests_too_deeply_fails_with_a_summary(self):
+        for levels in (2000, 100_000):
+            with self.subTest(levels=levels):
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)
+                ts.git(self.repo.path, "checkout", "-q", "-b", f"deep-{levels}")
+                head = self.repo.commit(files={rc.MANIFEST: '{"renames": %s}' % nested(levels)})
+                ts.git(self.repo.path, "checkout", "-q", "main")
+                self.assertEqual(self.main(head, self.commits(head)), 1)
+                text = self.summary_text()
+                self.assertIn("## validate: PR #7: FAIL", text)
+                self.assertIn("claude-plugin/marketplace.json does not parse at the PR head", text)
 
     def test_an_unexpected_error_is_no_verdict_with_a_summary(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
