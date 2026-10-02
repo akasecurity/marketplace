@@ -74,6 +74,16 @@ class TestRuleI(StalenessCase):
         self.assertFalse(rules["staleness-i-refused"].red)
         self.assertFalse(rules["staleness-entry"].red)
 
+    def test_the_rule_says_the_release_is_above_every_pin_main_included(self):
+        # The pinned set is main's pin and every fleet-v tag's, so the text must not say only the tags'.
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=30))}
+        rule = self.rules()["staleness-i"]
+        self.assertEqual(rule.title,
+                         "staleness: npm has had a passing ai-tc release above every pin for over 24 hours")
+        self.assertIn("above `0.9.15`, the highest version `main` or any `fleet-v` tag pins, that pass", rule.detail)
+        self.assertNotIn("no `fleet-v` tag pins", rule.detail)
+
     def test_a_refused_version_is_named_once_it_has_been_on_npm_for_an_hour(self):
         self.candidates = ["0.9.16", "0.9.17"]
         self.bad = {"0.9.16": ("provenance", "ref refs/heads/release"), "0.9.17": ("commit-on-main", "behind")}
