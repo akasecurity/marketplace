@@ -27,5 +27,5 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: unit tests (standard library only, no network)
+      - name: unit tests (standard library only, no outside network)
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
