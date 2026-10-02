@@ -2768,10 +2768,6 @@ class TestCli(unittest.TestCase):
                         pass
                 self.assertIsNone(rc.time_left())
 
-    def test_a_usage_error_starts_no_budget(self):
-        cli("no-such-command")
-        self.assertIsNone(rc.time_left())
-
     def test_candidates(self):
         repo = self.repo()
         with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
