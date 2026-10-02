@@ -1100,13 +1100,27 @@ CONTENTS_LISTING_CAP = 1000
 EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
 UNREADABLE_FILE = "non-additive: the migration file cannot be read"
 
+# ai-tc also changes the store in code, not only through its migration journal: every time it
+# opens a store it runs steps in migrations.ts after the journal loop (add a column, create a
+# trigger, rebuild an index, run a one-time UPDATE), and the trigger's condition comes from
+# sync-failure.ts. A release whose only store change is in these files has no new journal tag.
+# They are compared as whole files (their git blob shas at the two attested commits) and
+# never read: the statements are TypeScript with interpolated names and helper calls, and a
+# shape a reader of that missed would read as additive, the direction this check exists to
+# prevent. migrations.ts is the one file the store cannot be opened without.
+STORE_CODE_DIR = "packages/persistence/src"
+STORE_CODE_ENTRY = "migrations.ts"
+STORE_CODE_FILES = (STORE_CODE_ENTRY, "sync-failure.ts")
+STORE_CODE_CHANGED = "non-additive: the store code ai-tc runs when it opens a store changed outside the migration journal"
+STORE_CODE_MISSING = "non-additive: the store code ai-tc runs at open cannot be found"
 
-def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
-    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
-    or None when that directory is not there. One request however many files it holds.
-    The raw media type the file reads use returns bytes with no sha, so this asks for the
-    JSON listing instead."""
-    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+
+def _directory_listing(directory: str, commit: str, fetch: Fetch) -> list | None:
+    """The entries of one ai-tc directory at commit, or None when that directory is not
+    there. One request however many files it holds. The raw media type the file reads use
+    returns bytes with no sha, so this asks for the JSON listing instead. A listing that
+    fails, is malformed or may be cut short is no verdict."""
+    url = f"{AI_TC_API}/contents/{directory}?ref={commit}"
     status, body = fetch(url, {"Accept": "application/vnd.github+json"})
     if status == 404:
         return None
@@ -1122,6 +1136,15 @@ def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
         raise InfraError(
             "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
         )
+    return listing
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there."""
+    listing = _directory_listing(MIGRATIONS_DIR, commit, fetch)
+    if listing is None:
+        return None
     return {
         entry["name"][: -len(".sql")]: entry.get("sha")
         for entry in listing
@@ -1157,9 +1180,49 @@ def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch)
     return kinds
 
 
+def _store_code_blobs(commit: str, fetch: Fetch) -> dict:
+    """{file name: git blob sha} for each of STORE_CODE_FILES that is a plain file in ai-tc's
+    persistence source at commit. A file that is not there, or a directory that is not there,
+    is left out."""
+    listing = _directory_listing(STORE_CODE_DIR, commit, fetch) or []
+    blobs = {}
+    for entry in listing:
+        name = entry.get("name")
+        if name not in STORE_CODE_FILES or entry.get("type") != "file":
+            continue
+        sha = entry.get("sha")
+        if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+            raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {name}")
+        blobs[name] = sha
+    return blobs
+
+
+def _store_code_changes(from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{path: kind} for each store-code file that is not the same blob at the two commits,
+    appeared or vanished, and for the entry file when the later commit has none (ai-tc may
+    have moved it, and then nothing here can say what the store does at open). Empty when
+    the files are the same at both. A listing that fails or is malformed is no verdict."""
+    before, after = (_store_code_blobs(commit, fetch) for commit in (from_commit, to_commit))
+    kinds = {}
+    for name in STORE_CODE_FILES:
+        if name == STORE_CODE_ENTRY and name not in after:
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_MISSING
+        elif before.get(name) != after.get(name):
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_CHANGED
+    return kinds
+
+
 def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
     """Classify the local-store migrations ai-tc added, removed from the journal or edited
-    in place between two attested commits."""
+    in place between two attested commits, and any change to the store code it runs at open
+    outside that journal (STORE_CODE_FILES).
+
+    The store code is seen as a changed file, not by kind, so an edit to a comment alone
+    flags a release. It is recorded in `kinds` under the file's path and never in
+    `migrations`, which stays a list of journal tags. Some inputs to the store are out of
+    view: the list of event types a one-time UPDATE counts (repositories/history-sync.ts),
+    the adopt-or-replay logic under db/migrations, and the generated schema in
+    packages/schema (ai-tc's own test holds it to the journal's .sql files)."""
     for commit in (from_commit, to_commit):
         if not isinstance(commit, str) or not SHA40.fullmatch(commit):
             raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
@@ -1183,15 +1246,21 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
     edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
     kinds.update(edited)
     migrations = added + removed + list(edited)
+    # Before the early returns: a release whose only store change is in code has no journal
+    # tag, and counts whatever EVERY_MIGRATION_COUNTS says.
+    store_code = _store_code_changes(from_commit, to_commit, fetch)
+    kinds.update(store_code)
+    notes = []
+    if migrations and EVERY_MIGRATION_COUNTS:
+        notes.append(
+            "every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated"
+        )
+    if store_code:
+        notes.append("the store code ai-tc runs when it opens a store changed outside the migration journal")
+    if notes:
+        return Classification("not-rollback-safe", migrations, kinds, note="; ".join(notes))
     if not migrations:
         return Classification("additive", [], kinds)
-    if EVERY_MIGRATION_COUNTS:
-        return Classification(
-            "not-rollback-safe",
-            migrations,
-            kinds,
-            note="every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated",
-        )
     flagged = any(kind != "additive" for kind in kinds.values())
     return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
 
