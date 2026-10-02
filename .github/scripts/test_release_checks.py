@@ -1,4 +1,4 @@
-"""Unit tests for release_checks.py. Standard library only and no network: every fetch,
+"""Unit tests for release_checks.py. Standard library only and no outside network: every fetch,
 npm run and sleep is injected. live_release_checks.py holds the three live checks."""
 
 from __future__ import annotations
@@ -6,10 +6,13 @@ from __future__ import annotations
 import contextlib
 import copy
 import http.client
+import http.server
 import io
 import json
 import os
 import subprocess
+import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -62,6 +65,19 @@ class TestErrorClasses(unittest.TestCase):
             with self.subTest(verdict=repr(verdict)):
                 with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
                     self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
+
+
+class TestRunningTheFile(unittest.TestCase):
+    def test_running_the_file_is_a_usage_error_until_the_command_line_exists(self):
+        # The docstring defines exit 0 as "the check passes", so a file that prints nothing
+        # and exits 0 would be read as a pass by `release_checks.py verify X && proceed`.
+        # The in-process tests cannot see this: they never run the file as a program.
+        result = subprocess.run(
+            [sys.executable, rc.__file__, "verify", "0.9.16"], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("nothing was checked", result.stderr)
 
 
 class TestSelectEntry(unittest.TestCase):
@@ -172,6 +188,30 @@ class TestPinnedVersions(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.pinned_versions(self.repo.path)
 
+    def test_a_tag_pinning_the_package_twice_pins_nothing(self):
+        # Two entries pinning the package is ambiguous, so the tag pins nothing, as a tag
+        # whose manifest does not parse does. Its version must not reach the candidate or
+        # rollback floors. Main is put back to one entry afterwards: main is read strictly.
+        doc = ts.manifest("0.9.20")
+        twin = copy.deepcopy(doc["plugins"][2])
+        twin["name"] = "ai-tc-canary"
+        doc["plugins"].append(twin)
+        self.repo.commit(doc)
+        self.repo.tag("fleet-v11")
+        self.repo.commit(ts.manifest("0.9.14"))
+        self.assertIsNone(rc._tag_pin(self.repo.path, "fleet-v11"))
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [
+                ("main", "0.9.14"),
+                ("fleet-v1", None),
+                ("fleet-v2", "0.9.6"),
+                ("fleet-v10", "0.9.12"),
+                ("fleet-v11", None),
+            ],
+        )
+        self.assertNotIn("0.9.20", rc.pinned_versions(self.repo.path))
+
     def test_a_repository_without_main_is_infrastructure(self):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
         with self.assertRaises(rc.InfraError):
@@ -232,15 +272,56 @@ class _FailingBody(io.BytesIO):
         raise self.error
 
 
+class _Origin(http.server.BaseHTTPRequestHandler):
+    """A loopback server: records each request's headers on its server, and answers 302 to
+    the server's redirect_to, or 200 when it has none."""
+
+    def do_GET(self):
+        self.server.requests.append(dict(self.headers))
+        self.send_response(302 if self.server.redirect_to else 200)
+        if self.server.redirect_to:
+            self.send_header("Location", self.server.redirect_to)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
 class TestHttpFetch(unittest.TestCase):
     URL = "https://registry.npmjs.org/x"
 
     def fetch_with(self, **patch):
-        with mock.patch.object(rc.urllib.request, "urlopen", **patch):
+        with mock.patch.object(rc._OPENER, "open", **patch):
             return rc.http_fetch(self.URL, {})
+
+    def serve(self, redirect_to=None):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
+        server.requests = []
+        server.redirect_to = redirect_to
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
 
     def test_a_status_and_body_come_back_as_they_are(self):
         self.assertEqual(self.fetch_with(return_value=_Response(b"ok")), (200, b"ok"))
+
+    def test_a_redirect_comes_back_as_its_status_and_is_not_followed(self):
+        # urllib's default handler copies every header onto the follow-up request, the token
+        # included, whatever host the redirect names. Here the token is forced on (the first
+        # server is not api.github.com) so a followed redirect would deliver it to the second.
+        second = self.serve()
+        first = self.serve(redirect_to=f"http://localhost:{second.server_port}/")
+        environ = {"GITHUB_TOKEN": "dummy-token", "no_proxy": "*", "NO_PROXY": "*"}
+        with mock.patch.dict(os.environ, environ):
+            with mock.patch.object(rc, "_sends_token_to", return_value=True):
+                result = rc.http_fetch(f"http://127.0.0.1:{first.server_port}/", {})
+        self.assertEqual(result, (302, b""))
+        self.assertEqual([seen.get("Authorization") for seen in first.requests], ["Bearer dummy-token"])
+        self.assertEqual(second.requests, [])
 
     def test_an_http_error_status_is_returned_and_not_raised(self):
         error = rc.urllib.error.HTTPError(self.URL, 503, "unavailable", {}, io.BytesIO(b"later"))
@@ -347,6 +428,17 @@ class TestNpmCandidates(unittest.TestCase):
         fetch = self.fetch({"0.9.15": {}})
         rc.npm_candidates({"0.9.14"}, fetch=fetch)
         self.assertEqual(fetch.calls, [(rc.packument_url(), {"Accept": "application/json"})])
+
+    def test_a_4xx_registry_answer_is_no_verdict_even_with_a_packument_body(self):
+        # Only a 200 is an answer. A 4xx whose body happens to be a valid packument must not
+        # be read: a status check that refused only 5xx would turn it into candidates.
+        for status in (403, 404):
+            with self.subTest(status=status):
+                fetch = ts.FakeFetch({rc.packument_url(): (status, {"versions": {"0.9.15": {}}})})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(f"answered {status}", caught.exception.detail)
 
     def test_a_registry_error_is_infrastructure(self):
         with self.assertRaises(rc.InfraError):
