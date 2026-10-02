@@ -34,6 +34,14 @@ import urllib.parse
 import urllib.request
 from typing import Callable
 
+# This version has no command line yet, and the docstring above says exit 0 is a pass. Run as
+# a program, the file therefore says so and exits 2 (no verdict), never the silent 0 that
+# `release_checks.py verify X && proceed` would read as a pass. The command line replaces
+# this guard. Importing the module is unaffected.
+if __name__ == "__main__":
+    print("release_checks.py: this version has no command line; nothing was checked", file=sys.stderr)
+    sys.exit(2)
+
 # The one plugin this marketplace pins, and what a publish of it must attest to. These
 # are constants of this reviewed file: nothing read from a PR, the registry or an
 # attestation may nominate the workflow that is supposed to vouch for a release.
