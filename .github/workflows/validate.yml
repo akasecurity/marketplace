@@ -46,12 +46,20 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      # npm 11 (Node 24). The provenance check runs `npm audit signatures`, which on an
-      # older npm returns an empty verified set and would refuse a good release.
+      # npm 11.12 or later. The provenance check runs `npm audit signatures
+      # --include-attestations`, which only that npm honours: an older one prints no
+      # attestations, which reads as a release with no provenance. Node 24.15.0 is the first
+      # release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm). A bare
+      # "24" is not enough: setup-node takes a copy of Node in the runner's tool cache that
+      # matches the spec before it downloads anything, so "24" can resolve to an older cached
+      # 24.x. No older copy matches a range that starts at 24.15.0, so the action uses a cached
+      # copy of 24.15.0 or later if there is one, and downloads a release otherwise.
+      # The check refuses an older npm with no verdict (MIN_NPM in release_checks.py), but the
+      # workflow should not depend on that.
       # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (the pin import-plugin-release.yml uses).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "24"
+          node-version: ">=24.15.0 <25"
 
       - name: fetch the PR head as data (never checked out)
         env:

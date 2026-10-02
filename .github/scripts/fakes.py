@@ -17,7 +17,8 @@ REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
 VERSIONS = ("0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17")
 INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64)).decode() for v in VERSIONS}
-# The real attested commits through 0.9.14, then stand-ins for the versions not released yet.
+# The real attested commits through 0.9.14, then invented stand-ins for every later version.
+# 0.9.15 is a real release too, but these tests use it as an invented next release.
 ATTESTED = {**ts.ATTESTED, **{v: v.split(".")[2] * 20 for v in VERSIONS if v not in ts.ATTESTED}}
 CODEOWNERS = "* @Vaishnav-OM @venuverse\n"
 
@@ -60,6 +61,9 @@ class FakeGit:
 
     def rev_parse(self, rev: str) -> str:
         return self.chain[-1] if rev == "main" else rev
+
+    def main(self) -> str:
+        return "main"
 
     def show(self, rev: str, path: str) -> str | None:
         return self.files.get((self.rev_parse(rev), path))
@@ -148,12 +152,12 @@ def not_found(path: str = "") -> GitHubError:
 
 
 def pull(number: int, head: str, *, state: str = "open", merged: bool = False,
-         created_at: str = "2026-09-29T00:00:00Z", labels: tuple = (), repo: str = REPO) -> dict:
-    """A pull request as the REST list endpoint returns it."""
+         created_at: str = "2026-09-29T00:00:00Z", labels: tuple = (), repo: str = REPO, author: str = BOT) -> dict:
+    """A pull request as the REST list endpoint returns it, opened by the release bot unless `author` says otherwise."""
     return {"number": number, "node_id": f"PR_{number}", "state": state, "created_at": created_at,
             "merged_at": "2026-09-29T01:00:00Z" if merged else None,
             "head": {"ref": head, "sha": f"{number:040x}", "repo": {"full_name": repo}},
-            "labels": [{"name": name} for name in labels], "user": {"login": BOT}}
+            "labels": [{"name": name} for name in labels], "user": {"login": author}}
 
 
 def pulls_route(pulls: list[dict]) -> Callable:
