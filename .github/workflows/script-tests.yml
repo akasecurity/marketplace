@@ -1,8 +1,8 @@
 name: script-tests
 
 # Runs the release-check unit tests on the PR's own code. This is safe on pull_request:
-# the token is read-only and no secret is in scope. It is not a required check (validate
-# is), but a red run here means the module every release workflow runs has regressed.
+# the token is read-only and no secret is in scope. It is not a required check; a red run
+# here means the module every release workflow runs has regressed.
 
 on:
   pull_request:
