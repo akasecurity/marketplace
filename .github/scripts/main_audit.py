@@ -149,7 +149,8 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
     the router files nothing and closes nothing for it; it records the number of commits it set out to audit and the
     number of red results. Every red result is keyed to this push and never closes by itself (auto_close is
     off), so a push the audit could not finish is recorded too: an error part-way through keeps what was
-    found so far and adds an unaudited result, rather than failing the job into the shared workflow issue.
+    found so far and adds an unaudited result, rather than failing the job (a failed job is filed against its
+    push too, by the router).
     A main that was moved rather than extended audits what the rewrite added (rewrite_of).
     """
     results: list[Result] = []
