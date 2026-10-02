@@ -382,5 +382,40 @@ class StalenessWorkflow(WorkflowCase):
         self.assertNotIn("npm 11 (node 24)", self.text.lower())
 
 
+class MainAuditWorkflow(WorkflowCase):
+    name = "main-audit.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_every_push_to_main_is_audited_and_none_is_dropped(self):
+        self.assertIn("  push:\n    branches: [main]\n", self.head)
+        self.assertNotIn("concurrency:", self.text)
+
+    def test_the_audit_sees_full_history_and_the_pushed_range(self):
+        self.assertIn("          fetch-depth: 0\n", self.jobs["audit"])
+        self.assertIn("          BEFORE: ${{ github.event.before }}\n", self.jobs["audit"])
+        self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["audit"])
+
+    def test_a_failed_audit_job_is_filed_against_its_push(self):
+        # The router keys the failed-job issue to this push, so a second failed run opens its own.
+        self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["file-issues"])
+        # ... through the environment, never spliced into the command line.
+        self.assertFalse([line for line in self.jobs["file-issues"].splitlines()
+                          if line.strip().startswith("run:") and "${{" in line])
+
+    def test_the_audit_job_may_read_checks_to_see_that_validate_passed(self):
+        self.assertIn("      checks: read\n", self.jobs["audit"])
+        self.assertNotIn("checks: write", self.text)
+
+    def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
+        self.assertNotIn("secrets.", self.text)
+        self.assertNotIn("environment:", self.text)
+        self.assertEqual(list(self.jobs), ["audit", "file-issues"])
+        self.assertNotIn("issues: write", self.jobs["audit"])
+        self.assertIn("      issues: write\n", self.jobs["file-issues"])
+        self.assertIn("    if: always()\n", self.jobs["file-issues"])
+
+
 if __name__ == "__main__":
     unittest.main()
