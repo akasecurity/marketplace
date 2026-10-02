@@ -72,10 +72,18 @@ field — so "change all four" does not apply to a version change.
 - **A rollback** is a rollback-mode dispatch of the same workflow, with a version or a `fleet-v<N>`
   name. Its `bot/rollback-ai-tc-<from>-to-<v>` PR moves only the pin, down to a version a `fleet-v`
   tag has pinned and not below the rollback floor that `rollback-safety.json` records; one code
-  owner approves it. Never reset `main` backwards, and never restore a whole manifest from a tag:
-  that would undo the other entries' edits.
+  owner approves it, and auto-merge squash-merges it once `validate` is green. Never reset `main`
+  backwards, and never restore a whole manifest from a tag: that would undo the other entries'
+  edits.
 - **Nobody edits the ai-tc entry by hand.** `validate` fails any human change to it other than its
   `description` (see "Adding or renaming a plugin", step 5).
+- **A `rollback-safety.json` entry is computed, never typed.** A release PR adds its version's
+  entry, and `validate` recomputes it from the store migrations between the previous pinned
+  release's attested commit and this one's. It recomputes an entry `main` already records for the
+  version too, and fails one that runs up to another commit than the release's attested one or that
+  is weaker than the computation (a stronger recorded class stands). A person changes an entry only
+  in a code-owner-reviewed PR, and `validate` calls a change toward `additive` out as lowering the
+  rollback floor; a person may not add an entry for a version nothing pins.
 
 **Who signed a release is read from its signing certificate, never from the statement.**
 `npm audit signatures` checks the signature and the certificate's chain, but no identity: a release
@@ -149,14 +157,26 @@ may use.
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
   no secret: it takes the highest exact npm version above every version `main` or a `fleet-v` tag
   has pinned that passes the release checks, never npm `latest` on trust. Its `open-pr` job creates
-  the bot branch with a create-only ref, never a force-push (a branch with an open PR is skipped; one
-  with no open PR is skipped on a plain forward run, and deleted and created again only by a
-  `reimport` or rollback dispatch), opens the PR and enables auto-merge. A version a code owner rejected (its PR closed unmerged), or one a
-  rollback moved away from, comes back only through a dispatch with `reimport: true`.
+  the bot branch with a create-only ref, never a force-push, opens the PR and enables auto-merge.
+  What it does with a branch that already exists depends on what used it: one with an open bot PR
+  is skipped; one the bot's closed PR used is skipped on a plain forward run, and deleted and
+  created again only by a `reimport` or rollback dispatch; one no PR ever used was left by a run
+  that died before opening it, and any run deletes it and creates it again. It never deletes the
+  head of a PR the bot did not open: that run goes red until a person closes the PR. It tells its
+  own PRs from anyone else's by their author (`release_checks.BOT_LOGIN`), so a person's PR from a
+  `bot/` branch name neither stops the schedule nor is closed by it, and while no bot login is
+  configured it refuses, red. A version a code owner rejected (its PR closed unmerged), or one a
+  rollback moved away from, comes back only through a dispatch with `reimport: true`. A version
+  `main` already records in `rollback-safety.json` is recomputed first, and the import stops, red,
+  if the recorded entry runs up to another commit than the release's attested one or says
+  `additive` where the computation says not-rollback-safe, since `validate` would fail the PR.
   `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
   open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
   rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it.
-  While a rollback PR is open, the scheduled import opens nothing. A candidate that fails a check
+  While a rollback PR is open, the scheduled import opens nothing, and a forward PR opened by hand
+  gets no auto-merge. The forward and rollback jobs do not wait for each other, so a forward job
+  looks for an open rollback PR before it enables auto-merge and again after, and turns auto-merge
+  off if one opened meanwhile. A candidate that fails a check
   is logged once and skipped, so it never hides a release above or below it. A candidate the
   checks cannot finish on (no verdict, below) is not skipped: the run stops there, red, and does
   not fall back to a lower version, because the one it could not check may be the real newest.
@@ -166,7 +186,12 @@ may use.
 - **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
   its script, reading the PR's files as data. An approver confirms the check run is `validate.yml`'s
   run from `main`, and trusts its summary over the PR body. A check that cannot finish reports
-  NO VERDICT and fails the required check; it is never reported as the PR breaking a rule.
+  NO VERDICT and fails the required check; it is never reported as the PR breaking a rule. On a bot
+  PR every commit must also carry GitHub's verified signature. The summary's `Main read at` row
+  names the `main` commit whose pins and rollback floor it read, and every value taken from the PR
+  appears in it inside a code span. `validate` does not run again when `main` moves, so if
+  `rollback-safety.json` changed on `main` after a rollback PR's run, its approver re-runs the
+  check before approving (the PR's checklist says so).
 - **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
   comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
   ai-tc version changed and has no `fleet-v` tag yet, and deletes the bot's branches whose PRs are
