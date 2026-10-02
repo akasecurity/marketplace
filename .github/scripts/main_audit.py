@@ -1,4 +1,4 @@
-"""main-audit: every commit a push adds to main must be the merge of a code-owner-approved PR that passed validate.
+"""main-audit: every commit a push adds to main's first-parent line must be the merge of a code-owner-approved PR that passed validate.
 
 Red unless each commit is the merge commit of a PR with an approving review, on
 the PR's final head, from a code owner (CODEOWNERS at the commit's parent, read
