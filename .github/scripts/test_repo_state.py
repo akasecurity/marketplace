@@ -1,5 +1,6 @@
-"""Guards on what main holds: the ai-tc entry's shape and the seeded rollback-safety.json.
-They read the committed files, so every bot pin PR must keep them true."""
+"""Guards on what main holds: the ai-tc entry's shape, the seeded rollback-safety.json, and the
+entries recorded after the seed. They read the committed files, so every bot pin PR must keep
+them true: nothing here may name the version main currently pins."""
 
 from __future__ import annotations
 
@@ -47,6 +48,20 @@ def journal_numbers(entry):
     return [tag.split("_", 1)[0] for tag in entry["migrations"]]
 
 
+# Entries recorded after the seed was taken, each as release_checks.py safety-entry computed it
+# from the two attested commits. An entry is never rewritten once recorded, so these stay true
+# however far the pin moves on. The commit is spelled out because the unit fixtures use 0.9.15 as
+# an invented next release.
+RECORDED = {
+    "0.9.15": {
+        "classification": "not-rollback-safe",
+        "from": ts.ATTESTED["0.9.14"],
+        "to": "b65d0ab867e7827e21d0532ae2e1845885933449",
+        "migrations": ["0036_secret_vault_identity_fingerprint"],
+    },
+}
+
+
 class TestCommittedRollbackSafety(unittest.TestCase):
     def setUp(self):
         self.raw = read(rc.SAFETY_FILE)
@@ -65,6 +80,18 @@ class TestCommittedRollbackSafety(unittest.TestCase):
                     (got["classification"], got["from"], got["to"], journal_numbers(got)),
                     (want["classification"], want["from"], want["to"], journal_numbers(want)),
                 )
+
+    def test_the_recorded_entries_are_what_safety_entry_computed(self):
+        for version, want in RECORDED.items():
+            with self.subTest(version):
+                self.assertEqual(self.doc["versions"][version], want)
+
+    def test_the_version_main_pins_has_an_entry(self):
+        # The rollback floor counts a pinned version with no entry as flagged, so a pin that
+        # reached main without one blocks every rollback across it until its entry is recorded.
+        pinned = rc.entry_version(rc.select_ai_tc_entry(rc.parse_json(read(rc.MANIFEST))))
+        self.assertIsNotNone(pinned)
+        self.assertIn(pinned, self.doc["versions"])
 
     def test_every_seeded_release_with_a_migration_is_flagged(self):
         flagged = {v for v, e in self.doc["versions"].items() if e["classification"] == "not-rollback-safe"}
