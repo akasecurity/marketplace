@@ -291,5 +291,54 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertNotIn("expired", done.stdout)
 
 
+class TagReleaseWorkflow(WorkflowCase):
+    name = "tag-release.yml"
+
+    def test_common_shape(self):
+        self.assert_common_shape()
+
+    def test_triggers_and_serialization(self):
+        self.assertIn("  push:\n    branches: [main]\n", self.head)
+        self.assertIn("\n  workflow_dispatch:\n", self.head)
+        self.assertIn("  group: tag-release\n", self.head)
+        self.assertIn("  cancel-in-progress: false\n", self.head)
+
+    def test_one_job_in_the_bot_environment_audits_before_it_mints(self):
+        self.assertEqual(list(self.jobs), ["tag"])
+        job = self.jobs["tag"]
+        self.assertIn("    environment: marketplace-bot\n", job)
+        self.assertLess(job.index("tag_audit.py check"), job.index("actions/create-github-app-token@"))
+        self.assertLess(job.index("actions/create-github-app-token@"), job.index("tag_release.py sweep"))
+        self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
+
+    def test_branch_clean_up_follows_the_sweep_and_never_runs_after_a_failed_one(self):
+        job = self.jobs["tag"]
+        self.assertLess(job.index("tag_release.py sweep"), job.index("tag_release.py cleanup-branches"))
+        # A step with a condition can run after an earlier one failed (`always()`, `failure()`); without one it cannot.
+        self.assertNotRegex(job, r"(?m)^\s+if:")
+        # `continue-on-error` lets a failed sweep step pass, and the next step would then run after it.
+        self.assertNotIn("continue-on-error", job)
+
+
+class ScriptTestsWorkflow(WorkflowCase):
+    name = "script-tests.yml"
+
+    def pull_request_paths(self) -> list[str]:
+        found = re.search(r"(?m)^  pull_request:\n    paths:\n((?:      - .*\n)+)", self.head)
+        self.assertIsNotNone(found, "the pull_request trigger has a paths filter")
+        return [line.strip()[2:].strip('"') for line in found.group(1).splitlines()]
+
+    def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
+        # tag-release reads that file strictly, and a tag cut for a commit whose parent holds a shape it cannot read
+        # records an unknown approver. validate, the required check, does not read it, so the unit test that reads
+        # the repository's own copy is the only check on the PR: once a commit is merged, the file at its parent can
+        # no longer change.
+        self.assertIn(".github/CODEOWNERS", self.pull_request_paths())
+
+    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_that_path_to_run(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_tag_release.py"), encoding="utf-8") as handle:
+            self.assertIn("def test_the_repositorys_own_codeowners_file_can_be_read(", handle.read())
+
+
 if __name__ == "__main__":
     unittest.main()
