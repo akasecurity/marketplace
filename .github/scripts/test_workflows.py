@@ -311,6 +311,12 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertLess(job.index("actions/create-github-app-token@"), job.index("tag_release.py sweep"))
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    def test_branch_clean_up_follows_the_sweep_and_never_runs_after_a_failed_one(self):
+        job = self.jobs["tag"]
+        self.assertLess(job.index("tag_release.py sweep"), job.index("tag_release.py cleanup-branches"))
+        # A step with a condition can run after an earlier one failed (`always()`, `failure()`); without one it cannot.
+        self.assertNotRegex(job, r"(?m)^\s+if:")
+
 
 if __name__ == "__main__":
     unittest.main()
