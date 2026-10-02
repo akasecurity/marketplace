@@ -179,6 +179,22 @@ class TestPinnedVersions(unittest.TestCase):
         self.assertEqual(rc.main_ref(self.repo.path), "refs/remotes/origin/main")
         self.assertEqual(rc.pins_by_ref(self.repo.path)["main"], "0.9.13")
 
+    def test_pins_by_ref_reads_main_at_the_commit_it_is_given(self):
+        resolved = self.repo.head()
+        self.repo.commit(ts.manifest("0.9.15"))  # main moves on after a caller resolved it
+        self.assertEqual(rc.pins_by_ref(self.repo.path)["main"], "0.9.15")
+        pins = rc.pins_by_ref(self.repo.path, main_rev=resolved)
+        self.assertEqual(pins["main"], "0.9.14")
+        self.assertEqual(
+            list(pins.items()),
+            [("main", "0.9.14"), ("fleet-v1", None), ("fleet-v2", "0.9.6"), ("fleet-v10", "0.9.12")],
+        )
+
+    def test_a_commit_that_cannot_be_read_is_a_git_failure(self):
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.pins_by_ref(self.repo.path, main_rev="0" * 40)
+        self.assertEqual(caught.exception.check, "git")
+
     def test_main_without_the_entry_pins_nothing(self):
         doc = ts.manifest()
         del doc["plugins"][2]

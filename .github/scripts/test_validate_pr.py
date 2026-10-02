@@ -874,6 +874,24 @@ class TestMain(unittest.TestCase):
         self.assertEqual(self.main(head, self.commits(head)), 0)
         self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
 
+    def test_the_pins_are_read_at_the_main_commit_the_run_resolved(self):
+        # Main gains a commit that pins 0.9.15 after the run resolved it. The summary names the
+        # commit the run read, so the pins must come from that one too: an entry for 0.9.15 is
+        # still one nothing pins.
+        head = self.pr_commit(ts.manifest(), {rc.SAFETY_FILE: rc.dump_json({"versions": {**ts.SEED, "0.9.15": NEXT_ENTRY}})})
+        resolved = ts.git(self.repo.path, "rev-parse", "main").strip()
+        read_pins = rc.pins_by_ref
+
+        def pins_after_main_moves(*args, **kwargs):
+            self.repo.commit(ts.manifest(NEXT))
+            return read_pins(*args, **kwargs)
+
+        with mock.patch.object(rc, "pins_by_ref", side_effect=pins_after_main_moves):
+            self.assertEqual(self.main(head, self.commits(head)), 1)
+        text = self.summary_text()
+        self.assertIn("rollback-safety.json gains 0.9.15, which nothing pins", text)
+        self.assertIn(f"| Main read at | `{resolved[:12]}` |", text)
+
     def test_a_failing_pr_names_the_main_commit_it_read_too(self):
         doc = ts.manifest()
         ts.ai_tc(doc)["source"]["version"] = "0.9.13"
