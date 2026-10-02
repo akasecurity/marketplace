@@ -112,7 +112,8 @@ bot create a `fleet-v` tag and nobody at all move or delete one, and refuse ever
   one it recorded.
 - **Never move, delete or re-sign an existing `fleet-v<N>` tag.** `tag-audit` treats a tag that no
   longer resolves to its recorded object as a supply-chain event, not a typo;
-  `.github/fleet-tags.frozen.json` records the tags that existed when it was switched on.
+  `.github/fleet-tags.frozen.json` records the tags as of the last reviewed freeze, and a reviewed
+  re-freeze is how a changed tag is accepted and the baseline reset.
 - Managed fleets either follow `main`, which moves only through a code-owner-approved pull request
   (an org owner's break-glass merge aside, which `main-audit` reports), or register this
   marketplace at a `fleet-v<N>` tag, which never moves; a fleet on a tag moves only when its own
@@ -139,11 +140,11 @@ every file, and the `main` ruleset requires one of them to approve (someone othe
 last pusher) and the `validate` check to pass, so a code owner's own PR needs the other code
 owner. Merges are squash merges. Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
-login only to a user, so a team, an email address, a path rule or a second rule is not read. A PR
-merged on top of such a file gets `approver: unknown` in its tag and a `main-audit` issue, rather
-than a guess, and that file is fixed history no later PR can change. The unit tests run on a PR
-that changes the file and fail one the reader cannot read. Before pushing, validate the JSON and
-run the scripts' tests:
+login only to a user, so a team, an email address, a path rule, a second rule or a file that is
+not UTF-8 text is not read. A PR merged on top of such a file gets `approver: unknown` in its tag,
+if it moved the pin, and a `main-audit` issue, rather than a guess; once a commit is merged, the
+file at its parent can no longer change. The unit tests run on a PR that changes the file and fail
+one the reader cannot read. Before pushing, validate the JSON and run the scripts' tests:
 
 ```bash
 for f in plugins.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
@@ -181,14 +182,14 @@ may use.
   `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
   open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
   rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it.
-  While a rollback PR is open, the scheduled import opens nothing, and a forward PR opened by hand
-  gets no auto-merge. The forward and rollback jobs do not wait for each other, so a forward job
-  looks for an open rollback PR before it enables auto-merge and again after, and turns auto-merge
-  off if one opened meanwhile. A candidate that fails a check is logged once and skipped, so it
-  never hides a release above or below it. A candidate the checks cannot finish on (no verdict,
-  below) is not skipped: the run stops there, red, and does not fall back to a lower version,
-  because the one it could not check may be the real newest. The next run tries again, and a
-  dispatch naming a lower `target` that is still above every pin imports that release meanwhile,
+  While a rollback PR is open, the scheduled import opens nothing, and a pull request that a forward
+  dispatch opens gets no auto-merge. The forward and rollback jobs do not wait for each other, so a
+  forward job looks for an open rollback PR before it enables auto-merge and again after, and turns
+  auto-merge off if one opened meanwhile. A candidate that fails a check is logged once and skipped,
+  so it never hides a release above or below it. A candidate the checks cannot finish on (no
+  verdict, below) is not skipped: the run stops there, red, and does not fall back to a lower
+  version, because the one it could not check may be the real newest. The next run tries again, and
+  a dispatch naming a lower `target` that is still above every pin imports that release meanwhile,
   since that path reads no candidate list. A dispatched `target` or rollback target with no verdict
   ends red the same way.
 - **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
@@ -196,9 +197,9 @@ may use.
   run from `main`, and trusts its summary over the PR body. A check that cannot finish reports
   NO VERDICT and fails the required check; it is never reported as the PR breaking a rule. On a bot
   PR every commit must also carry GitHub's verified signature. The summary's `Main read at` row
-  names the `main` commit whose pins and rollback floor it read, and every value taken from the PR
-  appears in it inside a code span. `validate` does not run again when `main` moves, so if
-  `rollback-safety.json` changed on `main` after a rollback PR's run, its approver re-runs the
+  names the `main` commit whose pins and rollback floor it read, and every free-text value taken
+  from the PR appears in it inside a code span. `validate` does not run again when `main` moves, so
+  if `rollback-safety.json` changed on `main` after a rollback PR's run, its approver re-runs the
   check before approving (the PR's checklist says so).
 - **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
   comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
@@ -207,10 +208,12 @@ may use.
   PR merged into `main` counts as a commit's merge. A commit that GitHub links to no merged PR is
   left untagged, and so is everything after it, until it is an hour old, so that a slow link never
   becomes a permanent `pr: none` tag; from then on it is tagged as a push without a PR, which
-  `tag-audit` reports. A restore after the entry was removed is compared with the last version
-  pinned before the removal, so a lower one records `rollback-from`. A tag or a branch deletion
-  that GitHub refuses ends the run with one error naming the ruleset, not a traceback, and a failed
-  sweep runs no clean-up.
+  `tag-audit` reports. A commit dated more than five minutes ahead of the runner's clock (only a
+  direct push can carry one, for example from a machine with the wrong time) is not waited for: it
+  is tagged at once, so its date never holds the tags after it. A restore after the entry was
+  removed is compared with the last version pinned before the removal, so a lower one records
+  `rollback-from`. A tag or a branch deletion that GitHub refuses ends the run with one error naming
+  the ruleset, not a traceback, and a failed sweep runs no clean-up.
 - **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
   included) has been on npm for 24 hours, npm has a version the importer refuses, the release
   checks reached no verdict on a version that has been on npm for over an hour, or whose publish
@@ -225,13 +228,14 @@ may use.
 - **`tag-audit`** (daily, on every tag push or deletion, and by hand) checks the `fleet-v` ledger
   against the frozen list, the last green run and `main`'s history, and that the rulesets are active
   as configured. A tag that changed since the last green run stays red until a reviewed PR
-  re-freezes the list (`python3 .github/scripts/tag_audit.py freeze`), which is how a person records
-  that the change is explained; a deleted tag has to be put back at its commit first. When there is
-  no snapshot to compare with (none was kept, it expired after 90 days, or it was deleted), the
-  frozen list has to record every `fleet-v` tag, so the baseline is re-set in a reviewed PR and not
-  by the passage of time. Keep artifact retention at 90 days, and dispatch `tag-audit` once after
-  turning it on so a baseline exists before `tag-release` cuts the first tag after the frozen list;
-  `tag-release` asks for no comparison.
+  re-freezes the list
+  (`python3 .github/scripts/tag_audit.py freeze --out .github/fleet-tags.frozen.json`, run with the
+  tags fetched), which is how a person records that the change is explained; a deleted tag has to be
+  put back at its commit first. When there is no snapshot to compare with (none was kept, it expired
+  after 90 days, or it was deleted), the frozen list has to record every `fleet-v` tag, so the
+  baseline is re-set in a reviewed PR and not by the passage of time. Keep artifact retention at 90
+  days, and dispatch `tag-audit` once after turning it on so a baseline exists before `tag-release`
+  cuts the first tag after the frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
   added that is not the merge of a PR with a code owner's approval of its final head, from someone
   other than the head's last pusher and not since withdrawn, and a passing `validate` check from
@@ -241,12 +245,14 @@ may use.
   (`web-flow` aside): the audit does not use GitHub's activity API, which does record pushers,
   because what it records for a push made by the App or by auto-merge is unverified, and a head
   that names neither is reported, since an approval could then be the pusher's own. CODEOWNERS is
-  read strictly at the commit's parent, and a file that cannot be read is that commit's problem. A
-  push that moves `main` without extending it (the old tip is not an ancestor of the new one) gets
-  its own issue and audits the first-parent commits after the two tips' merge base, or only the new
-  tip when there is no merge base to start from (for instance, the old tip is no longer in the
-  checkout). A push the audit could not finish, and a job that failed, each get an issue of their
-  own, keyed to the push; a person closes every `main-audit` issue.
+  read strictly at the commit's parent, and a file that cannot be read (a team, a path rule, no
+  file, or bytes that are not UTF-8 text) is that commit's problem: a red result for it while the
+  rest of the push is still audited. A push that moves `main` without extending it (the old tip is
+  not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
+  two tips' merge base. It audits only the new tip when there is no merge base to start from (for
+  instance, the old tip is no longer in the checkout) and when nothing comes after the merge base (a
+  reset back to an ancestor). A push the audit could not finish, and a job that failed, each get an
+  issue of their own, keyed to the push; a person closes every `main-audit` issue.
 
 **No verdict is not a refusal.** `release_checks.py` keeps two outcomes apart. A check that reached
 a verdict and said no raises `ReleaseCheckError` (the command exits 1). A check that could not
@@ -262,8 +268,9 @@ Each rule has one issue, found by a hidden marker among the issues the workflow'
 whatever labels it carries, so an issue a person filed never stands in for it. A rule that clears
 closes its issue, and one that goes red again within 48 hours reopens that issue instead of opening a
 new one, so its escalation clock keeps running; once an issue has been open for 48 hours the
-escalation owner is assigned, once. A person's close is final, and `main-audit`'s issues, which are
-keyed to a commit or a push, are closed only by a person.
+escalation owner is assigned, once. An issue a person closed is never reopened; if its rule is still
+red, the next run opens a new one. `main-audit`'s issues, which are keyed to a commit or a push, are
+closed only by a person.
 
 **The release path covers one plugin.** `release_checks.py` names one package and one release
 pipeline, and the importer, `validate`, `tag-release` and `staleness` act only on the entry that
