@@ -23,7 +23,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 FLEET_PINNED = {
     # The oldest rollback target (fleet-v2); the unit fixtures hold no commit for it.
     "0.9.6": "dc73c73f3ca46aa644bda144cc99e972b60814f7",
-    **{v: ts.ATTESTED[v] for v in ("0.9.8", "0.9.9", "0.9.10", "0.9.12", "0.9.13", "0.9.14")},
+    **{v: ts.ATTESTED[v] for v in ("0.9.8", "0.9.9", "0.9.10", "0.9.12", "0.9.13", "0.9.14", "0.9.15")},
 }
 
 
