@@ -48,7 +48,7 @@ REGISTRY_URL = release_checks.packument_url()
 SHADOWS = ("refs/main", "refs/tags/main", "refs/remotes/main", "refs/remotes/main/HEAD")
 TITLES = {
     "staleness-entry": "staleness: the ai-tc entry is missing from main",
-    "staleness-i": "staleness: npm has a passing ai-tc release that no fleet-v tag pins, for over 24 hours",
+    "staleness-i": "staleness: npm has had a passing ai-tc release above every pin for over 24 hours",
     "staleness-i-refused": "staleness: npm has an ai-tc version the importer refuses",
     "staleness-i-no-verdict": "staleness: the release checks reached no verdict on an ai-tc version",
     "staleness-ii": "staleness: a bot PR has been open for more than 24 hours",
@@ -119,9 +119,10 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
     undecided = bool(unverified)
     return [entry,
             result("staleness-i", True if stale else (None if undecided else False),
-                   f"npm has releases above `{highest}` that pass the importer's checks and that no `fleet-v` "
-                   "tag pins, for more than 24 hours:\n" + "\n".join(stale) + "\n\nThe importer runs every 15 "
-                   "minutes: look for an open or closed pin PR, or a failing import-plugin-release run."),
+                   f"npm has releases above `{highest}`, the highest version `main` or any `fleet-v` tag pins, that "
+                   "pass the importer's checks, for more than 24 hours:\n" + "\n".join(stale)
+                   + "\n\nThe importer runs every 15 minutes: look for an open or closed pin PR, or a failing "
+                   "import-plugin-release run."),
             result("staleness-i-refused", True if refused else (None if undecided else False),
                    f"npm has versions above `{highest}` that the importer refuses:\n" + "\n".join(refused)
                    + "\n\nA version published from a branch can never pass (its attestation binds a branch, not "
