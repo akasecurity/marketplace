@@ -50,12 +50,13 @@ def journal_numbers(entry):
 
 # Entries recorded after the seed was taken, each as release_checks.py safety-entry computed it
 # from the two attested commits. An entry is never rewritten once recorded, so these stay true
-# however far the pin moves on.
+# however far the pin moves on. The commit is spelled out because the unit fixtures use 0.9.15 as
+# an invented next release.
 RECORDED = {
     "0.9.15": {
         "classification": "not-rollback-safe",
         "from": ts.ATTESTED["0.9.14"],
-        "to": ts.ATTESTED["0.9.15"],
+        "to": "b65d0ab867e7827e21d0532ae2e1845885933449",
         "migrations": ["0036_secret_vault_identity_fingerprint"],
     },
 }
