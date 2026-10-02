@@ -84,9 +84,6 @@ class FakeGit:
         index = self.chain.index(sha)
         return self.chain[index - 1] if index else None
 
-    def commits_between(self, before: str, after: str) -> list[str]:
-        return self.first_parent_after(before, after)
-
     def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         if ancestor not in self.chain:
             return None
