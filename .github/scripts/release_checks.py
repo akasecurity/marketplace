@@ -100,6 +100,30 @@ MIGRATION_TAG = re.compile(r"[0-9]{4}_[a-z0-9_]+")
 ATTEMPTS = 5
 RETRY_SECONDS = 20
 
+# How long one HTTP request may run before it counts as no answer.
+HTTP_TIMEOUT = 60
+
+# The worst case for ONE version, if every call runs to its bound and every retry is used:
+#   the registry read of the version    5 x 60 s + 4 x 20 s waits     =  380 s
+#   npm init and npm --version          2 x 120 s                     =  240 s
+#   npm install                         5 x 300 s + 4 x 20 s waits    = 1580 s
+#   npm audit signatures                5 x 120 s + 4 x 20 s waits    =  680 s
+#   the two GitHub reads                2 x 60 s                      =  120 s
+#                                                                      3000 s, 50 minutes.
+# A caller verifies more than one version, and the migration reads that classify_migrations
+# makes sit outside verify_release altogether, so a run cannot rely on those bounds alone: a
+# workflow job would be killed by GitHub before this script said "no verdict" itself. One
+# budget bounds the whole run instead. An entry point starts it once (start_budget); every
+# HTTP request and npm call is clipped to what remains of it, and a wait between attempts that
+# would use up the rest ends the run with InfraError("deadline") rather than start an attempt
+# that cannot finish. Each figure is below the limit of the job that runs the checks, so the
+# script's own "no verdict" comes first, and leaves the job room to set itself up: validate and
+# the importer's verify job are allowed 30 minutes, staleness 45 minutes for every candidate it
+# verifies, and a person at a terminal is given 20.
+BUDGET_CLI = 20 * 60
+BUDGET_JOB = 25 * 60
+BUDGET_STALENESS = 40 * 60
+
 
 class _CheckFailure(Exception):
     """What every release-check failure carries: the check's name and a detail. It exists
@@ -120,6 +144,70 @@ class InfraError(_CheckFailure):
     """No verdict: the network, npm, git or an API failed (CLI exit 2). Deliberately NOT a
     ReleaseCheckError: a handler written for a verdict never catches an outage, so an
     unhandled one stops the run instead of reading as a refusal."""
+
+
+class _Budget:
+    """The time one run may take, counted on a monotonic clock."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float]) -> None:
+        self.seconds = seconds
+        self.clock = clock
+        self.end = clock() + seconds
+
+    def left(self) -> float:
+        return self.end - self.clock()
+
+
+_budget: _Budget | None = None
+
+
+def start_budget(seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+    """Give this run `seconds` to finish, counted from now. Each entry point calls this once,
+    first thing; calling it again would start the count over. `clock` is for tests."""
+    global _budget
+    _budget = _Budget(seconds, clock)
+
+
+def clear_budget() -> None:
+    """End the budget: every call is bounded by its own timeout alone again."""
+    global _budget
+    _budget = None
+
+
+def time_left() -> float | None:
+    """Seconds of the budget that remain (negative once it has run out), or None when no
+    budget was started."""
+    return None if _budget is None else _budget.left()
+
+
+def _out_of_time(when: str) -> InfraError:
+    seconds = _budget.seconds if _budget is not None else 0
+    return InfraError("deadline", f"this run's {seconds:g} s time budget ran out {when}: no verdict (NOT a failed check)")
+
+
+def _time_for(seconds: float, what: str) -> float:
+    """How long `what` may run: `seconds`, or what remains of the budget when that is less.
+    With nothing remaining it is not started: InfraError("deadline")."""
+    left = time_left()
+    if left is None:
+        return seconds
+    if left <= 0:
+        raise _out_of_time(f"before {what} could start")
+    return min(seconds, left)
+
+
+def _budget_spent() -> bool:
+    left = time_left()
+    return left is not None and left <= 0
+
+
+def _wait(sleep: Callable, before: str) -> None:
+    """The pause between two attempts. When the budget would be used up by the pause (or has
+    been), the attempt after it could not start, so the run ends here instead."""
+    left = time_left()
+    if left is not None and left <= RETRY_SECONDS:
+        raise _out_of_time(f"before {before} could start")
+    sleep(RETRY_SECONDS)
 
 
 def _reject_duplicates(pairs):
@@ -344,14 +432,17 @@ def http_fetch(url: str, headers: dict) -> tuple:
     answer that stops partway: http.client raises its own errors from the status line and
     the body, which urllib does not wrap, and reading an error status's body can fail the
     same way."""
+    timeout = _time_for(HTTP_TIMEOUT, f"GET {url}")
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
         try:
-            with _OPENER.open(request, timeout=60) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        if _budget_spent():
+            raise _out_of_time(f"during GET {url}") from exc
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
@@ -399,10 +490,12 @@ NPM_TIMEOUT = {"init": 120, "--version": 120, "install": 300, "audit": 120}
 
 
 def _npm(run, args: list, work: str):
-    seconds = NPM_TIMEOUT[args[0]]
+    seconds = _time_for(NPM_TIMEOUT[args[0]], f"npm {args[0]}")
     try:
         return run(["npm", *args], cwd=work, capture_output=True, text=True, timeout=seconds)
     except subprocess.TimeoutExpired as exc:
+        if _budget_spent():
+            raise _out_of_time(f"during npm {args[0]}") from exc
         raise InfraError("toolchain", f"npm {args[0]} did not finish within {seconds} s (NOT a signature result)") from exc
     except OSError as exc:
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
@@ -461,7 +554,7 @@ def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
 
     audit_once() returns npm's report, or None when npm printed nothing. judge(report)
     returns the result, or raises _NotIndexedYet when the release has no verified attestation
-    YET. Nothing printed and not-yet-indexed are waited out alike, from one budget: on the
+    YET. Nothing printed and not-yet-indexed are waited out alike, from one count of attempts: on the
     last audit each ends as its own error (InfraError, or _NotIndexedYet for the caller to
     turn into a verdict). Any other outcome of judge is final."""
     for attempt in range(1, ATTEMPTS + 1):
@@ -478,7 +571,7 @@ def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
             except _NotIndexedYet:
                 if attempt == ATTEMPTS:
                     raise
-        sleep(RETRY_SECONDS)
+        _wait(sleep, "the next audit")
 
 
 def npm_audit_signatures(
@@ -526,7 +619,7 @@ def npm_audit_signatures(
                     f"npm could not install {package}@{version} after {ATTEMPTS} attempts "
                     f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
                 )
-            sleep(RETRY_SECONDS)
+            _wait(sleep, "the next install")
 
         def audit_once():
             # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
@@ -569,7 +662,7 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
             if status == 404:
                 raise ReleaseCheckError("dist", f"{REGISTRY} does not serve {PACKAGE}@{version}")
             raise InfraError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
-        sleep(RETRY_SECONDS)
+        _wait(sleep, "the next read of the registry")
     try:
         doc = parse_json(body.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
@@ -1918,6 +2011,7 @@ def main(argv=None) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
+    start_budget(BUDGET_CLI)  # one budget for the whole command; cleared below however it ends
     try:
         return _command(args)
     except InfraError as exc:
@@ -1936,6 +2030,8 @@ def main(argv=None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         print(f"::error::internal: {detail}", file=sys.stderr)
         return _emit({"error": {"check": "internal", "detail": detail}}, 2)
+    finally:
+        clear_budget()
 
 
 if __name__ == "__main__":
