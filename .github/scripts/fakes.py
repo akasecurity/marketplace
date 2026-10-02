@@ -17,7 +17,8 @@ REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
 VERSIONS = ("0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17")
 INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64)).decode() for v in VERSIONS}
-# The real attested commits through 0.9.14, then stand-ins for the versions not released yet.
+# The real attested commits through 0.9.14, then invented stand-ins for every later version.
+# 0.9.15 is a real release too, but these tests use it as an invented next release.
 ATTESTED = {**ts.ATTESTED, **{v: v.split(".")[2] * 20 for v in VERSIONS if v not in ts.ATTESTED}}
 CODEOWNERS = "* @Vaishnav-OM @venuverse\n"
 
