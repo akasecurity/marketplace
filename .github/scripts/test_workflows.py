@@ -395,6 +395,13 @@ class MainAuditWorkflow(WorkflowCase):
         self.assertIn("          BEFORE: ${{ github.event.before }}\n", self.jobs["audit"])
         self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["audit"])
 
+    def test_a_failed_audit_job_is_filed_against_its_push(self):
+        # The router keys the failed-job issue to this push, so a second failed run opens its own.
+        self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["file-issues"])
+        # ... through the environment, never spliced into the command line.
+        self.assertFalse([line for line in self.jobs["file-issues"].splitlines()
+                          if line.strip().startswith("run:") and "${{" in line])
+
     def test_the_audit_job_may_read_checks_to_see_that_validate_passed(self):
         self.assertIn("      checks: read\n", self.jobs["audit"])
         self.assertNotIn("checks: write", self.text)

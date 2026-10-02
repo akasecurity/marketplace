@@ -8,7 +8,7 @@ name: main-audit
 # from the pushed commit's own copy, so a bypass push could change it in the
 # same push. Each offending commit, each push that rewrote main and each push
 # the audit could not finish gets its own issue, which only a person closes; if
-# the job itself dies (a timeout), the shared workflow issue stays open too.
+# the job itself dies (a timeout), that push gets a workflow issue of its own too.
 # No concurrency group: a group drops pending runs, and a dropped run would be
 # an unaudited push.
 
@@ -63,4 +63,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RESULTS_JSON: ${{ needs.audit.outputs.results }}
           JOB_RESULT: ${{ needs.audit.result }}
+          AFTER: ${{ github.event.after }}
         run: python3 .github/scripts/issue_router.py apply --label main-audit
