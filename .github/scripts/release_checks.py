@@ -1580,8 +1580,9 @@ EXPECTED_RULESETS = {
 # retargeted away from its refs keeps rules that still read correctly while it protects
 # nothing, so the patterns are audited too. main is named, never ~DEFAULT_BRANCH: a
 # default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
-# `/`), so bot-branches and tags-locked each list both depths. tags-locked never uses ~ALL:
-# GitHub documents it as every branch, and on a tag ruleset it could lock no tag.
+# `/`), so bot-branches and tags-locked each list both depths. tags-locked must list those two
+# globs, for explicitness: ~ALL also covers every tag (GitHub's own tag-ruleset recipes use it),
+# but each pattern list is audited exactly, so what the ruleset covers is spelled out, not implied.
 # x4 is one level on purpose: the branches it protects are named x4/<name>, and a tag that
 # shadows one carries the same name. Any deeper tag is covered by tags-locked.
 EXPECTED_REF_PATTERNS = {
