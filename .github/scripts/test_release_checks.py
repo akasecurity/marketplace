@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -62,6 +63,19 @@ class TestErrorClasses(unittest.TestCase):
             with self.subTest(verdict=repr(verdict)):
                 with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
                     self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
+
+
+class TestRunningTheFile(unittest.TestCase):
+    def test_running_the_file_is_a_usage_error_until_the_command_line_exists(self):
+        # The docstring defines exit 0 as "the check passes", so a file that prints nothing
+        # and exits 0 would be read as a pass by `release_checks.py verify X && proceed`.
+        # The in-process tests cannot see this: they never run the file as a program.
+        result = subprocess.run(
+            [sys.executable, rc.__file__, "verify", "0.9.16"], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("nothing was checked", result.stderr)
 
 
 class TestSelectEntry(unittest.TestCase):
