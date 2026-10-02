@@ -2257,7 +2257,9 @@ class TestAuditRulesets(unittest.TestCase):
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
 
     def test_tags_locked_on_all_is_caught(self):
-        # GitHub documents ~ALL as every branch; on a tag ruleset it could lock no tag.
+        # ~ALL would cover every tag on a tag ruleset too (GitHub's own tag recipes use it), but
+        # tags-locked must list the two explicit globs, so what it covers is spelled out and
+        # audited exactly. The audit reports the difference; it does not claim ~ALL locks nothing.
         on_all = {"include": ["~ALL"], "exclude": ["refs/tags/fleet-v*"]}
         routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": on_all}}})
         self.assertEqual(
