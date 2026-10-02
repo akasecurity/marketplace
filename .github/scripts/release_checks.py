@@ -1395,9 +1395,10 @@ def _without_pin(entry: dict) -> dict:
 
 def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     """Which importer mode a manifest change is EXACTLY. 'none' means the ai-tc entry is
-    unchanged; 'human' means any other change to it."""
+    unchanged; 'human' means any other change to it. The entry is compared as JSON, as the rest
+    of the manifest is, so true, 1 and 1.0 are three different values (Python's == says one)."""
     base, head = find_ai_tc_entry(base_manifest), find_ai_tc_entry(head_manifest)
-    if base == head:
+    if _canonical(base) == _canonical(head):
         return "none"
     if _rest_of(base_manifest) != _rest_of(head_manifest):
         return "human"
@@ -1408,7 +1409,7 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     old, new = entry_version(base), entry_version(head)
     if old is None or new is None or old == new:
         return "human"
-    if _without_pin(base) != _without_pin(head) or not _integrity_only(head.get("metadata")):
+    if _canonical(_without_pin(base)) != _canonical(_without_pin(head)) or not _integrity_only(head.get("metadata")):
         return "human"
     if "metadata" in base and not _integrity_only(base["metadata"]):
         return "human"

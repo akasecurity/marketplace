@@ -1475,6 +1475,28 @@ class TestDiffMode(unittest.TestCase):
     def test_a_new_integrity_at_the_same_version_is_human(self):
         self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.14", integrity=ts.OTHER_INTEGRITY)), "human")
 
+    def test_a_type_change_in_the_ai_tc_entry_is_human(self):
+        # Python's == says True == 1 == 1.0; JSON, and so the rest of the manifest, tells them
+        # apart. The real entry has no boolean or number today, so this needs a reviewed edit
+        # first, but then the comparison must still be exact.
+        def with_strict(version, value, integrity=ts.INTEGRITY):
+            doc = ts.manifest(version, integrity=integrity)
+            ts.ai_tc(doc)["strict"] = value
+            return doc
+
+        cases = {
+            "true to 1, same version": (with_strict("0.9.14", True), with_strict("0.9.14", 1)),
+            "true to 1, with an advance": (with_strict("0.9.14", True), with_strict("0.9.15", 1, ts.OTHER_INTEGRITY)),
+            "1 to 1.0, with an advance": (with_strict("0.9.14", 1), with_strict("0.9.15", 1.0, ts.OTHER_INTEGRITY)),
+            "false to 0, with an advance": (with_strict("0.9.14", False), with_strict("0.9.15", 0, ts.OTHER_INTEGRITY)),
+        }
+        for name, (base, head) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.diff_mode(base, head), "human")
+        # The same value, spelled the same, is still none or advance.
+        self.assertEqual(rc.diff_mode(with_strict("0.9.14", True), with_strict("0.9.14", True)), "none")
+        self.assertEqual(rc.diff_mode(with_strict("0.9.14", 1.0), with_strict("0.9.15", 1.0, ts.OTHER_INTEGRITY)), "advance")
+
     def test_a_description_edit_is_human(self):
         self.assertEqual(rc.diff_mode(ts.manifest(), ts.manifest(description="Better words.")), "human")
 
