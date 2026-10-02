@@ -1016,6 +1016,15 @@ def _statements(sql: str) -> list:
     return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
 
 
+# One SQLite name: quoted with backticks, double quotes or brackets (a doubled quote inside stands
+# for one quote), or a run with no quote, space or dot in it. A table and a column are read the
+# same way, so a quoted name that holds the words ADD or DROP stays one name instead of
+# starting a clause; the table may carry a schema in front of it. The dot is left out of the
+# bare run so the schema's dot has one reading and the match stays linear on a long token.
+_SQL_NAME = r"(?:`(?:[^`]|``)*`|\"(?:[^\"]|\"\")*\"|\[[^\]]*\]|[^\s`\"\[\].]+)"
+_SQL_TABLE = rf"(?:{_SQL_NAME}\.)?{_SQL_NAME}"
+
+
 def _non_additive_reason(statement: str) -> str | None:
     upper = statement.upper()
     if upper.startswith("PRAGMA "):
@@ -1030,17 +1039,21 @@ def _non_additive_reason(statement: str) -> str | None:
         return None
     if re.match(r"CREATE UNIQUE INDEX ", upper):
         return "a UNIQUE index, a new constraint an older build's writes can violate"
-    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
+    added = re.match(rf"ALTER TABLE {_SQL_TABLE} ADD (?:COLUMN )?{_SQL_NAME}(.*)", upper)
     if added:
         # Only the words after the column's name count, and only as words: the name itself
         # (`is_default`, `x default`) and any quoted name further on are not keywords.
         definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
         if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
             return "a NOT NULL column without a default"
+        if re.search(r"\bCHECK\b", definition):
+            return "a CHECK constraint an older build's writes can fail"
+        if re.search(r"\bREFERENCES\b", definition):
+            return "a foreign key an older build's deletes can fail"
         return None
-    if re.match(r"ALTER TABLE \S+ RENAME", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} RENAME", upper):
         return "a rename"
-    if re.match(r"ALTER TABLE \S+ DROP", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} DROP", upper):
         return "a dropped column"
     if upper.startswith("DROP "):
         return "a drop (" + " ".join(upper.split()[:2]).lower() + ")"
