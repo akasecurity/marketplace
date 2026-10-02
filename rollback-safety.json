@@ -47,6 +47,14 @@
       "migrations": [
         "0035_share_destination_provider_id"
       ]
+    },
+    "0.9.15": {
+      "classification": "not-rollback-safe",
+      "from": "a75532b98a70546d3825cbc237769aefe4dcc074",
+      "to": "b65d0ab867e7827e21d0532ae2e1845885933449",
+      "migrations": [
+        "0036_secret_vault_identity_fingerprint"
+      ]
     }
   }
 }
