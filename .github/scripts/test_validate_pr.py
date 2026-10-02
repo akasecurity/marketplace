@@ -330,6 +330,16 @@ class TestBotRules(unittest.TestCase):
     def test_a_head_ref_outside_bot_fails(self):
         failed_with(self, self.advance(pr=pull(head_ref=f"pin-ai-tc-{NEXT}")), "is not under refs/heads/bot/")
 
+    def test_the_pusher_note_says_what_the_commit_listing_lacks(self):
+        # GitHub does record who pushed a branch (its activity API), so the note must not say the API exposes
+        # no pusher; what validate lacks is the pull request's commit listing, which names no pusher.
+        notes = [note for note in self.advance().notes if note.startswith("Who pushed each commit")]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("bot-branches ruleset", notes[0])
+        self.assertIn("validate does not check it", notes[0])
+        self.assertIn("commit listing names authors and committers, not pushers", notes[0])
+        self.assertNotIn("exposes no pusher", notes[0])
+
     def test_a_commit_by_anyone_else_fails(self):
         commits = (
             {"sha": "e" * 40, "author": BOT, "committer": "web-flow", "verified": True},
