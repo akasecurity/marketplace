@@ -10,7 +10,10 @@ records the version, integrity, PR, approver and store-migration class, plus
 rollback-from, drill and approver-note when they apply. A commit that GitHub
 links to no merged PR is left untagged, and so is everything after it, until
 it is an hour old: a slow link must not become a permanent `pr: none` tag.
-After that hour it is tagged as a push without a PR. The owners that decide
+After that hour it is tagged as a push without a PR. A commit dated more than
+five minutes ahead of the runner's clock is not young either (only a direct
+push can carry one, and waiting for its date would hold every later tag back):
+it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
 no later pull request can change, so a parent whose file is anything else never
@@ -42,6 +45,11 @@ ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
 # hour staleness waits before it reports an untagged pin change).
 UNLINKED_GRACE = 3600
+# The clock-skew allowance, in seconds. GitHub dates a commit it makes at the moment it makes it, so a
+# commit it made is never more than seconds ahead of this runner's clock. One dated further ahead was
+# made on a machine with the wrong time (only a direct push can carry one), and it is not young: waiting
+# for its date would hold every later tag back until then. It is handled as an old unlinked commit.
+CLOCK_SKEW = 300
 # A user owner in CODEOWNERS: "@" and a login. A team ("@org/team") or an email address matches no reviewer's login.
 USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -233,7 +241,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         except Refused as refusal:
             owners, unreadable = None, " ".join(str(refusal).split())
         facts = pr_facts(gh, sha, owners, sleep, unreadable)
-        if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
+        if facts["pr"] == "none" and -CLOCK_SKEW <= now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
                           "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
