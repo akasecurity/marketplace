@@ -374,7 +374,8 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
     for commit in pr.commits:
         for problem in commit_problems(commit, bot_login):
             report.fail(problem)
-    report.note("Who pushed each commit is enforced by the bot-branches ruleset; the API exposes no pusher.")
+    report.note("Who pushed each commit is enforced by the bot-branches ruleset; validate does not check it, because "
+                "the pull request's commit listing names authors and committers, not pushers.")
     if mode not in MODE_LABEL:
         report.fail(f"a bot PR must be exactly one importer mode's shape (advance, rollback, remove or restore); this diff is {mode!r}")
         return
