@@ -318,5 +318,23 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertNotRegex(job, r"(?m)^\s+if:")
 
 
+class ScriptTestsWorkflow(WorkflowCase):
+    name = "script-tests.yml"
+
+    def pull_request_paths(self) -> list[str]:
+        found = re.search(r"(?m)^  pull_request:\n    paths:\n((?:      - .*\n)+)", self.head)
+        self.assertIsNotNone(found, "the pull_request trigger has a paths filter")
+        return [line.strip()[2:].strip('"') for line in found.group(1).splitlines()]
+
+    def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
+        # tag-release reads that file strictly and stops the sweep on a shape it refuses. validate, the required
+        # check, does not read it, so the unit test that reads the repository's own copy is the only check on the PR.
+        self.assertIn(".github/CODEOWNERS", self.pull_request_paths())
+
+    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_that_path_to_run(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_tag_release.py"), encoding="utf-8") as handle:
+            self.assertIn("def test_the_repositorys_own_codeowners_file_can_be_read(", handle.read())
+
+
 if __name__ == "__main__":
     unittest.main()
