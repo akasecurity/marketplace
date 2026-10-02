@@ -685,17 +685,29 @@ class TestWorkflow(unittest.TestCase):
 
     @staticmethod
     def lowest_admitted(spec):
-        """The lowest release setup-node's version spec can resolve to, or None when it admits
-        older ones (a bare major, an x-range, an alias). Only an exact version or a range that
-        starts at one is accepted."""
-        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", spec)
-        return tuple(int(part) for part in match.groups()) if match else None
+        """The lowest release setup-node's version spec can resolve to, or None when it can
+        resolve to a Node that does not ship the npm the gate needs: a bare major, an x-range,
+        an alias, another major (Node 25.0.0 through 25.8.2 bundle npm 11.6 to 11.11), or a range
+        with no upper bound, which setup-node resolves to the highest cached copy of any major.
+        Only an exact 24.x.y, or a range from one up to but not including 25, is accepted."""
+        match = re.fullmatch(r"24\.(\d+)\.(\d+)", spec) or re.fullmatch(r">=24\.(\d+)\.(\d+) <25", spec)
+        return (24, int(match.group(1)), int(match.group(2))) if match else None
 
     def test_the_lowest_release_a_spec_admits(self):
         for spec, lowest in (
             ("24.15.0", (24, 15, 0)),
+            ("24.16.1", (24, 16, 1)),
             (">=24.15.0 <25", (24, 15, 0)),
-            (">=24.16.1", (24, 16, 1)),
+            (">=24.16.1 <25", (24, 16, 1)),
+            # Another major bundles another npm: Node 25.0.0 through 25.8.2 ship npm 11.6 to 11.11.
+            ("25.0.0", None),
+            (">=25.9.0 <26", None),
+            # No upper bound, or one past 25: the highest cached copy of any major can be chosen.
+            (">=24.15.0", None),
+            (">=24.16.1", None),
+            (">=24.15.0 <26", None),
+            (">=24.15.0 <24.99.0", None),
+            ("<25", None),
             ("24", None),
             ("24.x", None),
             ("^24.15.0", None),
