@@ -321,6 +321,108 @@ class TestApprover(unittest.TestCase):
         self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
 
 
+class TestCodeOwners(unittest.TestCase):
+    def owners(self, text):
+        files = {} if text is None else {("x", ".github/CODEOWNERS"): text}
+        return tr.code_owners(FakeGit(chain=["x"], files=files), "x")
+
+    def test_one_star_line_of_users_is_read_whatever_surrounds_it(self):
+        cases = {
+            "the repository's own file": ("* @Vaishnav-OM @venuverse\n", ["Vaishnav-OM", "venuverse"]),
+            "comments and blank lines": ("# who reviews\n\n* @a_b @c-d  # everyone\n\n", ["a_b", "c-d"]),
+            "tabs and CRLF line ends": ("*\t@a\t@b\r\n", ["a", "b"]),
+            "no final newline": ("* @a", ["a"]),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self.owners(text), expected)
+
+    def test_the_repositorys_own_codeowners_file_can_be_read(self):
+        # A change to that file that the strict reader cannot read would stop every sweep, so it fails here first.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "CODEOWNERS")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertEqual(self.owners(text), ["Vaishnav-OM", "venuverse"])
+
+    def test_anything_else_is_a_refusal_that_names_the_file(self):
+        cases = {
+            "no file": (None, "is missing"),
+            "an empty file": ("", "exactly one rule"),
+            "only comments": ("# nobody yet\n", "exactly one rule"),
+            "a team": ("* @akasecurity/maintainers\n", "`@akasecurity/maintainers`"),
+            "a team among users": ("* @a @org/team @b\n", "`@org/team`"),
+            "an email address": ("* @a b@example.com\n", "`b@example.com`"),
+            "a name without an at sign": ("* someone\n", "`someone`"),
+            "a bare at sign": ("* @\n", "`@`"),
+            "a handle that is not a login": ("* @a. @b[bot]\n", "`@a.`"),
+            "a path rule beside the star line": ("* @a\n/docs @b\n", "exactly one rule"),
+            "only a path rule": ("/docs @a\n", "exactly one rule"),
+            "two star lines": ("* @a\n* @b\n", "exactly one rule"),
+            "a different catch-all pattern": ("** @a\n", "exactly one rule"),
+            "a star line naming no owner": ("*\n", "names no owner"),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(Refused) as caught:
+                    self.owners(text)
+                self.assertIn(".github/CODEOWNERS at x", str(caught.exception))
+                self.assertIn(expected, str(caught.exception))
+
+
+class TestSweepOwners(unittest.TestCase):
+    def test_a_codeowners_file_it_cannot_read_stops_the_sweep(self):
+        cases = {
+            "a team owner": "* @akasecurity/maintainers\n",
+            "a path rule": "* @Vaishnav-OM @venuverse\n/docs @venuverse\n",
+            "no file": None,
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                git = history(chain=("t8", "b"))
+                if text is None:
+                    del git.files[("t8", ".github/CODEOWNERS")]
+                else:
+                    git.files[("t8", ".github/CODEOWNERS")] = text
+                gh = sweep_github()
+                with self.assertRaisesRegex(Refused, r"b changed the ai-tc version, but nothing from it on was tagged: "
+                                                     r"\.github/CODEOWNERS at t8"):
+                    tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+                self.assertEqual(gh.writes(), [])  # no tag object, no ref
+
+    def test_the_commits_before_the_unreadable_file_keep_their_tags(self):
+        git = history(chain=("t8", "b", "c"))
+        git.files[("b", ".github/CODEOWNERS")] = "* @akasecurity/maintainers\n"  # c's parent
+        gh = sweep_github()
+        with self.assertRaisesRegex(Refused, r"c changed the ai-tc version.*CODEOWNERS at b"):
+            tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        self.assertEqual([(call[2]["tag"], call[2]["object"]) for call in gh.called("POST", R("git/tags"))],
+                         [("fleet-v9", "b")])
+
+    def test_a_refusal_is_one_error_annotation(self):
+        git = history(chain=("t8", "b"))
+        git.files[("t8", ".github/CODEOWNERS")] = "* @akasecurity/maintainers\n"
+        code, out = run_main("sweep", git, sweep_github())
+        self.assertEqual(code, 1)
+        self.assertTrue(out.startswith("::error::b changed the ai-tc version"), out)
+        self.assertEqual(out.count("\n"), 1)
+
+    def test_a_root_commit_has_no_owners_to_read(self):
+        # Nothing precedes it, so there is no file to read and no approval to be recorded as a bypass.
+        class RootOnly(FakeGit):
+            def first_parent_after(self, base, tip):
+                return ["r"]
+
+        git = RootOnly(chain=["r"], tags=[fleet_tag(8, "t8")], files={
+            ("r", MANIFEST): manifest("0.9.15", INTEGRITY["0.9.15"]), ("r", SAFETY_FILE): safety({})})
+        gh = sweep_github()
+        gh.routes[("GET", R("commits/r/pulls"))] = [
+            {"number": 13, "merge_commit_sha": "r", "merged_at": "2026-10-02T00:00:00Z", "base": {"ref": "main"}}]
+        tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        message = gh.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertIn("approver: none\n", message)
+        self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
+
+
 def branch_ref(name: str, tip: str) -> dict:
     return {"ref": f"refs/heads/{name}", "object": {"sha": tip, "type": "commit"}}
 

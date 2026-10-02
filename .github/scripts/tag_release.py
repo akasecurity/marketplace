@@ -10,15 +10,18 @@ records the version, integrity, PR, approver and store-migration class, plus
 rollback-from, drill and approver-note when they apply. A commit that GitHub
 links to no merged PR is left untagged, and so is everything after it, until
 it is an hour old: a slow link must not become a permanent `pr: none` tag.
-After that hour it is tagged as a push without a PR. The run also deletes
-the bot's own branches whose PRs are closed, since only the bot may delete
-bot/** branches.
+After that hour it is tagged as a push without a PR. The owners that decide
+whether a PR was approved come from CODEOWNERS, read strictly: one `*` line of
+user owners, and anything else stops the sweep rather than guessing who counts.
+The run also deletes the bot's own branches whose PRs are closed, since only
+the bot may delete bot/** branches.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable
@@ -26,7 +29,7 @@ from typing import Callable
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
-from issue_router import CODEOWNERS_FILE, parse_codeowners
+from issue_router import CODEOWNERS_FILE
 from release_checks import MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
 
 ABSENT = "entry removed"
@@ -35,6 +38,8 @@ ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
 # hour staleness waits before it reports an untagged pin change).
 UNLINKED_GRACE = 3600
+# A user owner in CODEOWNERS: "@" and a login. A team ("@org/team") or an email address matches no reviewer's login.
+USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 def version_at(git: Git, sha: str | None) -> str:
@@ -60,6 +65,29 @@ def last_pinned(git: Git, sha: str | None) -> str:
             return version
         sha = git.first_parent(sha)
     return ABSENT
+
+
+def code_owners(git: Git, sha: str) -> list[str]:
+    """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
+    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule
+    or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
+    shape would turn a real approval into a recorded bypass."""
+    raw = git.show(sha, CODEOWNERS_FILE)
+    where = f"{CODEOWNERS_FILE} at {sha[:12]}"
+    if raw is None:
+        raise Refused(f"{where} is missing; code owners can only be read from a file of one `*` line naming users.")
+    rules = [fields for fields in (line.split("#", 1)[0].split() for line in raw.splitlines()) if fields]
+    if len(rules) != 1 or rules[0][0] != "*":
+        raise Refused(f"{where} does not hold exactly one rule, a `*` line; code owners can only be read from a "
+                      "file of one `*` line naming users, with no path rules.")
+    owners = rules[0][1:]
+    if not owners:
+        raise Refused(f"{where} names no owner on its `*` line.")
+    unusable = [owner for owner in owners if not USER_OWNER.fullmatch(owner)]
+    if unusable:
+        raise Refused(f"{where} names {', '.join(f'`{owner}`' for owner in unusable)}, which is not a user "
+                      "(`@login`); a team or an email address cannot be matched to a reviewer.")
+    return [owner[1:] for owner in owners]
 
 
 def integrity_at(git: Git, sha: str) -> str:
@@ -185,7 +213,11 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if previous == ABSENT:
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
-        owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
+        try:
+            owners = code_owners(git, parent) if parent else []
+        except Refused as refusal:
+            raise Refused(f"{sha[:12]} changed the ai-tc version, but nothing from it on was tagged: "
+                          f"{refusal}") from refusal
         facts = pr_facts(gh, sha, owners, sleep)
         if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
