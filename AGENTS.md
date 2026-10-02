@@ -232,8 +232,21 @@ may use.
   by the passage of time. Keep artifact retention at 90 days, and dispatch `tag-audit` once after
   turning it on so a baseline exists before `tag-release` cuts the first tag after the frozen list;
   `tag-release` asks for no comparison.
-- **`main-audit`** (every push to `main`) opens an issue for any commit that reached `main` without
-  a code-owner-approved PR.
+- **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
+  added that is not the merge of a PR with a code owner's approval of its final head, from someone
+  other than the head's last pusher and not since withdrawn, and a passing `validate` check from
+  GitHub Actions on that head. The branch commits a merge-commit merge brings in are not on that
+  line and are not checked, and a rebase merge would report each rebased commit but the last, which
+  is why merges are squash-only. The last pusher is the author or committer of the head commit
+  (`web-flow` aside): the audit does not use GitHub's activity API, which does record pushers,
+  because what it records for a push made by the App or by auto-merge is unverified, and a head
+  that names neither is reported, since an approval could then be the pusher's own. CODEOWNERS is
+  read strictly at the commit's parent, and a file that cannot be read is that commit's problem. A
+  push that moves `main` without extending it (the old tip is not an ancestor of the new one) gets
+  its own issue and audits the first-parent commits after the two tips' merge base, or only the new
+  tip when there is no merge base to start from (for instance, the old tip is no longer in the
+  checkout). A push the audit could not finish, and a job that failed, each get an issue of their
+  own, keyed to the push; a person closes every `main-audit` issue.
 
 **No verdict is not a refusal.** `release_checks.py` keeps two outcomes apart. A check that reached
 a verdict and said no raises `ReleaseCheckError` (the command exits 1). A check that could not
