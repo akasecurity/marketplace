@@ -494,7 +494,14 @@ def npm_audit_signatures(
     copy of the packument (cacheable for five minutes, which would make the retries pointless).
     Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
     `verified` list at all, which is reported as a toolchain failure, not as a missing
-    attestation."""
+    attestation.
+
+    The install and every audit name npmjs as the package's registry on their own command
+    line. `npm audit signatures` takes each package's registry from npm's configuration, which
+    includes a user-level ~/.npmrc and NPM_CONFIG_USERCONFIG, and it fetches the registry's
+    signing keys, the packument and the attestations from there. Left to that configuration,
+    a caller's own registry setting would redirect those reads, and a release that is fine
+    could be refused for lack of attestations."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
@@ -520,7 +527,11 @@ def npm_audit_signatures(
         def audit_once():
             # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
             # exit status is not.
-            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations", "--prefer-online"], work)
+            audit = _npm(
+                run,
+                ["audit", "signatures", "--json", "--include-attestations", "--prefer-online", registry_flag],
+                work,
+            )
             return _npm_report(audit.stdout) if audit.stdout.strip() else None
 
         return _audit_until_judged(audit_once, judge, sleep)

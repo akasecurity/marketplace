@@ -580,9 +580,29 @@ class TestNpmAuditSignatures(unittest.TestCase):
     def test_the_audit_asks_for_attestations_and_a_fresh_read_of_the_registry(self):
         run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
         rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        # The last argument names npmjs as the scope's registry, as the install does: the audit
+        # otherwise reads its keys, packument and attestations from the caller's npm configuration.
         self.assertEqual(
-            run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations", "--prefer-online"]
+            run.calls[-1][0],
+            ["npm", "audit", "signatures", "--json", "--include-attestations", "--prefer-online",
+             "--@akasecurity:registry=https://registry.npmjs.org"],
         )
+
+    def test_every_audit_names_npmjs_as_the_registry_the_way_the_install_does(self):
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        run = FakeRun(audits=[unindexed])
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None, judge=never)
+        install = next(args for args, _ in run.calls if args[1] == "install")
+        audits = [args for args, _ in run.calls if args[1] == "audit"]
+        flag = "--@akasecurity:registry=https://registry.npmjs.org"
+        self.assertIn(flag, install)
+        self.assertEqual(len(audits), 5)
+        self.assertTrue(all(flag in args for args in audits))
 
     def test_the_audit_is_the_part_that_is_repeated(self):
         # Registry lag is waited out by auditing again, not by installing again: one scratch
