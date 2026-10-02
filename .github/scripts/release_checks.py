@@ -492,6 +492,9 @@ def npm_audit_signatures(
     it. The install happens ONCE: a lagging registry is waited out by auditing again, and each
     audit passes --prefer-online so that it asks the registry instead of reading npm's cached
     copy of the packument (cacheable for five minutes, which would make the retries pointless).
+    That skips npm's local cache only. npmjs' CDN answers from its own copy (max-age 300)
+    whatever the client sends, so the retries, about 80 s apart in all, may all be served the
+    same edge copy: do not count on them to outlast a stale one.
     Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
     `verified` list at all, which is reported as a toolchain failure, not as a missing
     attestation.
@@ -526,7 +529,8 @@ def npm_audit_signatures(
 
         def audit_once():
             # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
-            # exit status is not.
+            # exit status is not. --prefer-online skips npm's local cache, not npmjs' CDN's
+            # (see the docstring).
             audit = _npm(
                 run,
                 ["audit", "signatures", "--json", "--include-attestations", "--prefer-online", registry_flag],
