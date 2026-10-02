@@ -11,8 +11,12 @@ rollback-from, drill and approver-note when they apply. A commit that GitHub
 links to no merged PR is left untagged, and so is everything after it, until
 it is an hour old: a slow link must not become a permanent `pr: none` tag.
 After that hour it is tagged as a push without a PR. The owners that decide
-whether a PR was approved come from CODEOWNERS, read strictly: one `*` line of
-user owners, and anything else stops the sweep rather than guessing who counts.
+whether a PR was approved come from CODEOWNERS at the merged commit's parent,
+read strictly: one `*` line of user owners. That file is fixed history, which
+no later pull request can change, so a parent whose file is anything else never
+stops the sweep (it would stop tagging for good): the commit is tagged with
+`approver: unknown` and an approver-note saying why, rather than a guess at who
+counts.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
 """
@@ -71,7 +75,8 @@ def code_owners(git: Git, sha: str) -> list[str]:
     """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
     naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule
     or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
-    shape would turn a real approval into a recorded bypass."""
+    shape would turn a real approval into a recorded bypass. What a caller does with the Refused is its own
+    call: the sweep tags with an unknown approver, because the file it reads is fixed history."""
     raw = git.show(sha, CODEOWNERS_FILE)
     where = f"{CODEOWNERS_FILE} at {sha[:12]}"
     if raw is None:
@@ -153,15 +158,23 @@ def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[s
             and login in owners and login not in exclude]
 
 
-def pr_facts(gh: GitHub, sha: str, owners: list[str], sleep: Callable[[float], None] = time.sleep) -> dict:
+def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
+             unreadable: str = "") -> dict:
+    """What the tag records about the PR that merged `sha`. `owners` is None when CODEOWNERS could not be read
+    at the commit's parent, and `unreadable` says why: the PR is still named, but nobody can be matched to an
+    approval, so the approver is unknown and no bypass is claimed. With no PR there is no approval to match,
+    so the owners do not matter."""
     pull = merged_pull(gh, sha, sleep)
     if pull is None:
         return {"pr": "none", "approver": "none", "note": "no pull request merged this commit", "drill": False}
     number = pull["number"]
     full = gh.get(gh.repo_path(f"pulls/{number}"))
     head = full["head"]["sha"]
-    approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
+    if owners is None:
+        return {"pr": str(number), "approver": "unknown", "drill": drill,
+                "note": f"code owners could not be read: {unreadable or 'CODEOWNERS is not one line of users'}"}
+    approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
     if approvers:
         return {"pr": str(number), "approver": approvers[-1], "note": None, "drill": drill}
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
@@ -213,12 +226,13 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if previous == ABSENT:
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
+        # The parent's file is fixed history: refusing here would keep every later commit untagged for good, as no
+        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag.
         try:
-            owners = code_owners(git, parent) if parent else []
+            owners, unreadable = (code_owners(git, parent) if parent else []), ""
         except Refused as refusal:
-            raise Refused(f"{sha[:12]} changed the ai-tc version, but nothing from it on was tagged: "
-                          f"{refusal}") from refusal
-        facts = pr_facts(gh, sha, owners, sleep)
+            owners, unreadable = None, " ".join(str(refusal).split())
+        facts = pr_facts(gh, sha, owners, sleep, unreadable)
         if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
