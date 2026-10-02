@@ -1,13 +1,15 @@
 name: main-audit
 
-# On every push to main: red unless every commit the push added is the merge
-# commit of a PR with an approving review from a code owner, on the PR's final
-# head, by someone other than its last pusher (AGENTS.md, "The workflows").
+# On every push to main: red unless every commit the push added to main's
+# first-parent line is the merge commit of a PR whose final head has an
+# approving review from a code owner other than its last pusher, and a passing
+# validate check from GitHub Actions (AGENTS.md, "The workflows"). The branch
+# commits a merge-commit merge brings in are not on that line and are not checked.
 # Detective only: the main ruleset prevents, and this records a bypass. It runs
 # from the pushed commit's own copy, so a bypass push could change it in the
 # same push. Each offending commit, each push that rewrote main and each push
 # the audit could not finish gets its own issue, which only a person closes; if
-# the job itself dies (a timeout), the shared workflow issue stays open too.
+# the job itself dies (a timeout), that push gets a workflow issue of its own too.
 # No concurrency group: a group drops pending runs, and a dropped run would be
 # an unaudited push.
 
@@ -25,6 +27,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      checks: read
     outputs:
       results: ${{ steps.audit.outputs.results }}
     steps:
@@ -56,9 +59,10 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - name: open an issue for each commit that reached main unapproved
+      - name: open an issue for each commit that reached main unapproved or unvalidated
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS_JSON: ${{ needs.audit.outputs.results }}
           JOB_RESULT: ${{ needs.audit.result }}
+          AFTER: ${{ github.event.after }}
         run: python3 .github/scripts/issue_router.py apply --label main-audit

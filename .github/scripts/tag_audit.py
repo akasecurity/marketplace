@@ -10,6 +10,15 @@ and the merged bot PR it names. This script adds what audit_tags's inputs
 cannot carry: the tag objects the last green run saw, and the rulesets'
 presence, enforcement, targets, rules and conditions. Bypass lists are
 visible only to admins; the probe and an admin's read-back cover those.
+
+A change to a tag since the last green run stays red until a reviewed pull
+request re-freezes the tag list (`freeze`), which is how a person records
+that it is explained. When the run was asked to compare (`--previous`) but
+no snapshot exists, because none was ever kept, it expired or it was deleted,
+the comparison is replaced by a stricter rule: the frozen list must record
+every fleet-v tag, so the baseline is re-set in a reviewed pull request
+rather than by the passage of time. A run that is not asked to compare
+(tag-release's) applies neither.
 """
 from __future__ import annotations
 
@@ -103,20 +112,50 @@ def freeze_text(git: Git) -> str:
     return release_checks.dump_json(snapshot(git))
 
 
-def compare_previous(previous: list[dict], current: list[dict]) -> list[str]:
+REFREEZE = "if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
+
+
+def compare_previous(previous: list[dict], current: list[dict], frozen: list[dict] | None = None) -> list[str]:
+    """What changed since the last green run's snapshot. A change a reviewed pull request re-froze is
+    accepted: the committed list is where a person records that a tag's new state is explained. Only an
+    exact match counts, so a tag that moved again after the re-freeze is still named, and a deleted tag
+    is never accepted (the list has no row that says "gone"): it has to be put back and then re-frozen.
+    `frozen` is None when the list could not be read, which accepts nothing."""
     now = {tag["tag"]: tag for tag in current}
+    recorded = {(row["tag"], row["object"], row["commit"]) for row in frozen or []}
     problems = []
     for tag in previous:
         seen = now.get(tag["tag"])
         if seen is None:
-            problems.append(f"{tag['tag']} (tag object {tag['object']}) existed at the last green run and is gone")
+            problems.append(f"{tag['tag']} (tag object {tag['object']}) existed at the last green run and is gone; "
+                            f"re-create it at commit {tag['commit']}, then {REFREEZE}")
         elif (seen["object"], seen["commit"]) != (tag["object"], tag["commit"]):
+            if (tag["tag"], seen["object"], seen["commit"]) in recorded:
+                continue
             problems.append(f"{tag['tag']} moved since the last green run: tag object {tag['object']} -> "
-                            f"{seen['object']}, commit {tag['commit']} -> {seen['commit']}")
+                            f"{seen['object']}, commit {tag['commit']} -> {seen['commit']}; {REFREEZE}")
     return problems
 
 
-def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None) -> list[str]:
+def uncovered(current: list[dict], frozen: list[dict] | None) -> list[str]:
+    """The stand-in for the comparison when there is no snapshot to compare with: every fleet-v tag must
+    have a row in the frozen list. `frozen` None means the list could not be read; the ledger check already
+    reports that, so nothing is added here."""
+    if frozen is None:
+        return []
+    recorded = {row["tag"] for row in frozen}
+    missing = [tag["tag"] for tag in current if tag["tag"] not in recorded]
+    if not missing:
+        return []
+    return [f"no snapshot from an earlier green run to compare against, and the frozen list does not record "
+            f"{', '.join(missing)}; re-freeze every fleet-v tag in a reviewed pull request to set a new baseline"]
+
+
+def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
+              baseline_expected: bool = False) -> list[str]:
+    """Every problem. `baseline_expected` says the caller asked for the comparison (a snapshot path was
+    given): if the snapshot is then absent (previous None), the frozen list has to cover every tag. A caller
+    that never asks, as tag-release does not, gets neither the comparison nor the coverage rule."""
     # The rulesets are checked once, by check_rulesets below (it adds exactly-one-per-name and
     # the fetch-and-merge rule); release_checks.audit_tags would otherwise check them a second
     # time and file every ruleset problem twice. test_the_configured_rulesets_pass pins RULESETS
@@ -124,8 +163,13 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None) ->
     problems = [f"tag ledger: {problem}"
                 for problem in release_checks.audit_tags(git.repo_dir, frozen, check_rulesets=False)]
     problems += check_rulesets(gh)
-    if previous is not None:
-        problems += compare_previous(previous, snapshot(git))
+    if previous is not None or baseline_expected:
+        # An unreadable list is already a ledger problem above, and accepts nothing here.
+        rows = release_checks._tag_rows(frozen, "frozen tag list", [])
+        if previous is not None:
+            problems += compare_previous(previous, snapshot(git), rows)
+        else:
+            problems += uncovered(snapshot(git), rows)
     return problems
 
 
@@ -141,7 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     check = sub.add_parser("check")
     check.add_argument("--repo-dir", default=".")
     check.add_argument("--frozen", required=True)
-    check.add_argument("--previous")
+    check.add_argument("--previous", help="the snapshot an earlier green run kept; given but absent, the frozen "
+                                           "list has to record every fleet-v tag")
     check.add_argument("--snapshot")
     check.add_argument("--results", action="store_true", help="write the outputs results and red, and exit 0")
     freeze = sub.add_parser("freeze")
@@ -155,13 +200,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"froze {len(git.fleet_tags())} fleet-v tags into {args.out}")
         return 0
     previous = None
-    if args.previous and os.path.exists(args.previous):
-        with open(args.previous, encoding="utf-8") as handle:
-            previous = json.load(handle)
-    elif args.previous:
-        print("::notice::no snapshot from an earlier green tag-audit run; the frozen list and the ledger rules still apply")
+    if args.previous is not None:
+        if os.path.exists(args.previous):
+            with open(args.previous, encoding="utf-8") as handle:
+                previous = json.load(handle)
+        else:
+            print("::notice::no snapshot from an earlier green tag-audit run to compare against; "
+                  "the frozen list has to record every fleet-v tag")
     gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
-    problems = run_check(git, gh, args.frozen, previous)
+    problems = run_check(git, gh, args.frozen, previous, baseline_expected=args.previous is not None)
     if args.snapshot:
         os.makedirs(os.path.dirname(args.snapshot) or ".", exist_ok=True)
         with open(args.snapshot, "w", encoding="utf-8") as handle:

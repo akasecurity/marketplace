@@ -17,7 +17,8 @@ REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
 VERSIONS = ("0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17")
 INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64)).decode() for v in VERSIONS}
-# The real attested commits through 0.9.14, then stand-ins for the versions not released yet.
+# The real attested commits through 0.9.14, then invented stand-ins for every later version.
+# 0.9.15 is a real release too, but these tests use it as an invented next release.
 ATTESTED = {**ts.ATTESTED, **{v: v.split(".")[2] * 20 for v in VERSIONS if v not in ts.ATTESTED}}
 CODEOWNERS = "* @Vaishnav-OM @venuverse\n"
 
@@ -61,6 +62,9 @@ class FakeGit:
     def rev_parse(self, rev: str) -> str:
         return self.chain[-1] if rev == "main" else rev
 
+    def main(self) -> str:
+        return "main"
+
     def show(self, rev: str, path: str) -> str | None:
         return self.files.get((self.rev_parse(rev), path))
 
@@ -80,13 +84,16 @@ class FakeGit:
         index = self.chain.index(sha)
         return self.chain[index - 1] if index else None
 
-    def commits_between(self, before: str, after: str) -> list[str]:
-        return self.first_parent_after(before, after)
-
     def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
         if ancestor not in self.chain:
             return None
         return descendant in self.chain and self.chain.index(ancestor) <= self.chain.index(descendant)
+
+    def merge_base(self, first: str, second: str) -> str | None:
+        """On a single chain, the earlier of two commits is the base of both."""
+        if first not in self.chain or second not in self.chain:
+            return None
+        return first if self.chain.index(first) <= self.chain.index(second) else second
 
     def commit_time(self, sha: str) -> int:
         return self.times[sha]
@@ -136,7 +143,10 @@ class FakeGitHub:
         return self._answer("DELETE", path)
 
     def paginate(self, path, params=None):
-        return iter(self._answer("GET", path, None, params))
+        answer = self._answer("GET", path, None, params)
+        if isinstance(answer, dict):  # an envelope such as {"total_count": n, "check_runs": [...]}, as ghapi reads it
+            answer = next((value for value in answer.values() if isinstance(value, list)), [])
+        return iter(answer)
 
     def graphql(self, query, variables):
         return self._answer("GRAPHQL", re.search(r"\{\s*(\w+)", query).group(1), variables)
@@ -153,12 +163,12 @@ def not_found(path: str = "") -> GitHubError:
 
 
 def pull(number: int, head: str, *, state: str = "open", merged: bool = False,
-         created_at: str = "2026-09-29T00:00:00Z", labels: tuple = (), repo: str = REPO) -> dict:
-    """A pull request as the REST list endpoint returns it."""
+         created_at: str = "2026-09-29T00:00:00Z", labels: tuple = (), repo: str = REPO, author: str = BOT) -> dict:
+    """A pull request as the REST list endpoint returns it, opened by the release bot unless `author` says otherwise."""
     return {"number": number, "node_id": f"PR_{number}", "state": state, "created_at": created_at,
             "merged_at": "2026-09-29T01:00:00Z" if merged else None,
             "head": {"ref": head, "sha": f"{number:040x}", "repo": {"full_name": repo}},
-            "labels": [{"name": name} for name in labels], "user": {"login": BOT}}
+            "labels": [{"name": name} for name in labels], "user": {"login": author}}
 
 
 def pulls_route(pulls: list[dict]) -> Callable:

@@ -17,9 +17,10 @@ name: import-plugin-release
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
 # marketplace-bot environment, whose deployment policy admits only main, and acts
 # as the bot App: a bot branch made with a create-only ref, never force-pushed (an
-# existing branch with an open PR is skipped; one with no open PR is skipped on a
-# plain forward run, and deleted and created again only by a reimport or rollback
-# dispatch), the PR, and auto-merge
+# existing branch with an open PR is skipped; one the bot's closed PR used is skipped
+# on a plain forward run, and deleted and created again only by a reimport or
+# rollback dispatch; one no PR ever used was left by a run that died before opening
+# it, and any run deletes it and creates it again), the PR, and auto-merge
 # (squash). Acting as the App, not with the workflow's own token, is what lets
 # validate start on the PR and lets the merge start tag-release: events the
 # workflow token causes start no pull_request_target or push runs.
@@ -65,7 +66,9 @@ on:
 # branch; rollback (and remove and restore, once built) each queue in their own
 # group, so a scheduled run can never replace a pending rollback. A group keeps
 # one pending run and drops the rest; a dropped scheduled run is harmless, since
-# the next tick re-evaluates.
+# the next tick re-evaluates. The groups do not wait for each other, so a forward run
+# looks for an open rollback PR before it enables auto-merge and again after, and
+# turns auto-merge off if one opened meanwhile.
 concurrency:
   group: ${{ github.event_name == 'schedule' && 'import-forward' || format('import-{0}', inputs.mode) }}
   cancel-in-progress: false
@@ -94,11 +97,18 @@ jobs:
           persist-credentials: false
       # npm 11.12 or later: on an older npm, `npm audit signatures --include-attestations`
       # prints no attestations at all, so release_checks stops with no verdict (a
-      # toolchain failure) rather than judge a release it cannot see.
+      # toolchain failure) rather than judge a release it cannot see. Node 24.15.0 is the
+      # first release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm).
+      # A bare "24" is not enough: setup-node takes a copy of Node in the runner's tool cache
+      # that matches the spec before it downloads anything, so "24" can resolve to an older
+      # cached 24.x. No older copy matches a range that starts at 24.15.0, so the action uses
+      # a cached copy of 24.15.0 or later if there is one, and downloads a release otherwise.
+      # The check refuses an older npm with no verdict (MIN_NPM in release_checks.py), but the
+      # workflow should not depend on that.
       # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "24"
+          node-version: ">=24.15.0 <25"
       - name: plan (no secrets)
         id: plan
         env:

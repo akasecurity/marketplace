@@ -12,6 +12,8 @@ import tempfile
 import textwrap
 import unittest
 
+import release_checks
+
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
 
 
@@ -79,6 +81,27 @@ class ImporterWorkflow(WorkflowCase):
     def test_the_workflow_token_never_writes(self):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
+    # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
+    FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
+
+    def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
+        # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
+        # can resolve to an older cached 24.x whose npm the release checks refuse, red, on every run.
+        # Only an exact version, or a range that starts at one, cannot.
+        specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
+        self.assertEqual(len(specs), 1, "the importer installs Node exactly once, with a quoted node-version")
+        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
+        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
+        self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
+
+    def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
+        self.assertIn("npm 11.12", self.text)
+        self.assertNotIn("npm 11 (node 24)", self.text.lower())
+
 
 RUN_77 = '[{"databaseId": 77, "event": "schedule"}]'
 READY = '{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}'
@@ -119,7 +142,7 @@ class TagAuditWorkflow(WorkflowCase):
         self.assertIn("name: fleet-tags-snapshot", upload)
         self.assertIn("retention-days: 90", upload)
         self.assertIn("# Kept only from a green audit", self.jobs["audit"])
-        self.assertRegex(self.jobs["audit"], r"It lasts 90\s+# days")
+        self.assertRegex(self.jobs["audit"], r"It lasts 90(?:\s+#)?\s+days")
 
     def test_the_baseline_comes_only_from_a_green_run_on_main(self):
         fetch = self.step("name: fetch the snapshot the last green run kept")
@@ -219,10 +242,11 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertTrue(calls[-1].startswith("run download 55 "))
 
-    def test_the_fetch_step_with_no_earlier_green_run_compares_against_the_frozen_list_only(self):
+    def test_the_fetch_step_with_no_earlier_green_run_requires_the_frozen_list_to_cover_every_tag(self):
         done, calls = self.run_fetch()
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
+        self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
         # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
         self.assertTrue(calls[0].startswith("run list "))
         self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
@@ -232,7 +256,25 @@ class TagAuditWorkflow(WorkflowCase):
                                      artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}')
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::run 77 kept a snapshot that has expired", done.stdout)
+        self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
         self.assertFalse([call for call in calls if call.startswith("run download")])
+
+    def test_a_green_run_with_no_snapshot_takes_the_no_baseline_path(self):
+        # A snapshot someone deleted must not wedge the audit red for good: the run goes on without a
+        # baseline, and tag_audit.py then requires the frozen list to record every fleet-v tag.
+        cases = {
+            "the green run lists no artifact": '{"artifacts": []}',
+            "another artifact only": '{"artifacts": [{"name": "other", "expired": false}]}',
+        }
+        for label, artifacts in cases.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=RUN_77, artifacts=artifacts)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("::notice::run 77 is the last green run but lists no fleet-tags-snapshot artifact",
+                              done.stdout)
+                self.assertNotIn("expired", done.stdout)
+                self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
+                self.assertFalse([call for call in calls if call.startswith("run download")])
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,
@@ -240,9 +282,6 @@ class TagAuditWorkflow(WorkflowCase):
         cases = {
             "the run listing fails": dict(runs=RUN_77, list_fails=True),
             "the artifact listing fails": dict(listed, api_fails=True),
-            "the green run lists no snapshot": dict(runs=RUN_77, artifacts='{"artifacts": []}'),
-            "another artifact only": dict(runs=RUN_77,
-                                          artifacts='{"artifacts": [{"name": "other", "expired": false}]}'),
             "the download fails": dict(listed, download_fails=True),
         }
         for label, kwargs in cases.items():
@@ -272,6 +311,34 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertLess(job.index("actions/create-github-app-token@"), job.index("tag_release.py sweep"))
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    def test_branch_clean_up_follows_the_sweep_and_never_runs_after_a_failed_one(self):
+        job = self.jobs["tag"]
+        self.assertLess(job.index("tag_release.py sweep"), job.index("tag_release.py cleanup-branches"))
+        # A step with a condition can run after an earlier one failed (`always()`, `failure()`); without one it cannot.
+        self.assertNotRegex(job, r"(?m)^\s+if:")
+        # `continue-on-error` lets a failed sweep step pass, and the next step would then run after it.
+        self.assertNotIn("continue-on-error", job)
+
+
+class ScriptTestsWorkflow(WorkflowCase):
+    name = "script-tests.yml"
+
+    def pull_request_paths(self) -> list[str]:
+        found = re.search(r"(?m)^  pull_request:\n    paths:\n((?:      - .*\n)+)", self.head)
+        self.assertIsNotNone(found, "the pull_request trigger has a paths filter")
+        return [line.strip()[2:].strip('"') for line in found.group(1).splitlines()]
+
+    def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
+        # tag-release reads that file strictly, and a tag cut for a commit whose parent holds a shape it cannot read
+        # records an unknown approver. validate, the required check, does not read it, so the unit test that reads
+        # the repository's own copy is the only check on the PR, and the last chance to fix the file before it
+        # becomes history that no pull request can change.
+        self.assertIn(".github/CODEOWNERS", self.pull_request_paths())
+
+    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_that_path_to_run(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_tag_release.py"), encoding="utf-8") as handle:
+            self.assertIn("def test_the_repositorys_own_codeowners_file_can_be_read(", handle.read())
+
 
 class StalenessWorkflow(WorkflowCase):
     name = "staleness.yml"
@@ -292,6 +359,28 @@ class StalenessWorkflow(WorkflowCase):
         self.assertIn("      issues: write\n", self.jobs["file-issues"])
         self.assertIn("    if: always()\n", self.jobs["file-issues"])
 
+    # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
+    # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
+    FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
+
+    def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
+        # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
+        # can resolve to an older cached 24.x whose npm the release checks cannot finish on, and every
+        # hourly run would then report the same no-verdict alert. Only an exact version, or a range
+        # that starts at one, cannot.
+        specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
+        self.assertEqual(len(specs), 1, "staleness installs Node exactly once, with a quoted node-version")
+        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
+        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
+        self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
+
+    def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
+        self.assertIn("npm 11.12", self.text)
+        self.assertNotIn("npm 11 (node 24)", self.text.lower())
+
 
 class MainAuditWorkflow(WorkflowCase):
     name = "main-audit.yml"
@@ -307,6 +396,17 @@ class MainAuditWorkflow(WorkflowCase):
         self.assertIn("          fetch-depth: 0\n", self.jobs["audit"])
         self.assertIn("          BEFORE: ${{ github.event.before }}\n", self.jobs["audit"])
         self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["audit"])
+
+    def test_a_failed_audit_job_is_filed_against_its_push(self):
+        # The router keys the failed-job issue to this push, so a second failed run opens its own.
+        self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["file-issues"])
+        # ... through the environment, never spliced into the command line.
+        self.assertFalse([line for line in self.jobs["file-issues"].splitlines()
+                          if line.strip().startswith("run:") and "${{" in line])
+
+    def test_the_audit_job_may_read_checks_to_see_that_validate_passed(self):
+        self.assertIn("      checks: read\n", self.jobs["audit"])
+        self.assertNotIn("checks: write", self.text)
 
     def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
         self.assertNotIn("secrets.", self.text)
