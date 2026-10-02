@@ -184,13 +184,13 @@ may use.
   While a rollback PR is open, the scheduled import opens nothing, and a forward PR opened by hand
   gets no auto-merge. The forward and rollback jobs do not wait for each other, so a forward job
   looks for an open rollback PR before it enables auto-merge and again after, and turns auto-merge
-  off if one opened meanwhile. A candidate that fails a check
-  is logged once and skipped, so it never hides a release above or below it. A candidate the
-  checks cannot finish on (no verdict, below) is not skipped: the run stops there, red, and does
-  not fall back to a lower version, because the one it could not check may be the real newest.
-  The next run tries again, and a dispatch naming a lower `target` that is still above every pin
-  imports that release meanwhile, since that path reads no candidate list. A dispatched `target` or
-  rollback target with no verdict ends red the same way.
+  off if one opened meanwhile. A candidate that fails a check is logged once and skipped, so it
+  never hides a release above or below it. A candidate the checks cannot finish on (no verdict,
+  below) is not skipped: the run stops there, red, and does not fall back to a lower version,
+  because the one it could not check may be the real newest. The next run tries again, and a
+  dispatch naming a lower `target` that is still above every pin imports that release meanwhile,
+  since that path reads no candidate list. A dispatched `target` or rollback target with no verdict
+  ends red the same way.
 - **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
   its script, reading the PR's files as data. An approver confirms the check run is `validate.yml`'s
   run from `main`, and trusts its summary over the PR body. A check that cannot finish reports
