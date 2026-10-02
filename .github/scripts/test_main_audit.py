@@ -25,7 +25,7 @@ def repo() -> FakeGit:
 def github(*, pulls=None, author=BOT, committer=BOT, reviews=None) -> FakeGitHub:
     return FakeGitHub({
         ("GET", R("commits/s1/pulls")): pulls if pulls is not None else [
-            {"number": 30, "merge_commit_sha": "s1", "merged_at": "2026-10-05T10:00:00Z"}],
+            {"number": 30, "merge_commit_sha": "s1", "merged_at": "2026-10-05T10:00:00Z", "base": {"ref": "main"}}],
         ("GET", R("pulls/30")): {"head": {"sha": "h30"}},
         ("GET", R("commits/h30")): {"author": {"login": author}, "committer": {"login": committer}},
         ("GET", R("pulls/30/reviews")): reviews if reviews is not None else [
