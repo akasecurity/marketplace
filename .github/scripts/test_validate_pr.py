@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import os
+import pathlib
+import re
 import unittest
 from unittest import mock
 
@@ -109,7 +111,7 @@ class TestEveryPrRules(unittest.TestCase):
     def test_duplicate_plugin_names_fail(self):
         agents = copy.deepcopy(ts.AGENTS_MANIFEST)
         agents["plugins"].append(copy.deepcopy(agents["plugins"][0]))
-        failed_with(self, self.human(head_files=files(ts.manifest(), agents=agents)), "repeated: preflight")
+        failed_with(self, self.human(head_files=files(ts.manifest(), agents=agents)), "repeated: `preflight`")
 
     def test_renames_naming_ai_tc_fail(self):
         head = ts.manifest()
@@ -121,10 +123,10 @@ class TestEveryPrRules(unittest.TestCase):
             with self.subTest(key):
                 head = ts.manifest()
                 head[key] = value
-                failed_with(self, self.human(head), f"may change); changed: {key}")
+                failed_with(self, self.human(head), f"may change); changed: `{key}`")
         head = ts.manifest()
         head["metadata"]["pluginRoot"] = "./plugins"
-        failed_with(self, self.human(head), "changed: metadata")
+        failed_with(self, self.human(head), "changed: `metadata`")
 
     def test_the_three_mutable_top_level_keys_may_change(self):
         head = ts.manifest()
@@ -154,7 +156,7 @@ def human_report(head_doc, *, base_doc=None, changed=(rc.MANIFEST,), head_safety
     report = vp.Report()
     entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
     head = copy.deepcopy(ts.SEED) if head_safety is None else head_safety
-    vp.human_rules(entries, copy.deepcopy(ts.SEED), head, sorted(changed), report)
+    vp.human_rules(entries, copy.deepcopy(ts.SEED), head, sorted(changed), report, pinned={v for v in ts.PINS.values() if v})
     return report
 
 
@@ -195,10 +197,52 @@ class TestHumanRules(unittest.TestCase):
         report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
         self.assertEqual(report.failures, [])
         self.assertIn(
-            "HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
+            "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
             "the approving code owner owns this classification",
             report.notes,
         )
+
+    def test_an_edit_that_does_not_lower_the_floor_is_not_labelled_so(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety["0.9.13"]["classification"] = "not-rollback-safe"
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertIn(
+            "HUMAN EDIT of rollback-safety.json 0.9.13: additive -> not-rollback-safe; "
+            "the approving code owner owns this classification",
+            report.notes,
+        )
+        self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
+
+    def test_a_hand_added_entry_for_a_version_nothing_pins_fails(self):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety["0.9.15"] = copy.deepcopy(NEXT_ENTRY)
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        failed_with(self, report, "rollback-safety.json gains 0.9.15, which nothing pins")
+        failed_with(self, report, "never typed ahead of it")
+
+    def test_an_entry_added_for_a_version_a_tag_pins_is_only_a_note(self):
+        # 0.9.8 is pinned by fleet-v3, and the seed has no entry for it: a person may supply it.
+        head_safety = {"0.9.8": copy.deepcopy(NEXT_ENTRY), **copy.deepcopy(ts.SEED)}
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any("0.9.8: absent -> not-rollback-safe" in n for n in report.notes), report.notes)
+
+    def test_a_human_added_entry_that_is_additive_for_a_pinned_version_lowers_the_floor(self):
+        head_safety = {"0.9.8": {**copy.deepcopy(NEXT_ENTRY), "classification": "additive", "migrations": []}, **copy.deepcopy(ts.SEED)}
+        report = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any(n.startswith("LOWERS THE ROLLBACK FLOOR: ") and "0.9.8: absent -> additive" in n for n in report.notes), report.notes)
+
+    def test_evaluate_gives_a_human_pr_the_versions_main_and_the_tags_pin(self):
+        head_safety = {**ts.SEED, "0.9.15": NEXT_ENTRY}
+        report = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety=head_safety), [rc.SAFETY_FILE])
+        failed_with(self, report, "rollback-safety.json gains 0.9.15, which nothing pins")
+        pinned_now = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety=head_safety), [rc.SAFETY_FILE], pins={**ts.PINS, "main": "0.9.15"})
+        self.assertEqual(pinned_now.failures, [])
+        # 0.9.8 is pinned by fleet-v3 alone, not by main: a version only a tag pins is accepted too.
+        tag_only = run(pull(**HUMAN), files(ts.manifest()), files(ts.manifest(), safety={"0.9.8": NEXT_ENTRY, **ts.SEED}), [rc.SAFETY_FILE])
+        self.assertEqual(tag_only.failures, [])
 
     def test_removing_a_safety_entry_is_called_out(self):
         head_safety = copy.deepcopy(ts.SEED)
@@ -220,7 +264,7 @@ class TestHumanRules(unittest.TestCase):
         report = vp.Report()
         text = '{"versions": {"0.9.14": {"classification": "safe"}}}'
         self.assertIsNone(vp.safety_versions(text, report, label="the PR head"))
-        failed_with(self, report, "at the PR head: rollback-safety.json '0.9.14'")
+        failed_with(self, report, "at the PR head: `rollback-safety.json '0.9.14'")
 
     def test_the_bot_hint_explains_an_unconfigured_identity(self):
         self.assertIn("release_checks.BOT_LOGIN is None", vp.bot_hint(pull(), None))
@@ -228,14 +272,16 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(vp.bot_hint(pull(**HUMAN), BOT), "")
 
 
-def bot_report(head_doc, *, base_doc=None, pr=None, changed=None, head_safety=None, tip=None, pins=None, verify_fn=verify):
+def bot_report(
+    head_doc, *, base_doc=None, pr=None, changed=None, base_safety=None, head_safety=None, tip=None, pins=None, verify_fn=verify
+):
     report = vp.Report()
     entries = vp.every_pr_rules(base_doc or ts.manifest(), head_doc, report)
     vp.bot_rules(
         pr or pull(),
         entries,
         dict(ts.PINS) if pins is None else pins,
-        copy.deepcopy(ts.SEED),
+        copy.deepcopy(ts.SEED) if base_safety is None else base_safety,
         copy.deepcopy(ts.SEED) if head_safety is None else head_safety,
         copy.deepcopy(ts.SEED) if tip is None else tip,
         sorted(changed if changed is not None else [rc.MANIFEST]),
@@ -294,8 +340,17 @@ class TestBotRules(unittest.TestCase):
         failed_with(self, report, f"commit dddddddddddd is committed by venuverse: a bot commit's committer is {BOT}")
         self.assertFalse(any("eeeeeeeeeeee" in f for f in report.failures), report.failures)
 
-    def test_a_commit_the_app_pushed_itself_passes_unsigned(self):
-        commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": False},)
+    def test_an_unsigned_commit_fails_whoever_it_names_as_committer(self):
+        # Naming the App as author and committer is two lines anyone who can push may write.
+        for verified in (False, None):
+            with self.subTest(verified=verified):
+                commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": verified},)
+                report = self.advance(pr=pull(commits=commits))
+                failed_with(self, report, "commit eeeeeeeeeeee has no verified signature: a bot commit is one GitHub created for the App and signed")
+                self.assertEqual(len(report.failures), 1, report.failures)
+
+    def test_a_signed_commit_naming_the_app_as_committer_passes(self):
+        commits = ({"sha": "e" * 40, "author": BOT, "committer": BOT, "verified": True},)
         self.assertEqual(self.advance(pr=pull(commits=commits)).failures, [])
 
     def test_a_web_flow_commit_needs_a_verified_signature(self):
@@ -313,7 +368,7 @@ class TestBotRules(unittest.TestCase):
         failed_with(self, self.advance(pr=pull(commits=())), "lists no commits")
 
     def test_an_extra_file_fails(self):
-        failed_with(self, self.advance(changed=[rc.MANIFEST, rc.SAFETY_FILE, "README.md"]), "it also changes: README.md")
+        failed_with(self, self.advance(changed=[rc.MANIFEST, rc.SAFETY_FILE, "README.md"]), "it also changes: `README.md`")
 
     def test_an_integrity_npm_does_not_serve_fails(self):
         report = bot_report(
@@ -349,7 +404,8 @@ class TestBotRules(unittest.TestCase):
         )
         self.assertEqual(report.failures, [])
         self.assertTrue(any(n.startswith("RE-IMPORT: 0.9.14") for n in report.notes))
-        self.assertIn(("Store migration", "not-rollback-safe (recorded)"), report.rows)
+        # The recorded class is stronger than the computed one, so it stands.
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes additive)"), report.rows)
 
     def test_a_reimport_that_rewrites_its_recorded_entry_fails(self):
         rewritten = copy.deepcopy(ts.SEED)
@@ -363,6 +419,66 @@ class TestBotRules(unittest.TestCase):
             head_safety=rewritten,
         )
         failed_with(self, report, "already records 0.9.14")
+
+    def recorded_forward(self, entry, **overrides):
+        """A forward PR for NEXT, which the base already records as `entry`; the file is left alone."""
+        recorded = {**ts.SEED, NEXT: entry}
+        kwargs = dict(base_safety=copy.deepcopy(recorded), head_safety=copy.deepcopy(recorded))
+        kwargs.update(overrides)
+        return bot_report(ts.manifest(NEXT), **kwargs)
+
+    def test_a_recorded_entry_weaker_than_the_computed_one_fails(self):
+        # validate computes not-rollback-safe for 0.9.15, so an entry that says additive was typed, not computed.
+        entry = {"classification": "additive", "from": ts.ATTESTED["0.9.14"], "to": ATTESTED[NEXT], "migrations": []}
+        report = self.recorded_forward(entry)
+        failed_with(self, report, "records 0.9.15 as additive, but validate computes not-rollback-safe (0036_migration)")
+        failed_with(self, report, "a code owner corrects the entry in a reviewed PR")
+
+    def test_a_recorded_entry_for_another_commit_fails(self):
+        entry = {**NEXT_ENTRY, "to": "2" * 40}
+        failed_with(self, self.recorded_forward(entry), f"records 0.9.15 up to commit `{'2' * 40}`, but 0.9.15's attested commit is `{'f' * 40}`")
+
+    def test_a_recorded_entry_that_matches_the_computation_passes(self):
+        report = self.recorded_forward(NEXT_ENTRY)
+        self.assertEqual(report.failures, [])
+        self.assertFalse(any(n.startswith("rollback-safety.json records") for n in report.notes), report.notes)
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes not-rollback-safe)"), report.rows)
+
+    def test_a_recorded_entry_stronger_than_the_computed_one_passes(self):
+        # Fail-safe: validate computes additive for 0.9.13, and the recorded not-rollback-safe stands.
+        report = bot_report(
+            ts.manifest("0.9.13"),
+            base_doc=ts.manifest("0.9.12"),
+            pr=pull(head_ref="bot/pin-ai-tc-0.9.13"),
+            pins={**ts.PINS, "main": "0.9.12"},
+            base_safety={**ts.SEED, "0.9.13": {**ts.SEED["0.9.13"], "classification": "not-rollback-safe"}},
+            head_safety={**ts.SEED, "0.9.13": {**ts.SEED["0.9.13"], "classification": "not-rollback-safe"}},
+        )
+        self.assertEqual(report.failures, [])
+        self.assertIn(("Store migration", "not-rollback-safe (recorded; validate computes additive)"), report.rows)
+
+    def test_a_different_starting_commit_is_only_a_note(self):
+        entry = {**NEXT_ENTRY, "from": ts.ATTESTED["0.9.13"]}
+        report = self.recorded_forward(entry)
+        self.assertEqual(report.failures, [])
+        self.assertTrue(any("records 0.9.15 from commit" in n and "only the commit it runs up to" in n for n in report.notes), report.notes)
+
+    def test_an_outage_recomputing_a_recorded_entry_is_no_verdict(self):
+        def down_below(version):
+            if version == "0.9.14":
+                raise rc.InfraError("network", "down")
+            return verify(version)
+
+        with self.assertRaises(rc.InfraError):
+            self.recorded_forward(NEXT_ENTRY, verify_fn=down_below)
+
+    def test_a_release_that_cannot_be_recomputed_fails(self):
+        def gone_below(version):
+            if version == "0.9.14":
+                raise rc.ReleaseCheckError("dist", "npmjs does not serve 0.9.14")
+            return verify(version)
+
+        failed_with(self, self.recorded_forward(NEXT_ENTRY, verify_fn=gone_below), "could not compute 0.9.15's store-migration entry (dist)")
 
     def rollback(self, target="0.9.13", **overrides):
         kwargs = dict(pr=pull(head_ref=f"bot/rollback-ai-tc-0.9.14-to-{target}"), tip=copy.deepcopy(ADDITIVE_TIP))
@@ -484,7 +600,96 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual((report.rows, report.exit_code), ([], 1))
 
 
+class TestWorkflow(unittest.TestCase):
+    """validate.yml cannot run here, but what it promises the script can be read from it."""
+
+    WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / "workflows" / "validate.yml"
+    # The first Node 24 release that bundles an npm of MIN_NPM or later: v24.15.0 ships npm
+    # 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
+    FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
+
+    @staticmethod
+    def lowest_admitted(spec):
+        """The lowest release setup-node's version spec can resolve to, or None when it admits
+        older ones (a bare major, an x-range, an alias). Only an exact version or a range that
+        starts at one is accepted."""
+        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", spec)
+        return tuple(int(part) for part in match.groups()) if match else None
+
+    def test_the_lowest_release_a_spec_admits(self):
+        for spec, lowest in (
+            ("24.15.0", (24, 15, 0)),
+            (">=24.15.0 <25", (24, 15, 0)),
+            (">=24.16.1", (24, 16, 1)),
+            ("24", None),
+            ("24.x", None),
+            ("^24.15.0", None),
+            (">=24", None),
+            ("lts/*", None),
+            ("latest", None),
+        ):
+            with self.subTest(spec):
+                self.assertEqual(self.lowest_admitted(spec), lowest)
+
+    def test_the_workflow_runs_a_node_that_ships_an_npm_the_gate_accepts(self):
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        specs = re.findall(r"uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: \"([^\"]+)\"", text)
+        self.assertEqual(len(specs), 1, "validate.yml must install Node exactly once, with a quoted node-version")
+        lowest = self.lowest_admitted(specs[0])
+        self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_npm_floor_the_node_version_was_chosen_for_is_the_gates(self):
+        # If the gate's floor moves, the Node release above has to move with it.
+        self.assertEqual(rc.MIN_NPM, (11, 12, 0))
+
+    def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
+        text = self.WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("npm 11 (Node 24)", text)
+        self.assertIn("npm 11.12", text)
+
+
 class TestSummary(unittest.TestCase):
+    def test_pull_request_text_is_inert_in_the_summary(self):
+        # Every name a pull request supplies reaches the summary, which renders as markdown.
+        hostile = {
+            "plugin": "<h2>PASS</h2>",
+            "key": "<img src=x onerror=alert(1)>",
+            "path": ".github/<b>workflow</b>.yml",
+            "duplicate": "<u>twice</u>",
+            "version": "<i>9.9.9</i>",
+            "safety key": "[approve here](https://example.invalid) <img src=x>",
+        }
+        agents = copy.deepcopy(ts.AGENTS_MANIFEST)
+        agents["plugins"] += [{"name": hostile["plugin"]}, {"name": hostile["plugin"]}]
+        head = files(ts.manifest(), agents=agents)
+        head_doc = ts.manifest()
+        head_doc[hostile["key"]] = True
+        head[rc.MANIFEST] = rc.dump_json(head_doc)
+        head["plugins.json"] = '{"%s": 1, "%s": 2, "plugins": []}' % (hostile["duplicate"], hostile["duplicate"])
+        head[rc.SAFETY_FILE] = rc.dump_json({"versions": {hostile["version"]: {}}})
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, hostile["path"]])
+        # A rollback-safety.json that repeats a key is refused with the key quoted in the message.
+        repeated = files(ts.manifest())
+        repeated[rc.SAFETY_FILE] = '{"versions": {}, "%s": 1, "%s": 2}' % ((hostile["safety key"],) * 2)
+        unparsed = run(pull(**HUMAN), files(ts.manifest()), repeated, [rc.SAFETY_FILE])
+        failed_with(self, unparsed, "rollback-safety.json does not parse at the PR head")
+        human = vp.Report()
+        vp.human_rules((None, None, "none"), {}, {}, [hostile["path"]], human)
+        bot = vp.Report()
+        vp.bot_rules(
+            pull(), (ts.ai_tc(ts.manifest()), ts.ai_tc(ts.manifest("0.9.15")), "advance"), dict(ts.PINS), {}, {}, {},
+            [rc.MANIFEST, hostile["path"]], bot, bot_login=BOT, verify=verify, classify=classify,
+        )
+        text = "\n".join(vp.render_summary(r, 7) for r in (report, unparsed, human, bot))
+        for what, value in hostile.items():
+            with self.subTest(what):
+                self.assertIn(value, text)  # it reached the summary ...
+        # ... and every one of them sits inside a code span, so none is left to be read as markup.
+        outside = re.sub(r"`[^`]*`", "", text)
+        self.assertNotIn("<", outside)
+        self.assertNotIn("](", outside)
+
     def test_a_pass_names_the_verdict_the_rows_and_the_run_to_confirm(self):
         report = vp.Report()
         report.row("Mode", "ADVANCE (bot PR)")
@@ -627,6 +832,46 @@ class TestMain(unittest.TestCase):
         self.repo.commit(files={"llms.txt": "moved on main\n"})
         start = ts.git(self.repo.path, "merge-base", "HEAD", head).strip()
         self.assertEqual(vp.changed_files(self.repo.path, start, head), ["README.md"])
+
+    def test_the_summary_names_the_main_commit_it_read(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.repo.commit(files={"llms.txt": "moved on main\n"})
+        tip = ts.git(self.repo.path, "rev-parse", "main").strip()
+        self.assertEqual(self.main(head, self.commits(head)), 0)
+        self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
+
+    def test_a_failing_pr_names_the_main_commit_it_read_too(self):
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head = self.pr_commit(doc)
+        tip = ts.git(self.repo.path, "rev-parse", "main").strip()
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
+
+    def test_a_commit_listing_that_is_not_json_or_not_a_list_is_no_verdict(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        for body in (b"not json", {"a": 1}, [1], [{"sha": "x"}, "text"]):
+            with self.subTest(body=body):
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)  # the summary file is appended to, so read this run's alone
+                code = self.main(head, ts.FakeFetch({self.COMMITS_URL: (200, body)}))
+                self.assertEqual(code, 2)
+                text = self.summary_text()
+                self.assertIn("NO VERDICT", text)
+                self.assertIn("api: GET ", text)
+
+    def test_an_unexpected_error_is_no_verdict_with_a_summary(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        with mock.patch.object(vp, "evaluate", side_effect=KeyError("surprise")):
+            self.assertEqual(self.main(head, self.commits(head)), 2)
+        text = self.summary_text()
+        self.assertIn("NO VERDICT", text)
+        self.assertIn("internal: KeyError", text)
+
+    def test_an_interrupt_is_not_swallowed_by_the_net(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        with mock.patch.object(vp, "evaluate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.main(head, self.commits(head))
 
     def test_a_non_hex_head_is_no_verdict(self):
         self.assertEqual(self.main("main", ts.FakeFetch()), 2)
