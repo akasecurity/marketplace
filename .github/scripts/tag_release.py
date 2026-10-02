@@ -13,8 +13,8 @@ it is an hour old: a slow link must not become a permanent `pr: none` tag.
 After that hour it is tagged as a push without a PR. The owners that decide
 whether a PR was approved come from CODEOWNERS, read strictly: one `*` line of
 user owners, and anything else stops the sweep rather than guessing who counts.
-The run also deletes the bot's own branches whose PRs are closed, since only
-the bot may delete bot/** branches.
+The run also deletes the bot's own branches that still point at the head a
+closed PR closed on, since only the bot may delete bot/** branches.
 """
 from __future__ import annotations
 
