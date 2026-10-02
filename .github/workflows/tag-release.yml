@@ -7,7 +7,9 @@ name: tag-release
 # and stops, red and creating nothing, if any fails; that refusal is a signal, not
 # a control, since this file runs from the pushed commit. Tags are created as the
 # bot App, the only identity ruleset fleet-tags-create lets create one; no Mac
-# follows a tag. It also deletes the bot's own branches whose PRs are closed.
+# follows a tag. It then deletes the bot's own branches that still point at the head
+# a closed PR closed on, but only after a sweep that finished: a refused or failed
+# sweep ends the run first, and the branches wait for the next one.
 
 on:
   push:
@@ -53,7 +55,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: python3 .github/scripts/tag_release.py sweep --repo-dir .
-      - name: delete the bot's branches whose PRs are closed
+      # No `if:` on this step (or any other): it runs only while every step before it has passed.
+      - name: delete the bot's branches left at the head of a closed PR
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: python3 .github/scripts/tag_release.py cleanup-branches
