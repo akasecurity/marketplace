@@ -1,4 +1,4 @@
-"""Unit tests for release_checks.py. Standard library only and no network: every fetch,
+"""Unit tests for release_checks.py. Standard library only and no outside network: every fetch,
 npm run and sleep is injected. live_release_checks.py holds the three live checks."""
 
 from __future__ import annotations
@@ -6,11 +6,13 @@ from __future__ import annotations
 import contextlib
 import copy
 import http.client
+import http.server
 import io
 import json
 import os
 import subprocess
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -246,15 +248,56 @@ class _FailingBody(io.BytesIO):
         raise self.error
 
 
+class _Origin(http.server.BaseHTTPRequestHandler):
+    """A loopback server: records each request's headers on its server, and answers 302 to
+    the server's redirect_to, or 200 when it has none."""
+
+    def do_GET(self):
+        self.server.requests.append(dict(self.headers))
+        self.send_response(302 if self.server.redirect_to else 200)
+        if self.server.redirect_to:
+            self.send_header("Location", self.server.redirect_to)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
 class TestHttpFetch(unittest.TestCase):
     URL = "https://registry.npmjs.org/x"
 
     def fetch_with(self, **patch):
-        with mock.patch.object(rc.urllib.request, "urlopen", **patch):
+        with mock.patch.object(rc._OPENER, "open", **patch):
             return rc.http_fetch(self.URL, {})
+
+    def serve(self, redirect_to=None):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
+        server.requests = []
+        server.redirect_to = redirect_to
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
 
     def test_a_status_and_body_come_back_as_they_are(self):
         self.assertEqual(self.fetch_with(return_value=_Response(b"ok")), (200, b"ok"))
+
+    def test_a_redirect_comes_back_as_its_status_and_is_not_followed(self):
+        # urllib's default handler copies every header onto the follow-up request, the token
+        # included, whatever host the redirect names. Here the token is forced on (the first
+        # server is not api.github.com) so a followed redirect would deliver it to the second.
+        second = self.serve()
+        first = self.serve(redirect_to=f"http://localhost:{second.server_port}/")
+        environ = {"GITHUB_TOKEN": "dummy-token", "no_proxy": "*", "NO_PROXY": "*"}
+        with mock.patch.dict(os.environ, environ):
+            with mock.patch.object(rc, "_sends_token_to", return_value=True):
+                result = rc.http_fetch(f"http://127.0.0.1:{first.server_port}/", {})
+        self.assertEqual(result, (302, b""))
+        self.assertEqual([seen.get("Authorization") for seen in first.requests], ["Bearer dummy-token"])
+        self.assertEqual(second.requests, [])
 
     def test_an_http_error_status_is_returned_and_not_raised(self):
         error = rc.urllib.error.HTTPError(self.URL, 503, "unavailable", {}, io.BytesIO(b"later"))

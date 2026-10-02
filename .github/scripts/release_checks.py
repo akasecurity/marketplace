@@ -280,7 +280,8 @@ Fetch = Callable[[str, dict], tuple]
 
 
 def _sends_token_to(url: str) -> bool:
-    """Only api.github.com ever sees the job's token; the registry is read anonymously."""
+    """Only api.github.com ever sees the job's token, and never across a redirect (http_fetch
+    follows none); the registry is read anonymously."""
     return urllib.parse.urlsplit(url).hostname == "api.github.com"
 
 
@@ -294,15 +295,28 @@ def _headers_for(url: str, extra: dict) -> dict:
     return headers
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect, so a 30x comes back as its own status. urllib's default handler
+    copies the request's headers onto the follow-up request, Authorization included, even
+    when it goes to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError,
-    and so is an answer that stops partway: http.client raises its own errors from the status
-    line and the body, which urllib does not wrap, and reading an error status's body can
-    fail the same way."""
+    """GET url. An HTTP error status is returned, not raised, and a redirect is not followed
+    (its status is returned like any other); no answer at all is InfraError, and so is an
+    answer that stops partway: http.client raises its own errors from the status line and
+    the body, which urllib does not wrap, and reading an error status's body can fail the
+    same way."""
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with _OPENER.open(request, timeout=60) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
