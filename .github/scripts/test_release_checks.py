@@ -565,6 +565,34 @@ class FakeRun:
         return sum(1 for args, _ in self.calls if args[1] == command)
 
 
+class FakeClock:
+    """A clock that moves only when a test moves it: stands in for time.monotonic."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class ClockedRun(FakeRun):
+    """A FakeRun whose every call, a hang included, takes `seconds` of a FakeClock."""
+
+    def __init__(self, clock, seconds, **kwargs):
+        super().__init__(**kwargs)
+        self.clock = clock
+        self.seconds = seconds
+
+    def __call__(self, args, **kwargs):
+        try:
+            return super().__call__(args, **kwargs)
+        finally:
+            self.clock.advance(self.seconds)
+
+
 class TestNpmAuditSignatures(unittest.TestCase):
     def test_installs_exactly_the_version_from_npmjs_without_scripts_in_a_scratch_dir(self):
         run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
@@ -1124,6 +1152,201 @@ INSERT INTO `__new_widgets`("id", "mode") SELECT "id", "mode" FROM `widgets`;-->
 DROP TABLE `widgets`;--> statement-breakpoint
 ALTER TABLE `__new_widgets` RENAME TO `widgets`;--> statement-breakpoint
 PRAGMA foreign_keys=ON;"""
+
+
+class TestTimeBudget(unittest.TestCase):
+    """One budget bounds a whole run: the per-call bounds and the retries alone add up to about
+    50 minutes for one version, more than the jobs that run the checks are allowed."""
+
+    URL = "https://registry.npmjs.org/x"
+
+    def budget(self, seconds):
+        clock = FakeClock()
+        rc.start_budget(seconds, clock=clock)
+        self.addCleanup(rc.clear_budget)
+        return clock
+
+    def sleeping(self, clock):
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.advance(seconds)
+
+        sleep.taken = sleeps
+        return sleep
+
+    def request_timeout(self):
+        with mock.patch.object(rc._OPENER, "open", return_value=_Response(b"ok")) as opener:
+            rc.http_fetch(self.URL, {})
+        return opener.call_args.kwargs["timeout"]
+
+    def test_without_a_budget_every_call_keeps_its_own_bound(self):
+        self.assertIsNone(rc.time_left())
+        self.assertEqual(rc._time_for(300, "npm install"), 300)
+        self.assertEqual(self.request_timeout(), 60)
+        sleeps = []
+        rc._wait(sleeps.append, "the next install")
+        self.assertEqual(sleeps, [20])
+
+    def test_the_budget_counts_down_on_its_clock_and_can_be_cleared(self):
+        clock = self.budget(100)
+        self.assertEqual(rc.time_left(), 100)
+        clock.advance(30)
+        self.assertEqual(rc.time_left(), 70)
+        clock.advance(80)
+        self.assertEqual(rc.time_left(), -10)
+        rc.clear_budget()
+        self.assertIsNone(rc.time_left())
+
+    def test_the_budget_runs_on_the_monotonic_clock_unless_given_another(self):
+        rc.start_budget(100)
+        self.addCleanup(rc.clear_budget)
+        self.assertTrue(99 < rc.time_left() <= 100)
+
+    def test_every_budget_ends_before_the_job_that_runs_it(self):
+        # validate and the importer's verify job are allowed 30 minutes, staleness 45 (for every
+        # candidate it verifies). The script's own "no verdict" must come first.
+        self.assertLess(rc.BUDGET_JOB, 30 * 60)
+        self.assertLess(rc.BUDGET_STALENESS, 45 * 60)
+        self.assertEqual(rc.BUDGET_CLI, 20 * 60)
+
+    def test_a_request_keeps_its_own_bound_while_the_budget_is_longer(self):
+        self.budget(500)
+        self.assertEqual(self.request_timeout(), 60)
+
+    def test_a_request_is_clipped_to_what_remains(self):
+        clock = self.budget(100)
+        clock.advance(88)
+        self.assertEqual(self.request_timeout(), 12)
+
+    def test_no_request_is_started_once_the_budget_is_used_up(self):
+        clock = self.budget(100)
+        for step in (100, 30):  # left 0, then -30
+            clock.advance(step)
+            with self.subTest(left=rc.time_left()):
+                with mock.patch.object(rc._OPENER, "open") as opener:
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.http_fetch(self.URL, {})
+                self.assertEqual(caught.exception.check, "deadline")
+                self.assertIn(self.URL, caught.exception.detail)
+                opener.assert_not_called()
+
+    def test_a_request_that_fails_as_the_budget_ends_is_the_deadline_not_the_network(self):
+        clock = self.budget(100)
+
+        def cut_off(request, timeout):
+            clock.advance(timeout)
+            raise TimeoutError("timed out")
+
+        clock.advance(88)
+        with mock.patch.object(rc._OPENER, "open", side_effect=cut_off):
+            with self.assertRaises(rc.InfraError) as caught:
+                rc.http_fetch(self.URL, {})
+        self.assertEqual(caught.exception.check, "deadline")
+
+    def test_a_request_that_fails_with_time_left_is_still_the_network(self):
+        self.budget(100)
+        with mock.patch.object(rc._OPENER, "open", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(rc.InfraError) as caught:
+                rc.http_fetch(self.URL, {})
+        self.assertEqual(caught.exception.check, "network")
+
+    def test_an_npm_call_is_clipped_to_what_remains(self):
+        clock = self.budget(500)
+        clock.advance(380)
+        run = FakeRun()
+        rc._npm(run, ["install"], "work")
+        self.assertEqual(run.timeouts, [("install", 120)])
+
+    def test_no_npm_call_is_started_once_the_budget_is_used_up(self):
+        clock = self.budget(60)
+        clock.advance(60)
+        run = FakeRun()
+        with self.assertRaises(rc.InfraError) as caught:
+            rc._npm(run, ["audit"], "work")
+        self.assertEqual(caught.exception.check, "deadline")
+        self.assertIn("npm audit", caught.exception.detail)
+        self.assertEqual(run.calls, [])
+
+    def test_an_npm_call_cut_off_by_the_budget_is_the_deadline_not_a_hung_npm(self):
+        clock = self.budget(100)
+        with self.assertRaises(rc.InfraError) as caught:
+            rc._npm(ClockedRun(clock, 100, hang="install"), ["install"], "work")
+        self.assertEqual(caught.exception.check, "deadline")
+        self.assertIn("NOT a failed check", caught.exception.detail)
+
+    def test_an_npm_call_that_hangs_with_time_left_is_still_toolchain(self):
+        self.budget(1000)
+        with self.assertRaises(rc.InfraError) as caught:
+            rc._npm(FakeRun(hang="install"), ["install"], "work")
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("npm install did not finish within 300 s", caught.exception.detail)
+
+    def test_a_wait_that_would_use_up_the_budget_is_not_taken(self):
+        # With 20 s left or less the attempt after the wait could not start.
+        for left in (20, 5, -3):
+            with self.subTest(left=left):
+                sleep = self.sleeping(self.budget(left))
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc._wait(sleep, "the next audit")
+                self.assertEqual(caught.exception.check, "deadline")
+                self.assertIn("the next audit", caught.exception.detail)
+                self.assertEqual(sleep.taken, [])
+        sleep = self.sleeping(self.budget(21))
+        rc._wait(sleep, "the next audit")
+        self.assertEqual(sleep.taken, [20])
+
+    def test_registry_reads_stop_when_the_next_attempt_could_not_start(self):
+        clock = self.budget(150)
+        sleep, reads = self.sleeping(clock), []
+
+        def slow_registry(url, headers):
+            reads.append(url)
+            clock.advance(40)
+            return 503, b""
+
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.registry_dist("0.9.14", fetch=slow_registry, sleep=sleep)
+        self.assertEqual(caught.exception.check, "deadline")
+        self.assertEqual((len(reads), sleep.taken), (3, [20, 20]))
+
+    def test_audits_stop_when_the_next_one_could_not_start(self):
+        clock = self.budget(100)
+        sleep, audits = self.sleeping(clock), []
+
+        def slow_audit():
+            audits.append(clock.now)
+            clock.advance(45)
+            return {"invalid": [], "verified": []}
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc.InfraError) as caught:
+            rc._audit_until_judged(slow_audit, never, sleep)
+        self.assertEqual(caught.exception.check, "deadline")
+        self.assertEqual((len(audits), sleep.taken), (2, [20]))
+
+    def test_verify_release_ends_as_no_verdict_inside_the_budget(self):
+        # Every npm call takes 300 s of a 20-minute budget: init and the version read use 600,
+        # the first install 300, and the second install is cut to the 280 s that remain. It
+        # fails like the first, and the wait before a third is not taken: nothing could follow it.
+        clock = self.budget(1200)
+        sleep = self.sleeping(clock)
+        run = ClockedRun(clock, 300, install=(1,))
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleep, judge=judge)
+
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleep)
+        self.assertEqual(caught.exception.check, "deadline")
+        self.assertEqual(
+            run.timeouts, [("init", 120), ("--version", 120), ("install", 300), ("install", 280)]
+        )
+        self.assertEqual(sleep.taken, [20])
+        self.assertEqual(clock.now, 1000 + 1220)
 
 
 class TestMigrationKind(unittest.TestCase):
@@ -2515,6 +2738,38 @@ class TestCli(unittest.TestCase):
                 with mock.patch.object(rc, "classify_migrations", side_effect=error):
                     with self.assertRaises(type(error)):
                         cli("classify", "a" * 40, "b" * 40)
+
+    def test_the_command_runs_inside_a_twenty_minute_budget(self):
+        seen = []
+
+        def command(args):
+            seen.append(rc.time_left())
+            return 0
+
+        with mock.patch.object(rc, "_command", command):
+            self.assertEqual(cli("diff-mode", "base.json", "head.json")[0], 0)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(rc.BUDGET_CLI - 60 < seen[0] <= rc.BUDGET_CLI)
+
+    def test_the_budget_ends_with_the_command_however_it_ends(self):
+        for error in (
+            rc.InfraError("network", "down"),
+            rc.ReleaseCheckError("version", "no"),
+            OSError("gone"),
+            KeyError("status"),
+            KeyboardInterrupt(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "_command", side_effect=error):
+                    try:
+                        cli("diff-mode", "base.json", "head.json")
+                    except KeyboardInterrupt:
+                        pass
+                self.assertIsNone(rc.time_left())
+
+    def test_a_usage_error_starts_no_budget(self):
+        cli("no-such-command")
+        self.assertIsNone(rc.time_left())
 
     def test_candidates(self):
         repo = self.repo()
