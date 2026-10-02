@@ -791,7 +791,12 @@ class TestNpmAuditSignatures(unittest.TestCase):
         self.assertIn("NOT a signature result", caught.exception.detail)
 
     def test_an_error_document_never_reaches_a_provenance_refusal(self):
-        error = json.dumps({"error": {"summary": "audit endpoint unavailable"}, "invalid": [], "verified": []})
+        # All three lists are present, so the document is shaped like a report and only the
+        # "error" key says it is not one. Without `missing`, provenance_verdict refuses the
+        # document as toolchain by itself, and this test would pass with the guard deleted.
+        error = json.dumps(
+            {"error": {"summary": "audit endpoint unavailable"}, "invalid": [], "missing": [], "verified": []}
+        )
         with self.assertRaises(rc.InfraError):
             rc.verify_release(
                 "0.9.14",
