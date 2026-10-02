@@ -205,6 +205,35 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("last pusher (venuverse)", results[0].detail)
 
+    def test_a_head_whose_pusher_cannot_be_named_is_red_whoever_approved(self):
+        # The head commit's author and committer are the stand-in for the last pusher. When neither is a login
+        # (an email GitHub cannot match to an account; web-flow alone), the approver cannot be told from the
+        # pusher, so an owner's approval is not accepted on trust.
+        cases = {
+            "an author with no account and a web committer": dict(author=None, committer="web-flow"),
+            "only web-flow": dict(author="web-flow", committer="web-flow"),
+            "an empty login": dict(author="", committer=""),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                results = self.audit(github(**kwargs))
+                self.assertEqual(len(results), 1)
+                self.assertIn("could not identify who pushed its final head `h30`", results[0].detail)
+        routes = pr_routes("s1")
+        routes[("GET", R("commits/h30"))] = {"author": None, "committer": None}  # no author or committer object at all
+        results = self.audit(FakeGitHub(routes))
+        self.assertEqual(len(results), 1)
+        self.assertIn("could not identify who pushed", results[0].detail)
+
+    def test_a_pusher_named_by_either_field_is_enough_to_judge_the_approval(self):
+        for kwargs in (dict(author=None, committer="Vaishnav-OM"), dict(author="Vaishnav-OM", committer=None)):
+            with self.subTest(**kwargs):
+                self.assertEqual(self.audit(github(**kwargs)), [])
+        # ... and it is still the pusher's own approval that is refused.
+        results = self.audit(github(author=None, committer="venuverse"))
+        self.assertEqual(len(results), 1)
+        self.assertIn("last pusher (venuverse)", results[0].detail)
+
     def test_a_web_commit_counts_its_author_not_web_flow(self):
         self.assertEqual(self.audit(github(author="Vaishnav-OM", committer="web-flow")), [])
 

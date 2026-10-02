@@ -9,8 +9,10 @@ decides), and whose final head has a passing `validate` check from GitHub
 Actions (its latest run decides). A commit that fails more than one of these
 gets one result. REST names no pusher, so the head commit's author and
 committer stand in for the last pusher (web-flow, GitHub's committer for web
-edits, is skipped); the main ruleset's "most recent push approved by someone
-else" is what enforces the rule, and this records when it was bypassed.
+edits, is skipped), and a head for which they name nobody is red, since an
+approval could then be the pusher's own. The stand-in can still name the wrong
+person; the main ruleset's "most recent push approved by someone else" is what
+enforces the rule, and this records when it was bypassed.
 Detective only: it runs from the pushed commit's own file, so a bypass push can
 change it in the same push. Every red result is keyed to its push and closed
 only by a person; a push the audit could not finish, or one that moved main
@@ -63,6 +65,12 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
     pushers = {login for login in ((head_commit.get("author") or {}).get("login"),
                                    (head_commit.get("committer") or {}).get("login"))
                if login and login not in NOT_A_PUSHER}
+    if not pushers:
+        # With no login for either field the stand-in names nobody, and an empty set would let every owner's
+        # approval through, the pusher's own included. Not knowing who pushed is not a pass.
+        return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
+                "(neither its author nor its committer is a GitHub account other than web-flow), so an approval "
+                "could not be told from the pusher's own.")
     # Each owner's latest approving or change-requesting review decides, the same rule that names the approver in
     # a fleet tag: an approval its owner later withdrew, or that was dismissed, does not count.
     if owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners, exclude=pushers):
