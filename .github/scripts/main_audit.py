@@ -1,8 +1,10 @@
-"""main-audit: every commit a push adds to main must be the merge of a code-owner-approved PR.
+"""main-audit: every commit a push adds to main must be the merge of a code-owner-approved PR that passed validate.
 
 Red unless each commit is the merge commit of a PR with an approving review,
 on the PR's final head, from a code owner (CODEOWNERS at the commit's parent)
-who is not its last pusher. REST names no pusher, so the head commit's author
+who is not its last pusher, and whose final head has a passing `validate`
+check from GitHub Actions (its latest run decides). A commit that fails both
+gets one result. REST names no pusher, so the head commit's author
 and committer stand in for the last pusher (web-flow, GitHub's committer for
 web edits, is skipped); the main ruleset's "most recent push approved by
 someone else" is what enforces the rule, and this records when it was
@@ -24,6 +26,7 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import write_output
 from issue_router import CODEOWNERS_FILE, Result, parse_codeowners, results_to_json
+from release_checks import GITHUB_ACTIONS_APP_ID
 from tag_release import merged_pull
 
 LABEL = "main-audit"
@@ -32,6 +35,8 @@ REWRITE_RULE = "main-audit-rewrite-"
 UNAUDITED_RULE = "main-audit-unaudited-"
 ZERO = re.compile(r"0{40}")
 NOT_A_PUSHER = {"web-flow"}
+# The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
+VALIDATE_CHECK = "validate"
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
@@ -43,12 +48,7 @@ def added_commits(git: Git, before: str, after: str) -> list[str]:
     return git.first_parent_after(before, after)
 
 
-def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
-    pull = merged_pull(gh, sha, sleep)
-    if pull is None:
-        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
-    number = pull["number"]
-    head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
+def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> str | None:
     parent = git.first_parent(sha)
     owners = parse_codeowners(git.show(parent, CODEOWNERS_FILE) or "") if parent else []
     head_commit = gh.get(gh.repo_path(f"commits/{head}"))
@@ -64,6 +64,39 @@ def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None])
     return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
             f"({', '.join(owners) or 'none listed'}) on its final head `{head}` by someone other than its last "
             f"pusher ({', '.join(sorted(pushers)) or 'unknown'}).")
+
+
+def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
+    """Why `head` has no passing `validate` check from GitHub Actions, or None when its latest run succeeded.
+
+    The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
+    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that
+    failed after an earlier pass leaves the head unvalidated."""
+    runs = [run for run in gh.paginate(gh.repo_path(f"commits/{head}/check-runs"),
+                                       {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID, "filter": "all"})
+            if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    lead = (f"`{sha}` merged PR #{number} without a passing `{VALIDATE_CHECK}` check from GitHub Actions on its "
+            f"final head `{head}`: ")
+    if not runs:
+        return lead + "none ran."
+    latest = max(runs, key=lambda run: run.get("id") or 0)
+    if latest.get("status") != "completed":
+        return lead + f"the latest run is {latest.get('status') or 'unfinished'}."
+    if latest.get("conclusion") != "success":
+        return lead + f"the latest run ended {latest.get('conclusion') or 'without a result'}."
+    return None
+
+
+def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
+    """What is wrong with how `sha` reached main, or None. A commit with both problems gets one description."""
+    pull = merged_pull(gh, sha, sleep)
+    if pull is None:
+        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
+    number = pull["number"]
+    head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
+    problems = [problem for problem in (approval_problem(gh, git, sha, number, head),
+                                        validate_problem(gh, sha, number, head)) if problem]
+    return " ".join(problems) or None
 
 
 def rewrite_problem(git: Git, before: str, after: str) -> str | None:
@@ -111,7 +144,8 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
             if problem:
                 results.append(Result(
                     rule=f"main-audit-{sha[:12]}", label=LABEL,
-                    title=f"main-audit: {sha[:12]} reached main without a code-owner-approved PR", red=True,
+                    title=f"main-audit: {sha[:12]} reached main without a code-owner-approved PR that passed validate",
+                    red=True,
                     auto_close=False,
                     detail=problem + "\n\nIf this was a break-glass merge, record the incident and who merged it "
                                      "here; a person closes this issue once it is explained."))
@@ -142,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     for item in flagged:
         print(f"::error::{item.detail.splitlines()[0]}")
     commits = [item for item in flagged if not item.rule.startswith((REWRITE_RULE, UNAUDITED_RULE))]
-    print(f"{len(commits)} commit(s) in this push reached main without a code-owner-approved PR")
+    print(f"{len(commits)} commit(s) in this push reached main without a code-owner-approved PR that passed validate")
     print(f"{len(flagged) - len(commits)} other problem(s) with this push: main rewritten, or the audit unfinished")
     write_output("results", results_to_json(results))
     return 0

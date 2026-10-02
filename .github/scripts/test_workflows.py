@@ -395,6 +395,10 @@ class MainAuditWorkflow(WorkflowCase):
         self.assertIn("          BEFORE: ${{ github.event.before }}\n", self.jobs["audit"])
         self.assertIn("          AFTER: ${{ github.event.after }}\n", self.jobs["audit"])
 
+    def test_the_audit_job_may_read_checks_to_see_that_validate_passed(self):
+        self.assertIn("      checks: read\n", self.jobs["audit"])
+        self.assertNotIn("checks: write", self.text)
+
     def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
         self.assertNotIn("secrets.", self.text)
         self.assertNotIn("environment:", self.text)

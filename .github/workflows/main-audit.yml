@@ -2,7 +2,8 @@ name: main-audit
 
 # On every push to main: red unless every commit the push added is the merge
 # commit of a PR with an approving review from a code owner, on the PR's final
-# head, by someone other than its last pusher (AGENTS.md, "The workflows").
+# head, by someone other than its last pusher, whose final head also has a
+# passing validate check from GitHub Actions (AGENTS.md, "The workflows").
 # Detective only: the main ruleset prevents, and this records a bypass. It runs
 # from the pushed commit's own copy, so a bypass push could change it in the
 # same push. Each offending commit, each push that rewrote main and each push
@@ -25,6 +26,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      checks: read
     outputs:
       results: ${{ steps.audit.outputs.results }}
     steps:
@@ -56,7 +58,7 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - name: open an issue for each commit that reached main unapproved
+      - name: open an issue for each commit that reached main unapproved or unvalidated
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS_JSON: ${{ needs.audit.outputs.results }}
