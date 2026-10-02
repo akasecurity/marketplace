@@ -341,7 +341,7 @@ class TestMainAudit(unittest.TestCase):
 
         for label, reviews, expected in (
                 ("changes requested after the approval", [review("APPROVED"), review("CHANGES_REQUESTED")], 1),
-                ("the approval dismissed", [review("APPROVED"), review("DISMISSED")], 1),
+                ("a dismissed review after the approval", [review("APPROVED"), review("DISMISSED")], 1),
                 ("a comment after the approval changes nothing", [review("APPROVED"), review("COMMENTED")], 0),
                 ("an approval after the request for changes", [review("CHANGES_REQUESTED"), review("APPROVED")], 0),
                 ("one owner withdrew and the other approved",
