@@ -2483,8 +2483,9 @@ class TestCli(unittest.TestCase):
         repo.write(rc.SAFETY_FILE, rc.dump_json({"versions": ts.SEED}))
         self.elsewhere()
         code, out, _ = cli("floor", "0.9.13", "--repo", repo.path)
+        self.assertEqual(code, 1, out)
         result = json.loads(out)
-        self.assertEqual((code, result["floor"], result["highest_pinned"]), (1, "0.9.14", "0.9.14"))
+        self.assertEqual((result["floor"], result["highest_pinned"]), ("0.9.14", "0.9.14"))
 
     def test_a_path_given_on_the_command_line_is_used_as_given(self):
         repo = self.repo()
