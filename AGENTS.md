@@ -94,6 +94,12 @@ and store-migration class, and for a rollback the version it rolled back from. R
 the release bot create a `fleet-v` tag and nobody at all move or delete one, and refuse every
 other tag name:
 
+- **Only a tag cut by hand is signed.** The `fleet-v` tags cut before `tag-release` existed were
+  signed by hand; the tags `tag-release` cuts are annotated but **not signed**, because the release
+  bot creates them through GitHub's API. What protects every `fleet-v` tag is the rulesets and
+  `tag-audit`, not a signature, and nothing reads one: no check in this repository does, and the
+  fleet configuration that registers this marketplace at a tag checks only that the name has the
+  form `fleet-v<N>` and that the tag still resolves to the commit recorded for it.
 - **Never move, delete or re-sign an existing `fleet-v<N>` tag.** `tag-audit` treats a tag that no
   longer resolves to its recorded object as a supply-chain event, not a typo;
   `.github/fleet-tags.frozen.json` records the tags that existed when it was switched on.
