@@ -7,12 +7,14 @@ is that commit's problem rather than a guess) who is not its last pusher and has
 not since withdrawn it (an owner's latest approving or change-requesting review
 decides), and whose final head has a passing `validate` check from GitHub
 Actions (its latest run decides). A commit that fails more than one of these
-gets one result. REST names no pusher, so the head commit's author and
-committer stand in for the last pusher (web-flow, GitHub's committer for web
-edits, is skipped), and a head for which they name nobody is red, since an
-approval could then be the pusher's own. The stand-in can still name the wrong
-person; the main ruleset's "most recent push approved by someone else" is what
-enforces the rule, and this records when it was bypassed.
+gets one result. The head commit's author and committer stand in for the last
+pusher (web-flow, GitHub's committer for web edits, is skipped), and a head for
+which they name nobody is red, since an approval could then be the pusher's own.
+GitHub's activity API does record who pushed, but it is not used here yet: what
+it records for a push made by the App or by auto-merge has not been verified.
+The stand-in can still name the wrong person (a force-push by someone who did
+not write the commit); the main ruleset's "most recent push approved by someone
+else" is what enforces the rule, and this records when it was bypassed.
 Detective only: it runs from the pushed commit's own file, so a bypass push can
 change it in the same push. Every red result is keyed to its push and closed
 only by a person; a push the audit could not finish, or one that moved main
