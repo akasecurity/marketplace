@@ -109,7 +109,8 @@ HTTP_TIMEOUT = 60
 #   npm install                         5 x 300 s + 4 x 20 s waits    = 1580 s
 #   npm audit signatures                5 x 120 s + 4 x 20 s waits    =  680 s
 #   the two GitHub reads                2 x 60 s                      =  120 s
-#                                                                      3000 s, 50 minutes.
+#                                                                      -------
+#                                                                       3000 s, 50 minutes
 # A caller verifies more than one version, and the migration reads that classify_migrations
 # makes sit outside verify_release altogether, so a run cannot rely on those bounds alone: a
 # workflow job would be killed by GitHub before this script said "no verdict" itself. One
@@ -120,9 +121,9 @@ HTTP_TIMEOUT = 60
 # script's own "no verdict" comes first, and leaves the job room to set itself up: validate and
 # the importer's verify job are allowed 30 minutes, staleness 45 minutes for every candidate it
 # verifies, and a person at a terminal is given 20.
-BUDGET_CLI = 20 * 60
-BUDGET_JOB = 25 * 60
-BUDGET_STALENESS = 40 * 60
+BUDGET_CLI = 20 * 60  # the command line
+BUDGET_JOB = 25 * 60  # validate and the importer's verify job
+BUDGET_STALENESS = 40 * 60  # the staleness check
 
 
 class _CheckFailure(Exception):
@@ -431,7 +432,8 @@ def http_fetch(url: str, headers: dict) -> tuple:
     (its status is returned like any other); no answer at all is InfraError, and so is an
     answer that stops partway: http.client raises its own errors from the status line and
     the body, which urllib does not wrap, and reading an error status's body can fail the
-    same way."""
+    same way. The request is cut to what remains of the run's budget (start_budget), and is
+    not started at all when nothing remains: InfraError("deadline")."""
     timeout = _time_for(HTTP_TIMEOUT, f"GET {url}")
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
