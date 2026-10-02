@@ -591,6 +591,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     classify = classify or rc.classify_migrations
     number = env.get("PR_NUMBER", "?")
     main_sha = None
+    rc.start_budget(rc.BUDGET_JOB)  # one budget for the whole run; cleared below however it ends
     try:
         head_sha, base_repo = env.get("HEAD_SHA", ""), env.get("BASE_REPO", "")
         if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
@@ -632,6 +633,8 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
         # this did not expect. No verdict, so exit 2 with the summary written, never a stack
         # trace alone. KeyboardInterrupt and SystemExit are not Exceptions and pass through.
         report = Report(infra=f"internal: {type(exc).__name__}: {exc}")
+    finally:
+        rc.clear_budget()
     if main_sha:
         # main moves without starting this check again, so the summary says which commit it read.
         report.row("Main read at", _code(main_sha[:12]))

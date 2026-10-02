@@ -714,6 +714,12 @@ class TestWorkflow(unittest.TestCase):
         self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
         self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
 
+    def test_the_run_budget_ends_before_the_job_is_cancelled(self):
+        # validate reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"^\s+timeout-minutes: (\d+)\s*$", self.WORKFLOW.read_text(encoding="utf-8"), re.M)
+        self.assertEqual(len(limits), 1, "validate.yml must set one job timeout")
+        self.assertLess(rc.BUDGET_JOB, int(limits[0]) * 60)
+
     def test_the_npm_floor_the_node_version_was_chosen_for_is_the_gates(self):
         # If the gate's floor moves, the Node release above has to move with it.
         self.assertEqual(rc.MIN_NPM, (11, 12, 0))
@@ -1027,6 +1033,36 @@ class TestMain(unittest.TestCase):
         text = self.summary_text()
         self.assertIn("NO VERDICT", text)
         self.assertIn("internal: KeyError", text)
+
+    def test_the_run_starts_one_budget_of_about_twenty_five_minutes(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        seen = []
+        evaluate = vp.evaluate
+
+        def watching(*args, **kwargs):
+            seen.append(rc.time_left())
+            return evaluate(*args, **kwargs)
+
+        with mock.patch.object(vp, "evaluate", side_effect=watching), mock.patch.object(
+            rc, "start_budget", wraps=rc.start_budget
+        ) as started:
+            self.assertEqual(self.main(head, self.commits(head)), 0)
+        started.assert_called_once_with(rc.BUDGET_JOB)
+        self.assertEqual(rc.BUDGET_JOB, 25 * 60)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "no budget was running while validate worked")
+        self.assertTrue(rc.BUDGET_JOB - 60 < seen[0] <= rc.BUDGET_JOB)
+
+    def test_the_budget_ends_with_the_run_however_it_ends(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        for error in (rc.InfraError("network", "down"), rc.ReleaseCheckError("version", "no"), KeyError("status")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(vp, "evaluate", side_effect=error):
+                    self.main(head, self.commits(head))
+                self.assertIsNone(rc.time_left())
+        with mock.patch.object(vp, "evaluate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.main(head, self.commits(head))
+        self.assertIsNone(rc.time_left())
 
     def test_an_interrupt_is_not_swallowed_by_the_net(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
