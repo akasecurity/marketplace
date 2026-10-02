@@ -770,8 +770,15 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     except (ValueError, RecursionError) as exc:
         raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
     subjects = statement.get("subject")
+    # Only text can be the digest of the tarball. A list or an object in a later subject (npm
+    # checks only the first) is unhashable, and putting it in this set would raise TypeError
+    # here, before the certificate's identity is checked below, and lose that refusal.
     attested = {
-        _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        digest
+        for digest in (
+            _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        )
+        if isinstance(digest, str)
     }
     dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
     wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}

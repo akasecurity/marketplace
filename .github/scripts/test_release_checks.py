@@ -616,6 +616,27 @@ class TestVerifyRelease(unittest.TestCase):
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("anyone can publish with provenance", error.detail)
 
+    def test_an_unhashable_subject_digest_still_gets_the_identity_refusal(self):
+        # A statement is the publisher's JSON, and npm checks only its first subject. A list or
+        # an object as a later subject's digest used to raise TypeError before the certificate's
+        # identity was compared, so a foreign signer got a crash instead of the refusal that
+        # says anyone can publish with provenance.
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        for label, digest in (("a list", []), ("an object", {})):
+            with self.subTest(label):
+                foreign = ts.statement("0.9.14", repository=other)
+                foreign["subject"].append({"name": "extra", "digest": {"sha512": digest}})
+                cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+                error = self.refused("provenance", audits=[ts.audit_output("0.9.14", foreign, cert=cert)])
+                self.assertIn("anyone can publish with provenance", error.detail)
+                # The genuine signer with the same extra subject still passes: the tarball's
+                # digest is in the first subject.
+                genuine = ts.statement("0.9.14")
+                genuine["subject"].append({"name": "extra", "digest": {"sha512": digest}})
+                release, _ = self.verify(audits=[ts.audit_output("0.9.14", genuine)])
+                self.assertEqual(release.version, "0.9.14")
+
     def test_another_workflow_is_refused(self):
         path = ".github/workflows/other.yml"
         uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
