@@ -66,7 +66,9 @@ class FakeGit:
         return "main"
 
     def show(self, rev: str, path: str) -> str | None:
-        return self.files.get((self.rev_parse(rev), path))
+        content = self.files.get((self.rev_parse(rev), path))
+        # A file held as bytes is decoded as UTF-8, as gitrepo.Git.show decodes what it reads.
+        return content.decode("utf-8") if isinstance(content, bytes) else content
 
     def fleet_tags(self) -> list[dict]:
         return sorted(self.tags, key=lambda tag: tag["n"])
