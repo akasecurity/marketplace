@@ -1321,31 +1321,41 @@ class TestRollbackFloor(unittest.TestCase):
     SAFETY = {"versions": copy.deepcopy(ts.SEED)}
 
     def test_the_seed_refuses_a_rollback_from_0_9_14_to_0_9_13(self):
-        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
 
     def test_the_lowest_flagged_version_in_range_is_the_floor(self):
-        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.8", "0.9.14"), "0.9.9")
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.8", "0.9.14", pinned=set()), "0.9.9")
 
     def test_additive_versions_set_no_floor(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}, "0.9.12", "0.9.13"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}, "0.9.12", "0.9.13", pinned=set()))
 
     def test_the_target_itself_is_never_the_floor(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.12": dict(ts.SEED["0.9.12"])}}, "0.9.12", "0.9.13"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.12": dict(ts.SEED["0.9.12"])}}, "0.9.12", "0.9.13", pinned=set()))
 
     def test_a_flag_above_the_highest_pinned_version_is_ignored(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.15": dict(ts.SEED["0.9.14"])}}, "0.9.13", "0.9.14"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.15": dict(ts.SEED["0.9.14"])}}, "0.9.13", "0.9.14", pinned=set()))
 
     def test_a_malformed_or_missing_entry_counts_as_flagged(self):
-        self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": "additive"}}, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": "additive"}}, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
         # A pinned version with no entry at all (a break-glass pin, a restore) is flagged too.
         additive = {"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}
         pinned = {"0.9.12", "0.9.13", "0.9.14"}
         self.assertEqual(rc.rollback_floor(additive, "0.9.12", "0.9.14", pinned=pinned), "0.9.14")
         self.assertIsNone(rc.rollback_floor(additive, "0.9.12", "0.9.13", pinned=pinned))
 
+    def test_the_pinned_set_must_be_named(self):
+        # With no pinned set a version missing from the file sets no floor, which is a weaker
+        # floor than the same call with the set. A caller has to say which set it means.
+        with self.assertRaises(TypeError):
+            rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14")
+        with self.assertRaises(TypeError):
+            rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", {"0.9.14"})
+        self.assertEqual(rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", pinned={"0.9.14"}), "0.9.14")
+        self.assertIsNone(rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", pinned=set()))
+
     def test_a_malformed_file_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
-            rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
+            rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14", pinned=set())
 
     def test_only_a_well_formed_additive_entry_is_trusted(self):
         # A version is safe to roll back across only on an entry that safety_problems accepts
@@ -1363,14 +1373,14 @@ class TestRollbackFloor(unittest.TestCase):
         for name, entry in malformed.items():
             with self.subTest(name):
                 self.assertNotEqual(rc.safety_problems({"versions": {"0.9.14": entry}}), [])
-                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14"), "0.9.14")
+                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
         self.assertEqual(rc.safety_problems({"versions": {"0.9.14": good}}), [])
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14", pinned=set()))
 
     def test_a_malformed_entry_flags_only_its_own_version(self):
         versions = {"0.9.13": dict(ts.SEED["0.9.13"]), "0.9.14": {"classification": "additive"}}
-        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13"))
-        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14"), "0.9.14")
+        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13", pinned=set()))
+        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14", pinned=set()), "0.9.14")
 
 
 class TestSafetyProblems(unittest.TestCase):
