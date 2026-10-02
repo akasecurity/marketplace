@@ -738,7 +738,76 @@ class TestMigrationKind(unittest.TestCase):
             "ALTER TABLE `widgets` ADD `x` integer NOT NULL GENERATED ALWAYS AS (1) VIRTUAL;",
             "ALTER TABLE `widgets` ADD `x` text;",
             # The words are in a quoted name, not in the column's constraints.
-            "ALTER TABLE `widgets` ADD `x` integer REFERENCES `not null`(`id`);",
+            "ALTER TABLE `widgets` ADD `x` text COLLATE `not null`;",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), "additive")
+
+    def test_a_table_name_holding_add_does_not_hide_a_drop_or_rename(self):
+        # The table is read as one name, quoted or not, so the words ADD, DROP and RENAME inside
+        # a quoted name start no clause. Read as a run of non-space characters, ` ADD ` inside the
+        # name matched and the real DROP or RENAME landed in the column's definition.
+        names = {
+            "backticks": "`t ADD c`",
+            "double quotes": '"t ADD c"',
+            "double quotes with a doubled quote inside": '"t"" ADD c"',
+            "backticks with a doubled backtick inside": "`t`` ADD c`",
+            "brackets": "[t ADD c]",
+            "a schema in front": "`main`.`t ADD c`",
+        }
+        statements = [
+            ("a dropped column", "ALTER TABLE {t} DROP COLUMN `x`;"),
+            ("a rename", "ALTER TABLE {t} RENAME TO `u`;"),
+            ("a rename", "ALTER TABLE {t} RENAME COLUMN `x` TO `y`;"),
+        ]
+        for name, table in names.items():
+            for reason, sql in statements:
+                with self.subTest(name, statement=sql):
+                    self.assertEqual(rc.migration_kind(sql.format(t=table)), f"non-additive: {reason}")
+
+    def test_an_added_column_in_a_table_with_an_odd_name_is_still_additive(self):
+        for table in ("`t ADD c`", '"t"" ADD c"', "[t ADD c]", "main.widgets", '"main"."widgets"', "`t DROP x`"):
+            with self.subTest(table):
+                self.assertEqual(rc.migration_kind(f"ALTER TABLE {table} ADD `x` text;"), "additive")
+                self.assertEqual(rc.migration_kind(f"ALTER TABLE {table} ADD COLUMN x integer DEFAULT 0 NOT NULL;"), "additive")
+
+    def test_a_name_that_cannot_be_read_as_one_is_not_additive(self):
+        # Fail closed: a table name the reader does not recognise is an unrecognised statement.
+        for sql in ("ALTER TABLE a.b.c ADD x text;", "ALTER TABLE ADD x text;", "ALTER TABLE `t` `u` ADD x text;"):
+            with self.subTest(sql):
+                self.assertTrue(rc.migration_kind(sql).startswith("non-additive"), rc.migration_kind(sql))
+
+    def test_an_added_column_with_check_or_references_is_not_additive(self):
+        # A CHECK is a new constraint an older build's inserts can fail; a REFERENCES adds a
+        # foreign key an older build's delete on the parent can fail once a newer build fills it in.
+        check = "non-additive: a CHECK constraint an older build's writes can fail"
+        reference = "non-additive: a foreign key an older build's deletes can fail"
+        cases = {
+            "a check on another column": ("ALTER TABLE `widgets` ADD `c` integer CHECK (`d` > 0);", check),
+            "a check on the column itself": ("ALTER TABLE `widgets` ADD `c` integer CHECK (`c` > 0);", check),
+            "a named check": ("ALTER TABLE `widgets` ADD `c` integer DEFAULT 0 CONSTRAINT `c_ok` CHECK (`c` >= 0);", check),
+            "a check, unquoted": ("ALTER TABLE widgets ADD COLUMN c integer CHECK(c > 0);", check),
+            "a check that mentions NOT NULL, with a default": (
+                "ALTER TABLE `widgets` ADD `c` integer DEFAULT 0 CHECK (`c` IS NOT NULL);",
+                check,
+            ),
+            "a reference": ("ALTER TABLE `widgets` ADD `c` integer REFERENCES `gadgets`(`id`);", reference),
+            "a reference, unquoted": ("ALTER TABLE widgets ADD c integer REFERENCES gadgets(id) ON DELETE CASCADE;", reference),
+            "a reference in a double-quoted table": ('ALTER TABLE "t ADD c" ADD `c` integer REFERENCES `g`(`id`);', reference),
+        }
+        for name, (sql, kind) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), kind)
+
+    def test_the_words_check_and_references_in_a_name_or_a_string_decide_nothing(self):
+        cases = [
+            "ALTER TABLE `widgets` ADD `check` integer;",
+            "ALTER TABLE `widgets` ADD `references` integer;",
+            "ALTER TABLE widgets ADD check_count integer;",
+            "ALTER TABLE widgets ADD references_total integer;",
+            "ALTER TABLE `widgets` ADD `c` text DEFAULT 'CHECK (1) REFERENCES x';",
+            "ALTER TABLE `widgets` ADD `c` text COLLATE `references`;",
         ]
         for sql in cases:
             with self.subTest(sql):
