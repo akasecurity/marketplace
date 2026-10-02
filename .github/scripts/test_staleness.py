@@ -213,6 +213,41 @@ class TestRuleINoVerdict(StalenessCase):
         self.assertIn("staleness-i: not evaluated this run; its issue is left as it is", outcomes)
 
 
+class FullRefOnly(FakeGit):
+    """A checkout where main is refs/remotes/origin/main and the bare name is a hazard: a tag named main
+    resolves before the branch of that name, so reading "main" can point anywhere."""
+
+    def main(self):
+        return "refs/remotes/origin/main"
+
+    def rev_parse(self, rev):
+        if rev == "main":
+            raise AssertionError("main was read by its bare name")
+        return self.chain[-1] if rev == "refs/remotes/origin/main" else rev
+
+
+def full_ref_only(base: FakeGit, *, tags=None) -> FullRefOnly:
+    return FullRefOnly(chain=base.chain, files=base.files, times=base.times,
+                       tags=base.tags if tags is None else tags, messages=base.messages)
+
+
+class TestMainIsReadByItsFullRef(StalenessCase):
+    """Each place that reads main is its own case, so that undoing one of them fails one test."""
+
+    def test_the_entry_is_read_from_the_full_ref(self):
+        for main_entry in (True, False):
+            with self.subTest(main_entry=main_entry):
+                with contextlib.redirect_stdout(self.log):
+                    entry = st.entry_and_rule_i(full_ref_only(repo(main_entry=main_entry)), "/fake/marketplace",
+                                                NOW, {})[0]
+                self.assertEqual(entry.red, not main_entry)
+
+    def test_the_untagged_pin_change_walk_starts_from_the_full_ref(self):
+        rule = st.rule_iii(full_ref_only(repo()), FROZEN, NOW)
+        self.assertTrue(rule.red)
+        self.assertIn("`b` (ai-tc 0.9.15", rule.detail)
+
+
 class TestOtherRules(StalenessCase):
     def test_rule_ii_names_bot_prs_open_for_more_than_a_day(self):
         self.pulls += [pull(30, "bot/pin-ai-tc-0.9.16", created_at=stamp(dt.timedelta(hours=25))),
