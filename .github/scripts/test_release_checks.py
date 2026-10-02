@@ -1,4 +1,4 @@
-"""Unit tests for release_checks.py. Standard library only and no network: every fetch,
+"""Unit tests for release_checks.py. Standard library only and no outside network: every fetch,
 npm run and sleep is injected. live_release_checks.py holds the three live checks."""
 
 from __future__ import annotations
@@ -7,10 +7,13 @@ import contextlib
 import copy
 import hashlib
 import http.client
+import http.server
 import io
 import json
 import os
 import subprocess
+import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -63,6 +66,19 @@ class TestErrorClasses(unittest.TestCase):
             with self.subTest(verdict=repr(verdict)):
                 with mock.patch.object(rc, "_manifest_at", side_effect=verdict):
                     self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
+
+
+class TestRunningTheFile(unittest.TestCase):
+    def test_running_the_file_is_a_usage_error_until_the_command_line_exists(self):
+        # The docstring defines exit 0 as "the check passes", so a file that prints nothing
+        # and exits 0 would be read as a pass by `release_checks.py verify X && proceed`.
+        # The in-process tests cannot see this: they never run the file as a program.
+        result = subprocess.run(
+            [sys.executable, rc.__file__, "verify", "0.9.16"], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("nothing was checked", result.stderr)
 
 
 class TestSelectEntry(unittest.TestCase):
@@ -172,6 +188,30 @@ class TestPinnedVersions(unittest.TestCase):
         self.repo.commit(doc)
         with self.assertRaises(rc.ReleaseCheckError):
             rc.pinned_versions(self.repo.path)
+
+    def test_a_tag_pinning_the_package_twice_pins_nothing(self):
+        # Two entries pinning the package is ambiguous, so the tag pins nothing, as a tag
+        # whose manifest does not parse does. Its version must not reach the candidate or
+        # rollback floors. Main is put back to one entry afterwards: main is read strictly.
+        doc = ts.manifest("0.9.20")
+        twin = copy.deepcopy(doc["plugins"][2])
+        twin["name"] = "ai-tc-canary"
+        doc["plugins"].append(twin)
+        self.repo.commit(doc)
+        self.repo.tag("fleet-v11")
+        self.repo.commit(ts.manifest("0.9.14"))
+        self.assertIsNone(rc._tag_pin(self.repo.path, "fleet-v11"))
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [
+                ("main", "0.9.14"),
+                ("fleet-v1", None),
+                ("fleet-v2", "0.9.6"),
+                ("fleet-v10", "0.9.12"),
+                ("fleet-v11", None),
+            ],
+        )
+        self.assertNotIn("0.9.20", rc.pinned_versions(self.repo.path))
 
     def test_a_repository_without_main_is_infrastructure(self):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
@@ -315,15 +355,56 @@ class _FailingBody(io.BytesIO):
         raise self.error
 
 
+class _Origin(http.server.BaseHTTPRequestHandler):
+    """A loopback server: records each request's headers on its server, and answers 302 to
+    the server's redirect_to, or 200 when it has none."""
+
+    def do_GET(self):
+        self.server.requests.append(dict(self.headers))
+        self.send_response(302 if self.server.redirect_to else 200)
+        if self.server.redirect_to:
+            self.send_header("Location", self.server.redirect_to)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
 class TestHttpFetch(unittest.TestCase):
     URL = "https://registry.npmjs.org/x"
 
     def fetch_with(self, **patch):
-        with mock.patch.object(rc.urllib.request, "urlopen", **patch):
+        with mock.patch.object(rc._OPENER, "open", **patch):
             return rc.http_fetch(self.URL, {})
+
+    def serve(self, redirect_to=None):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
+        server.requests = []
+        server.redirect_to = redirect_to
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
 
     def test_a_status_and_body_come_back_as_they_are(self):
         self.assertEqual(self.fetch_with(return_value=_Response(b"ok")), (200, b"ok"))
+
+    def test_a_redirect_comes_back_as_its_status_and_is_not_followed(self):
+        # urllib's default handler copies every header onto the follow-up request, the token
+        # included, whatever host the redirect names. Here the token is forced on (the first
+        # server is not api.github.com) so a followed redirect would deliver it to the second.
+        second = self.serve()
+        first = self.serve(redirect_to=f"http://localhost:{second.server_port}/")
+        environ = {"GITHUB_TOKEN": "dummy-token", "no_proxy": "*", "NO_PROXY": "*"}
+        with mock.patch.dict(os.environ, environ):
+            with mock.patch.object(rc, "_sends_token_to", return_value=True):
+                result = rc.http_fetch(f"http://127.0.0.1:{first.server_port}/", {})
+        self.assertEqual(result, (302, b""))
+        self.assertEqual([seen.get("Authorization") for seen in first.requests], ["Bearer dummy-token"])
+        self.assertEqual(second.requests, [])
 
     def test_an_http_error_status_is_returned_and_not_raised(self):
         error = rc.urllib.error.HTTPError(self.URL, 503, "unavailable", {}, io.BytesIO(b"later"))
@@ -430,6 +511,17 @@ class TestNpmCandidates(unittest.TestCase):
         fetch = self.fetch({"0.9.15": {}})
         rc.npm_candidates({"0.9.14"}, fetch=fetch)
         self.assertEqual(fetch.calls, [(rc.packument_url(), {"Accept": "application/json"})])
+
+    def test_a_4xx_registry_answer_is_no_verdict_even_with_a_packument_body(self):
+        # Only a 200 is an answer. A 4xx whose body happens to be a valid packument must not
+        # be read: a status check that refused only 5xx would turn it into candidates.
+        for status in (403, 404):
+            with self.subTest(status=status):
+                fetch = ts.FakeFetch({rc.packument_url(): (status, {"versions": {"0.9.15": {}}})})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(f"answered {status}", caught.exception.detail)
 
     def test_a_registry_error_is_infrastructure(self):
         with self.assertRaises(rc.InfraError):
@@ -933,6 +1025,27 @@ class TestVerifyRelease(unittest.TestCase):
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
         self.assertIn("anyone can publish with provenance", error.detail)
 
+    def test_an_unhashable_subject_digest_still_gets_the_identity_refusal(self):
+        # A statement is the publisher's JSON, and npm checks only its first subject. A list or
+        # an object as a later subject's digest used to raise TypeError before the certificate's
+        # identity was compared, so a foreign signer got a crash instead of the refusal that
+        # says anyone can publish with provenance.
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        for label, digest in (("a list", []), ("an object", {})):
+            with self.subTest(label):
+                foreign = ts.statement("0.9.14", repository=other)
+                foreign["subject"].append({"name": "extra", "digest": {"sha512": digest}})
+                cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+                error = self.refused("provenance", audits=[ts.audit_output("0.9.14", foreign, cert=cert)])
+                self.assertIn("anyone can publish with provenance", error.detail)
+                # The genuine signer with the same extra subject still passes: the tarball's
+                # digest is in the first subject.
+                genuine = ts.statement("0.9.14")
+                genuine["subject"].append({"name": "extra", "digest": {"sha512": digest}})
+                release, _ = self.verify(audits=[ts.audit_output("0.9.14", genuine)])
+                self.assertEqual(release.version, "0.9.14")
+
     def test_another_workflow_is_refused(self):
         path = ".github/workflows/other.yml"
         uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
@@ -1033,7 +1146,76 @@ class TestMigrationKind(unittest.TestCase):
             "ALTER TABLE `widgets` ADD `x` integer NOT NULL GENERATED ALWAYS AS (1) VIRTUAL;",
             "ALTER TABLE `widgets` ADD `x` text;",
             # The words are in a quoted name, not in the column's constraints.
-            "ALTER TABLE `widgets` ADD `x` integer REFERENCES `not null`(`id`);",
+            "ALTER TABLE `widgets` ADD `x` text COLLATE `not null`;",
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                self.assertEqual(rc.migration_kind(sql), "additive")
+
+    def test_a_table_name_holding_add_does_not_hide_a_drop_or_rename(self):
+        # The table is read as one name, quoted or not, so the words ADD, DROP and RENAME inside
+        # a quoted name start no clause. Read as a run of non-space characters, ` ADD ` inside the
+        # name matched and the real DROP or RENAME landed in the column's definition.
+        names = {
+            "backticks": "`t ADD c`",
+            "double quotes": '"t ADD c"',
+            "double quotes with a doubled quote inside": '"t"" ADD c"',
+            "backticks with a doubled backtick inside": "`t`` ADD c`",
+            "brackets": "[t ADD c]",
+            "a schema in front": "`main`.`t ADD c`",
+        }
+        statements = [
+            ("a dropped column", "ALTER TABLE {t} DROP COLUMN `x`;"),
+            ("a rename", "ALTER TABLE {t} RENAME TO `u`;"),
+            ("a rename", "ALTER TABLE {t} RENAME COLUMN `x` TO `y`;"),
+        ]
+        for name, table in names.items():
+            for reason, sql in statements:
+                with self.subTest(name, statement=sql):
+                    self.assertEqual(rc.migration_kind(sql.format(t=table)), f"non-additive: {reason}")
+
+    def test_an_added_column_in_a_table_with_an_odd_name_is_still_additive(self):
+        for table in ("`t ADD c`", '"t"" ADD c"', "[t ADD c]", "main.widgets", '"main"."widgets"', "`t DROP x`"):
+            with self.subTest(table):
+                self.assertEqual(rc.migration_kind(f"ALTER TABLE {table} ADD `x` text;"), "additive")
+                self.assertEqual(rc.migration_kind(f"ALTER TABLE {table} ADD COLUMN x integer DEFAULT 0 NOT NULL;"), "additive")
+
+    def test_a_name_that_cannot_be_read_as_one_is_not_additive(self):
+        # Fail closed: a table name the reader does not recognise is an unrecognised statement.
+        for sql in ("ALTER TABLE a.b.c ADD x text;", "ALTER TABLE ADD x text;", "ALTER TABLE `t` `u` ADD x text;"):
+            with self.subTest(sql):
+                self.assertTrue(rc.migration_kind(sql).startswith("non-additive"), rc.migration_kind(sql))
+
+    def test_an_added_column_with_check_or_references_is_not_additive(self):
+        # A CHECK is a new constraint an older build's inserts can fail; a REFERENCES adds a
+        # foreign key an older build's delete on the parent can fail once a newer build fills it in.
+        check = "non-additive: a CHECK constraint an older build's writes can fail"
+        reference = "non-additive: a foreign key an older build's deletes can fail"
+        cases = {
+            "a check on another column": ("ALTER TABLE `widgets` ADD `c` integer CHECK (`d` > 0);", check),
+            "a check on the column itself": ("ALTER TABLE `widgets` ADD `c` integer CHECK (`c` > 0);", check),
+            "a named check": ("ALTER TABLE `widgets` ADD `c` integer DEFAULT 0 CONSTRAINT `c_ok` CHECK (`c` >= 0);", check),
+            "a check, unquoted": ("ALTER TABLE widgets ADD COLUMN c integer CHECK(c > 0);", check),
+            "a check that mentions NOT NULL, with a default": (
+                "ALTER TABLE `widgets` ADD `c` integer DEFAULT 0 CHECK (`c` IS NOT NULL);",
+                check,
+            ),
+            "a reference": ("ALTER TABLE `widgets` ADD `c` integer REFERENCES `gadgets`(`id`);", reference),
+            "a reference, unquoted": ("ALTER TABLE widgets ADD c integer REFERENCES gadgets(id) ON DELETE CASCADE;", reference),
+            "a reference in a double-quoted table": ('ALTER TABLE "t ADD c" ADD `c` integer REFERENCES `g`(`id`);', reference),
+        }
+        for name, (sql, kind) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.migration_kind(sql), kind)
+
+    def test_the_words_check_and_references_in_a_name_or_a_string_decide_nothing(self):
+        cases = [
+            "ALTER TABLE `widgets` ADD `check` integer;",
+            "ALTER TABLE `widgets` ADD `references` integer;",
+            "ALTER TABLE widgets ADD check_count integer;",
+            "ALTER TABLE widgets ADD references_total integer;",
+            "ALTER TABLE `widgets` ADD `c` text DEFAULT 'CHECK (1) REFERENCES x';",
+            "ALTER TABLE `widgets` ADD `c` text COLLATE `references`;",
         ]
         for sql in cases:
             with self.subTest(sql):
@@ -1195,15 +1377,39 @@ def directory(tags, edited=()):
     return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
 
 
+STORE_CODE = "packages/persistence/src/migrations.ts"
+TRIGGER_CODE = "packages/persistence/src/sync-failure.ts"
+
+
+def store_directory(*, changed=(), omit=()):
+    """What the Contents API answers for ai-tc's persistence source: the two store-code files, spelled
+    out here so the test does not read the names from the code it tests, and a neighbour that is not
+    one, each with a git blob sha. A name in `changed` has a different
+    sha; a name in `omit` is not there."""
+    return [
+        {
+            "name": name,
+            "path": f"{rc.STORE_CODE_DIR}/{name}",
+            "sha": blob(name, "changed" if name in changed else ""),
+            "type": "file",
+        }
+        for name in ("database.ts", "migrations.ts", "sync-failure.ts")
+        if name not in omit
+    ]
+
+
 class TestClassifyMigrations(unittest.TestCase):
-    def fetch(self, from_tags, to_tags, sql, *, edited=(), routes=None):
+    def fetch(self, from_tags, to_tags, sql, *, edited=(), store_changed=(), routes=None):
         """Journals, listings and added files for a pair of releases. `edited` tags carry a
-        different blob sha at TO; `routes` replaces any of the answers."""
+        different blob sha at TO, and so do the `store_changed` files of the store code; the
+        store code is otherwise the same at both. `routes` replaces any of the answers."""
         answers = {
             ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
             ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
             ts.contents_url(rc.MIGRATIONS_DIR, FROM): (200, directory(from_tags)),
             ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(to_tags, edited)),
+            ts.contents_url(rc.STORE_CODE_DIR, FROM): (200, store_directory()),
+            ts.contents_url(rc.STORE_CODE_DIR, TO): (200, store_directory(changed=store_changed)),
         }
         for tag, text in sql.items():
             answers[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
@@ -1231,10 +1437,14 @@ class TestClassifyMigrations(unittest.TestCase):
         tag = "0035_migration"
         fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE})
         rc.classify_migrations(FROM, TO, fetch=fetch)
-        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(f"/contents/{rc.MIGRATIONS_DIR}")]
+        directories = (rc.MIGRATIONS_DIR, rc.STORE_CODE_DIR)
+        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(tuple(f"/contents/{d}" for d in directories))]
         files = [(url, h) for url, h in fetch.calls if (url, h) not in listings]
-        # One listing per attested commit, however many migrations the journals hold.
-        self.assertEqual(sorted(url for url, _ in listings), sorted([ts.contents_url(rc.MIGRATIONS_DIR, c) for c in (FROM, TO)]))
+        # One listing of each directory per attested commit, however many migrations the journals hold.
+        self.assertEqual(
+            sorted(url for url, _ in listings),
+            sorted(ts.contents_url(d, c) for d in directories for c in (FROM, TO)),
+        )
         self.assertTrue(all(h.get("Accept") == "application/vnd.github+json" for _, h in listings))
         self.assertEqual(len(files), 3)  # the two journals and the one added file
         self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in files))
@@ -1271,6 +1481,102 @@ class TestClassifyMigrations(unittest.TestCase):
         )
         self.assertEqual(result.migrations, [added, removed, "0000_initial"])
         self.assertEqual(result.kinds[added], "additive")
+
+    def test_a_store_change_in_code_with_no_migration_is_not_rollback_safe(self):
+        # ai-tc changes the store in code as well as through the journal. A release whose only
+        # store change is there has no new tag, and counts whatever the flag says.
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("migrations.ts",))
+                result = rc.classify_migrations(FROM, TO, fetch=fetch)
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+                self.assertEqual(result.kinds, {STORE_CODE: rc.STORE_CODE_CHANGED})
+                self.assertIn("store code", result.note)
+
+    def test_store_code_is_recorded_in_kinds_and_never_in_migrations(self):
+        # The journal list stays a list of journal tags, so what is written to the safety file
+        # is the same with or without a code change beside a migration.
+        tag = "0035_migration"
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE}, store_changed=("migrations.ts",))
+                result = rc.classify_migrations(FROM, TO, fetch=fetch)
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", [tag]))
+                self.assertEqual(result.kinds, {tag: "additive", STORE_CODE: rc.STORE_CODE_CHANGED})
+
+    def test_a_change_to_the_trigger_condition_counts(self):
+        # sync-failure.ts holds the condition the trigger in migrations.ts is built from.
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("sync-failure.ts",)))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+        self.assertEqual(result.kinds, {TRIGGER_CODE: rc.STORE_CODE_CHANGED})
+
+    def test_a_store_code_file_that_appears_or_vanishes_counts(self):
+        # sync-failure.ts first shipped in a release of its own; a file that is in only one of
+        # the two commits is a change. One that is in neither is not a change.
+        cases = {
+            "appears": (store_directory(omit=("sync-failure.ts",)), store_directory(), True),
+            "vanishes": (store_directory(), store_directory(omit=("sync-failure.ts",)), True),
+            "was never there": (store_directory(omit=("sync-failure.ts",)), store_directory(omit=("sync-failure.ts",)), False),
+        }
+        for name, (earlier, later, counts) in cases.items():
+            with self.subTest(name):
+                routes = {ts.contents_url(rc.STORE_CODE_DIR, FROM): (200, earlier), ts.contents_url(rc.STORE_CODE_DIR, TO): (200, later)}
+                result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+                self.assertEqual(result.classification, "not-rollback-safe" if counts else "additive")
+                self.assertEqual(result.kinds, {TRIGGER_CODE: rc.STORE_CODE_CHANGED} if counts else {})
+
+    def test_store_code_that_moved_or_vanished_counts(self):
+        # If ai-tc moves migrations.ts, nothing here can say what the store does at open.
+        gone = (404, {"message": "Not Found"})
+        cases = {
+            "the file is missing from the later listing": (ts.contents_url(rc.STORE_CODE_DIR, TO), (200, store_directory(omit=("migrations.ts",)))),
+            "the later commit has no such directory": (ts.contents_url(rc.STORE_CODE_DIR, TO), gone),
+            "the file is a directory at the later commit": (
+                ts.contents_url(rc.STORE_CODE_DIR, TO),
+                (200, [dict(e, type="dir") if e["name"] == "migrations.ts" else e for e in store_directory()]),
+            ),
+        }
+        for name, (url, answer) in cases.items():
+            for counts in (True, False):
+                with self.subTest(name, every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                    result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={url: answer}))
+                    self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+                    self.assertEqual(result.kinds[STORE_CODE], rc.STORE_CODE_MISSING)
+        # No such directory at the earlier commit: what the store did then is unknown too.
+        routes = {ts.contents_url(rc.STORE_CODE_DIR, FROM): gone}
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+        self.assertEqual(result.kinds[STORE_CODE], rc.STORE_CODE_CHANGED)
+
+    def test_unchanged_store_code_keeps_a_release_with_no_migration_additive(self):
+        # The 0.9.12 -> 0.9.13 shape: other files in the same directory changed with no store
+        # change, so only the named files are compared, not the directory.
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("database.ts",)))
+        self.assertEqual((result.classification, result.migrations, result.kinds), ("additive", [], {}))
+
+    def test_a_store_code_listing_outage_is_no_verdict(self):
+        good = store_directory()
+        junk = lambda value: [dict(e, sha=value) if e["name"] == "migrations.ts" else e for e in good]
+        crowd = [{"name": f"x{i}.ts", "path": f"{rc.STORE_CODE_DIR}/x{i}.ts", "sha": blob(f"x{i}"), "type": "file"} for i in range(1000)]
+        cases = {
+            "a 403": (403, b""),
+            "a 500": (500, b""),
+            "a 502": (502, b""),
+            "not JSON": (200, b"not json"),
+            "a single file, not a directory": (200, {"name": "migrations.ts", "type": "file", "sha": blob("x")}),
+            "null": (200, b"null"),
+            "an entry that is not an object": (200, [*good, "x.ts"]),
+            "a listing at the API's cap": (200, good + crowd[: 1000 - len(good)]),
+            "a sha that is not 40 hex": (200, junk("not-a-sha")),
+            "a sha that is not a string": (200, junk(7)),
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.STORE_CODE_DIR, commit): answer})
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
 
     def test_a_shipped_migration_the_listing_does_not_hold_is_not_additive(self):
         # The journal names it but the directory has no such file (or the directory cannot
@@ -1423,31 +1729,41 @@ class TestRollbackFloor(unittest.TestCase):
     SAFETY = {"versions": copy.deepcopy(ts.SEED)}
 
     def test_the_seed_refuses_a_rollback_from_0_9_14_to_0_9_13(self):
-        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
 
     def test_the_lowest_flagged_version_in_range_is_the_floor(self):
-        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.8", "0.9.14"), "0.9.9")
+        self.assertEqual(rc.rollback_floor(self.SAFETY, "0.9.8", "0.9.14", pinned=set()), "0.9.9")
 
     def test_additive_versions_set_no_floor(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}, "0.9.12", "0.9.13"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}, "0.9.12", "0.9.13", pinned=set()))
 
     def test_the_target_itself_is_never_the_floor(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.12": dict(ts.SEED["0.9.12"])}}, "0.9.12", "0.9.13"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.12": dict(ts.SEED["0.9.12"])}}, "0.9.12", "0.9.13", pinned=set()))
 
     def test_a_flag_above_the_highest_pinned_version_is_ignored(self):
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.15": dict(ts.SEED["0.9.14"])}}, "0.9.13", "0.9.14"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.15": dict(ts.SEED["0.9.14"])}}, "0.9.13", "0.9.14", pinned=set()))
 
     def test_a_malformed_or_missing_entry_counts_as_flagged(self):
-        self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": "additive"}}, "0.9.13", "0.9.14"), "0.9.14")
+        self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": "additive"}}, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
         # A pinned version with no entry at all (a break-glass pin, a restore) is flagged too.
         additive = {"versions": {"0.9.13": dict(ts.SEED["0.9.13"])}}
         pinned = {"0.9.12", "0.9.13", "0.9.14"}
         self.assertEqual(rc.rollback_floor(additive, "0.9.12", "0.9.14", pinned=pinned), "0.9.14")
         self.assertIsNone(rc.rollback_floor(additive, "0.9.12", "0.9.13", pinned=pinned))
 
+    def test_the_pinned_set_must_be_named(self):
+        # With no pinned set a version missing from the file sets no floor, which is a weaker
+        # floor than the same call with the set. A caller has to say which set it means.
+        with self.assertRaises(TypeError):
+            rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14")
+        with self.assertRaises(TypeError):
+            rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", {"0.9.14"})
+        self.assertEqual(rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", pinned={"0.9.14"}), "0.9.14")
+        self.assertIsNone(rc.rollback_floor({"versions": {}}, "0.9.13", "0.9.14", pinned=set()))
+
     def test_a_malformed_file_is_refused(self):
         with self.assertRaises(rc.ReleaseCheckError):
-            rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14")
+            rc.rollback_floor({"0.9.14": {}}, "0.9.13", "0.9.14", pinned=set())
 
     def test_only_a_well_formed_additive_entry_is_trusted(self):
         # A version is safe to roll back across only on an entry that safety_problems accepts
@@ -1465,14 +1781,14 @@ class TestRollbackFloor(unittest.TestCase):
         for name, entry in malformed.items():
             with self.subTest(name):
                 self.assertNotEqual(rc.safety_problems({"versions": {"0.9.14": entry}}), [])
-                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14"), "0.9.14")
+                self.assertEqual(rc.rollback_floor({"versions": {"0.9.14": entry}}, "0.9.13", "0.9.14", pinned=set()), "0.9.14")
         self.assertEqual(rc.safety_problems({"versions": {"0.9.14": good}}), [])
-        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14"))
+        self.assertIsNone(rc.rollback_floor({"versions": {"0.9.14": good}}, "0.9.13", "0.9.14", pinned=set()))
 
     def test_a_malformed_entry_flags_only_its_own_version(self):
         versions = {"0.9.13": dict(ts.SEED["0.9.13"]), "0.9.14": {"classification": "additive"}}
-        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13"))
-        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14"), "0.9.14")
+        self.assertIsNone(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.13", pinned=set()))
+        self.assertEqual(rc.rollback_floor({"versions": versions}, "0.9.12", "0.9.14", pinned=set()), "0.9.14")
 
 
 class TestSafetyProblems(unittest.TestCase):
@@ -1576,6 +1892,28 @@ class TestDiffMode(unittest.TestCase):
 
     def test_a_new_integrity_at_the_same_version_is_human(self):
         self.assertEqual(rc.diff_mode(ts.manifest("0.9.14"), ts.manifest("0.9.14", integrity=ts.OTHER_INTEGRITY)), "human")
+
+    def test_a_type_change_in_the_ai_tc_entry_is_human(self):
+        # Python's == says True == 1 == 1.0; JSON, and so the rest of the manifest, tells them
+        # apart. The real entry has no boolean or number today, so this needs a reviewed edit
+        # first, but then the comparison must still be exact.
+        def with_strict(version, value, integrity=ts.INTEGRITY):
+            doc = ts.manifest(version, integrity=integrity)
+            ts.ai_tc(doc)["strict"] = value
+            return doc
+
+        cases = {
+            "true to 1, same version": (with_strict("0.9.14", True), with_strict("0.9.14", 1)),
+            "true to 1, with an advance": (with_strict("0.9.14", True), with_strict("0.9.15", 1, ts.OTHER_INTEGRITY)),
+            "1 to 1.0, with an advance": (with_strict("0.9.14", 1), with_strict("0.9.15", 1.0, ts.OTHER_INTEGRITY)),
+            "false to 0, with an advance": (with_strict("0.9.14", False), with_strict("0.9.15", 0, ts.OTHER_INTEGRITY)),
+        }
+        for name, (base, head) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rc.diff_mode(base, head), "human")
+        # The same value, spelled the same, is still none or advance.
+        self.assertEqual(rc.diff_mode(with_strict("0.9.14", True), with_strict("0.9.14", True)), "none")
+        self.assertEqual(rc.diff_mode(with_strict("0.9.14", 1.0), with_strict("0.9.15", 1.0, ts.OTHER_INTEGRITY)), "advance")
 
     def test_a_description_edit_is_human(self):
         self.assertEqual(rc.diff_mode(ts.manifest(), ts.manifest(description="Better words.")), "human")
