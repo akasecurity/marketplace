@@ -384,8 +384,8 @@ class TestCodeOwners(unittest.TestCase):
                 self.assertEqual(self.owners(text), expected)
 
     def test_the_repositorys_own_codeowners_file_can_be_read(self):
-        # A change to that file that the strict reader cannot read would make the tag of every commit merged on top
-        # of it record an unknown approver, so it fails here first, while a pull request can still fix it.
+        # Once a commit is merged, the CODEOWNERS of its parent can no longer change, so a pin change on top of a
+        # file the strict reader cannot read is tagged with an unknown approver. This fails the pull request first.
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "CODEOWNERS")
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
@@ -479,8 +479,8 @@ class TestSweepOwners(unittest.TestCase):
                 self.assertEqual(len(gh.called("POST", R("git/refs"))), 1)
 
     def test_an_unreadable_file_marks_only_the_commits_whose_parent_holds_it(self):
-        # b's parent (t8) and d's parent (c) are readable; c's parent (b) is not. Reading each commit's own parent
-        # is what lets the sweep carry on past it: d is tagged with its real approver.
+        # b's parent (t8) and d's parent (c) are readable; c's parent (b) is not. The catch that no longer refuses is
+        # what lets the sweep carry on past c; reading each commit's own parent is what gives d its real approver.
         git = history(chain=("t8", "b", "c", "d"), times={"d": NOW - 7200})
         git.files[("b", ".github/CODEOWNERS")] = "* @akasecurity/maintainers\n"
         gh = sweep_github()
