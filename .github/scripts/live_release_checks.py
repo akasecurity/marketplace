@@ -16,6 +16,7 @@ import _testsupport as ts
 import release_checks as rc
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+STORE_CODE = f"{rc.STORE_CODE_DIR}/{rc.STORE_CODE_ENTRY}"
 
 # Every release a fleet-v tag pins, with the commit its signing certificate names: the
 # versions the fleet can be rolled back to. 0.9.11 is on npm, but no tag pins it. The
@@ -71,6 +72,19 @@ class TestLiveRelease(unittest.TestCase):
         )
         unchanged = classify_pair("0.9.12", "0.9.13")
         self.assertEqual((unchanged.classification, unchanged.migrations), ("additive", []))
+
+    def test_the_real_store_code_listing_flags_a_change_with_no_new_migration(self):
+        # Reads ai-tc's real persistence source listings. 0.9.11 changed migrations.ts and added
+        # no migration; the change was to comments, which a whole-file comparison cannot tell
+        # from any other, so the release counts. 0.9.13 changed other files in that directory and
+        # neither of the two store-code files.
+        commented = classify_pair("0.9.10", "0.9.11")
+        self.assertEqual(
+            (commented.classification, commented.migrations, commented.kinds),
+            ("not-rollback-safe", [], {STORE_CODE: rc.STORE_CODE_CHANGED}),
+        )
+        unchanged = classify_pair("0.9.12", "0.9.13")
+        self.assertEqual((unchanged.classification, unchanged.migrations, unchanged.kinds), ("additive", [], {}))
 
 
 def classify_pair(earlier, later):

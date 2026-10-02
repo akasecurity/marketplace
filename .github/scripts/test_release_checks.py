@@ -900,15 +900,38 @@ def directory(tags, edited=()):
     return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
 
 
+STORE_CODE = f"{rc.STORE_CODE_DIR}/{rc.STORE_CODE_ENTRY}"
+TRIGGER_CODE = f"{rc.STORE_CODE_DIR}/sync-failure.ts"
+
+
+def store_directory(*, changed=(), omit=()):
+    """What the Contents API answers for ai-tc's persistence source: the two store-code files and
+    a neighbour that is not one, each with a git blob sha. A name in `changed` has a different
+    sha; a name in `omit` is not there."""
+    return [
+        {
+            "name": name,
+            "path": f"{rc.STORE_CODE_DIR}/{name}",
+            "sha": blob(name, "changed" if name in changed else ""),
+            "type": "file",
+        }
+        for name in ("database.ts", *rc.STORE_CODE_FILES)
+        if name not in omit
+    ]
+
+
 class TestClassifyMigrations(unittest.TestCase):
-    def fetch(self, from_tags, to_tags, sql, *, edited=(), routes=None):
+    def fetch(self, from_tags, to_tags, sql, *, edited=(), store_changed=(), routes=None):
         """Journals, listings and added files for a pair of releases. `edited` tags carry a
-        different blob sha at TO; `routes` replaces any of the answers."""
+        different blob sha at TO, and so do the `store_changed` files of the store code; the
+        store code is otherwise the same at both. `routes` replaces any of the answers."""
         answers = {
             ts.contents_url(JOURNAL, FROM): (200, journal(*from_tags)),
             ts.contents_url(JOURNAL, TO): (200, journal(*to_tags)),
             ts.contents_url(rc.MIGRATIONS_DIR, FROM): (200, directory(from_tags)),
             ts.contents_url(rc.MIGRATIONS_DIR, TO): (200, directory(to_tags, edited)),
+            ts.contents_url(rc.STORE_CODE_DIR, FROM): (200, store_directory()),
+            ts.contents_url(rc.STORE_CODE_DIR, TO): (200, store_directory(changed=store_changed)),
         }
         for tag, text in sql.items():
             answers[ts.contents_url(f"{rc.MIGRATIONS_DIR}/{tag}.sql", TO)] = (200, text.encode())
@@ -936,10 +959,14 @@ class TestClassifyMigrations(unittest.TestCase):
         tag = "0035_migration"
         fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE})
         rc.classify_migrations(FROM, TO, fetch=fetch)
-        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(f"/contents/{rc.MIGRATIONS_DIR}")]
+        directories = (rc.MIGRATIONS_DIR, rc.STORE_CODE_DIR)
+        listings = [(url, h) for url, h in fetch.calls if url.split("?")[0].endswith(tuple(f"/contents/{d}" for d in directories))]
         files = [(url, h) for url, h in fetch.calls if (url, h) not in listings]
-        # One listing per attested commit, however many migrations the journals hold.
-        self.assertEqual(sorted(url for url, _ in listings), sorted([ts.contents_url(rc.MIGRATIONS_DIR, c) for c in (FROM, TO)]))
+        # One listing of each directory per attested commit, however many migrations the journals hold.
+        self.assertEqual(
+            sorted(url for url, _ in listings),
+            sorted(ts.contents_url(d, c) for d in directories for c in (FROM, TO)),
+        )
         self.assertTrue(all(h.get("Accept") == "application/vnd.github+json" for _, h in listings))
         self.assertEqual(len(files), 3)  # the two journals and the one added file
         self.assertTrue(all(h.get("Accept") == "application/vnd.github.raw+json" for _, h in files))
@@ -976,6 +1003,102 @@ class TestClassifyMigrations(unittest.TestCase):
         )
         self.assertEqual(result.migrations, [added, removed, "0000_initial"])
         self.assertEqual(result.kinds[added], "additive")
+
+    def test_a_store_change_in_code_with_no_migration_is_not_rollback_safe(self):
+        # ai-tc changes the store in code as well as through the journal. A release whose only
+        # store change is there has no new tag, and counts whatever the flag says.
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("migrations.ts",))
+                result = rc.classify_migrations(FROM, TO, fetch=fetch)
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+                self.assertEqual(result.kinds, {STORE_CODE: rc.STORE_CODE_CHANGED})
+                self.assertIn("store code", result.note)
+
+    def test_store_code_is_recorded_in_kinds_and_never_in_migrations(self):
+        # The journal list stays a list of journal tags, so what is written to the safety file
+        # is the same with or without a code change beside a migration.
+        tag = "0035_migration"
+        for counts in (True, False):
+            with self.subTest(every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                fetch = self.fetch(BASE_TAGS, BASE_TAGS + (tag,), {tag: SQL_NULLABLE}, store_changed=("migrations.ts",))
+                result = rc.classify_migrations(FROM, TO, fetch=fetch)
+                self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", [tag]))
+                self.assertEqual(result.kinds, {tag: "additive", STORE_CODE: rc.STORE_CODE_CHANGED})
+
+    def test_a_change_to_the_trigger_condition_counts(self):
+        # sync-failure.ts holds the condition the trigger in migrations.ts is built from.
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("sync-failure.ts",)))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+        self.assertEqual(result.kinds, {TRIGGER_CODE: rc.STORE_CODE_CHANGED})
+
+    def test_a_store_code_file_that_appears_or_vanishes_counts(self):
+        # sync-failure.ts first shipped in a release of its own; a file that is in only one of
+        # the two commits is a change. One that is in neither is not a change.
+        cases = {
+            "appears": (store_directory(omit=("sync-failure.ts",)), store_directory(), True),
+            "vanishes": (store_directory(), store_directory(omit=("sync-failure.ts",)), True),
+            "was never there": (store_directory(omit=("sync-failure.ts",)), store_directory(omit=("sync-failure.ts",)), False),
+        }
+        for name, (earlier, later, counts) in cases.items():
+            with self.subTest(name):
+                routes = {ts.contents_url(rc.STORE_CODE_DIR, FROM): (200, earlier), ts.contents_url(rc.STORE_CODE_DIR, TO): (200, later)}
+                result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+                self.assertEqual(result.classification, "not-rollback-safe" if counts else "additive")
+                self.assertEqual(result.kinds, {TRIGGER_CODE: rc.STORE_CODE_CHANGED} if counts else {})
+
+    def test_store_code_that_moved_or_vanished_counts(self):
+        # If ai-tc moves migrations.ts, nothing here can say what the store does at open.
+        gone = (404, {"message": "Not Found"})
+        cases = {
+            "the file is missing from the later listing": (ts.contents_url(rc.STORE_CODE_DIR, TO), (200, store_directory(omit=("migrations.ts",)))),
+            "the later commit has no such directory": (ts.contents_url(rc.STORE_CODE_DIR, TO), gone),
+            "the file is a directory at the later commit": (
+                ts.contents_url(rc.STORE_CODE_DIR, TO),
+                (200, [dict(e, type="dir") if e["name"] == "migrations.ts" else e for e in store_directory()]),
+            ),
+        }
+        for name, (url, answer) in cases.items():
+            for counts in (True, False):
+                with self.subTest(name, every_migration_counts=counts), mock.patch.object(rc, "EVERY_MIGRATION_COUNTS", counts):
+                    result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={url: answer}))
+                    self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+                    self.assertEqual(result.kinds[STORE_CODE], rc.STORE_CODE_MISSING)
+        # No such directory at the earlier commit: what the store did then is unknown too.
+        routes = {ts.contents_url(rc.STORE_CODE_DIR, FROM): gone}
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, routes=routes))
+        self.assertEqual((result.classification, result.migrations), ("not-rollback-safe", []))
+        self.assertEqual(result.kinds[STORE_CODE], rc.STORE_CODE_CHANGED)
+
+    def test_unchanged_store_code_keeps_a_release_with_no_migration_additive(self):
+        # The 0.9.12 -> 0.9.13 shape: other files in the same directory changed with no store
+        # change, so only the named files are compared, not the directory.
+        result = rc.classify_migrations(FROM, TO, fetch=self.fetch(BASE_TAGS, BASE_TAGS, {}, store_changed=("database.ts",)))
+        self.assertEqual((result.classification, result.migrations, result.kinds), ("additive", [], {}))
+
+    def test_a_store_code_listing_outage_is_no_verdict(self):
+        good = store_directory()
+        junk = lambda value: [dict(e, sha=value) if e["name"] == "migrations.ts" else e for e in good]
+        crowd = [{"name": f"x{i}.ts", "path": f"{rc.STORE_CODE_DIR}/x{i}.ts", "sha": blob(f"x{i}"), "type": "file"} for i in range(1000)]
+        cases = {
+            "a 403": (403, b""),
+            "a 500": (500, b""),
+            "a 502": (502, b""),
+            "not JSON": (200, b"not json"),
+            "a single file, not a directory": (200, {"name": "migrations.ts", "type": "file", "sha": blob("x")}),
+            "null": (200, b"null"),
+            "an entry that is not an object": (200, [*good, "x.ts"]),
+            "a listing at the API's cap": (200, good + crowd[: 1000 - len(good)]),
+            "a sha that is not 40 hex": (200, junk("not-a-sha")),
+            "a sha that is not a string": (200, junk(7)),
+        }
+        for name, answer in cases.items():
+            for commit in (FROM, TO):
+                with self.subTest(name, commit=commit[:8]):
+                    fetch = self.fetch(BASE_TAGS, BASE_TAGS, {}, routes={ts.contents_url(rc.STORE_CODE_DIR, commit): answer})
+                    with self.assertRaises(rc.InfraError) as caught:
+                        rc.classify_migrations(FROM, TO, fetch=fetch)
+                    self.assertEqual(caught.exception.check, "classify")
 
     def test_a_shipped_migration_the_listing_does_not_hold_is_not_additive(self):
         # The journal names it but the directory has no such file (or the directory cannot
