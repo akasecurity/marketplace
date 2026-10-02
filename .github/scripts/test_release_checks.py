@@ -69,16 +69,18 @@ class TestErrorClasses(unittest.TestCase):
 
 
 class TestRunningTheFile(unittest.TestCase):
-    def test_running_the_file_is_a_usage_error_until_the_command_line_exists(self):
-        # The docstring defines exit 0 as "the check passes", so a file that prints nothing
-        # and exits 0 would be read as a pass by `release_checks.py verify X && proceed`.
-        # The in-process tests cannot see this: they never run the file as a program.
+    def test_running_the_file_runs_the_command_line(self):
+        # The in-process tests call main() and never run the file as a program, so a guard left
+        # in front of the command line (one that exits before it) would pass all of them. A
+        # workflow or a person runs the file itself.
+        repo = ts.Repo(self)
+        base = repo.write("base.json", rc.dump_json(ts.manifest("0.9.14")))
+        head = repo.write("head.json", rc.dump_json(ts.manifest("0.9.14")))
         result = subprocess.run(
-            [sys.executable, rc.__file__, "verify", "0.9.16"], capture_output=True, text=True
+            [sys.executable, rc.__file__, "diff-mode", base, head], capture_output=True, text=True
         )
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, "")
-        self.assertIn("nothing was checked", result.stderr)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(json.loads(result.stdout), {"mode": "none"})
 
 
 class TestSelectEntry(unittest.TestCase):
