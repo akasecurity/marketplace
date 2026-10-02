@@ -105,7 +105,8 @@ def snapshot(git: Git) -> list[dict]:
 
 
 def freeze_text(git: Git) -> str:
-    """The frozen list: every fleet-v tag that exists when tag-audit is activated."""
+    """The frozen list: every fleet-v tag as it stands now. It records the tags as of the last reviewed
+    freeze; a reviewed re-freeze is how a changed tag is accepted and the baseline is reset."""
     lightweight = [tag["tag"] for tag in git.fleet_tags() if tag["object"] == tag["commit"]]
     if lightweight:
         raise SystemExit(f"refusing to freeze lightweight fleet tags: {', '.join(lightweight)}")

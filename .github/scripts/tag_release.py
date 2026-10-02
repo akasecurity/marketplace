@@ -10,13 +10,17 @@ records the version, integrity, PR, approver and store-migration class, plus
 rollback-from, drill and approver-note when they apply. A commit that GitHub
 links to no merged PR is left untagged, and so is everything after it, until
 it is an hour old: a slow link must not become a permanent `pr: none` tag.
-After that hour it is tagged as a push without a PR. The owners that decide
+After that hour it is tagged as a push without a PR. A commit dated more than
+five minutes ahead of the runner's clock is not young either (only a direct
+push can carry one, and waiting for its date would hold every later tag back):
+it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
 no later pull request can change, so a parent whose file is anything else never
-stops the sweep (it would stop tagging for good): the commit is tagged with
-`approver: unknown` and an approver-note saying why, rather than a guess at who
-counts.
+stops the sweep (it would stop tagging for good): a commit a pull request merged
+is tagged with `approver: unknown` and an approver-note saying why, rather than
+a guess at who counts. A commit no pull request merged records `approver: none`
+whatever the file holds, as there is no approval to match.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
 """
@@ -42,6 +46,11 @@ ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
 # hour staleness waits before it reports an untagged pin change).
 UNLINKED_GRACE = 3600
+# The clock-skew allowance, in seconds. GitHub dates a commit it makes at the moment it makes it, so a
+# commit it made is never more than seconds ahead of this runner's clock. One dated further ahead was
+# made on a machine with the wrong time (only a direct push can carry one), and it is not young: waiting
+# for its date would hold every later tag back until then. It is handled as an old unlinked commit.
+CLOCK_SKEW = 300
 # A user owner in CODEOWNERS: "@" and a login. A team ("@org/team") or an email address matches no reviewer's login.
 USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
@@ -73,12 +82,18 @@ def last_pinned(git: Git, sha: str | None) -> str:
 
 def code_owners(git: Git, sha: str) -> list[str]:
     """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
-    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule
-    or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
-    shape would turn a real approval into a recorded bypass. What a caller does with the Refused is its own
-    call: the sweep tags with an unknown approver, because the file it reads is fixed history."""
-    raw = git.show(sha, CODEOWNERS_FILE)
+    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule,
+    a file that is not UTF-8 text or no file at all is a Refused, not a guess: a reviewer's login can be matched
+    only to a user, so any other shape would turn a real approval into a recorded bypass. What a caller does
+    with the Refused is its own call: for a commit a pull request merged, the sweep tags with an unknown
+    approver, because the file it reads is fixed history (a commit no pull request merged records `none`)."""
     where = f"{CODEOWNERS_FILE} at {sha[:12]}"
+    try:
+        raw = git.show(sha, CODEOWNERS_FILE)
+    except UnicodeDecodeError as error:
+        # Git.show decodes what it reads as UTF-8; a file that is not text is no more readable than a team owner.
+        raise Refused(f"{where} is not valid UTF-8 text (byte {error.start} is not); code owners can only be "
+                      "read from a file of one `*` line naming users.") from error
     if raw is None:
         raise Refused(f"{where} is missing; code owners can only be read from a file of one `*` line naming users.")
     rules = [fields for fields in (line.split("#", 1)[0].split() for line in raw.splitlines()) if fields]
@@ -227,13 +242,14 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
         # The parent's file is fixed history: refusing here would keep every later commit untagged for good, as no
-        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag.
+        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag of a commit
+        # a pull request merged.
         try:
             owners, unreadable = (code_owners(git, parent) if parent else []), ""
         except Refused as refusal:
             owners, unreadable = None, " ".join(str(refusal).split())
         facts = pr_facts(gh, sha, owners, sleep, unreadable)
-        if facts["pr"] == "none" and now() - git.commit_time(sha) < UNLINKED_GRACE:
+        if facts["pr"] == "none" and -CLOCK_SKEW <= now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
                           "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
