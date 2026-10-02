@@ -597,7 +597,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
             base,
             head,
             changed_files(repo, start, head_sha),
-            rc.pins_by_ref(repo),
+            rc.pins_by_ref(repo, main_rev=main_sha),
             read_at(repo, main_sha, rc.SAFETY_FILE),
             bot_login=rc.BOT_LOGIN,
             verify=verify,

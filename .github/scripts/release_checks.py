@@ -369,10 +369,14 @@ def _tag_pin(repo_dir: str, tag: str) -> str | None:
     return entry_version(pins[0]) if len(pins) == 1 else None
 
 
-def pins_by_ref(repo_dir: str) -> dict:
-    """{"main": <pin>, "fleet-v1": <pin>, ...}. Strict for main, lenient for history."""
+def pins_by_ref(repo_dir: str, *, main_rev: str | None = None) -> dict:
+    """{"main": <pin>, "fleet-v1": <pin>, ...}. Strict for main, lenient for history.
+
+    Main's pin is read at `main_rev` when a caller that resolved main once passes the
+    commit, so the pins and the caller's other reads of main come from one commit. Without
+    it, main is resolved here, by name."""
     try:
-        main_doc = _read_manifest(repo_dir, main_ref(repo_dir))
+        main_doc = _read_manifest(repo_dir, main_ref(repo_dir) if main_rev is None else main_rev)
     except ValueError as exc:
         raise ReleaseCheckError("manifest", f"main's {MANIFEST} does not parse: {exc}") from exc
     pins = {"main": entry_version(find_ai_tc_entry(main_doc))}
