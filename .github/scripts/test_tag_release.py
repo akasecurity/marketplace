@@ -146,6 +146,34 @@ class TestSweep(unittest.TestCase):
                 self.assertIn("pr: none\napprover: none\n", message)
                 self.assertIn("approver-note: no pull request merged this commit\n", message)
 
+    def test_an_unlinked_commit_dated_ahead_of_the_clock_does_not_hold_the_tags_after_it(self):
+        # Only a direct push can carry a future committer date (GitHub dates the commits it makes at the moment
+        # it makes them), for example from a machine with the wrong clock. Waiting for that date would leave
+        # this commit and every later one untagged until then, so it is tagged now as an old one would be.
+        ahead = {"just past the allowance": tr.CLOCK_SKEW + 1, "hours": 7200 * 3, "years": 86400 * 365 * 5}
+        for label, seconds in ahead.items():
+            with self.subTest(label):
+                gh = sweep_github()
+                # d (the entry's removal, no PR) is dated ahead; c (a linked rollback) comes after it.
+                git = history(chain=("t8", "d", "c"), times={"d": NOW + seconds})
+                self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
+                                 ["fleet-v9 -> d (ai-tc entry removed)", "fleet-v10 -> c (ai-tc 0.9.14)"])
+                message = gh.called("POST", R("git/tags"))[0][2]["message"]
+                self.assertIn("pr: none\napprover: none\n", message)
+                self.assertIn("approver-note: no pull request merged this commit\n", message)
+
+    def test_an_unlinked_commit_dated_a_little_ahead_of_the_clock_is_still_young(self):
+        # A runner's clock and a committer's differ by a little, so a date within the allowance is not a wrong
+        # clock: the commit is held for the hour like any other young one.
+        for seconds in (120, tr.CLOCK_SKEW):
+            with self.subTest(seconds=seconds):
+                gh = sweep_github()
+                git = history(chain=("t8", "b", "d"), times={"d": NOW + seconds})
+                with self.assertRaisesRegex(Refused, "links no merged pull request"):
+                    tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+                tags = [call[2] for call in gh.called("POST", R("git/tags"))]
+                self.assertEqual([(t["tag"], t["object"]) for t in tags], [("fleet-v9", "b")])
+
     def test_a_young_commit_is_tagged_when_a_merged_pr_is_linked(self):
         # Only a commit with no linked PR waits: the age of one that has a PR is never consulted.
         gh = sweep_github()
