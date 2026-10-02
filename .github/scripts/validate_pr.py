@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """validate.yml's rules for every PR into this repository.
 
-This runs from the BASE branch's copy (pull_request_target). It reads the PR's files as
-data: `git show <sha>:<path>` of the head commit, never a checkout, and it never imports
-or executes anything the PR contains.
+This runs from the default branch's (main's) copy (pull_request_target: since 2025-12-08
+GitHub takes the workflow and the checkout from the default branch, whatever the PR's base).
+It reads the PR's files as data: `git show <sha>:<path>` of the head commit, never a
+checkout, and it never imports or executes anything the PR contains.
 
 It is a correctness check on the automated path, not a security boundary: code-owner
 review of every change is the control.
@@ -436,8 +437,8 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
 def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins, tip_safety_text, *, bot_login, verify, classify) -> Report:
     """Every rule validate applies to one PR.
 
-    The base files come from the PR's merge base. The tip safety text is main's
-    rollback-safety.json, which alone decides the floor."""
+    The base files come from the merge base of main and the PR head. The tip safety text
+    is main's rollback-safety.json, which alone decides the floor."""
     report = Report()
     head_docs = parse_manifests(head_files, report, label="the PR head")
     for path in (rc.MANIFEST, rc.SAFETY_FILE):
@@ -485,8 +486,8 @@ def render_summary(report: Report, number) -> str:
     lines = [
         f"## validate: PR #{number}: {verdict}",
         "",
-        "validate.yml from the base branch, run on pull_request_target. Before trusting a green "
-        "result, open this check run and confirm it is that workflow: any GitHub Actions job "
+        "validate.yml from main (the default branch), run on pull_request_target. Before trusting a "
+        "green result, open this check run and confirm it is that workflow: any GitHub Actions job "
         "named validate satisfies the required check.",
         "",
     ]

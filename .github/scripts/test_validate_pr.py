@@ -706,6 +706,9 @@ class TestSummary(unittest.TestCase):
         text = vp.render_summary(report, 7)
         self.assertTrue(text.startswith("## validate: PR #7: PASS\n"))
         self.assertIn("confirm it is that workflow", text)
+        # pull_request_target runs the default branch's copy, whatever branch the PR targets.
+        self.assertIn("validate.yml from main (the default branch)", text)
+        self.assertNotIn("base branch", text)
         self.assertIn("| Mode | ADVANCE (bot PR) |", text)
         self.assertTrue(text.endswith("\n"))
 

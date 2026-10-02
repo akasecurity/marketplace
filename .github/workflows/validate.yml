@@ -2,8 +2,10 @@ name: validate
 
 # The required check on main.
 #
-# It runs on pull_request_target, so the workflow and the scripts that run are the
-# BASE branch's copy, never the PR's. The PR's files are read as data
+# It runs on pull_request_target, so the workflow and the scripts that run are the default
+# branch's (main's) copy, never the PR's: since 2025-12-08 GitHub takes the workflow and the
+# checkout from the default branch, whatever the PR's base. A PR into another branch (a
+# stacked one) is therefore judged against main. The PR's files are read as data
 # (git show <head sha>:<path>); nothing from the head is executed.
 #
 # It is a correctness check on the automated path, not a security boundary: code-owner
@@ -37,7 +39,7 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      # Checks out the base branch (pull_request_target's default), with full history and
+      # Checks out main (the commit pull_request_target runs at), with full history and
       # every tag, so the pins of main and of each fleet-v tag can be read. No credential
       # is persisted: this job pushes nothing.
       # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (the pin import-plugin-release.yml uses).
