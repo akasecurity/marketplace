@@ -74,10 +74,12 @@ Managed fleets either follow `main`, which moves only through a code-owner-appro
 register this marketplace at a `fleet-v<N>` tag and move only when their own configuration names a
 later one.
 
-The one exception is break-glass: a few organisation owners can merge past the approval requirement
-when no code owner is reachable, for example to roll a bad release back. Such a merge is recorded
-in the tag message, and an automated audit of `main` opens an issue for any commit that reached it
-without an approved pull request.
+The one exception is break-glass: a few organisation owners can merge past the `main` ruleset's
+approval or `validate` requirement when no code owner is reachable, for example to roll a bad
+release back. An automated audit of `main` opens an issue for every commit that reached it without a
+code-owner-approved pull request whose final head passed `validate`. If the merge moved the ai-tc pin
+and no code owner had approved it, its `fleet-v<N>` tag also records `approver: none` and who merged
+it.
 `preflight` and `claude-tools` still float on their default branches.
 
 ## About
