@@ -1,6 +1,7 @@
 """Guards on what main holds: the ai-tc entry's shape, the seeded rollback-safety.json, and the
 entries recorded after the seed. They read the committed files, so every bot pin PR must keep
-them true: nothing here may name the version main currently pins."""
+them true: no assertion here depends on which version main pins, except that a pin from the seed
+up has a rollback-safety entry."""
 
 from __future__ import annotations
 
@@ -48,10 +49,23 @@ def journal_numbers(entry):
     return [tag.split("_", 1)[0] for tag in entry["migrations"]]
 
 
+# The first version the seed covers. A pin below it (a rollback to an older fleet release) was
+# never seeded, so the rule that a pinned version has an entry does not reach it.
+FIRST_SEEDED = min(ts.SEED, key=rc.vkey)
+
+
+def pin_lacking_entry(pinned, versions):
+    """[pinned] when it is at or above the seed and has no entry, else []."""
+    if rc.vkey(pinned) >= rc.vkey(FIRST_SEEDED) and pinned not in versions:
+        return [pinned]
+    return []
+
+
 # Entries recorded after the seed was taken, each as release_checks.py safety-entry computed it
-# from the two attested commits. An entry is never rewritten once recorded, so these stay true
-# however far the pin moves on. The commit is spelled out because the unit fixtures use 0.9.15 as
-# an invented next release.
+# from the two attested commits. The test below fails when a listed entry changes, so a reviewed
+# change to one updates it here in the same PR, and these stay true however far the pin moves on.
+# An entry the importer records later is not listed until someone adds it here. The commit is
+# spelled out because the unit fixtures use 0.9.15 as an invented next release.
 RECORDED = {
     "0.9.15": {
         "classification": "not-rollback-safe",
@@ -91,9 +105,23 @@ class TestCommittedRollbackSafety(unittest.TestCase):
         # reached main without one blocks every rollback across it until its entry is recorded.
         pinned = rc.entry_version(rc.select_ai_tc_entry(rc.parse_json(read(rc.MANIFEST))))
         self.assertIsNotNone(pinned)
-        self.assertIn(pinned, self.doc["versions"])
+        self.assertEqual(pin_lacking_entry(pinned, self.doc["versions"]), [])
 
     def test_every_seeded_release_with_a_migration_is_flagged(self):
         flagged = {v for v, e in self.doc["versions"].items() if e["classification"] == "not-rollback-safe"}
         self.assertTrue({"0.9.9", "0.9.10", "0.9.12", "0.9.14"} <= flagged)
         self.assertEqual(self.doc["versions"]["0.9.13"]["classification"], "additive")
+
+
+class TestPinEntryRule(unittest.TestCase):
+    def test_a_pin_from_the_seed_up_needs_an_entry(self):
+        self.assertEqual(FIRST_SEEDED, "0.9.9")
+        self.assertEqual(pin_lacking_entry("0.9.9", {}), ["0.9.9"])
+        self.assertEqual(pin_lacking_entry("0.9.16", {"0.9.15": {}}), ["0.9.16"])
+        self.assertEqual(pin_lacking_entry("0.9.16", {"0.9.16": {}}), [])
+
+    def test_a_pin_below_the_seed_needs_none(self):
+        # fleet-v2 and fleet-v3 pin 0.9.6 and 0.9.8, which the seed does not cover.
+        for pinned in ("0.9.6", "0.9.8"):
+            with self.subTest(pinned):
+                self.assertEqual(pin_lacking_entry(pinned, {}), [])
