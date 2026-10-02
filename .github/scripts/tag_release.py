@@ -17,9 +17,10 @@ it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
 no later pull request can change, so a parent whose file is anything else never
-stops the sweep (it would stop tagging for good): the commit is tagged with
-`approver: unknown` and an approver-note saying why, rather than a guess at who
-counts.
+stops the sweep (it would stop tagging for good): a commit a pull request merged
+is tagged with `approver: unknown` and an approver-note saying why, rather than
+a guess at who counts. A commit no pull request merged records `approver: none`
+whatever the file holds, as there is no approval to match.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
 """
@@ -82,9 +83,10 @@ def last_pinned(git: Git, sha: str | None) -> str:
 def code_owners(git: Git, sha: str) -> list[str]:
     """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
     naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule,
-    a file that is not UTF-8 text or no file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other
-    shape would turn a real approval into a recorded bypass. What a caller does with the Refused is its own
-    call: the sweep tags with an unknown approver, because the file it reads is fixed history."""
+    a file that is not UTF-8 text or no file at all is a Refused, not a guess: a reviewer's login can be matched
+    only to a user, so any other shape would turn a real approval into a recorded bypass. What a caller does
+    with the Refused is its own call: for a commit a pull request merged, the sweep tags with an unknown
+    approver, because the file it reads is fixed history (a commit no pull request merged records `none`)."""
     where = f"{CODEOWNERS_FILE} at {sha[:12]}"
     try:
         raw = git.show(sha, CODEOWNERS_FILE)
@@ -240,7 +242,8 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
         # The parent's file is fixed history: refusing here would keep every later commit untagged for good, as no
-        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag.
+        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag of a commit
+        # a pull request merged.
         try:
             owners, unreadable = (code_owners(git, parent) if parent else []), ""
         except Refused as refusal:
