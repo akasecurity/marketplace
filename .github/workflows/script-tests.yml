@@ -3,8 +3,9 @@ name: script-tests
 # Runs the release-check unit tests on the PR's own code. This is safe on pull_request:
 # the token is read-only and no secret is in scope. It is not a required check (validate
 # is), but a red run here means the module every release workflow runs has regressed.
-# .github/CODEOWNERS is listed because tag-release reads it strictly and stops its sweep on a
-# shape it refuses; the test that reads this repository's own copy runs here, on the PR.
+# .github/CODEOWNERS is listed because tag-release reads it strictly, and a tag cut for a commit
+# whose parent holds a shape it cannot read records an unknown approver; the test that reads
+# this repository's own copy runs here, on the PR, while the file can still be fixed.
 
 on:
   pull_request:
