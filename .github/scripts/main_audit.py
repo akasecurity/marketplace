@@ -113,11 +113,15 @@ def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None])
     return " ".join(problems) or None
 
 
-def rewrite_problem(git: Git, before: str, after: str) -> str | None:
-    """Why this push moved main other than by adding commits on top of the old tip, or None when it did not.
+def rewrite_of(git: Git, before: str, after: str) -> tuple[str, list[str]] | None:
+    """How this push moved main other than by adding commits on top of the old tip, as (why, the commits to
+    audit), or None when it did not.
 
-    An old tip that only main held is not fetched once main has moved off it, so an unknown `before` is the
-    ordinary shape of a reset or force-push and reads as one."""
+    The commits to audit are the first-parent commits after the merge base of the old and new tips: what the
+    rewrite put on main that its predecessor did not hold. Where that cannot be known, the new tip alone is
+    audited and the text says so: an old tip that only main held is not fetched once main has moved off it,
+    so an unknown `before` is the ordinary shape of a reset or force-push, and two tips with no common history
+    have no base. A rewrite that adds nothing past the base (a reset back to an ancestor) audits its tip too."""
     if not before or ZERO.fullmatch(before):
         return None
     ancestor = git.is_ancestor(before, after)
@@ -125,8 +129,17 @@ def rewrite_problem(git: Git, before: str, after: str) -> str | None:
         return None
     if ancestor is None:
         return (f"main moved from `{before}` to `{after}` and the old tip is not in the checkout, so it is no "
-                "longer reachable from any branch or tag: history was rewritten or reset.")
-    return f"main moved from `{before}` to `{after}` and the old tip is not an ancestor of the new one: history was rewritten or reset."
+                "longer reachable from any branch or tag: history was rewritten or reset. There is no merge base "
+                "to start from, so only the new tip was audited.", [after])
+    moved = f"main moved from `{before}` to `{after}` and the old tip is not an ancestor of the new one: history was rewritten or reset."
+    base = git.merge_base(before, after)
+    if base is None:
+        return moved + " The old and new tips share no history, so only the new tip was audited.", [after]
+    added = git.first_parent_after(base, after)
+    if not added:
+        return (moved + f" The new tip adds nothing after their merge base `{base[:12]}`, so only the new tip was "
+                "audited.", [after])
+    return moved + f" The {len(added)} commit(s) after their merge base `{base[:12]}` were audited.", added
 
 
 def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float], None] = time.sleep) -> list[Result]:
@@ -137,14 +150,14 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
     number of red results. Every red result is keyed to this push and never closes by itself (auto_close is
     off), so a push the audit could not finish is recorded too: an error part-way through keeps what was
     found so far and adds an unaudited result, rather than failing the job into the shared workflow issue.
-    A moved-not-extended main audits the new tip only.
+    A main that was moved rather than extended audits what the rewrite added (rewrite_of).
     """
     results: list[Result] = []
     commits: list[str] = []
     try:
-        moved = rewrite_problem(git, before, after)
-        if moved:
-            commits = [after]
+        rewrite = rewrite_of(git, before, after)
+        if rewrite:
+            moved, commits = rewrite
             results.append(Result(
                 rule=f"{REWRITE_RULE}{after[:12]}", label=LABEL, red=True, auto_close=False,
                 title=f"main-audit: main moved from {before[:12]} to {after[:12]} without extending it",

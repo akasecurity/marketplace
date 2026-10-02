@@ -23,6 +23,32 @@ def repo() -> FakeGit:
     return FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
 
 
+@contextlib.contextmanager
+def scratch_repo():
+    """An empty repository on main in a temporary directory: yields (path, sh, commit), where `commit(name, text)`
+    writes a file, commits it and returns its sha."""
+    with tempfile.TemporaryDirectory() as root:
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+        def sh(*args):
+            return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        def commit(name, text=None):
+            path = os.path.join(root, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(name if text is None else text)
+            sh("add", name)
+            sh("commit", "-q", "-m", name)
+            return sh("rev-parse", "HEAD")
+
+        sh("init", "-q", "-b", "main")
+        yield root, sh, commit
+
+
 def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID) -> dict:
     """A check run as the API lists it: by default the green `validate` run of GitHub Actions."""
     return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app}}
@@ -85,6 +111,7 @@ class TestMainAudit(unittest.TestCase):
                          [("main-audit-rewrite-s1", True, False), ("main-audit-s1", True, False),
                           ("main-audit", False, False)])
         self.assertIn("not in the checkout", results[0].detail)
+        self.assertIn("only the new tip was audited", results[0].detail)
 
     def test_a_failure_part_way_keeps_what_was_found_and_is_recorded_against_the_push(self):
         git = FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
@@ -148,25 +175,7 @@ class TestMainAudit(unittest.TestCase):
     def test_a_merge_commit_audits_only_mains_first_parent_commit(self):
         # A pull request merged with a merge commit puts the branch's own commits into the push too. They are
         # not on main's first-parent line and have no pull request of their own, so they are not audited.
-        with tempfile.TemporaryDirectory() as root:
-            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
-
-            def sh(*args):
-                return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
-                                      text=True).stdout.strip()
-
-            def commit(name, text):
-                path = os.path.join(root, name)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(text)
-                sh("add", name)
-                sh("commit", "-q", "-m", name)
-                return sh("rev-parse", "HEAD")
-
-            sh("init", "-q", "-b", "main")
+        with scratch_repo() as (root, sh, commit):
             base = commit(".github/CODEOWNERS", CODEOWNERS)
             sh("switch", "-q", "-c", "feature")
             first, second = commit("one", "1"), commit("two", "2")
@@ -180,6 +189,43 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(results[0].detail, "1 commit(s) audited in this push, 0 flagged.")
         self.assertEqual(gh.called("GET", R(f"commits/{first}/pulls")), [])
         self.assertEqual(gh.called("GET", R(f"commits/{second}/pulls")), [])
+
+    def test_a_rewrite_audits_every_first_parent_commit_after_the_merge_base(self):
+        with scratch_repo() as (root, sh, commit):
+            commit(".github/CODEOWNERS", CODEOWNERS)
+            base = commit("a")
+            old_tip = commit("b")
+            sh("branch", "old", old_tip)  # the old tip is still in the checkout, so the merge base can be found
+            sh("reset", "-q", "--hard", base)
+            first, second = commit("c"), commit("d")
+            gh = FakeGitHub({("GET", R(f"commits/{first}/pulls")): [], ("GET", R(f"commits/{second}/pulls")): []})
+            results = ma.audit(Git(root), gh, old_tip, second, sleep=lambda seconds: None)
+        self.assertEqual([item.rule for item in results],
+                         [f"main-audit-rewrite-{second[:12]}", f"main-audit-{first[:12]}", f"main-audit-{second[:12]}",
+                          "main-audit"])
+        self.assertIn(f"after their merge base `{base[:12]}`", results[0].detail)
+        self.assertEqual(results[-1].detail, "2 commit(s) audited in this push, 3 flagged.")
+        self.assertEqual(gh.called("GET", R(f"commits/{old_tip}/pulls")), [])
+
+    def test_a_rewrite_that_adds_nothing_past_the_merge_base_still_audits_the_new_tip(self):
+        results = ma.audit(repo(), github(), "s2", "s1", sleep=lambda seconds: None)
+        self.assertEqual([item.rule for item in results], ["main-audit-rewrite-s1", "main-audit"])
+        self.assertIn("adds nothing after their merge base `s1`", results[0].detail)
+        self.assertEqual(results[-1].detail, "1 commit(s) audited in this push, 1 flagged.")
+
+    def test_a_rewrite_with_no_shared_history_audits_the_new_tip_only(self):
+        with scratch_repo() as (root, sh, commit):
+            commit(".github/CODEOWNERS", CODEOWNERS)
+            tip = commit("b")
+            sh("switch", "-q", "--orphan", "other")
+            unrelated = commit("x")
+            sh("switch", "-q", "main")
+            gh = FakeGitHub({("GET", R(f"commits/{tip}/pulls")): []})
+            results = ma.audit(Git(root), gh, unrelated, tip, sleep=lambda seconds: None)
+        self.assertEqual([item.rule for item in results],
+                         [f"main-audit-rewrite-{tip[:12]}", f"main-audit-{tip[:12]}", "main-audit"])
+        self.assertIn("share no history", results[0].detail)
+        self.assertIn("only the new tip was audited", results[0].detail)
 
     def test_the_owners_are_read_at_the_commits_parent_not_the_commit_itself(self):
         # The PR's own tree makes its approver an owner; the parent's tree does not.
