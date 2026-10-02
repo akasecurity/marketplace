@@ -316,6 +316,8 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertLess(job.index("tag_release.py sweep"), job.index("tag_release.py cleanup-branches"))
         # A step with a condition can run after an earlier one failed (`always()`, `failure()`); without one it cannot.
         self.assertNotRegex(job, r"(?m)^\s+if:")
+        # `continue-on-error` lets a failed sweep step pass, and the next step would then run after it.
+        self.assertNotIn("continue-on-error", job)
 
 
 class ScriptTestsWorkflow(WorkflowCase):
