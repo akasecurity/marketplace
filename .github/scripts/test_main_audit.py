@@ -260,6 +260,26 @@ class TestMainAudit(unittest.TestCase):
         self.assertIn("without an approving review from a code owner", results[0].detail)
         self.assertIn("without a passing `validate` check", results[0].detail)
 
+    def test_an_approval_the_owner_later_withdrew_does_not_count(self):
+        def review(state, login="venuverse", commit="h30"):
+            return {"state": state, "commit_id": commit, "user": {"login": login}}
+
+        for label, reviews, expected in (
+                ("changes requested after the approval", [review("APPROVED"), review("CHANGES_REQUESTED")], 1),
+                ("the approval dismissed", [review("APPROVED"), review("DISMISSED")], 1),
+                ("a comment after the approval changes nothing", [review("APPROVED"), review("COMMENTED")], 0),
+                ("an approval after the request for changes", [review("CHANGES_REQUESTED"), review("APPROVED")], 0),
+                ("one owner withdrew and the other approved",
+                 [review("APPROVED"), review("CHANGES_REQUESTED"), review("APPROVED", "Vaishnav-OM")], 0),
+                ("both owners withdrew",
+                 [review("APPROVED"), review("APPROVED", "Vaishnav-OM"), review("CHANGES_REQUESTED"),
+                  review("CHANGES_REQUESTED", "Vaishnav-OM")], 1)):
+            with self.subTest(label):
+                results = self.audit(github(reviews=reviews))
+                self.assertEqual(len(results), expected)
+                if expected:
+                    self.assertIn("without an approving review from a code owner", results[0].detail)
+
     def test_an_approver_who_is_not_a_code_owner_does_not_count(self):
         reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}}]
         self.assertEqual(len(self.audit(github(reviews=reviews))), 1)
