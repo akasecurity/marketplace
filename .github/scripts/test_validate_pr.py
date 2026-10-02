@@ -167,6 +167,26 @@ class TestHumanRules(unittest.TestCase):
         self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
         self.assertTrue(any("change all four files" in n for n in report.notes))
 
+    def test_a_description_that_is_not_a_non_empty_string_fails(self):
+        removed = object()
+        for bad in (None, 123, "", "   ", ["x"], {"text": "x"}, True, removed):
+            with self.subTest(description=bad if bad is not removed else "key removed"):
+                head = ts.manifest()
+                if bad is removed:
+                    del ts.ai_tc(head)["description"]
+                else:
+                    ts.ai_tc(head)["description"] = bad
+                report = human_report(head)
+                failed_with(self, report, "the ai-tc entry's description must be a non-empty string")
+                self.assertEqual(report.exit_code, 1)
+                self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
+
+    def test_a_description_that_is_a_string_with_words_in_it_passes(self):
+        for good in ("Clearer words.", "  padded  ", "x", "Ünïcode ✓"):
+            with self.subTest(description=good):
+                report = human_report(ts.manifest(description=good))
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+
     def test_a_perfect_advance_by_a_human_fails(self):
         report = human_report(ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY))
         failed_with(self, report, "a human PR may change only the ai-tc entry's description")
