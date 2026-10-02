@@ -892,3 +892,413 @@ def verify_release(version: str, *, fetch: Fetch = http_fetch, audit=npm_audit_s
     run_url = release_run_url(statement)
     commit_on_ai_tc_main(git_commit, fetch=fetch)
     return VerifiedRelease(version, integrity, shasum, git_commit, run_url)
+
+
+@dataclasses.dataclass
+class Classification:
+    classification: str
+    migrations: list
+    kinds: dict = dataclasses.field(default_factory=dict, compare=False)
+    note: str = dataclasses.field(default="", compare=False)
+
+
+# ai-tc runs a migration as the chunks left by splitting its text on this pattern, wherever
+# it stands: after a statement on the same line, inside a comment, across a line break (see
+# splitStatements in its migrations module). The split is on the raw text, before any quote
+# or comment is read, so it is made first here too. JavaScript's \s is not Python's: it
+# counts U+FEFF and leaves out a few control characters, so its set is spelled out.
+_JS_WHITESPACE = "".join(
+    map(
+        chr,
+        (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B))
+        + (0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF),
+    )
+)
+STATEMENT_BREAKPOINT = re.compile("-->[" + re.escape(_JS_WHITESPACE) + "]*statement-breakpoint")
+
+
+class _Unterminated(ValueError):
+    """A quoted string or name, or a block comment, that never closes."""
+
+
+def _closing_quote(text: str, start: int) -> int:
+    """The index of the quote that closes the one at `start`. A doubled quote inside reads
+    as a close and a re-open, which comes to the same thing, so it needs no case of its own."""
+    stop = text.find(text[start], start + 1)
+    if stop < 0:
+        raise _Unterminated(f"a {text[start]} at {start} is never closed")
+    return stop
+
+
+def _chunk_statements(chunk: str) -> list:
+    """The statements of one chunk, read left to right the way SQLite reads them.
+
+    A single-quoted string becomes '' (what it says decides nothing, and a ';' or '--' in it
+    ends nothing). A quoted name ("..." `...` [...]) is kept whole, so a __new_ table is
+    still seen. A -- comment runs to the end of the line and a /* */ comment to its close;
+    both are dropped. A ';' outside all of those ends a statement."""
+    statements: list = []
+    parts: list = []
+
+    def end() -> None:
+        statement = " ".join("".join(parts).split())
+        if statement:
+            statements.append(statement)
+        parts.clear()
+
+    i, size = 0, len(chunk)
+    while i < size:
+        char = chunk[i]
+        if char == "'":
+            i = _closing_quote(chunk, i) + 1
+            parts.append("''")
+        elif char in '"`':
+            stop = _closing_quote(chunk, i) + 1
+            parts.append(chunk[i:stop])
+            i = stop
+        elif char == "[":
+            stop = chunk.find("]", i + 1) + 1
+            if stop == 0:
+                raise _Unterminated(f"a [ at {i} is never closed")
+            parts.append(chunk[i:stop])
+            i = stop
+        elif chunk.startswith("--", i):
+            stop = chunk.find("\n", i)
+            i = size if stop < 0 else stop
+            parts.append(" ")
+        elif chunk.startswith("/*", i):
+            stop = chunk.find("*/", i + 2)
+            if stop < 0:
+                raise _Unterminated(f"a /* at {i} is never closed")
+            i = stop + 2
+            parts.append(" ")
+        elif char == ";":
+            end()
+            i += 1
+        else:
+            parts.append(char)
+            i += 1
+    end()
+    return statements
+
+
+def _statements(sql: str) -> list:
+    """Every statement ai-tc would run for one migration file. Raises _Unterminated."""
+    return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
+
+
+def _non_additive_reason(statement: str) -> str | None:
+    upper = statement.upper()
+    if upper.startswith("PRAGMA "):
+        # The two drizzle writes around a table rebuild, and nothing else: any other
+        # pragma changes how the store behaves (journal mode, schema writes, user_version).
+        if re.fullmatch(r"PRAGMA FOREIGN_KEYS\s*=\s*(?:ON|OFF)", upper):
+            return None
+        return "a PRAGMA other than foreign_keys=ON/OFF"
+    if "__NEW_" in upper:
+        return "a table rebuild (drizzle's __new_ copy)"
+    if re.match(r"CREATE TABLE ", upper) or re.match(r"CREATE INDEX ", upper):
+        return None
+    if re.match(r"CREATE UNIQUE INDEX ", upper):
+        return "a UNIQUE index, a new constraint an older build's writes can violate"
+    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
+    if added:
+        # Only the words after the column's name count, and only as words: the name itself
+        # (`is_default`, `x default`) and any quoted name further on are not keywords.
+        definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
+        if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
+            return "a NOT NULL column without a default"
+        return None
+    if re.match(r"ALTER TABLE \S+ RENAME", upper):
+        return "a rename"
+    if re.match(r"ALTER TABLE \S+ DROP", upper):
+        return "a dropped column"
+    if upper.startswith("DROP "):
+        return "a drop (" + " ".join(upper.split()[:2]).lower() + ")"
+    if re.match(r"CREATE (?:TEMP |TEMPORARY )?VIEW ", upper):
+        return "a view, which may stand in for a former table"
+    if re.match(r"CREATE (?:TEMP |TEMPORARY )?TRIGGER ", upper):
+        return "a trigger, which changes what an older build's writes do"
+    return "an unrecognised statement"
+
+
+def migration_kind(sql: str) -> str:
+    """'additive', or 'non-additive: <first reason>', for one migration file."""
+    try:
+        statements = _statements(sql)
+    except _Unterminated:
+        return "non-additive: an unterminated quoted string or comment"
+    if not statements:
+        return "non-additive: no statements"
+    for statement in statements:
+        reason = _non_additive_reason(statement)
+        if reason:
+            return f"non-additive: {reason}"
+    return "additive"
+
+
+def _ai_tc_file(path: str, commit: str, fetch: Fetch) -> str | None:
+    url = f"{AI_TC_API}/contents/{path}?ref={commit}"
+    status, body = fetch(url, {"Accept": "application/vnd.github.raw+json"})
+    if status == 404:
+        return None
+    if status != 200:
+        raise InfraError("classify", f"GET {url} answered {status}")
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The file at an attested commit never changes, so this is a verdict, not an outage.
+        raise ReleaseCheckError("classify", f"{path} at {commit} is not UTF-8: {exc}") from exc
+
+
+def _journal_tags(commit: str, fetch: Fetch):
+    raw = _ai_tc_file(f"{MIGRATIONS_DIR}/meta/_journal.json", commit, fetch)
+    if raw is None:
+        return None
+    try:
+        document = parse_json(raw)
+    except (ValueError, RecursionError) as exc:
+        raise ReleaseCheckError("classify", f"the migration journal at {commit} does not parse: {exc}") from exc
+    entries = document.get("entries") if isinstance(document, dict) else None
+    tags = [e.get("tag") if isinstance(e, dict) else None for e in entries] if isinstance(entries, list) else None
+    if tags is None or not all(isinstance(t, str) and MIGRATION_TAG.fullmatch(t) for t in tags):
+        raise ReleaseCheckError("classify", f"the migration journal at {commit} has an unexpected shape")
+    return tags
+
+
+# The Contents API lists at most this many entries of a directory, and does not say it stopped.
+CONTENTS_LISTING_CAP = 1000
+EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
+UNREADABLE_FILE = "non-additive: the migration file cannot be read"
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there. One request however many files it holds.
+    The raw media type the file reads use returns bytes with no sha, so this asks for the
+    JSON listing instead."""
+    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+    status, body = fetch(url, {"Accept": "application/vnd.github+json"})
+    if status == 404:
+        return None
+    if status != 200:
+        raise InfraError("classify", f"GET {url} answered {status}")
+    try:
+        listing = parse_json(body.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise InfraError("classify", f"GET {url} answered non-JSON: {exc}") from exc
+    if not isinstance(listing, list) or not all(isinstance(entry, dict) for entry in listing):
+        raise InfraError("classify", f"GET {url} did not answer a directory listing")
+    if len(listing) >= CONTENTS_LISTING_CAP:
+        raise InfraError(
+            "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
+        )
+    return {
+        entry["name"][: -len(".sql")]: entry.get("sha")
+        for entry in listing
+        if entry.get("type") == "file" and isinstance(entry.get("name"), str) and entry["name"].endswith(".sql")
+    }
+
+
+def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{tag: kind} for each migration that both journals name and whose file is not the same
+    blob at the two commits, or cannot be compared. ai-tc's store migrator records an
+    applied migration by its tag and never re-runs it, so an edit changes what a fresh store
+    gets but not what an existing one has: the two diverge, and no rollback across the
+    release is safe. A file that cannot be found counts the same way, as it does for an added
+    migration. A listing that fails or is malformed is no verdict."""
+    if not tags:
+        return {}
+    listings = [_migration_blobs(commit, fetch) for commit in (from_commit, to_commit)]
+    kinds = {}
+    for tag in tags:
+        shas = []
+        for blobs in listings:
+            if blobs is None or tag not in blobs:
+                shas.append(None)
+                continue
+            sha = blobs[tag]
+            if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+                raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {tag}.sql")
+            shas.append(sha)
+        if None in shas:
+            kinds[tag] = UNREADABLE_FILE
+        elif shas[0] != shas[1]:
+            kinds[tag] = EDITED_IN_PLACE
+    return kinds
+
+
+def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
+    """Classify the local-store migrations ai-tc added, removed from the journal or edited
+    in place between two attested commits."""
+    for commit in (from_commit, to_commit):
+        if not isinstance(commit, str) or not SHA40.fullmatch(commit):
+            raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
+    before = _journal_tags(from_commit, fetch)
+    after = _journal_tags(to_commit, fetch)
+    if before is None or after is None:
+        unreadable = from_commit if before is None else to_commit
+        return Classification(
+            "not-rollback-safe",
+            [],
+            note=f"the migration journal at {unreadable} cannot be read, so the version counts as not rollback-safe",
+        )
+    added = [t for t in after if t not in before]
+    removed = [t for t in before if t not in after]
+    kinds = {}
+    for tag in added:
+        sql = _ai_tc_file(f"{MIGRATIONS_DIR}/{tag}.sql", to_commit, fetch)
+        kinds[tag] = UNREADABLE_FILE if sql is None else migration_kind(sql)
+    for tag in removed:
+        kinds[tag] = "non-additive: removed from the journal (history rewritten)"
+    edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
+    kinds.update(edited)
+    migrations = added + removed + list(edited)
+    if not migrations:
+        return Classification("additive", [], kinds)
+    if EVERY_MIGRATION_COUNTS:
+        return Classification(
+            "not-rollback-safe",
+            migrations,
+            kinds,
+            note="every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated",
+        )
+    flagged = any(kind != "additive" for kind in kinds.values())
+    return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
+
+
+SAFETY_KEYS = ["classification", "from", "to", "migrations"]
+
+
+def _entry_problems(version, entry) -> list:
+    """What is wrong with one rollback-safety.json entry (empty = well formed)."""
+    where = f"{SAFETY_FILE} {version!r}"
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        return [f"{where}: not an exact x.y.z"]
+    if not isinstance(entry, dict) or list(entry) != SAFETY_KEYS:
+        return [f"{where}: keys must be exactly {SAFETY_KEYS}, in that order"]
+    problems = []
+    if entry["classification"] not in ("additive", "not-rollback-safe"):
+        problems.append(f"{where}: classification must be additive or not-rollback-safe")
+    for key in ("from", "to"):
+        if not isinstance(entry[key], str) or not SHA40.fullmatch(entry[key]):
+            problems.append(f"{where}: {key} must be a 40-hex commit id")
+    migrations = entry["migrations"]
+    if not isinstance(migrations, list) or not all(isinstance(m, str) and MIGRATION_TAG.fullmatch(m) for m in migrations):
+        problems.append(f"{where}: migrations must be a list of migration tags")
+    return problems
+
+
+def safety_problems(doc) -> list:
+    """What is wrong with a rollback-safety.json document (empty = well formed)."""
+    if not isinstance(doc, dict) or list(doc) != ["versions"] or not isinstance(doc["versions"], dict):
+        return [f'{SAFETY_FILE} must be exactly {{"versions": {{...}}}}']
+    return [problem for version, entry in doc["versions"].items() for problem in _entry_problems(version, entry)]
+
+
+def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=classify_migrations) -> dict:
+    """The rollback-safety.json entry for version: its migrations since the highest pinned
+    version below it, classified, with the two attested commits."""
+    below = [p for p in pinned if vkey(p) < vkey(version)]
+    if not below:
+        raise ReleaseCheckError("safety", f"no pinned version is below {version} to compute its migrations from")
+    start = verify(max(below, key=vkey)).git_commit
+    end = verify(version).git_commit
+    result = classify(start, end)
+    return {"classification": result.classification, "from": start, "to": end, "migrations": list(result.migrations)}
+
+
+def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
+    """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
+    or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
+    so does a version in `pinned` with no entry at all: a pin that reached main without a
+    computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
+    safety. An entry is judged on its own: one malformed entry flags its own version and
+    does not stop the others being read, because refusing the file would block every
+    rollback."""
+    versions = safety.get("versions") if isinstance(safety, dict) else None
+    if not isinstance(versions, dict):
+        raise ReleaseCheckError("safety", f'{SAFETY_FILE} must be {{"versions": {{...}}}}')
+    low, high = vkey(target), vkey(highest_pinned)
+    candidates = set(versions) | {v for v in pinned if isinstance(v, str)}
+    flagged = [
+        version
+        for version in candidates
+        if isinstance(version, str)
+        and SEMVER.fullmatch(version)
+        and low < vkey(version) <= high
+        and not (
+            version in versions
+            and not _entry_problems(version, versions[version])
+            and versions[version]["classification"] == "additive"
+        )
+    ]
+    return min(flagged, key=vkey) if flagged else None
+
+
+def _canonical(value) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def _rest_of(manifest: dict) -> tuple:
+    """Everything a pin change must leave alone: the top-level keys, and every other entry
+    in any order."""
+    top = {k: v for k, v in manifest.items() if k != "plugins"}
+    others = sorted(_canonical(p) for p in _plugins(manifest) if not _is_ai_tc(p))
+    return _canonical(top), others
+
+
+def _integrity_only(metadata) -> bool:
+    return (
+        isinstance(metadata, dict)
+        and set(metadata) == {"integrity"}
+        and isinstance(metadata["integrity"], str)
+        and INTEGRITY.fullmatch(metadata["integrity"]) is not None
+    )
+
+
+def _restore_shape(entry: dict) -> bool:
+    """{name: ai-tc, source: {npm, PACKAGE, x.y.z, REGISTRY}, description, metadata: {integrity}}."""
+    source = entry.get("source")
+    return (
+        set(entry) == {"name", "source", "description", "metadata"}
+        and entry["name"] == ENTRY_NAME
+        and isinstance(entry["description"], str)
+        and entry["description"].strip() != ""
+        and isinstance(source, dict)
+        and set(source) == {"source", "package", "version", "registry"}
+        and source["source"] == "npm"
+        and source["package"] == PACKAGE
+        and source["registry"] == REGISTRY
+        and entry_version(entry) is not None
+        and _integrity_only(entry["metadata"])
+    )
+
+
+def _without_pin(entry: dict) -> dict:
+    stripped = {k: v for k, v in entry.items() if k != "metadata"}
+    if isinstance(stripped.get("source"), dict):
+        stripped["source"] = {k: v for k, v in stripped["source"].items() if k != "version"}
+    return stripped
+
+
+def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
+    """Which importer mode a manifest change is EXACTLY. 'none' means the ai-tc entry is
+    unchanged; 'human' means any other change to it."""
+    base, head = find_ai_tc_entry(base_manifest), find_ai_tc_entry(head_manifest)
+    if base == head:
+        return "none"
+    if _rest_of(base_manifest) != _rest_of(head_manifest):
+        return "human"
+    if head is None:
+        return "remove"
+    if base is None:
+        return "restore" if _restore_shape(head) else "human"
+    old, new = entry_version(base), entry_version(head)
+    if old is None or new is None or old == new:
+        return "human"
+    if _without_pin(base) != _without_pin(head) or not _integrity_only(head.get("metadata")):
+        return "human"
+    if "metadata" in base and not _integrity_only(base["metadata"]):
+        return "human"
+    return "advance" if vkey(new) > vkey(old) else "rollback"

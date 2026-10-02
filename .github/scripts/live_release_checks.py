@@ -60,3 +60,18 @@ class TestLiveRelease(unittest.TestCase):
         for version, commit in FLEET_PINNED.items():
             with self.subTest(version):
                 self.assertEqual(rc.verify_release(version).git_commit, commit)
+
+    def test_the_real_migrations_listing_finds_the_one_new_migration_and_no_edit(self):
+        # Reads ai-tc's real directory listings (blob shas) at both attested commits. 0.9.14
+        # added one migration and edited none; 0.9.13 added none.
+        added = classify_pair("0.9.13", "0.9.14")
+        self.assertEqual(
+            (added.classification, added.migrations, list(added.kinds)),
+            ("not-rollback-safe", ["0035_share_destination_provider_id"], ["0035_share_destination_provider_id"]),
+        )
+        unchanged = classify_pair("0.9.12", "0.9.13")
+        self.assertEqual((unchanged.classification, unchanged.migrations), ("additive", []))
+
+
+def classify_pair(earlier, later):
+    return rc.classify_migrations(ts.ATTESTED[earlier], ts.ATTESTED[later])
