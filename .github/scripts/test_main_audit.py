@@ -280,6 +280,43 @@ class TestMainAudit(unittest.TestCase):
                 if expected:
                     self.assertIn("without an approving review from a code owner", results[0].detail)
 
+    def test_a_codeowners_file_it_cannot_read_is_that_commits_problem(self):
+        files = {
+            "a team": "* @akasecurity/maintainers\n",
+            "a team beside a user": "* @akasecurity/maintainers @venuverse\n",
+            "an email address": "* owner@example.invalid @venuverse\n",
+            "a path rule": "/docs @writer-example\n* @Vaishnav-OM @venuverse\n",
+            "a second star rule": "* @Vaishnav-OM\n* @venuverse\n",
+            "no owner on the star line": "*\n",
+            "no file": None,
+        }
+        for label, text in files.items():
+            with self.subTest(label):
+                git = FakeGit(chain=["p", "s1", "s2"], files={
+                    **({("p", ".github/CODEOWNERS"): text} if text is not None else {}),
+                    ("s1", ".github/CODEOWNERS"): CODEOWNERS})
+                results = self.audit(github(), git)
+                self.assertEqual([item.rule for item in results], ["main-audit-s1"])
+                self.assertIn("its approval could not be checked: .github/CODEOWNERS at p", results[0].detail)
+
+    def test_an_unreadable_codeowners_file_does_not_stop_the_rest_of_the_push_being_audited(self):
+        git = FakeGit(chain=["p", "s1", "s2"], files={("p", ".github/CODEOWNERS"): "* @akasecurity/maintainers\n",
+                                                       ("s1", ".github/CODEOWNERS"): CODEOWNERS})
+        gh = FakeGitHub({**pr_routes("s1"), **pr_routes("s2", number=31, head="h31", runs=[])})
+        results = ma.audit(git, gh, "p", "s2", sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red) for item in results],
+                         [("main-audit-s1", True), ("main-audit-s2", True), ("main-audit", False)])
+        self.assertIn("could not be checked", results[0].detail)
+        self.assertNotIn("could not be checked", results[1].detail)  # s2 is read at s1, whose file is fine
+        self.assertIn("without a passing `validate` check", results[1].detail)
+
+    def test_an_unreadable_codeowners_file_and_a_failed_validate_are_one_result(self):
+        git = FakeGit(chain=["p", "s1"], files={("p", ".github/CODEOWNERS"): "* @akasecurity/maintainers\n"})
+        results = self.audit(github(runs=[validate_run(conclusion="failure")]), git)
+        self.assertEqual(len(results), 1)
+        self.assertIn("could not be checked", results[0].detail)
+        self.assertIn("without a passing `validate` check", results[0].detail)
+
     def test_an_approver_who_is_not_a_code_owner_does_not_count(self):
         reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}}]
         self.assertEqual(len(self.audit(github(reviews=reviews))), 1)
