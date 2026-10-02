@@ -211,17 +211,27 @@ may use.
   pinned before the removal, so a lower one records `rollback-from`. A tag or a branch deletion
   that GitHub refuses ends the run with one error naming the ruleset, not a traceback, and a failed
   sweep runs no clean-up.
-- **`staleness`** (hourly) files an issue when a passing release sits unpinned for 24 hours, npm has
-  a version the importer refuses, the release checks reached no verdict on a version that has been
-  on npm for over an hour, or whose publish time is unknown (its own issue, naming the version and
-  the check that did not finish), a bot PR is open for 24 hours, a pin change is untagged for an
-  hour, a stray tag or a second ref named `main` exists, or the ai-tc entry is gone; it posts a
-  "rolled back, awaiting fix-forward" notice while the latest tag is a rollback. While such a
-  version has no verdict, the unpinned-release and refused-version rules can still go red from the
-  versions that did finish, but they are not cleared. A younger version is left out, because
-  neither rule can name it yet, so an outage never closes the issue of a version they could name.
-- **`tag-audit`** (daily and on tag pushes) checks the `fleet-v` ledger against the frozen list, the
-  last green run and `main`'s history, and that the rulesets are active as configured.
+- **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
+  included) has been on npm for 24 hours, npm has a version the importer refuses, the release
+  checks reached no verdict on a version that has been on npm for over an hour, or whose publish
+  time is unknown (its own issue, naming the version and the check that did not finish), a bot PR
+  is open for 24 hours, a pin change is untagged for an hour, a stray tag or a second ref named
+  `main` exists, or the ai-tc entry is gone; it posts a "rolled back, awaiting fix-forward" notice
+  while the latest tag is a rollback. While such a version has no verdict, the unpinned-release and
+  refused-version rules can still go red from the versions that did finish, but they are not
+  cleared. A younger version is left out, because neither rule can name it yet, so an outage never
+  closes the issue of a version they could name. Every script that reads `main` uses its full ref,
+  so a tag named `main` cannot stand in for the branch before the stray-ref rule reports it.
+- **`tag-audit`** (daily, on every tag push or deletion, and by hand) checks the `fleet-v` ledger
+  against the frozen list, the last green run and `main`'s history, and that the rulesets are active
+  as configured. A tag that changed since the last green run stays red until a reviewed PR
+  re-freezes the list (`python3 .github/scripts/tag_audit.py freeze`), which is how a person records
+  that the change is explained; a deleted tag has to be put back at its commit first. When there is
+  no snapshot to compare with (none was kept, it expired after 90 days, or it was deleted), the
+  frozen list has to record every `fleet-v` tag, so the baseline is re-set in a reviewed PR and not
+  by the passage of time. Keep artifact retention at 90 days, and dispatch `tag-audit` once after
+  turning it on so a baseline exists before `tag-release` cuts the first tag after the frozen list;
+  `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for any commit that reached `main` without
   a code-owner-approved PR.
 
@@ -235,6 +245,12 @@ you mean, and decide what no verdict does there (`validate` fails, the importer 
 `staleness` reports it on its own rule).
 
 Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners.
+Each rule has one issue, found by a hidden marker among the issues the workflow's own token filed,
+whatever labels it carries, so an issue a person filed never stands in for it. A rule that clears
+closes its issue, and one that goes red again within 48 hours reopens that issue instead of opening a
+new one, so its escalation clock keeps running; once an issue has been open for 48 hours the
+escalation owner is assigned, once. A person's close is final, and `main-audit`'s issues, which are
+keyed to a commit or a push, are closed only by a person.
 
 **The release path covers one plugin.** `release_checks.py` names one package and one release
 pipeline, and the importer, `validate`, `tag-release` and `staleness` act only on the entry that
