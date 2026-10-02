@@ -37,6 +37,14 @@ import urllib.parse
 import urllib.request
 from typing import Callable
 
+# This version has no command line yet, and the docstring above says exit 0 is a pass. Run as
+# a program, the file therefore says so and exits 2 (no verdict), never the silent 0 that
+# `release_checks.py verify X && proceed` would read as a pass. The command line replaces
+# this guard. Importing the module is unaffected.
+if __name__ == "__main__":
+    print("release_checks.py: this version has no command line; nothing was checked", file=sys.stderr)
+    sys.exit(2)
+
 # The one plugin this marketplace pins, and what a publish of it must attest to. These
 # are constants of this reviewed file: nothing read from a PR, the registry or an
 # attestation may nominate the workflow that is supposed to vouch for a release. Who
@@ -310,7 +318,8 @@ Fetch = Callable[[str, dict], tuple]
 
 
 def _sends_token_to(url: str) -> bool:
-    """Only api.github.com ever sees the job's token; the registry is read anonymously."""
+    """Only api.github.com ever sees the job's token, and never across a redirect (http_fetch
+    follows none); the registry is read anonymously."""
     return urllib.parse.urlsplit(url).hostname == "api.github.com"
 
 
@@ -324,15 +333,28 @@ def _headers_for(url: str, extra: dict) -> dict:
     return headers
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect, so a 30x comes back as its own status. urllib's default handler
+    copies the request's headers onto the follow-up request, Authorization included, even
+    when it goes to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError,
-    and so is an answer that stops partway: http.client raises its own errors from the status
-    line and the body, which urllib does not wrap, and reading an error status's body can
-    fail the same way."""
+    """GET url. An HTTP error status is returned, not raised, and a redirect is not followed
+    (its status is returned like any other); no answer at all is InfraError, and so is an
+    answer that stops partway: http.client raises its own errors from the status line and
+    the body, which urllib does not wrap, and reading an error status's body can fail the
+    same way."""
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with _OPENER.open(request, timeout=60) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
@@ -870,8 +892,15 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     except (ValueError, RecursionError) as exc:
         raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
     subjects = statement.get("subject")
+    # Only text can be the digest of the tarball. A list or an object in a later subject (npm
+    # checks only the first) is unhashable, and putting it in this set would raise TypeError
+    # here, before the certificate's identity is checked below, and lose that refusal.
     attested = {
-        _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        digest
+        for digest in (
+            _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        )
+        if isinstance(digest, str)
     }
     dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
     wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}
@@ -1127,6 +1156,15 @@ def _statements(sql: str) -> list:
     return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
 
 
+# One SQLite name: quoted with backticks, double quotes or brackets (a doubled quote inside stands
+# for one quote), or a run with no quote, space or dot in it. A table and a column are read the
+# same way, so a quoted name that holds the words ADD or DROP stays one name instead of
+# starting a clause; the table may carry a schema in front of it. The dot is left out of the
+# bare run so the schema's dot has one reading and the match stays linear on a long token.
+_SQL_NAME = r"(?:`(?:[^`]|``)*`|\"(?:[^\"]|\"\")*\"|\[[^\]]*\]|[^\s`\"\[\].]+)"
+_SQL_TABLE = rf"(?:{_SQL_NAME}\.)?{_SQL_NAME}"
+
+
 def _non_additive_reason(statement: str) -> str | None:
     upper = statement.upper()
     if upper.startswith("PRAGMA "):
@@ -1141,17 +1179,21 @@ def _non_additive_reason(statement: str) -> str | None:
         return None
     if re.match(r"CREATE UNIQUE INDEX ", upper):
         return "a UNIQUE index, a new constraint an older build's writes can violate"
-    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
+    added = re.match(rf"ALTER TABLE {_SQL_TABLE} ADD (?:COLUMN )?{_SQL_NAME}(.*)", upper)
     if added:
         # Only the words after the column's name count, and only as words: the name itself
         # (`is_default`, `x default`) and any quoted name further on are not keywords.
         definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
         if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
             return "a NOT NULL column without a default"
+        if re.search(r"\bCHECK\b", definition):
+            return "a CHECK constraint an older build's writes can fail"
+        if re.search(r"\bREFERENCES\b", definition):
+            return "a foreign key an older build's deletes can fail"
         return None
-    if re.match(r"ALTER TABLE \S+ RENAME", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} RENAME", upper):
         return "a rename"
-    if re.match(r"ALTER TABLE \S+ DROP", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} DROP", upper):
         return "a dropped column"
     if upper.startswith("DROP "):
         return "a drop (" + " ".join(upper.split()[:2]).lower() + ")"
@@ -1211,13 +1253,27 @@ CONTENTS_LISTING_CAP = 1000
 EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
 UNREADABLE_FILE = "non-additive: the migration file cannot be read"
 
+# ai-tc also changes the store in code, not only through its migration journal: every time it
+# opens a store it runs steps in migrations.ts after the journal loop (add a column, create a
+# trigger, rebuild an index, run a one-time UPDATE), and the trigger's condition comes from
+# sync-failure.ts. A release whose only store change is in these files has no new journal tag.
+# They are compared as whole files (their git blob shas at the two attested commits) and
+# never read: the statements are TypeScript with interpolated names and helper calls, and a
+# shape a reader of that missed would read as additive, the direction this check exists to
+# prevent. migrations.ts is the one file the store cannot be opened without.
+STORE_CODE_DIR = "packages/persistence/src"
+STORE_CODE_ENTRY = "migrations.ts"
+STORE_CODE_FILES = (STORE_CODE_ENTRY, "sync-failure.ts")
+STORE_CODE_CHANGED = "non-additive: the store code ai-tc runs when it opens a store changed outside the migration journal"
+STORE_CODE_MISSING = "non-additive: the store code ai-tc runs at open cannot be found"
 
-def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
-    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
-    or None when that directory is not there. One request however many files it holds.
-    The raw media type the file reads use returns bytes with no sha, so this asks for the
-    JSON listing instead."""
-    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+
+def _directory_listing(directory: str, commit: str, fetch: Fetch) -> list | None:
+    """The entries of one ai-tc directory at commit, or None when that directory is not
+    there. One request however many files it holds. The raw media type the file reads use
+    returns bytes with no sha, so this asks for the JSON listing instead. A listing that
+    fails, is malformed or may be cut short is no verdict."""
+    url = f"{AI_TC_API}/contents/{directory}?ref={commit}"
     status, body = fetch(url, {"Accept": "application/vnd.github+json"})
     if status == 404:
         return None
@@ -1233,6 +1289,15 @@ def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
         raise InfraError(
             "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
         )
+    return listing
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there."""
+    listing = _directory_listing(MIGRATIONS_DIR, commit, fetch)
+    if listing is None:
+        return None
     return {
         entry["name"][: -len(".sql")]: entry.get("sha")
         for entry in listing
@@ -1268,9 +1333,49 @@ def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch)
     return kinds
 
 
+def _store_code_blobs(commit: str, fetch: Fetch) -> dict:
+    """{file name: git blob sha} for each of STORE_CODE_FILES that is a plain file in ai-tc's
+    persistence source at commit. A file that is not there, or a directory that is not there,
+    is left out."""
+    listing = _directory_listing(STORE_CODE_DIR, commit, fetch) or []
+    blobs = {}
+    for entry in listing:
+        name = entry.get("name")
+        if name not in STORE_CODE_FILES or entry.get("type") != "file":
+            continue
+        sha = entry.get("sha")
+        if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+            raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {name}")
+        blobs[name] = sha
+    return blobs
+
+
+def _store_code_changes(from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{path: kind} for each store-code file that is not the same blob at the two commits,
+    appeared or vanished, and for the entry file when the later commit has none (ai-tc may
+    have moved it, and then nothing here can say what the store does at open). Empty when
+    the files are the same at both. A listing that fails or is malformed is no verdict."""
+    before, after = (_store_code_blobs(commit, fetch) for commit in (from_commit, to_commit))
+    kinds = {}
+    for name in STORE_CODE_FILES:
+        if name == STORE_CODE_ENTRY and name not in after:
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_MISSING
+        elif before.get(name) != after.get(name):
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_CHANGED
+    return kinds
+
+
 def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
     """Classify the local-store migrations ai-tc added, removed from the journal or edited
-    in place between two attested commits."""
+    in place between two attested commits, and any change to the store code it runs at open
+    outside that journal (STORE_CODE_FILES).
+
+    The store code is seen as a changed file, not by kind, so an edit to a comment alone
+    flags a release. It is recorded in `kinds` under the file's path and never in
+    `migrations`, which stays a list of journal tags. Some inputs to the store are out of
+    view: the list of event types a one-time UPDATE counts (repositories/history-sync.ts),
+    the adopt-or-replay logic under db/migrations, and the generated schema in
+    packages/schema (ai-tc's own test holds it to the journal's .sql files)."""
     for commit in (from_commit, to_commit):
         if not isinstance(commit, str) or not SHA40.fullmatch(commit):
             raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
@@ -1294,15 +1399,21 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
     edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
     kinds.update(edited)
     migrations = added + removed + list(edited)
+    # Before the early returns: a release whose only store change is in code has no journal
+    # tag, and counts whatever EVERY_MIGRATION_COUNTS says.
+    store_code = _store_code_changes(from_commit, to_commit, fetch)
+    kinds.update(store_code)
+    notes = []
+    if migrations and EVERY_MIGRATION_COUNTS:
+        notes.append(
+            "every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated"
+        )
+    if store_code:
+        notes.append("the store code ai-tc runs when it opens a store changed outside the migration journal")
+    if notes:
+        return Classification("not-rollback-safe", migrations, kinds, note="; ".join(notes))
     if not migrations:
         return Classification("additive", [], kinds)
-    if EVERY_MIGRATION_COUNTS:
-        return Classification(
-            "not-rollback-safe",
-            migrations,
-            kinds,
-            note="every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated",
-        )
     flagged = any(kind != "additive" for kind in kinds.values())
     return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
 
@@ -1348,12 +1459,13 @@ def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=c
     return {"classification": result.classification, "from": start, "to": end, "migrations": list(result.migrations)}
 
 
-def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
+def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned) -> str | None:
     """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
     or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
     so does a version in `pinned` with no entry at all: a pin that reached main without a
     computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
-    safety. An entry is judged on its own: one malformed entry flags its own version and
+    safety. `pinned` has no default: leaving it out would drop that rule without saying so.
+    An entry is judged on its own: one malformed entry flags its own version and
     does not stop the others being read, because refusing the file would block every
     rollback."""
     versions = safety.get("versions") if isinstance(safety, dict) else None
@@ -1424,9 +1536,10 @@ def _without_pin(entry: dict) -> dict:
 
 def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     """Which importer mode a manifest change is EXACTLY. 'none' means the ai-tc entry is
-    unchanged; 'human' means any other change to it."""
+    unchanged; 'human' means any other change to it. The entry is compared as JSON, as the rest
+    of the manifest is, so true, 1 and 1.0 are three different values (Python's == says one)."""
     base, head = find_ai_tc_entry(base_manifest), find_ai_tc_entry(head_manifest)
-    if base == head:
+    if _canonical(base) == _canonical(head):
         return "none"
     if _rest_of(base_manifest) != _rest_of(head_manifest):
         return "human"
@@ -1437,7 +1550,7 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     old, new = entry_version(base), entry_version(head)
     if old is None or new is None or old == new:
         return "human"
-    if _without_pin(base) != _without_pin(head) or not _integrity_only(head.get("metadata")):
+    if _canonical(_without_pin(base)) != _canonical(_without_pin(head)) or not _integrity_only(head.get("metadata")):
         return "human"
     if "metadata" in base and not _integrity_only(base["metadata"]):
         return "human"
