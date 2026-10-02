@@ -2749,6 +2749,7 @@ class TestCli(unittest.TestCase):
         with mock.patch.object(rc, "_command", command):
             self.assertEqual(cli("diff-mode", "base.json", "head.json")[0], 0)
         self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "no budget was running while the command ran")
         self.assertTrue(rc.BUDGET_CLI - 60 < seen[0] <= rc.BUDGET_CLI)
 
     def test_the_budget_ends_with_the_command_however_it_ends(self):
