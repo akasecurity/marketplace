@@ -32,6 +32,12 @@ class Git:
     def rev_parse(self, rev: str) -> str:
         return self.run("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").strip()
 
+    def main(self) -> str:
+        """The full ref to read main from (release_checks.main_ref: origin's when the checkout has it,
+        else the local branch). A bare "main" would resolve to a tag of that name before the branch,
+        so a script that reads main passes this to rev_parse instead. No usable main is an InfraError."""
+        return release_checks.main_ref(self.repo_dir)
+
     def show(self, rev: str, path: str) -> str | None:
         """The file at `path` in commit `rev`, or None when that commit's tree has no entry there.
 
