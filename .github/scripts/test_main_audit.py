@@ -22,15 +22,20 @@ def repo() -> FakeGit:
     return FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
 
 
-def github(*, pulls=None, author=BOT, committer=BOT, reviews=None) -> FakeGitHub:
-    return FakeGitHub({
-        ("GET", R("commits/s1/pulls")): pulls if pulls is not None else [
-            {"number": 30, "merge_commit_sha": "s1", "merged_at": "2026-10-05T10:00:00Z", "base": {"ref": "main"}}],
-        ("GET", R("pulls/30")): {"head": {"sha": "h30"}},
-        ("GET", R("commits/h30")): {"author": {"login": author}, "committer": {"login": committer}},
-        ("GET", R("pulls/30/reviews")): reviews if reviews is not None else [
-            {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"}}],
-    })
+def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=BOT, reviews=None) -> dict:
+    """The routes main-audit reads for the pull request that merged `sha`."""
+    return {
+        ("GET", R(f"commits/{sha}/pulls")): pulls if pulls is not None else [
+            {"number": number, "merge_commit_sha": sha, "merged_at": "2026-10-05T10:00:00Z", "base": {"ref": "main"}}],
+        ("GET", R(f"pulls/{number}")): {"head": {"sha": head}},
+        ("GET", R(f"commits/{head}")): {"author": {"login": author}, "committer": {"login": committer}},
+        ("GET", R(f"pulls/{number}/reviews")): reviews if reviews is not None else [
+            {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}}],
+    }
+
+
+def github(**kwargs) -> FakeGitHub:
+    return FakeGitHub(pr_routes("s1", **kwargs))
 
 
 class TestMainAudit(unittest.TestCase):
@@ -131,6 +136,42 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual([(item.rule, item.red) for item in results],
                          [(f"main-audit-rewrite-{first[:12]}", True), (f"main-audit-{first[:12]}", True),
                           ("main-audit", False)])
+
+    def test_a_merge_commit_audits_only_mains_first_parent_commit(self):
+        # A pull request merged with a merge commit puts the branch's own commits into the push too. They are
+        # not on main's first-parent line and have no pull request of their own, so they are not audited.
+        with tempfile.TemporaryDirectory() as root:
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+            def sh(*args):
+                return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            def commit(name, text):
+                path = os.path.join(root, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                sh("add", name)
+                sh("commit", "-q", "-m", name)
+                return sh("rev-parse", "HEAD")
+
+            sh("init", "-q", "-b", "main")
+            base = commit(".github/CODEOWNERS", CODEOWNERS)
+            sh("switch", "-q", "-c", "feature")
+            first, second = commit("one", "1"), commit("two", "2")
+            sh("switch", "-q", "main")
+            sh("merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+            merge = sh("rev-parse", "HEAD")
+            gh = FakeGitHub({**pr_routes(merge, number=40, head="h40"),
+                             ("GET", R(f"commits/{first}/pulls")): [], ("GET", R(f"commits/{second}/pulls")): []})
+            results = ma.audit(Git(root), gh, base, merge, sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red) for item in results], [("main-audit", False)])
+        self.assertEqual(results[0].detail, "1 commit(s) audited in this push, 0 flagged.")
+        self.assertEqual(gh.called("GET", R(f"commits/{first}/pulls")), [])
+        self.assertEqual(gh.called("GET", R(f"commits/{second}/pulls")), [])
 
     def test_the_owners_are_read_at_the_commits_parent_not_the_commit_itself(self):
         # The PR's own tree makes its approver an owner; the parent's tree does not.

@@ -35,9 +35,12 @@ NOT_A_PUSHER = {"web-flow"}
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
+    """The commits a push put on main's first-parent line, oldest first: the squash commit of a squash merge,
+    the merge commit of a merge commit. The branch commits a merge commit brings in are on no pull request of
+    their own, so counting them would report each as pushed directly."""
     if not before or ZERO.fullmatch(before):
         return [after]
-    return git.commits_between(before, after)
+    return git.first_parent_after(before, after)
 
 
 def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:

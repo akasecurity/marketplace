@@ -88,7 +88,6 @@ class TestGit(Scratch):
         self.assertEqual(self.git.first_parent_after(base, "main"), [second, merge])
         self.assertEqual(self.git.first_parent(merge), second)
         self.assertIsNone(self.git.first_parent(base))
-        self.assertEqual(len(self.git.commits_between(base, merge)), 3)
         self.assertEqual(self.git.rev_parse("main"), merge)
 
     def test_main_is_the_branch_when_a_tag_is_named_main(self):
