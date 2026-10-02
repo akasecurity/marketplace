@@ -31,8 +31,8 @@ name: import-plugin-release
 # Moving the pin down is mode rollback, to a version a fleet-v tag has pinned
 # and not below the rollback floor in rollback-safety.json (below_floor opens the
 # PR anyway; validate then fails it, so only an org owner's break-glass merge
-# lands it). While a rollback PR is open the schedule opens nothing, and a
-# forward PR opened by hand gets no auto-merge.
+# lands it). While a rollback PR is open the schedule opens nothing, and a pull
+# request that a forward dispatch opens gets no auto-merge.
 #
 # One code owner's approval, after running the candidate in one real session
 # (the PR's checklist), is the only human act per release; tag-release then

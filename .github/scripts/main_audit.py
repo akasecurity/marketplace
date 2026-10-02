@@ -4,12 +4,13 @@ Red unless each commit is the merge commit of a PR with an approving review, on
 the PR's final head, from a code owner (CODEOWNERS at the commit's parent, read
 strictly: one `*` line of users, as tag-release reads it, and any other shape
 is that commit's problem rather than a guess) who is not its last pusher and has
-not since withdrawn it (an owner's latest approving or change-requesting review
-decides), and whose final head has a passing `validate` check from GitHub
-Actions (its latest run decides). A commit that fails more than one of these
-gets one result. The head commit's author and committer stand in for the last
-pusher (web-flow, GitHub's committer for web edits, is skipped), and a head for
-which they name nobody is red, since an approval could then be the pusher's own.
+not since withdrawn it (an owner's latest approving, change-requesting or
+dismissed review decides), and whose final head has a passing `validate` check
+from GitHub Actions (its latest run decides). A commit that fails more than one
+of these gets one result. The head commit's author and committer stand in for
+the last pusher (web-flow, GitHub's committer for web edits, is skipped), and a
+head for which they name nobody is red, since an approval could then be the
+pusher's own.
 GitHub's activity API does record who pushed, but it is not used here yet: what
 it records for a push made by the App or by auto-merge has not been verified.
 The stand-in can still name the wrong person (a force-push by someone who did
@@ -73,8 +74,8 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
         return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
                 "(neither its author nor its committer is a GitHub account other than web-flow), so an approval "
                 "could not be told from the pusher's own.")
-    # Each owner's latest approving or change-requesting review decides, the same rule that names the approver in
-    # a fleet tag: an approval its owner later withdrew, or that was dismissed, does not count.
+    # Each owner's latest approving, change-requesting or dismissed review decides, the same rule that names the
+    # approver in a fleet tag: an approval its owner later withdrew, or that was dismissed, does not count.
     if owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners, exclude=pushers):
         return None
     return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
