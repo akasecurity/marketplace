@@ -98,9 +98,11 @@ forged.
 
 **`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
 annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
-and store-migration class, and for a rollback the version it rolled back from. Rulesets let only
-the release bot create a `fleet-v` tag and nobody at all move or delete one, and refuse every
-other tag name:
+and store-migration class, and for a rollback the version it rolled back from. The approver is the
+code owner whose latest review approves the PR's final head; with none, the message says
+`approver: none` and who merged it, and when CODEOWNERS at the commit's parent could not be read
+the PR is still named but the approver is `unknown`, with the reason. Rulesets let only the release
+bot create a `fleet-v` tag and nobody at all move or delete one, and refuse every other tag name:
 
 - **Only a tag cut by hand is signed.** The `fleet-v` tags cut before `tag-release` existed were
   signed by hand; the tags `tag-release` cuts are annotated but **not signed**, because the release
@@ -135,7 +137,13 @@ other tag name:
 Every change reaches `main` through a pull request. `.github/CODEOWNERS` names the code owners of
 every file, and the `main` ruleset requires one of them to approve (someone other than the PR's
 last pusher) and the `validate` check to pass, so a code owner's own PR needs the other code
-owner. Merges are squash merges. Before pushing, validate the JSON and run the scripts' tests:
+owner. Merges are squash merges. Keep `.github/CODEOWNERS` as one `*` line naming users:
+`tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
+login only to a user, so a team, an email address, a path rule or a second rule is not read. A PR
+merged on top of such a file gets `approver: unknown` in its tag and a `main-audit` issue, rather
+than a guess, and that file is fixed history no later PR can change. The unit tests run on a PR
+that changes the file and fail one the reader cannot read. Before pushing, validate the JSON and
+run the scripts' tests:
 
 ```bash
 for f in plugins.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
@@ -194,8 +202,15 @@ may use.
   check before approving (the PR's checklist says so).
 - **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
   comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
-  ai-tc version changed and has no `fleet-v` tag yet, and deletes the bot's branches whose PRs are
-  closed.
+  ai-tc version changed and has no `fleet-v` tag yet, and then deletes the bot's branches that
+  still point at the head of a closed PR (a branch re-created after its PR closed is kept). Only a
+  PR merged into `main` counts as a commit's merge. A commit that GitHub links to no merged PR is
+  left untagged, and so is everything after it, until it is an hour old, so that a slow link never
+  becomes a permanent `pr: none` tag; from then on it is tagged as a push without a PR, which
+  `tag-audit` reports. A restore after the entry was removed is compared with the last version
+  pinned before the removal, so a lower one records `rollback-from`. A tag or a branch deletion
+  that GitHub refuses ends the run with one error naming the ruleset, not a traceback, and a failed
+  sweep runs no clean-up.
 - **`staleness`** (hourly) files an issue when a passing release sits unpinned for 24 hours, npm has
   a version the importer refuses, the release checks reached no verdict on a version that has been
   on npm for over an hour, or whose publish time is unknown (its own issue, naming the version and
