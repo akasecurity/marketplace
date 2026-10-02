@@ -900,13 +900,14 @@ def directory(tags, edited=()):
     return [{"name": "meta", "path": f"{rc.MIGRATIONS_DIR}/meta", "sha": blob("meta"), "type": "dir"}, *files]
 
 
-STORE_CODE = f"{rc.STORE_CODE_DIR}/{rc.STORE_CODE_ENTRY}"
-TRIGGER_CODE = f"{rc.STORE_CODE_DIR}/sync-failure.ts"
+STORE_CODE = "packages/persistence/src/migrations.ts"
+TRIGGER_CODE = "packages/persistence/src/sync-failure.ts"
 
 
 def store_directory(*, changed=(), omit=()):
-    """What the Contents API answers for ai-tc's persistence source: the two store-code files and
-    a neighbour that is not one, each with a git blob sha. A name in `changed` has a different
+    """What the Contents API answers for ai-tc's persistence source: the two store-code files, spelled
+    out here so the test does not read the names from the code it tests, and a neighbour that is not
+    one, each with a git blob sha. A name in `changed` has a different
     sha; a name in `omit` is not there."""
     return [
         {
@@ -915,7 +916,7 @@ def store_directory(*, changed=(), omit=()):
             "sha": blob(name, "changed" if name in changed else ""),
             "type": "file",
         }
-        for name in ("database.ts", *rc.STORE_CODE_FILES)
+        for name in ("database.ts", "migrations.ts", "sync-failure.ts")
         if name not in omit
     ]
 
