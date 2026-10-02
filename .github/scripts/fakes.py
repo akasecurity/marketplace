@@ -89,6 +89,12 @@ class FakeGit:
             return None
         return descendant in self.chain and self.chain.index(ancestor) <= self.chain.index(descendant)
 
+    def merge_base(self, first: str, second: str) -> str | None:
+        """On a single chain, the earlier of two commits is the base of both."""
+        if first not in self.chain or second not in self.chain:
+            return None
+        return first if self.chain.index(first) <= self.chain.index(second) else second
+
     def commit_time(self, sha: str) -> int:
         return self.times[sha]
 

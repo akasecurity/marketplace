@@ -83,6 +83,16 @@ class Git:
                            f"{proc.stderr.decode('utf-8', 'replace').strip()}")
         return proc.returncode == 0
 
+    def merge_base(self, first: str, second: str) -> str | None:
+        """The best common ancestor of two commits, or None when they share no history. Both must be commits
+        this checkout has (is_ancestor says whether one is); anything else is a GitError."""
+        proc = self._run("merge-base", first, second, check=False)
+        if proc.returncode == 1:  # git's answer for two commits with nothing in common
+            return None
+        if proc.returncode != 0:
+            raise GitError(f"git merge-base {first} {second} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+        return proc.stdout.decode("utf-8").strip()
+
     def commit_time(self, sha: str) -> int:
         return int(self.run("show", "-s", "--format=%ct", sha).strip())
 
