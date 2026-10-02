@@ -137,7 +137,10 @@ class FakeGitHub:
         return self._answer("DELETE", path)
 
     def paginate(self, path, params=None):
-        return iter(self._answer("GET", path, None, params))
+        answer = self._answer("GET", path, None, params)
+        if isinstance(answer, dict):  # an envelope such as {"total_count": n, "check_runs": [...]}, as ghapi reads it
+            answer = next((value for value in answer.values() if isinstance(value, list)), [])
+        return iter(answer)
 
     def graphql(self, query, variables):
         return self._answer("GRAPHQL", re.search(r"\{\s*(\w+)", query).group(1), variables)
