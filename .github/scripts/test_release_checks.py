@@ -188,6 +188,30 @@ class TestPinnedVersions(unittest.TestCase):
         with self.assertRaises(rc.ReleaseCheckError):
             rc.pinned_versions(self.repo.path)
 
+    def test_a_tag_pinning_the_package_twice_pins_nothing(self):
+        # Two entries pinning the package is ambiguous, so the tag pins nothing, as a tag
+        # whose manifest does not parse does. Its version must not reach the candidate or
+        # rollback floors. Main is put back to one entry afterwards: main is read strictly.
+        doc = ts.manifest("0.9.20")
+        twin = copy.deepcopy(doc["plugins"][2])
+        twin["name"] = "ai-tc-canary"
+        doc["plugins"].append(twin)
+        self.repo.commit(doc)
+        self.repo.tag("fleet-v11")
+        self.repo.commit(ts.manifest("0.9.14"))
+        self.assertIsNone(rc._tag_pin(self.repo.path, "fleet-v11"))
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [
+                ("main", "0.9.14"),
+                ("fleet-v1", None),
+                ("fleet-v2", "0.9.6"),
+                ("fleet-v10", "0.9.12"),
+                ("fleet-v11", None),
+            ],
+        )
+        self.assertNotIn("0.9.20", rc.pinned_versions(self.repo.path))
+
     def test_a_repository_without_main_is_infrastructure(self):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
         with self.assertRaises(rc.InfraError):
@@ -404,6 +428,17 @@ class TestNpmCandidates(unittest.TestCase):
         fetch = self.fetch({"0.9.15": {}})
         rc.npm_candidates({"0.9.14"}, fetch=fetch)
         self.assertEqual(fetch.calls, [(rc.packument_url(), {"Accept": "application/json"})])
+
+    def test_a_4xx_registry_answer_is_no_verdict_even_with_a_packument_body(self):
+        # Only a 200 is an answer. A 4xx whose body happens to be a valid packument must not
+        # be read: a status check that refused only 5xx would turn it into candidates.
+        for status in (403, 404):
+            with self.subTest(status=status):
+                fetch = ts.FakeFetch({rc.packument_url(): (status, {"versions": {"0.9.15": {}}})})
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_candidates({"0.9.14"}, fetch=fetch)
+                self.assertEqual(caught.exception.check, "npm")
+                self.assertIn(f"answered {status}", caught.exception.detail)
 
     def test_a_registry_error_is_infrastructure(self):
         with self.assertRaises(rc.InfraError):
