@@ -351,3 +351,205 @@ class TestNpmCandidates(unittest.TestCase):
     def test_a_registry_error_is_infrastructure(self):
         with self.assertRaises(rc.InfraError):
             rc.npm_candidates(set(), fetch=ts.FakeFetch({rc.packument_url(): (503, b"")}))
+
+
+class FakeRun:
+    """Stands in for subprocess.run, answering by npm sub-command."""
+
+    def __init__(self, *, install=(0,), audit=(1, "{}")):
+        self.install = list(install)
+        self.audit = audit
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((list(args), kwargs.get("cwd")))
+        if args[:2] == ["npm", "init"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["npm", "install"]:
+            code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
+            return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
+        code, out = self.audit
+        return subprocess.CompletedProcess(args, code, out, "")
+
+
+class TestNpmAuditSignatures(unittest.TestCase):
+    def test_installs_exactly_the_version_from_npmjs_without_scripts_in_a_scratch_dir(self):
+        run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        install = next(a for a, _ in run.calls if a[:2] == ["npm", "install"])
+        self.assertIn("--ignore-scripts", install)
+        self.assertIn("--@akasecurity:registry=https://registry.npmjs.org", install)
+        self.assertEqual(install[-1], "@akasecurity/ai-tc-claude-code@0.9.14")
+        self.assertEqual(result["verified"][0]["version"], "0.9.14")
+        cwds = {cwd for _, cwd in run.calls}
+        self.assertEqual(len(cwds), 1)
+        self.assertNotEqual(cwds.pop(), os.getcwd())
+
+    def test_the_audit_asks_for_attestations(self):
+        run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+
+    def test_install_is_retried_then_reported_as_toolchain(self):
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(install=(1,)), sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_a_late_install_success_is_used(self):
+        run = FakeRun(install=(1, 1, 0), audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(sum(1 for a, _ in run.calls if a[:2] == ["npm", "install"]), 3)
+
+    def test_empty_audit_output_is_toolchain(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "  ")), sleep=lambda s: None)
+
+    def test_non_json_audit_output_is_toolchain(self):
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
+
+    def test_missing_npm_is_toolchain(self):
+        def run(args, **kwargs):
+            raise FileNotFoundError("npm")
+
+        with self.assertRaises(rc.InfraError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+
+
+class TestVerifyRelease(unittest.TestCase):
+    def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
+        fetch = ts.FakeFetch(routes if routes is not None else ts.release_routes(version))
+        queue = list(audits if audits is not None else [ts.audit_output(version)])
+
+        def audit(package, v):
+            self.assertEqual((package, v), (rc.PACKAGE, version))
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+        recorded = sleeps if sleeps is not None else []
+        return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
+
+    def refused(self, check, **kwargs):
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            self.verify(**kwargs)
+        self.assertEqual(caught.exception.check, check)
+        self.assertNotIsInstance(caught.exception, rc.InfraError)
+        return caught.exception
+
+    def test_a_tag_built_release_on_main_passes(self):
+        release, _ = self.verify()
+        self.assertEqual(
+            release, rc.VerifiedRelease("0.9.14", ts.INTEGRITY, ts.SHASUM, ts.ATTESTED["0.9.14"], ts.RUN_URL)
+        )
+
+    def test_the_commit_check_asks_whether_main_is_ahead_of_the_commit(self):
+        _, fetch = self.verify()
+        self.assertIn(f"{rc.AI_TC_API}/compare/{ts.ATTESTED['0.9.14']}...main?per_page=1", fetch.urls())
+
+    def test_identical_to_main_passes(self):
+        self.verify(routes=ts.release_routes("0.9.14", compare="identical"))
+
+    def test_behind_main_is_refused(self):
+        # Built on main's tip and never merged: the attacker's case.
+        self.refused("commit-on-main", routes=ts.release_routes("0.9.14", compare="behind"))
+
+    def test_diverged_is_refused(self):
+        self.refused("commit-on-main", routes=ts.release_routes("0.9.14", compare="diverged"))
+
+    def test_an_unknown_commit_is_refused(self):
+        routes = ts.release_routes("0.9.14")
+        routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (404, {"message": "Not Found"})
+        self.refused("commit-on-main", routes=routes)
+
+    def test_a_github_outage_is_no_verdict(self):
+        routes = ts.release_routes("0.9.14")
+        routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (502, b"")
+        with self.assertRaises(rc.InfraError):
+            self.verify(routes=routes)
+
+    def test_a_non_exact_version_is_refused_before_any_request(self):
+        fetch = ts.FakeFetch()
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v: {}, sleep=lambda s: None)
+        self.assertEqual((caught.exception.check, fetch.calls), ("version", []))
+
+    def test_registry_lag_is_retried(self):
+        routes = ts.release_routes("0.9.14")
+        url = ts.dist_url("0.9.14")
+        routes[url] = [(404, b'"version not found"'), (404, b'"version not found"'), routes[url]]
+        sleeps = []
+        self.verify(routes=routes, sleeps=sleeps)
+        self.assertEqual(sleeps, [20, 20])
+
+    def test_a_version_npm_never_serves_is_refused(self):
+        routes = ts.release_routes("0.9.14")
+        routes[ts.dist_url("0.9.14")] = (404, b'"version not found"')
+        sleeps = []
+        self.refused("dist", routes=routes, sleeps=sleeps)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_an_integrity_that_is_not_one_sha512_is_refused(self):
+        self.refused("dist", routes=ts.release_routes("0.9.14", integrity="sha1-abc"))
+
+    def test_an_unindexed_attestation_is_retried(self):
+        sleeps = []
+        self.verify(audits=[ts.audit_output("0.9.14", verified=False), ts.audit_output("0.9.14")], sleeps=sleeps)
+        self.assertEqual(sleeps, [20])
+
+    def test_no_attestation_after_five_tries_is_refused(self):
+        sleeps = []
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", verified=False)], sleeps=sleeps)
+        self.assertIn("no VERIFIED attestation", error.detail)
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+
+    def test_npm_reporting_invalid_is_refused(self):
+        self.refused("provenance", audits=[ts.audit_output("0.9.14", invalid=[{"code": "EINTEGRITYSIGNATURE"}])])
+
+    def test_an_off_tag_branch_publish_is_refused_without_crying_theft(self):
+        # The certificate and the statement both say the workflow ran from a branch.
+        ref = "refs/heads/release/0.9.x"
+        uri = f"{rc.PROV_REPO}/{ts.WORKFLOW}@{ref}"
+        stmt = ts.statement("0.9.14", ref=ref)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+        self.assertIn("not a stolen npm credential", error.detail)
+
+    def test_another_repository_is_refused(self):
+        other = "https://github.com/someone/ai-tc"
+        uri = f"{other}/{ts.WORKFLOW}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", repository=other)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, repository=other)
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+        self.assertIn("anyone can publish with provenance", error.detail)
+
+    def test_another_workflow_is_refused(self):
+        path = ".github/workflows/other.yml"
+        uri = f"{rc.PROV_REPO}/{path}@refs/tags/plugin-claude-v0.9.14"
+        stmt = ts.statement("0.9.14", path=path)
+        cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri)
+        self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+
+    def test_a_self_hosted_builder_is_refused(self):
+        stmt = ts.statement("0.9.14", builder="https://github.com/actions/runner/self-hosted")
+        cert = ts.signing_cert("0.9.14", runner="self-hosted")
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
+        self.assertIn("github-hosted", error.detail)
+
+    def test_an_attestation_for_different_bytes_is_refused(self):
+        stmt = ts.statement("0.9.14", sha512="00" * 64)
+        error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt)])
+        self.assertIn("different tarball", error.detail)
+
+    def test_a_statement_without_the_tag_dependency_is_refused(self):
+        stmt = ts.statement("0.9.14", dependency_uri=f"git+{rc.PROV_REPO}@refs/heads/main")
+        self.refused("attested-commit", audits=[ts.audit_output("0.9.14", stmt)])
+
+    def test_a_short_commit_is_refused(self):
+        stmt = ts.statement("0.9.14", commit="a75532b9")
+        self.refused("attested-commit", audits=[ts.audit_output("0.9.14", stmt)])
+
+    def test_a_foreign_run_url_is_refused(self):
+        stmt = ts.statement("0.9.14", run_url="https://example.com/actions/runs/1")
+        self.refused("run-url", audits=[ts.audit_output("0.9.14", stmt)])
