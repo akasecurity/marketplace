@@ -6,15 +6,18 @@ release_checks, and prints one JSON plan. `open-pr` runs in the
 marketplace-bot environment with the bot App's installation credential: it
 re-reads main through the API, writes the bot commit through the Git Data API
 (no local push and no persisted credential), creates the branch with a create-only
-ref, never a force-push (an existing branch with an open PR is skipped; one the bot's
-closed PR used is skipped on a plain forward run, and deleted and created again only by a
-reimport or rollback dispatch; one no PR ever used was left by a run that died before
+ref, never a force-push (an existing branch with an open bot PR is skipped, and one with an
+open PR of anyone else's is a red refusal, since deleting the branch would close that PR; one
+the bot's closed PR used is skipped on a plain forward run, and deleted and created again only
+by a reimport or rollback dispatch; one no PR ever used was left by a run that died before
 opening it, and any run deletes it and creates it again), opens the PR and enables
 auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
 version while a higher one has no verdict. Every decision about an open or closed PR looks at
 the pull requests the release bot opened and no others (release_checks.BOT_LOGIN), so a person's
-PR from a `bot/` branch name neither stops the schedule nor is closed; while no bot login is
+PR from a `bot/` branch name neither stops the schedule nor is closed, with one exception:
+open-pr refuses, red, to delete a branch that a person's open PR is from, and stays red for
+that version until the person closes the PR or renames its branch. While no bot login is
 configured the importer refuses, red. AGENTS.md ("ai-tc is pinned", "The workflows") describes
 the flow.
 """
@@ -127,7 +130,8 @@ def bot_login() -> str:
 
 def bot_pulls(pulls: list[dict]) -> list[dict]:
     """The pull requests the release bot opened. Every importer decision about an open or closed PR reads
-    through this, as validate does when it asks whose PR it is judging."""
+    through this, as validate does when it asks whose PR it is judging, except one refusal: open_pr lists
+    every author's open PRs from its branch, and refuses red to delete the branch of a person's."""
     login = bot_login()
     return [p for p in pulls if p["author"] == login]
 
