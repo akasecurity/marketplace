@@ -241,8 +241,9 @@ def pr_body(plan: dict, run_url: str) -> str:
                         if floor else f"no release between `{version}` and `{plan['highest_pinned']}` is flagged."))
         if plan.get("below_floor"):
             lines.append("**Dispatched with `below_floor: true`.** `validate` fails this PR; only an org owner's "
-                         "break-glass merge can land it, and `main-audit` opens an issue for that merge. Its tag "
-                         "records a bypass only if no code owner had approved the PR.")
+                         "break-glass merge can land it. The merge is recorded twice: its `fleet-v<N>` tag notes "
+                         "that `validate` had not passed on the PR's final head, and `main-audit` opens an issue "
+                         "for the merge.")
         if plan.get("crossed"):
             lines.append("Flagged not-rollback-safe releases this rollback moves back across: "
                          + ", ".join(f"`{v}`" for v in plan["crossed"])
