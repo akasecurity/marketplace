@@ -72,9 +72,26 @@ class Git:
         parts = self.run("rev-list", "--parents", "-n", "1", sha).split()
         return parts[1] if len(parts) > 1 else None
 
-    def commits_between(self, before: str, after: str) -> list[str]:
-        """Every commit `after` reaches and `before` does not, oldest first."""
-        return [line for line in self.run("rev-list", "--reverse", f"{before}..{after}").splitlines() if line]
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        """Whether `ancestor` is reachable from `descendant`; None when `ancestor` is not a commit this
+        checkout has (a force-pushed-over tip that no other ref keeps is never fetched)."""
+        if self._run("cat-file", "-e", f"{ancestor}^{{commit}}", check=False).returncode != 0:
+            return None
+        proc = self._run("merge-base", "--is-ancestor", ancestor, descendant, check=False)
+        if proc.returncode not in (0, 1):
+            raise GitError(f"git merge-base --is-ancestor {ancestor} {descendant} failed: "
+                           f"{proc.stderr.decode('utf-8', 'replace').strip()}")
+        return proc.returncode == 0
+
+    def merge_base(self, first: str, second: str) -> str | None:
+        """The best common ancestor of two commits, or None when they share no history. Both must be commits
+        this checkout has (is_ancestor says whether one is); anything else is a GitError."""
+        proc = self._run("merge-base", first, second, check=False)
+        if proc.returncode == 1:  # git's answer for two commits with nothing in common
+            return None
+        if proc.returncode != 0:
+            raise GitError(f"git merge-base {first} {second} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+        return proc.stdout.decode("utf-8").strip()
 
     def commit_time(self, sha: str) -> int:
         return int(self.run("show", "-s", "--format=%ct", sha).strip())

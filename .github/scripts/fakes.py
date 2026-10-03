@@ -86,8 +86,16 @@ class FakeGit:
         index = self.chain.index(sha)
         return self.chain[index - 1] if index else None
 
-    def commits_between(self, before: str, after: str) -> list[str]:
-        return self.first_parent_after(before, after)
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:
+        if ancestor not in self.chain:
+            return None
+        return descendant in self.chain and self.chain.index(ancestor) <= self.chain.index(descendant)
+
+    def merge_base(self, first: str, second: str) -> str | None:
+        """On a single chain, the earlier of two commits is the base of both."""
+        if first not in self.chain or second not in self.chain:
+            return None
+        return first if self.chain.index(first) <= self.chain.index(second) else second
 
     def commit_time(self, sha: str) -> int:
         return self.times[sha]
@@ -137,7 +145,10 @@ class FakeGitHub:
         return self._answer("DELETE", path)
 
     def paginate(self, path, params=None):
-        return iter(self._answer("GET", path, None, params))
+        answer = self._answer("GET", path, None, params)
+        if isinstance(answer, dict):  # an envelope such as {"total_count": n, "check_runs": [...]}, as ghapi reads it
+            answer = next((value for value in answer.values() if isinstance(value, list)), [])
+        return iter(answer)
 
     def graphql(self, query, variables):
         return self._answer("GRAPHQL", re.search(r"\{\s*(\w+)", query).group(1), variables)
