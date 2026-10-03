@@ -1,0 +1,85 @@
+name: validate
+
+# The required check on main.
+#
+# It runs on pull_request_target, so the workflow and the scripts that run are the
+# BASE branch's copy, never the PR's. The PR's files are read as data
+# (git show <head sha>:<path>); nothing from the head is executed.
+#
+# It is a correctness check on the automated path, not a security boundary: code-owner
+# review of every change is the control.
+#
+# There is one job, named exactly "validate", with no job-level if, no needs, and no path
+# or branch filter. A skipped job reports success, and a filtered-out required check
+# stays pending, so the job always runs and decides inside which rules apply.
+#
+# Before trusting a green run, open the check run and confirm it is this workflow's run
+# from main, with event pull_request_target. Any GitHub Actions job named "validate" on
+# the head commit would satisfy the required check too.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Checks out the base branch (pull_request_target's default), with full history and
+      # every tag, so the pins of main and of each fleet-v tag can be read. No credential
+      # is persisted: this job pushes nothing.
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (the pin import-plugin-release.yml uses).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # npm 11.12 or later. The provenance check runs `npm audit signatures
+      # --include-attestations`, which only that npm honours: an older one prints no
+      # attestations, which reads as a release with no provenance. Node 24.15.0 is the first
+      # release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm). A bare
+      # "24" is not enough: setup-node takes a copy of Node in the runner's tool cache that
+      # matches the spec before it downloads anything, so "24" can resolve to an older cached
+      # 24.x. No older copy matches a range that starts at 24.15.0, so the action uses a cached
+      # copy of 24.15.0 or later if there is one, and downloads a release otherwise.
+      # The check refuses an older npm with no verdict (MIN_NPM in release_checks.py), but the
+      # workflow should not depend on that.
+      # 49933ea5288caeca8642d1e84afbd3f7d6820020 == v4.4.0 (the pin import-plugin-release.yml uses).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ">=24.15.0 <25"
+
+      - name: fetch the PR head as data (never checked out)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          if ! printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::the PR head sha is not 40 hex"
+            exit 2
+          fi
+          git fetch --no-tags origin "+${HEAD_SHA}:refs/remotes/pr/head"
+
+      - name: validate
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/validate_pr.py
