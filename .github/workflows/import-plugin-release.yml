@@ -98,7 +98,7 @@ jobs:
       # npm 11.12 or later: on an older npm, `npm audit signatures --include-attestations`
       # prints no attestations at all, so release_checks stops with no verdict (a
       # toolchain failure) rather than judge a release it cannot see. Node 24.15.0 is the
-      # first release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm).
+      # first Node 24 release that bundles it (npm 11.12.1; every later 24.x bundles a newer npm).
       # A bare "24" is not enough: setup-node takes a copy of Node in the runner's tool cache
       # that matches the spec before it downloads anything, so "24" can resolve to an older
       # cached 24.x. No older copy matches a range that starts at 24.15.0, so the action uses
