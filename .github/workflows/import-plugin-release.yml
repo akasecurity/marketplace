@@ -135,11 +135,12 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      # bcd2ba49218906704ab6c1aa796996da409d3eb1 == v3.2.0 (verified with git ls-remote).
+      # bcd2ba49218906704ab6c1aa796996da409d3eb1 == v3.2.0 (verified with git ls-remote). The App is named by
+      # its client id: this release marks the app-id input deprecated.
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app
         with:
-          app-id: ${{ secrets.MARKETPLACE_BOT_APP_ID }}
+          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}
           private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write

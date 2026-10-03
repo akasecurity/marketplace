@@ -76,6 +76,14 @@ class ImporterWorkflow(WorkflowCase):
     def test_the_workflow_token_never_writes(self):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    def test_the_app_token_is_made_from_the_clients_id_not_the_deprecated_app_id(self):
+        # create-github-app-token marks app-id deprecated ("Use 'client-id' instead"): every run would
+        # warn, and a later major version may drop it. The secrets are the App's client id and key.
+        self.assertIn("          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}\n", self.jobs["open-pr"])
+        self.assertIn("          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}\n", self.jobs["open-pr"])
+        self.assertNotRegex(self.text, r"(?m)^\s+app-id:")
+        self.assertNotIn("MARKETPLACE_BOT_APP_ID", self.text)
+
     # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
     # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
     FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
