@@ -428,7 +428,9 @@ class TestPlanForward(PlanCase):
         self.candidates = ["0.9.15"]
         self.assertEqual(self.plan()["version"], "0.9.15")
 
-    def test_a_pin_named_pr_from_anyone_else_does_not_block_the_version(self):
+    def test_a_pin_named_pr_from_anyone_else_does_not_stop_the_plan_for_the_version(self):
+        # The plan only. open-pr still refuses, red, to delete that PR's branch while the branch exists
+        # (TestOpenPrForward.test_a_branch_another_authors_pr_is_open_from_is_not_deleted).
         self.candidates = ["0.9.15"]
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
         self.assertEqual(self.plan()["version"], "0.9.15")
