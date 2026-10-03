@@ -198,6 +198,10 @@ def check_plan(plan: dict) -> None:
 
 def pr_body(plan: dict, run_url: str) -> str:
     version, current, branch = plan["version"], plan["from_version"], plan["branch"]
+    # What the provenance check requires of a release, read from the one table it reads, so the body
+    # cannot say a different workflow or tag than the check enforces.
+    pipeline = release_checks.RELEASE_PIPELINE[PACKAGE]
+    provenance_repo = release_checks.PROV_REPO.removeprefix("https://github.com/")
     lines: list[str] = []
     if plan["mode"] == "forward":
         lines.append(f"Advances the `ai-tc` pin in `{MANIFEST}`: `{current}` → `{version}`.")
@@ -214,8 +218,8 @@ def pr_body(plan: dict, run_url: str) -> str:
         f"- package: `{PACKAGE}@{version}`",
         f"- integrity: `{plan['integrity']}` (also written to the entry's `metadata.integrity`)",
         f"- shasum: `{plan['shasum']}`",
-        f"- provenance: SLSA, built by `.github/workflows/release-plugin-claude.yml` in akasecurity/ai-tc "
-        f"at `refs/tags/plugin-claude-v{version}` on a GitHub-hosted runner",
+        f"- provenance: SLSA, built by `{pipeline['workflow']}` in {provenance_repo} "
+        f"at `refs/tags/{pipeline['tag_prefix']}{version}` on a GitHub-hosted runner",
         f"- attested commit: `{plan['git_commit']}`, on ai-tc main: yes",
         f"- ai-tc release run (its hook fail-open smoke tests run there): {plan['run_url']}",
         "",

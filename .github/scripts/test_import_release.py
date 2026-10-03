@@ -181,6 +181,17 @@ class TestPrBody(unittest.TestCase):
             self.assertIn(text, body)
         self.assertNotIn("git tag -s", body)
 
+    def test_the_provenance_line_follows_the_release_pipeline_the_check_reads(self):
+        pipeline = {**release_checks.RELEASE_PIPELINE[release_checks.PACKAGE],
+                    "workflow": ".github/workflows/release-other.yml", "tag_prefix": "other-v"}
+        with mock.patch.dict(release_checks.RELEASE_PIPELINE, {release_checks.PACKAGE: pipeline}), \
+                mock.patch.object(release_checks, "PROV_REPO", "https://github.com/example-org/example-repo"):
+            body = ir.pr_body(forward_plan(), "u")
+        self.assertIn("- provenance: SLSA, built by `.github/workflows/release-other.yml` in example-org/example-repo "
+                      "at `refs/tags/other-v0.9.15` on a GitHub-hosted runner", body)
+        for stale in ("release-plugin-claude.yml", "plugin-claude-v", "akasecurity/ai-tc "):
+            self.assertNotIn(stale, body)
+
     def test_a_reimport_says_so(self):
         self.assertIn("**Re-import**", ir.pr_body(forward_plan(reimport=True), "u"))
 
