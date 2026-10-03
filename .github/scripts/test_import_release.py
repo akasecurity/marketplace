@@ -205,13 +205,14 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("`validate` fails this PR", body)
         self.assertIn("claude plugin marketplace add akasecurity/marketplace#bot/rollback-ai-tc-0.9.14-to-0.9.13", body)
 
-    def test_a_below_floor_body_says_what_reports_the_merge_and_when_the_tag_records_it(self):
-        # A code owner can approve a PR that an org owner then merges past a failed validate: the tag
-        # names that owner and records no bypass, so only main-audit reports the merge.
+    def test_a_below_floor_body_says_the_tag_and_the_audit_both_record_the_merge(self):
+        # tag-release notes a merge whose final head has no passing validate run, whoever approved it,
+        # and main-audit opens an issue for the same merge. The body promises exactly those two.
         body = ir.pr_body(rollback_plan(floor="0.9.14", below_floor=True), "u")
-        self.assertIn("`main-audit` opens an issue for that merge", body)
-        self.assertIn("Its tag records a bypass only if no code owner had approved the PR.", body)
-        self.assertNotIn("its tag will record the bypass", body)
+        self.assertIn("only an org owner's break-glass merge can land it. The merge is recorded twice: its "
+                      "`fleet-v<N>` tag notes that `validate` had not passed on the PR's final head, and "
+                      "`main-audit` opens an issue for the merge.", body)
+        self.assertNotIn("only if no code owner had approved", body)
         self.assertNotIn("main-audit", ir.pr_body(rollback_plan(floor="0.9.14"), "u"))
 
     def test_a_rollback_body_asks_the_approver_to_rerun_validate_after_the_safety_file_moves(self):
