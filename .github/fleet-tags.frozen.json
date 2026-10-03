@@ -1,0 +1,42 @@
+[
+  {
+    "tag": "fleet-v1",
+    "object": "c521df22db51f2e556475a9e267e574988a3e6fb",
+    "commit": "abb08977a9a2dbd4e651ec041135345e976a2452"
+  },
+  {
+    "tag": "fleet-v2",
+    "object": "a2c946060a74e1002faba4b916430a66e87f6f42",
+    "commit": "a2639b73b92cd6ae87a8f0e252b239bbc5136120"
+  },
+  {
+    "tag": "fleet-v3",
+    "object": "50cf989430d2fe8210106a6206f13183860f5e29",
+    "commit": "f3e43d5363838bdba1d1dd2b247f7e937e4b7b70"
+  },
+  {
+    "tag": "fleet-v4",
+    "object": "982eb03de2a64dd15304cdc91b208c616ff1da03",
+    "commit": "313865ce2e15df9bc255d48853bdb030adc98766"
+  },
+  {
+    "tag": "fleet-v5",
+    "object": "4456144d7014af9e3e4a10356812f91a72301e25",
+    "commit": "fa3c0fcd1caea1a841d8c38f08536c68b6faf5ba"
+  },
+  {
+    "tag": "fleet-v6",
+    "object": "112002d7bf0a7cfac4c15f1edba2b87cb1f16508",
+    "commit": "7a72cb864642c3ac47ab4470c195b4b480067d2a"
+  },
+  {
+    "tag": "fleet-v7",
+    "object": "191b2da083d8b80b32c1d7fc6282b95525761fbb",
+    "commit": "fc29263cf89a472e7fc93e42dc7dc8f8d2abd47a"
+  },
+  {
+    "tag": "fleet-v8",
+    "object": "df4ce5f19f42cddc3beea2e7126912fa7a437291",
+    "commit": "31e4249caf50050d7787dc6462954fef42afe6e7"
+  }
+]
