@@ -56,12 +56,12 @@ class TestErrorClasses(unittest.TestCase):
     def test_a_handler_written_for_a_verdict_lets_an_outage_through(self):
         # _tag_pin is lenient about what a tag's manifest says, so every verdict-shaped
         # failure pins nothing. A failed read is no verdict and must not be dropped with them.
-        with mock.patch.object(rc, "_read_manifest", side_effect=rc.InfraError("git", "show failed")):
+        with mock.patch.object(rc, "_manifest_at", side_effect=rc.InfraError("git", "show failed")):
             with self.assertRaises(rc.InfraError):
                 rc._tag_pin("unused", "fleet-v1")
         for verdict in (rc.ReleaseCheckError("manifest", "no plugins list"), ValueError("does not parse")):
             with self.subTest(verdict=repr(verdict)):
-                with mock.patch.object(rc, "_read_manifest", side_effect=verdict):
+                with mock.patch.object(rc, "_manifest_at", side_effect=verdict):
                     self.assertIsNone(rc._tag_pin("unused", "fleet-v1"))
 
 
@@ -177,6 +177,88 @@ class TestPinnedVersions(unittest.TestCase):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
         with self.assertRaises(rc.InfraError):
             rc.pinned_versions(self.repo.path)
+
+
+def forget_object(repo_path, oid):
+    """Remove one loose git object, as a failed fetch or a damaged checkout leaves it missing."""
+    loose = os.path.join(repo_path, ".git", "objects", oid[:2], oid[2:])
+    os.chmod(loose, 0o644)
+    os.remove(loose)
+
+
+class TestPinnedVersionsReadFailures(unittest.TestCase):
+    """A tag that cannot be READ is no verdict. It must never be taken as a tag that pins
+    nothing: that would drop a version from the candidate floor and the rollback floor."""
+
+    def ledger(self):
+        repo = ts.Repo(self)
+        for number, version in enumerate(("0.9.12", "0.9.13", "0.9.14", "0.9.15"), start=1):
+            repo.commit(ts.manifest(version))
+            repo.tag(f"fleet-v{number}")
+        return repo
+
+    def delete_blob(self, repo, tag):
+        blob = ts.git(repo.path, "rev-parse", f"refs/tags/{tag}^{{commit}}:{rc.MANIFEST}").strip()
+        loose = os.path.join(repo.path, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+
+    def test_a_tag_whose_manifest_object_is_gone_is_infrastructure(self):
+        repo = self.ledger()
+        self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+        self.delete_blob(repo, "fleet-v3")
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_whose_manifest_directory_cannot_be_listed_is_infrastructure(self):
+        # The probe that tells an absent manifest from an unreadable one lists the tree
+        # first. When the listing itself fails, the file may well be there: the tag must
+        # not be taken as one that pins nothing, or its version leaves both floors.
+        repo = self.ledger()
+        directory = os.path.dirname(rc.MANIFEST)
+        forget_object(repo.path, ts.git(repo.path, "rev-parse", f"refs/tags/fleet-v3^{{commit}}:{directory}").strip())
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_at_a_commit_without_the_manifest_file_pins_nothing(self):
+        # tag-release cuts such a tag as "entry removed", and a tag is immutable, so reading
+        # it as a failed git read would be a permanent outage. The file is not there: the
+        # tag pins nothing, and every other tag keeps its pin.
+        repo = self.ledger()
+        ts.git(repo.path, "rm", "-q", rc.MANIFEST)
+        ts.git(repo.path, "commit", "-q", "-m", "drop the manifest")
+        repo.tag("fleet-v5")
+        repo.commit(ts.manifest("0.9.15"))  # main holds its manifest again: only the tag lacks one
+        pins = rc.pins_by_ref(repo.path)
+        self.assertEqual(pins["main"], "0.9.15")
+        self.assertIsNone(pins["fleet-v5"])
+        self.assertEqual([pins[f"fleet-v{n}"] for n in (1, 2, 3, 4)], ["0.9.12", "0.9.13", "0.9.14", "0.9.15"])
+        self.assertEqual(rc.pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+        self.assertEqual(rc.tag_pinned_versions(repo.path), {"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+
+    def test_a_manifest_that_does_not_parse_still_pins_nothing(self):
+        repo = self.ledger()
+        repo.commit(files={rc.MANIFEST: "{ not json"})
+        repo.tag("fleet-v5")
+        repo.commit(ts.manifest("0.9.15"))
+        pins = rc.pins_by_ref(repo.path)
+        self.assertIsNone(pins["fleet-v5"])
+        self.assertEqual(pins["fleet-v3"], "0.9.14")
+
+    def test_a_checkout_without_any_fleet_tag_is_infrastructure(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.14"))
+        for call in (rc.pins_by_ref, rc.pinned_versions, rc.tag_pinned_versions):
+            with self.subTest(call=call.__name__):
+                with self.assertRaises(rc.InfraError) as caught:
+                    call(repo.path)
+                self.assertEqual(caught.exception.check, "git")
 
 
 class TestHttpHeaders(unittest.TestCase):
@@ -357,20 +439,35 @@ class TestNpmCandidates(unittest.TestCase):
 class FakeRun:
     """Stands in for subprocess.run, answering by npm sub-command."""
 
-    def __init__(self, *, install=(0,), audit=(1, "{}")):
+    def __init__(self, *, install=(0,), audit=(1, "{}"), audits=None, npm_version="11.19.0", hang=None):
         self.install = list(install)
         self.audit = audit
+        self.audits = None if audits is None else list(audits)  # (code, stdout) per audit; the last repeats
+        self.npm_version = npm_version
+        self.hang = hang
         self.calls = []
+        self.timeouts = []  # (sub-command, the timeout the call carried), one per call
 
     def __call__(self, args, **kwargs):
         self.calls.append((list(args), kwargs.get("cwd")))
+        self.timeouts.append((args[1], kwargs.get("timeout")))
+        if args[1] == self.hang:
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
         if args[:2] == ["npm", "init"]:
             return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["npm", "--version"]:
+            return subprocess.CompletedProcess(args, 0, self.npm_version + "\n", "")
         if args[:2] == ["npm", "install"]:
             code = self.install.pop(0) if len(self.install) > 1 else self.install[0]
             return subprocess.CompletedProcess(args, code, "", "npm error 404" if code else "")
-        code, out = self.audit
+        if self.audits is not None:
+            code, out = self.audits.pop(0) if len(self.audits) > 1 else self.audits[0]
+        else:
+            code, out = self.audit
         return subprocess.CompletedProcess(args, code, out, "")
+
+    def count(self, command):
+        return sum(1 for args, _ in self.calls if args[1] == command)
 
 
 class TestNpmAuditSignatures(unittest.TestCase):
@@ -386,10 +483,143 @@ class TestNpmAuditSignatures(unittest.TestCase):
         self.assertEqual(len(cwds), 1)
         self.assertNotEqual(cwds.pop(), os.getcwd())
 
-    def test_the_audit_asks_for_attestations(self):
+    def test_the_audit_asks_for_attestations_and_a_fresh_read_of_the_registry(self):
         run = FakeRun(audit=(0, json.dumps(ts.audit_output("0.9.14"))))
         rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
-        self.assertEqual(run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations"])
+        self.assertEqual(
+            run.calls[-1][0], ["npm", "audit", "signatures", "--json", "--include-attestations", "--prefer-online"]
+        )
+
+    def test_the_audit_is_the_part_that_is_repeated(self):
+        # Registry lag is waited out by auditing again, not by installing again: one scratch
+        # directory, one init, one version read and one install serve every audit.
+        good = (1, json.dumps(ts.audit_output("0.9.14")))
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        calls = []
+
+        def judge(report):
+            calls.append(report)
+            if len(calls) < 4:
+                raise rc._NotIndexedYet("not yet")
+            return "judged"
+
+        run, sleeps = FakeRun(audits=[unindexed, unindexed, unindexed, good]), []
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=judge)
+        self.assertEqual(result, "judged")
+        self.assertEqual([run.count(c) for c in ("init", "--version", "install", "audit")], [1, 1, 1, 4])
+        self.assertEqual(sleeps, [20, 20, 20])
+        self.assertEqual(len({cwd for _, cwd in run.calls}), 1)
+        self.assertEqual(calls[-1]["verified"][0]["version"], "0.9.14")
+
+    def test_every_audit_revalidates_npms_cache(self):
+        # The registry's packument is cacheable for five minutes, so an audit repeated 20 s later
+        # would read the same cached answer. --prefer-online makes each one ask the registry.
+        unindexed = (1, json.dumps(ts.audit_output("0.9.14", verified=False)))
+        run = FakeRun(audits=[unindexed])
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None, judge=never)
+        audits = [args for args, _ in run.calls if args[1] == "audit"]
+        self.assertEqual(len(audits), 5)
+        self.assertTrue(all("--prefer-online" in args for args in audits))
+
+    def test_a_report_that_is_never_indexed_is_given_up_on_after_five_audits(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        with self.assertRaises(rc._NotIndexedYet):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_nothing_printed_and_not_indexed_yet_share_one_budget_of_five_audits(self):
+        nothing = (1, "")
+        report = (1, json.dumps(ts.audit_output("0.9.14")))
+
+        def never(report):
+            raise rc._NotIndexedYet("not yet")
+
+        for label, audits, expected in (
+            ("ends on a report", [nothing, report, nothing, report, report], rc._NotIndexedYet),
+            ("ends on nothing", [report, nothing, report, nothing, nothing], rc.InfraError),
+        ):
+            with self.subTest(label):
+                run, sleeps = FakeRun(audits=audits), []
+                with self.assertRaises(expected):
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=never)
+                self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_a_judgement_that_is_not_waiting_for_the_index_is_final(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14")))]), []
+
+        def refuse(report):
+            raise rc.ReleaseCheckError("provenance", "no")
+
+        with self.assertRaises(rc.ReleaseCheckError):
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append, judge=refuse)
+        self.assertEqual((run.count("audit"), sleeps), (1, []))
+
+    def test_verify_release_retries_through_one_install(self):
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        release = rc.verify_release(
+            "0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append
+        )
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
+    def test_the_default_audit_takes_the_judge_verify_release_hands_it(self):
+        # Every other test passes its own `audit`, so none of them reaches the function verify_release
+        # uses when it is given none. Its keyword-only defaults (the npm runner and the wait) are
+        # swapped for fakes, which leaves the call from verify_release to the real function as it is.
+        good = ts.audit_output("0.9.14")
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False))), (1, json.dumps(good))]), []
+        with mock.patch.dict(rc.npm_audit_signatures.__kwdefaults__, {"run": run, "sleep": sleeps.append}):
+            release = rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), sleep=sleeps.append)
+        self.assertEqual(release.version, "0.9.14")
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 2, [20]))
+
+    def test_verify_release_refuses_a_release_that_is_never_indexed_after_one_install(self):
+        run, sleeps = FakeRun(audits=[(1, json.dumps(ts.audit_output("0.9.14", verified=False)))]), []
+
+        def audit(package, version, judge):
+            return rc.npm_audit_signatures(package, version, run=run, sleep=sleeps.append, judge=judge)
+
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.verify_release("0.9.14", fetch=ts.FakeFetch(ts.release_routes("0.9.14")), audit=audit, sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "provenance")
+        self.assertIn("did not come from the release pipeline", caught.exception.detail)
+        self.assertEqual((run.count("install"), run.count("audit"), sleeps), (1, 5, [20, 20, 20, 20]))
+
+    def test_every_npm_call_carries_a_timeout(self):
+        # install gets the longest: it fetches the tarball and its dependencies.
+        run = FakeRun(audit=(1, json.dumps(ts.audit_output("0.9.14"))))
+        rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+        self.assertEqual(
+            run.timeouts, [("init", 120), ("--version", 120), ("install", 300), ("audit", 120)]
+        )
+        self.assertEqual(len(run.timeouts), len(run.calls))
+
+    def test_a_hung_npm_is_toolchain_and_is_not_retried(self):
+        # A hang is not lag: waiting it out again would only push the run toward its job's timeout.
+        for command, seconds in (("init", 120), ("--version", 120), ("install", 300), ("audit", 120)):
+            with self.subTest(command=command):
+                run, sleeps = FakeRun(hang=command, audit=(1, json.dumps(ts.audit_output("0.9.14")))), []
+                with self.assertRaises(rc.InfraError) as caught:
+                    rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
+                self.assertEqual(caught.exception.check, "toolchain")
+                self.assertIn(f"npm {command} did not finish within {seconds} s", caught.exception.detail)
+                self.assertIn("NOT a signature result", caught.exception.detail)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(sum(1 for args, _ in run.calls if args[1] == command), 1)
 
     def test_install_is_retried_then_reported_as_toolchain(self):
         sleeps = []
@@ -412,6 +642,110 @@ class TestNpmAuditSignatures(unittest.TestCase):
         with self.assertRaises(rc.InfraError):
             rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, "oops")), sleep=lambda s: None)
 
+    def test_audit_output_nested_too_deep_to_parse_is_toolchain(self):
+        # json.loads raises RecursionError, not ValueError, past the interpreter's depth.
+        deep = "[" * 100_000 + "]" * 100_000
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, deep)), sleep=lambda s: None)
+        self.assertEqual(caught.exception.check, "toolchain")
+
+    def test_empty_audit_output_is_retried_before_it_is_given_up_on(self):
+        sleeps, run = [], FakeRun(audit=(1, ""))
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=sleeps.append)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertEqual(sleeps, [20, 20, 20, 20])
+        self.assertEqual((run.count("install"), run.count("audit")), (1, 5))
+
+    def test_a_late_audit_answer_is_used(self):
+        answers = ["", "", json.dumps(ts.audit_output("0.9.14"))]
+        run = FakeRun()
+
+        def audit_run(args, **kwargs):
+            if args[:2] == ["npm", "audit"]:
+                return subprocess.CompletedProcess(args, 1, answers.pop(0), "")
+            return run(args, **kwargs)
+
+        result = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=audit_run, sleep=lambda s: None)
+        self.assertEqual(result["verified"][0]["version"], "0.9.14")
+
+    def test_npms_own_error_document_is_toolchain_not_a_verdict(self):
+        error = json.dumps({"error": {"summary": "found no installed dependencies to audit", "detail": ""}})
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, error)), sleep=lambda s: None)
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+
+    def test_an_error_document_never_reaches_a_provenance_refusal(self):
+        error = json.dumps({"error": {"summary": "audit endpoint unavailable"}, "invalid": [], "verified": []})
+        with self.assertRaises(rc.InfraError):
+            rc.verify_release(
+                "0.9.14",
+                fetch=ts.FakeFetch(ts.release_routes("0.9.14")),
+                audit=lambda package, version, judge: rc.npm_audit_signatures(
+                    package, version, run=FakeRun(audit=(1, error)), sleep=lambda s: None, judge=judge
+                ),
+                sleep=lambda s: None,
+            )
+
+    def test_output_that_is_not_a_report_object_is_toolchain(self):
+        for text in (
+            "[]", "null", '"text"', "7", "{}", '{"verified": []}', '{"invalid": "none"}', '{"invalid": [], "verified": {}}',
+            '{"invalid": []}', '{"invalid": [], "missing": []}',
+        ):
+            with self.subTest(text=text), self.assertRaises(rc.InfraError):
+                rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, text)), sleep=lambda s: None)
+
+    def test_a_report_with_nothing_verified_is_still_a_verdict(self):
+        # An npm that honours --include-attestations prints the verified list even when it is empty.
+        report = rc.npm_audit_signatures(
+            rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": [], "verified": []}))),
+            sleep=lambda s: None,
+        )
+        self.assertEqual((report["invalid"], report["verified"]), ([], []))
+
+    def test_a_report_without_a_verified_list_is_toolchain_not_a_missing_attestation(self):
+        # No list at all is an npm that ignored the flag, and says nothing about the release.
+        sleeps = []
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.npm_audit_signatures(
+                rc.PACKAGE, "0.9.14", run=FakeRun(audit=(1, json.dumps({"invalid": [], "missing": []}))), sleep=sleeps.append
+            )
+        self.assertEqual(caught.exception.check, "toolchain")
+        self.assertIn("NOT a signature result", caught.exception.detail)
+        self.assertEqual(sleeps, [], "a report npm cannot have meant is not waited out")
+
+    def test_an_npm_older_than_11_12_is_toolchain(self):
+        # --include-attestations first shipped in 11.12.0. An 11.0 to 11.11 npm takes the flag
+        # without an error and prints no attestations, so it must be refused as the toolchain.
+        for version in ("10.9.2", "9.0.0", "11.0.0", "11.5.1", "11.11.0", "11.11.9"):
+            with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
+                rc.npm_audit_signatures(
+                    rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
+                    sleep=lambda s: None,
+                )
+            self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("11.12.0", caught.exception.detail)
+            self.assertIn("NOT a signature result", caught.exception.detail)
+
+    def test_npm_11_12_and_later_is_accepted(self):
+        for version in ("11.12.0", "11.12.1", "11.16.0", "11.19.0", "12.0.0", "11.12.0-pre.1"):
+            with self.subTest(version=version):
+                run = FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14"))))
+                report = rc.npm_audit_signatures(rc.PACKAGE, "0.9.14", run=run, sleep=lambda s: None)
+                self.assertEqual(report["verified"][0]["version"], "0.9.14")
+
+    def test_an_unreadable_npm_version_is_toolchain(self):
+        # The audit itself would pass, so only the version gate can be what refuses.
+        for version in ("banana", "11", "11.12", ""):
+            with self.subTest(version=version), self.assertRaises(rc.InfraError) as caught:
+                rc.npm_audit_signatures(
+                    rc.PACKAGE, "0.9.14", run=FakeRun(npm_version=version, audit=(0, json.dumps(ts.audit_output("0.9.14")))),
+                    sleep=lambda s: None,
+                )
+            self.assertEqual(caught.exception.check, "toolchain")
+            self.assertIn("could not read npm's version", caught.exception.detail)
+
     def test_missing_npm_is_toolchain(self):
         def run(args, **kwargs):
             raise FileNotFoundError("npm")
@@ -423,13 +757,8 @@ class TestNpmAuditSignatures(unittest.TestCase):
 class TestVerifyRelease(unittest.TestCase):
     def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
         fetch = ts.FakeFetch(routes if routes is not None else ts.release_routes(version))
-        queue = list(audits if audits is not None else [ts.audit_output(version)])
-
-        def audit(package, v):
-            self.assertEqual((package, v), (rc.PACKAGE, version))
-            return queue.pop(0) if len(queue) > 1 else queue[0]
-
         recorded = sleeps if sleeps is not None else []
+        audit = ts.scripted_audit(self, version, audits if audits is not None else [ts.audit_output(version)], recorded.append)
         return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
 
     def refused(self, check, **kwargs):
@@ -447,7 +776,71 @@ class TestVerifyRelease(unittest.TestCase):
 
     def test_the_commit_check_asks_whether_main_is_ahead_of_the_commit(self):
         _, fetch = self.verify()
-        self.assertIn(f"{rc.AI_TC_API}/compare/{ts.ATTESTED['0.9.14']}...main?per_page=1", fetch.urls())
+        self.assertIn(ts.compare_url(ts.ATTESTED["0.9.14"]), fetch.urls())
+
+    def test_the_comparison_is_made_against_the_resolved_head_of_main_never_the_name(self):
+        # A tag named main in ai-tc could make the short name ambiguous, so the branch is read
+        # by its fully qualified ref and the comparison names the sha that read returned.
+        other = "d" * 40
+        _, fetch = self.verify(routes=ts.release_routes("0.9.14", main_sha=other))
+        commit = ts.ATTESTED["0.9.14"]
+        urls = fetch.urls()
+        self.assertEqual(
+            [u for u in urls if u.startswith(f"{rc.AI_TC_API}/")],
+            [ts.main_ref_url(), f"{rc.AI_TC_API}/compare/{commit}...{other}?per_page=1"],
+        )
+        self.assertFalse([u for u in urls if "...main" in u])
+
+    def test_a_failed_main_ref_read_is_no_verdict(self):
+        for status, body in ((404, {"message": "Not Found"}), (403, b""), (502, b"")):
+            with self.subTest(status=status):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.main_ref_url()] = (status, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+
+    def test_a_malformed_main_ref_is_no_verdict(self):
+        good = ts.main_ref_body()
+        for label, body in (
+            ("not json", b"<html>"),
+            ("a list", [good]),
+            ("no object", {"ref": "refs/heads/main"}),
+            ("object not a mapping", {"ref": "refs/heads/main", "object": "abc"}),
+            ("no sha", {"ref": "refs/heads/main", "object": {}}),
+            ("short sha", {"ref": "refs/heads/main", "object": {"sha": "abc123"}}),
+            ("uppercase sha", {"ref": "refs/heads/main", "object": {"sha": "E" * 40}}),
+            ("sha not a string", {"ref": "refs/heads/main", "object": {"sha": 7}}),
+            ("another ref", {**good, "ref": "refs/tags/main"}),
+            ("a duplicated key", b'{"ref": "refs/heads/main", "ref": "refs/heads/main", "object": {"sha": "' + b"e" * 40 + b'"}}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.main_ref_url()] = (200, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+
+    def test_a_compare_answer_that_is_not_a_json_object_is_no_verdict(self):
+        # A 200 whose body is not the comparison says nothing about the commit, so it is neither a
+        # refusal nor a crash.
+        for label, body in (
+            ("not json", b"<html>"),
+            ("empty", b""),
+            ("a list", b"[]"),
+            ("a string", b'"ahead"'),
+            ("null", b"null"),
+            ("a duplicated key", b'{"status": "behind", "status": "ahead"}'),
+            ("nested too deeply", b"[" * 100000 + b"]" * 100000),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = (200, body)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.verify(routes=routes)
+                self.assertEqual(caught.exception.check, "commit-on-main")
+                self.assertIn("compare", caught.exception.detail)
 
     def test_identical_to_main_passes(self):
         self.verify(routes=ts.release_routes("0.9.14", compare="identical"))
@@ -458,6 +851,21 @@ class TestVerifyRelease(unittest.TestCase):
 
     def test_diverged_is_refused(self):
         self.refused("commit-on-main", routes=ts.release_routes("0.9.14", compare="diverged"))
+
+    def test_a_422_and_an_object_with_no_known_status_are_verdicts(self):
+        # What commit_on_ai_tc_main's docstring says: GitHub cannot compare the two (404 or
+        # 422), or it answered a JSON object whose status is neither ahead nor identical.
+        # Only a body that is not that object, or another HTTP status, is no verdict.
+        for label, answer in (
+            ("a 422", (422, {"message": "No common ancestor"})),
+            ("an empty object", (200, {})),
+            ("a status of another kind", (200, {"status": "later"})),
+            ("a status that is not a string", (200, {"status": 7})),
+        ):
+            with self.subTest(label):
+                routes = ts.release_routes("0.9.14")
+                routes[ts.compare_url(ts.ATTESTED["0.9.14"])] = answer
+                self.refused("commit-on-main", routes=routes)
 
     def test_an_unknown_commit_is_refused(self):
         routes = ts.release_routes("0.9.14")
@@ -473,7 +881,7 @@ class TestVerifyRelease(unittest.TestCase):
     def test_a_non_exact_version_is_refused_before_any_request(self):
         fetch = ts.FakeFetch()
         with self.assertRaises(rc.ReleaseCheckError) as caught:
-            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v: {}, sleep=lambda s: None)
+            rc.verify_release("0.9.15-rc1", fetch=fetch, audit=lambda p, v, judge: {}, sleep=lambda s: None)
         self.assertEqual((caught.exception.check, fetch.calls), ("version", []))
 
     def test_registry_lag_is_retried(self):
@@ -1199,3 +1607,590 @@ class TestDiffMode(unittest.TestCase):
         head["plugins"].append(copy.deepcopy(head["plugins"][2]))
         with self.assertRaises(rc.ReleaseCheckError):
             rc.diff_mode(ts.manifest(), head)
+
+
+BOT = "aka-marketplace-bot[bot]"
+
+
+class TestParseTagMessage(unittest.TestCase):
+    def test_subject_and_fields(self):
+        fields = rc.parse_tag_message("fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\npr: #14\ndrill: true\n")
+        self.assertEqual(fields["subject"], "fleet-v9: ai-tc 0.9.15")
+        self.assertEqual((fields["version"], fields["pr"], fields["drill"]), ("0.9.15", "#14", "true"))
+
+    def test_the_first_value_wins(self):
+        self.assertEqual(rc.parse_tag_message("s\nversion: 1\nversion: 2")["version"], "1")
+
+
+class TestAuditTags(unittest.TestCase):
+    def setUp(self):
+        self.repo = ts.Repo(self)
+        for number, version in ((1, "0.9.6"), (2, "0.9.8"), (3, "0.9.9")):
+            self.repo.commit(ts.manifest(version), message=f"pin {version}")
+            self.repo.tag(f"fleet-v{number}", f"fleet-v{number}: a message cut by hand")
+        self.scratch = ts.Repo(self)  # lists live outside the audited repository
+        self.frozen = self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
+        self.fetch = ts.FakeFetch()
+        patcher = mock.patch.object(rc, "BOT_LOGIN", BOT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def audit(self, **kwargs):
+        return rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch, check_rulesets=False, **kwargs)
+
+    def cut(self, version, number, **kwargs):
+        commit = self.repo.commit(ts.manifest(version), message=f"pin {version}")
+        self.tag_at(commit, version, number, **kwargs)
+        return commit
+
+    def tag_at(self, commit, version, number, *, pr=12, author=BOT, merged=True, merge_commit=None, subject=None, recorded=None):
+        recorded = recorded or version
+        lines = [
+            subject or f"fleet-v{number}: ai-tc {recorded}",
+            "",
+            f"version: {recorded}",
+            f"integrity: {ts.INTEGRITY}",
+            f"pr: {pr}",
+            "approver: venuverse",
+            "store-migration: additive",
+        ]
+        self.repo.tag(f"fleet-v{number}", "\n".join(lines), rev=commit)
+        self.fetch.routes[f"{rc.MARKETPLACE_API}/pulls/{pr}"] = (
+            200,
+            {
+                "number": pr,
+                "user": {"login": author},
+                "merged_at": "2026-10-01T00:00:00Z" if merged else None,
+                "merge_commit_sha": merge_commit or commit,
+            },
+        )
+
+    def test_untouched_frozen_tags_pass(self):
+        self.assertEqual(self.audit(), [])
+
+    def test_the_snapshot_has_the_frozen_list_shape(self):
+        rows = rc.snapshot_tags(self.repo.path)
+        self.assertEqual([r["tag"] for r in rows], ["fleet-v1", "fleet-v2", "fleet-v3"])
+        self.assertTrue(all(set(r) == {"tag", "object", "commit"} and r["object"] != r["commit"] for r in rows))
+
+    def test_a_moved_frozen_tag_is_caught(self):
+        ts.git(self.repo.path, "tag", "-f", "-a", "fleet-v2", "-m", "moved", "HEAD")
+        self.assertTrue(any("fleet-v2 changed since the frozen list" in p for p in self.audit()))
+
+    def test_a_deleted_frozen_tag_is_caught(self):
+        ts.git(self.repo.path, "tag", "-d", "fleet-v3")
+        self.assertTrue(any("fleet-v3 is in the frozen list but no longer exists" in p for p in self.audit()))
+
+    def test_any_other_tag_is_caught(self):
+        self.repo.tag("main", "a shadow of the branch")
+        self.assertTrue(any("tag 'main' exists" in p for p in self.audit()))
+
+    def test_a_lightweight_fleet_tag_is_caught(self):
+        self.repo.commit(ts.manifest("0.9.10"))
+        self.repo.tag("fleet-v4", lightweight=True)
+        self.assertTrue(any("fleet-v4 is a lightweight tag" in p for p in self.audit()))
+
+    def test_a_gap_in_numbering_is_caught(self):
+        self.cut("0.9.10", 5)
+        self.assertTrue(any("not contiguous" in p for p in self.audit()))
+
+    def test_a_bot_tag_at_its_merge_commit_passes(self):
+        self.cut("0.9.10", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_removal_is_recorded_as_entry_removed(self):
+        doc = ts.manifest()
+        del doc["plugins"][2]
+        self.tag_at(self.repo.commit(doc), "entry removed", 4)
+        self.assertEqual(self.audit(), [])
+
+    def drop_the_manifest(self):
+        ts.git(self.repo.path, "rm", "-q", rc.MANIFEST)
+        ts.git(self.repo.path, "commit", "-q", "-m", "drop the manifest")
+        return self.repo.head()
+
+    def test_a_tag_at_a_commit_without_the_manifest_records_entry_removed(self):
+        # tag-release cuts a tag at a commit that holds no manifest as "entry removed", so the
+        # audit reads that commit the same way. It is not a failure of git.
+        self.tag_at(self.drop_the_manifest(), "entry removed", 4)
+        self.assertEqual(self.audit(), [])
+
+    def test_a_tag_at_a_commit_without_the_manifest_must_still_record_entry_removed(self):
+        self.tag_at(self.drop_the_manifest(), "0.9.10", 4)
+        self.assertEqual(
+            self.audit(),
+            ["fleet-v4 records version '0.9.10', but the manifest at its commit pins 'entry removed'"],
+        )
+
+    def test_a_manifest_object_git_cannot_read_is_no_verdict_not_drift(self):
+        # The tree lists the file and the blob is gone: git failed, which says nothing about the tag.
+        commit = self.cut("0.9.10", 4)
+        blob = ts.git(self.repo.path, "rev-parse", f"{commit}:{rc.MANIFEST}").strip()
+        loose = os.path.join(self.repo.path, ".git", "objects", blob[:2], blob[2:])
+        os.chmod(loose, 0o644)
+        os.remove(loose)
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
+    def test_a_manifest_directory_git_cannot_list_is_no_verdict_not_drift(self):
+        # The same failure one step earlier: the listing that looks for the file fails, so
+        # nothing is known about the manifest, and reading it as "entry removed" would call
+        # the tag's honest record drift.
+        commit = self.cut("0.9.10", 4)
+        forget_object(self.repo.path, ts.git(self.repo.path, "rev-parse", f"{commit}:{os.path.dirname(rc.MANIFEST)}").strip())
+        with self.assertRaises(rc.InfraError) as caught:
+            self.audit()
+        self.assertEqual(caught.exception.check, "git")
+
+    def test_a_tag_that_misstates_the_version_is_caught(self):
+        self.cut("0.9.10", 4, recorded="0.9.11")
+        self.assertTrue(any("records version '0.9.11'" in p for p in self.audit()))
+
+    def test_a_malformed_subject_is_caught(self):
+        self.cut("0.9.10", 4, subject="fleet-v4 ai-tc 0.9.10")
+        self.assertTrue(any("subject" in p for p in self.audit()))
+
+    def test_a_tag_off_main_is_caught(self):
+        ts.git(self.repo.path, "checkout", "-q", "-b", "side")
+        commit = self.repo.commit(ts.manifest("0.9.10"))
+        ts.git(self.repo.path, "checkout", "-q", "main")
+        self.tag_at(commit, "0.9.10", 4)
+        self.assertTrue(any("not on main's first-parent history" in p for p in self.audit()))
+
+    def test_a_tag_earlier_than_its_predecessor_is_caught(self):
+        self.cut("0.9.10", 4)
+        fleet_v3_commit = ts.git(self.repo.path, "rev-parse", "fleet-v3^{commit}").strip()
+        self.tag_at(fleet_v3_commit, "0.9.9", 5, pr=13)
+        self.assertTrue(any("fleet-v5's commit is not later on main than fleet-v4's" in p for p in self.audit()))
+
+    def test_a_human_pr_is_caught(self):
+        self.cut("0.9.10", 4, author="venuverse")
+        self.assertTrue(any("not the bot App" in p for p in self.audit()))
+
+    def test_an_unmerged_pr_is_caught(self):
+        self.cut("0.9.10", 4, merged=False)
+        self.assertTrue(any("is not merged" in p for p in self.audit()))
+
+    def test_a_different_merge_commit_is_caught(self):
+        self.cut("0.9.10", 4, merge_commit="d" * 40)
+        self.assertTrue(any("is not merged with" in p for p in self.audit()))
+
+    def pull_answer(self, answer, number=12):
+        self.fetch.routes[f"{rc.MARKETPLACE_API}/pulls/{number}"] = answer
+
+    def test_a_tag_naming_a_pull_request_that_does_not_exist_is_caught(self):
+        self.cut("0.9.10", 4)
+        self.pull_answer((404, {"message": "Not Found"}))
+        self.assertEqual(self.audit(), ["fleet-v4 names PR #12, which does not exist"])
+
+    def test_a_pull_request_read_that_fails_is_no_verdict_not_drift(self):
+        self.cut("0.9.10", 4)
+        for status in (401, 403, 429, 500, 502):
+            with self.subTest(status=status):
+                self.pull_answer((status, {"message": "no"}))
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+                self.assertIn(str(status), caught.exception.detail)
+
+    def test_a_pull_request_answer_that_is_not_a_json_object_is_no_verdict(self):
+        self.cut("0.9.10", 4)
+        for label, answer in (
+            ("not JSON", (200, b"<html>")),
+            ("a list", (200, [])),
+            ("a string", (200, b'"merged"')),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'{"merged_at": null, "merged_at": "2026-10-01T00:00:00Z"}')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+        ):
+            with self.subTest(answer=label):
+                self.pull_answer(answer)
+                with self.assertRaises(rc.InfraError) as caught:
+                    self.audit()
+                self.assertEqual(caught.exception.check, "api")
+
+    def test_a_pull_request_whose_author_is_not_an_object_is_not_the_bot(self):
+        commit = self.cut("0.9.10", 4)
+        self.pull_answer((200, {"user": "the-bot", "merged_at": "2026-10-01T00:00:00Z", "merge_commit_sha": commit}))
+        self.assertTrue(any("was opened by None, not the bot App" in p for p in self.audit()))
+
+    def test_no_bot_identity_confirms_no_new_tag(self):
+        self.cut("0.9.10", 4)
+        with mock.patch.object(rc, "BOT_LOGIN", None):
+            self.assertTrue(any("no bot identity is configured" in p for p in self.audit()))
+
+    def test_a_break_glass_tag_clears_once_the_frozen_list_names_it(self):
+        self.cut("0.9.10", 4, author="venuverse")
+        self.scratch.write("frozen.json", rc.dump_json(rc.snapshot_tags(self.repo.path)))
+        self.assertEqual(self.audit(), [])
+
+    def test_an_unreadable_frozen_list_is_a_problem(self):
+        self.frozen = os.path.join(self.scratch.path, "absent.json")
+        self.assertTrue(any("unreadable" in p for p in self.audit()))
+
+    def test_the_rulesets_are_audited_when_asked(self):
+        self.fetch.routes.update(ruleset_routes())
+        self.assertEqual(rc.audit_tags(self.repo.path, self.frozen, fetch=self.fetch), [])
+
+
+# Only this repository's own rulesets: includes_parents=false leaves out the organisation's and the enterprise's.
+RULESET_LISTING = f"{rc.MARKETPLACE_API}/rulesets?targets=branch,tag&includes_parents=false&per_page=100"
+
+
+def ruleset_routes(overrides=None, missing=()):
+    listing, routes = [], {}
+    for number, (name, (target, types)) in enumerate(rc.EXPECTED_RULESETS.items(), start=1):
+        if name in missing:
+            continue
+        listing.append({"id": number, "name": name, "target": target, "enforcement": "active"})
+        rules = [{"type": t} for t in sorted(types)]
+        if name == "main":
+            rules = [
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_approving_review_count": 1,
+                        "require_code_owner_review": True,
+                        "dismiss_stale_reviews_on_push": True,
+                        "require_last_push_approval": True,
+                        "required_review_thread_resolution": False,
+                        "allowed_merge_methods": ["squash"],
+                    },
+                },
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": False,
+                        "required_status_checks": [{"context": "validate", "integration_id": 15368}],
+                    },
+                },
+            ]
+        includes, exclude = rc.EXPECTED_REF_PATTERNS[name]
+        body = {
+            "id": number,
+            "name": name,
+            "target": target,
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": list(includes[0]), "exclude": list(exclude)}},
+            "rules": rules,
+        }
+        body.update((overrides or {}).get(name, {}))
+        routes[f"{rc.MARKETPLACE_API}/rulesets/{number}"] = (200, body)
+    routes[RULESET_LISTING] = (200, listing)
+    return routes
+
+
+class TestAuditRulesets(unittest.TestCase):
+    def test_the_seven_rulesets_as_specified_pass(self):
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes())), [])
+        # The include list is compared as a set: GitHub may return the globs in either order.
+        globs = {"include": ["refs/tags/**/*", "refs/tags/*"], "exclude": ["refs/tags/fleet-v*"]}
+        routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
+
+    def test_tags_locked_on_all_is_caught(self):
+        # GitHub documents ~ALL as every branch; on a tag ruleset it could lock no tag.
+        on_all = {"include": ["~ALL"], "exclude": ["refs/tags/fleet-v*"]}
+        routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": on_all}}})
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            ["ruleset 'tags-locked' covers include ['~ALL'] exclude ['refs/tags/fleet-v*'], "
+             "not include ['refs/tags/*', 'refs/tags/**/*'] exclude ['refs/tags/fleet-v*']"],
+        )
+
+    def test_a_missing_ruleset_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(missing=("x4-tags",))))
+        self.assertEqual(problems, ["ruleset 'x4-tags' does not exist"])
+
+    def test_a_duplicated_ruleset_name_is_flagged(self):
+        # Two rulesets named "main" cannot both be the one audited, and the last must not win
+        # silently: an inherited or stray ruleset of the same name would hide the real one.
+        routes = ruleset_routes()
+        listing = routes[RULESET_LISTING][1]
+        # The stray one comes first: neither copy is audited, so it is never fetched.
+        routes[RULESET_LISTING] = (200, [{"id": 99, "name": "main"}] + listing)
+        fetch = ts.FakeFetch(routes)
+        self.assertEqual(rc.audit_rulesets(fetch=fetch), ["ruleset 'main': expected exactly one, found 2"])
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/99", fetch.urls())
+        self.assertNotIn(f"{rc.MARKETPLACE_API}/rulesets/1", fetch.urls())
+
+    def test_every_duplicated_name_is_flagged_once_and_the_others_are_still_audited(self):
+        routes = ruleset_routes({"bot-branches": {"enforcement": "disabled"}})
+        listing = routes[RULESET_LISTING][1]
+        extra = [{"id": 90 + n, "name": name} for n, name in enumerate(("x4-tags", "x4-tags", "tags-locked"))]
+        routes[RULESET_LISTING] = (200, listing + extra)
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            [
+                "ruleset 'tags-locked': expected exactly one, found 2",
+                "ruleset 'bot-branches' is 'disabled', not active",
+                "ruleset 'x4-tags': expected exactly one, found 3",
+            ],
+        )
+
+    def test_only_the_repositorys_own_rulesets_are_listed(self):
+        fetch = ts.FakeFetch(ruleset_routes())
+        rc.audit_rulesets(fetch=fetch)
+        self.assertIn("includes_parents=false", fetch.urls()[0])
+        self.assertIn("per_page=100", fetch.urls()[0])
+
+    def test_a_disabled_ruleset_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"enforcement": "disabled"}})))
+        self.assertEqual(problems, ["ruleset 'fleet-tags-immutable' is 'disabled', not active"])
+
+    def test_a_missing_rule_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"bot-branches": {"rules": [{"type": "creation"}]}})))
+        self.assertEqual(problems, ["ruleset 'bot-branches' lacks rules: deletion, update"])
+
+    def test_a_wrong_target_or_ref_pattern_is_caught(self):
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"tags-locked": {"target": "branch"}})))
+        self.assertEqual(problems, ["ruleset 'tags-locked' targets 'branch', not 'tag'"])
+        retargeted = {"main": {"conditions": {"ref_name": {"include": ["refs/heads/trunk"], "exclude": []}}}}
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes(retargeted)))
+        self.assertEqual(
+            problems,
+            ["ruleset 'main' covers include ['refs/heads/trunk'] exclude [], not include ['refs/heads/main'] exclude []"],
+        )
+        # A probe pattern left in fleet-tags-immutable after the probe is caught too.
+        probe = {"include": ["refs/tags/fleet-v*", "refs/tags/ruleset-probe-*"], "exclude": []}
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"conditions": {"ref_name": probe}}})))
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
+
+    def test_main_must_be_squash_only_and_require_validate_from_actions(self):
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        main["rules"][2]["parameters"]["allowed_merge_methods"] = ["merge", "squash"]
+        main["rules"][3]["parameters"]["required_status_checks"] = [{"context": "validate"}]
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+            [
+                "ruleset 'main': allowed_merge_methods is ['merge', 'squash'], not ['squash']",
+                "ruleset 'main' does not require the validate check from the GitHub Actions app",
+            ],
+        )
+
+    LISTING = RULESET_LISTING
+
+    def no_verdict(self, routes):
+        with self.assertRaises(rc.InfraError) as caught:
+            rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+        self.assertEqual(caught.exception.check, "api")
+        return caught.exception
+
+    def test_a_listing_that_fails_is_no_verdict_not_drift(self):
+        # A 403 or a 502 says nothing about the rulesets, so it must not read as "every ruleset is missing".
+        for status in (401, 403, 404, 429, 500, 502):
+            with self.subTest(status=status):
+                error = self.no_verdict({self.LISTING: (status, b"")})
+                self.assertIn(str(status), error.detail)
+
+    def test_a_listing_that_is_not_a_json_list_is_no_verdict(self):
+        # Iterating a JSON object visits its keys, so every ruleset used to read as missing.
+        for label, answer in (
+            ("an object", (200, {})),
+            ("an object with a message", (200, {"message": "Server Error"})),
+            ("not JSON", (200, b"<html>")),
+            ("null", (200, b"null")),
+            ("a duplicated key", (200, b'[{"name": "main", "name": "other"}]')),
+            ("nested too deeply", (200, b"[" * 100000 + b"]" * 100000)),
+            ("entries that are not objects", (200, ["main", 3])),
+        ):
+            with self.subTest(listing=label):
+                self.no_verdict(ruleset_routes() | {self.LISTING: answer})
+
+    def test_a_ruleset_read_that_fails_is_no_verdict_not_drift(self):
+        for status in (403, 404, 500, 502):
+            with self.subTest(status=status):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/3"] = (status, b"")
+                error = self.no_verdict(routes)
+                self.assertIn(str(status), error.detail)
+
+    def test_a_ruleset_answer_that_is_not_a_json_object_is_no_verdict(self):
+        for label, answer in (("a list", (200, [])), ("not JSON", (200, b"<html>")), ("null", (200, b"null"))):
+            with self.subTest(ruleset=label):
+                self.no_verdict(ruleset_routes() | {f"{rc.MARKETPLACE_API}/rulesets/3": answer})
+
+
+def cli(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = rc.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+class TestCli(unittest.TestCase):
+    def repo(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.13"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.14"))
+        return repo
+
+    def test_verify_version_prints_the_verified_release(self):
+        with mock.patch.object(rc, "verify_release", return_value=fake_verify("0.9.14")):
+            code, out, _ = cli("verify-version", "0.9.14")
+        self.assertEqual((code, json.loads(out)["git_commit"]), (0, ts.ATTESTED["0.9.14"]))
+
+    def test_a_failed_check_exits_1_and_names_the_check(self):
+        with mock.patch.object(rc, "verify_release", side_effect=rc.ReleaseCheckError("commit-on-main", "behind")):
+            code, out, err = cli("verify-version", "0.9.15")
+        self.assertEqual((code, json.loads(out)["error"]["check"]), (1, "commit-on-main"))
+        self.assertIn("::error::commit-on-main: behind", err)
+
+    def test_no_verdict_exits_2(self):
+        with mock.patch.object(rc, "verify_release", side_effect=rc.InfraError("network", "down")):
+            code, out, _ = cli("verify-version", "0.9.15")
+        self.assertEqual((code, json.loads(out)["error"]["check"]), (2, "network"))
+
+    def test_usage_errors_exit_2(self):
+        self.assertEqual(cli("no-such-command")[0], 2)
+        self.assertEqual(cli("floor")[0], 2)
+
+    def test_an_unexpected_error_exits_2_as_internal(self):
+        # Only a verdict exits 1. A bug in this tool, or a document shaped in a way it did
+        # not expect, reaches no verdict, so a caller that fails on any non-zero status
+        # never reads a traceback (exit 1) as "the release failed its checks".
+        before, after = "a" * 40, "b" * 40
+        for error in (AttributeError("'list' object has no attribute 'get'"), TypeError("not subscriptable"), KeyError("status")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    code, out, err = cli("classify", before, after)
+                self.assertEqual(code, 2)
+                document = json.loads(out)["error"]
+                self.assertEqual(document["check"], "internal")
+                self.assertIn(type(error).__name__, document["detail"])
+                self.assertIn("::error::internal: " + type(error).__name__, err)
+
+    def test_an_interrupt_is_not_reported_as_an_internal_error(self):
+        for error in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        cli("classify", "a" * 40, "b" * 40)
+
+    def test_candidates(self):
+        repo = self.repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        candidates.assert_called_once_with({"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"pinned": ["0.9.13", "0.9.14"], "candidates": ["0.9.15"]}))
+
+    def test_classify_prints_a_rollback_safety_entry(self):
+        tag = "0035_migration"
+        result = rc.Classification("not-rollback-safe", [tag], {tag: "additive"})
+        with mock.patch.object(rc, "classify_migrations", return_value=result):
+            code, out, err = cli("classify", ts.ATTESTED["0.9.13"], ts.ATTESTED["0.9.14"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), ts.SEED["0.9.14"])
+        self.assertIn(f"{tag}: additive", err)
+
+    def test_safety_entry(self):
+        repo = self.repo()
+        with mock.patch.object(rc, "safety_entry", return_value=ts.SEED["0.9.14"]) as entry:
+            code, out, _ = cli("safety-entry", "0.9.14", "--repo", repo.path)
+        entry.assert_called_once_with("0.9.14", {"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"version": "0.9.14", "entry": ts.SEED["0.9.14"]}))
+
+    def test_floor_exits_1_when_the_target_crosses_it(self):
+        repo = self.repo()
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        code, out, _ = cli("floor", "0.9.13", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["floor"], result["highest_pinned"]), (1, "0.9.14", "0.9.14"))
+        self.assertEqual(result["error"]["check"], "floor")
+
+    def test_floor_exits_0_when_nothing_is_crossed(self):
+        repo = self.repo()
+        additive = {"0.9.14": {**ts.SEED["0.9.14"], "classification": "additive"}}
+        safety = repo.write("safety.json", rc.dump_json({"versions": additive}))
+        code, out, _ = cli("floor", "0.9.13", "--repo", repo.path, "--safety", safety)
+        self.assertEqual((code, json.loads(out)), (0, {"target": "0.9.13", "highest_pinned": "0.9.14", "floor": None}))
+
+    def test_diff_mode(self):
+        repo = ts.Repo(self)
+        base = repo.write("base.json", rc.dump_json(ts.manifest("0.9.14")))
+        head = repo.write("head.json", rc.dump_json(ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY)))
+        code, out, _ = cli("diff-mode", base, head)
+        self.assertEqual((code, json.loads(out)), (0, {"mode": "advance"}))
+
+    def test_diff_mode_on_an_ambiguous_manifest_exits_1(self):
+        repo = ts.Repo(self)
+        doc = ts.manifest()
+        doc["plugins"].append(copy.deepcopy(doc["plugins"][2]))
+        base = repo.write("base.json", rc.dump_json(ts.manifest()))
+        head = repo.write("head.json", rc.dump_json(doc))
+        self.assertEqual(cli("diff-mode", base, head)[0], 1)
+
+    def test_diff_mode_on_a_duplicate_key_exits_1(self):
+        repo = ts.Repo(self)
+        base = repo.write("base.json", rc.dump_json(ts.manifest()))
+        head = repo.write("head.json", '{"name": "a", "name": "b", "plugins": []}')
+        self.assertEqual(cli("diff-mode", base, head)[0], 1)
+
+    def test_audit_tags_exits_1_with_problems(self):
+        repo = self.repo()
+        frozen = repo.write("frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        repo.tag("stray")
+        code, out, _ = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--no-rulesets")
+        self.assertEqual((code, json.loads(out)["problems"]), (1, ["tag 'stray' exists: no tag other than fleet-v<N> may exist"]))
+
+    def test_the_audit_has_no_previous_run_option(self):
+        # Comparing against the last run's snapshot is tag_audit.py's job. Here a missing
+        # file used to be skipped without a word, so an audit given one checked nothing.
+        repo = self.repo()
+        frozen = repo.write("frozen.json", rc.dump_json(rc.snapshot_tags(repo.path)))
+        code, out, err = cli("audit-tags", "--repo", repo.path, "--frozen", frozen, "--previous", "missing.json", "--no-rulesets")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--previous", err)
+        with self.assertRaises(TypeError):
+            rc.audit_tags(repo.path, frozen, previous_path="missing.json", check_rulesets=False)
+
+    def test_snapshot_tags(self):
+        repo = self.repo()
+        code, out, _ = cli("snapshot-tags", "--repo", repo.path)
+        self.assertEqual((code, [r["tag"] for r in json.loads(out)]), (0, ["fleet-v1"]))
+
+    def numeric_order_repo(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.9"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.10"))
+        repo.tag("fleet-v2")
+        repo.commit(ts.manifest("0.9.14"))
+        return repo
+
+    def test_versions_are_ordered_numerically_wherever_the_cli_lists_or_picks_one(self):
+        repo = self.numeric_order_repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=[]):
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        self.assertEqual((code, json.loads(out)["pinned"]), (0, ["0.9.9", "0.9.10", "0.9.14"]))
+        # Its own classifications: 0.9.14 is stated here, so a change to the seeded
+        # classification of any version cannot move this test's expected floor.
+        versions = {
+            version: {**ts.SEED[version], "classification": classification}
+            for version, classification in (
+                ("0.9.9", "additive"),
+                ("0.9.10", "additive"),
+                ("0.9.14", "not-rollback-safe"),
+            )
+        }
+        safety = repo.write("safety.json", rc.dump_json({"versions": versions}))
+        code, out, _ = cli("floor", "0.9.10", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["highest_pinned"], result["floor"]), (1, "0.9.14", "0.9.14"))
+
+    def test_the_highest_pin_is_the_numerically_highest_when_text_order_would_pick_another(self):
+        repo = ts.Repo(self)
+        repo.commit(ts.manifest("0.9.9"))
+        repo.tag("fleet-v1")
+        repo.commit(ts.manifest("0.9.10"))
+        safety = repo.write("safety.json", rc.dump_json({"versions": ts.SEED}))
+        code, out, _ = cli("floor", "0.9.9", "--repo", repo.path, "--safety", safety)
+        result = json.loads(out)
+        self.assertEqual((code, result["highest_pinned"], result["floor"]), (1, "0.9.10", "0.9.10"))

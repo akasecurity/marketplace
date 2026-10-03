@@ -414,20 +414,35 @@ def dist_url(version):
     return f"{rc.packument_url()}/{version}"
 
 
-def compare_url(commit):
-    return f"{rc.AI_TC_API}/compare/{commit}...main?per_page=1"
+# The commit ai-tc's main branch points at in the fakes. Not any release's attested commit.
+MAIN_SHA = "e" * 40
+
+
+def main_ref_url():
+    return f"{rc.AI_TC_API}/git/ref/heads/main"
+
+
+def main_ref_body(sha=MAIN_SHA):
+    """What GET git/ref/heads/main answers."""
+    return {"ref": "refs/heads/main", "object": {"sha": sha, "type": "commit"}}
+
+
+def compare_url(commit, main_sha=MAIN_SHA):
+    return f"{rc.AI_TC_API}/compare/{commit}...{main_sha}?per_page=1"
 
 
 def contents_url(path, commit):
     return f"{rc.AI_TC_API}/contents/{path}?ref={commit}"
 
 
-def release_routes(version, *, compare="ahead", commit=None, integrity=INTEGRITY):
-    """The registry and GitHub answers for a release that passes every check."""
+def release_routes(version, *, compare="ahead", commit=None, integrity=INTEGRITY, main_sha=MAIN_SHA):
+    """The registry and GitHub answers for a release that passes every check: main's head
+    read, then the comparison against the sha that read returned."""
     commit = commit or ATTESTED.get(version, "c" * 40)
     return {
         dist_url(version): (200, {"version": version, "dist": {"integrity": integrity, "shasum": SHASUM}}),
-        compare_url(commit): (200, {"status": compare, "ahead_by": 1, "behind_by": 0}),
+        main_ref_url(): (200, main_ref_body(main_sha)),
+        compare_url(commit, main_sha): (200, {"status": compare, "ahead_by": 1, "behind_by": 0}),
     }
 
 
@@ -502,19 +517,28 @@ class Repo:
             git(self.path, "tag", "-a", name, "-m", message or name, rev)
 
 
+def scripted_audit(testcase, version, reports, sleep):
+    """An `audit` for verify_release that serves the scripted reports in order (the last one
+    repeats) through the production retry loop, so the waits and the number of audits are the
+    real ones. It stands in for npm_audit_signatures below the judge: nothing here installs
+    anything or checks a report's shape, so a malformed report reaches the judge as it is."""
+    queue = list(reports)
+
+    def audit(package, v, judge):
+        testcase.assertEqual((package, v), (rc.PACKAGE, version))
+        return rc._audit_until_judged(lambda: queue.pop(0) if len(queue) > 1 else queue[0], judge, sleep)
+
+    return audit
+
+
 class VerifyMixin:
     """verify() and its outcomes for a TestCase that drives release_checks.verify_release
     with a fake registry, a fake GitHub and a scripted npm audit."""
 
     def verify(self, version="0.9.14", *, routes=None, audits=None, sleeps=None):
         fetch = FakeFetch(routes if routes is not None else release_routes(version))
-        queue = list(audits if audits is not None else [audit_output(version)])
-
-        def audit(package, v):
-            self.assertEqual((package, v), (rc.PACKAGE, version))
-            return queue.pop(0) if len(queue) > 1 else queue[0]
-
         recorded = sleeps if sleeps is not None else []
+        audit = scripted_audit(self, version, audits if audits is not None else [audit_output(version)], recorded.append)
         return rc.verify_release(version, fetch=fetch, audit=audit, sleep=recorded.append), fetch
 
     def refused(self, check, **kwargs):
