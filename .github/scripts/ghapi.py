@@ -26,10 +26,24 @@ class GitHubError(Exception):
         self.body = body
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect, so a 30x comes back as its own status. urllib's default handler
+    copies the request's headers onto the follow-up request, Authorization included, even
+    when it goes to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
+    """One request; a status other than 2xx comes back as itself, and so does a redirect, which is
+    never followed: the bot's token must not reach a host the API named in a Location header."""
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _OPENER.open(request, timeout=60) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
