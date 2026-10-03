@@ -723,6 +723,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     env = os.environ
     gh = GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"])
+    if args.command == "plan":
+        # The verify job runs the release checks; open-pr runs none (its calls are GitHub's, each
+        # with its own timeout), so it starts no budget. One budget for the whole plan, cleared
+        # below however the run ends: every request and npm call is cut to what remains of it, so
+        # the run ends with a no-verdict of its own before GitHub cancels the job.
+        release_checks.start_budget(release_checks.BUDGET_JOB)
     try:
         if args.command == "plan":
             plan = make_plan(Git(args.repo_dir), gh, repo_dir=args.repo_dir, mode=env.get("MODE") or "forward",
@@ -748,6 +754,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             write_output("proceed", "false")
         return 1
+    finally:
+        release_checks.clear_budget()
     return 0
 
 

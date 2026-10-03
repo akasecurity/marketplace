@@ -133,6 +133,12 @@ class ImporterWorkflow(WorkflowCase):
         self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
         self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
 
+    def test_the_verify_budget_ends_before_the_job_is_cancelled(self):
+        # The plan reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"(?m)^    timeout-minutes: (\d+)\s*$", self.jobs["verify"])
+        self.assertEqual(len(limits), 1, "the verify job must set one timeout")
+        self.assertLess(release_checks.BUDGET_JOB, int(limits[0]) * 60)
+
     def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
         self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
 

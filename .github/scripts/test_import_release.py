@@ -932,6 +932,61 @@ class TestMain(unittest.TestCase):
         self.assertNotIn("proceed=", out.getvalue())
 
 
+class TestMainBudget(unittest.TestCase):
+    """The verify job's checks run inside one time budget, started once and ended with the run."""
+
+    PLAN_ENV = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule"}
+    OPEN_PR_ENV = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
+                   "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+
+    def run_main(self, command: str, env: dict, **patched):
+        with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO):
+            with mock.patch.object(ir, "make_plan", **patched.get("make_plan", {"return_value": forward_plan()})), \
+                    mock.patch.object(ir, "open_pr", **patched.get("open_pr", {"return_value": "opened"})):
+                return ir.main([command])
+
+    def test_the_plan_starts_one_budget_of_about_twenty_five_minutes(self):
+        seen = []
+
+        def watching(*args, **kwargs):
+            seen.append(release_checks.time_left())
+            return forward_plan()
+
+        with mock.patch.object(release_checks, "start_budget", wraps=release_checks.start_budget) as started:
+            self.assertEqual(self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": watching}), 0)
+        started.assert_called_once_with(release_checks.BUDGET_JOB)
+        self.assertEqual(release_checks.BUDGET_JOB, 25 * 60)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "no budget was running while the plan worked")
+        self.assertTrue(release_checks.BUDGET_JOB - 60 < seen[0] <= release_checks.BUDGET_JOB)
+
+    def test_the_budget_ends_with_the_plan_however_it_ends(self):
+        for error in (ir.Refused("nothing new", red=False), ir.Refused("no", red=True),
+                      release_checks.InfraError("network", "down"), release_checks.ReleaseCheckError("safety", "no")):
+            with self.subTest(error=type(error).__name__):
+                self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": error})
+                self.assertIsNone(release_checks.time_left())
+        for error in (KeyError("status"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(type(error)):
+                    self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": error})
+                self.assertIsNone(release_checks.time_left())
+        self.run_main("plan", self.PLAN_ENV)
+        self.assertIsNone(release_checks.time_left())
+
+    def test_open_pr_runs_no_release_check_and_starts_no_budget(self):
+        seen = []
+
+        def watching(*args, **kwargs):
+            seen.append(release_checks.time_left())
+            return "opened"
+
+        with mock.patch.object(release_checks, "start_budget") as started:
+            self.assertEqual(self.run_main("open-pr", self.OPEN_PR_ENV, open_pr={"side_effect": watching}), 0)
+        started.assert_not_called()
+        self.assertEqual(seen, [None])
+
+
 class TestMainNet(PlanCase):
     """Calls into release_checks that a planner leaves unwrapped: an outage or a malformed file there
     ends the run as one annotation and `proceed=false`, so open-pr is skipped, not as a traceback."""
