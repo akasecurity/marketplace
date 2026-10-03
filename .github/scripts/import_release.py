@@ -136,6 +136,22 @@ def pulls_by(pulls: list[dict], pattern: re.Pattern) -> list[dict]:
     return [p for p in pulls if pattern.fullmatch(p["head"])]
 
 
+def merged_bot_versions(bot_closed: list[dict]) -> set[str]:
+    """Versions the release bot's merged pull requests put on main or took it back from: the version
+    of each merged bot/pin-ai-tc-<v> and the `from` of each merged bot/rollback-ai-tc-<from>-to-<to>.
+    A fleet-v tag records a pin too, but tags are cut after the merge and only while tag-release is
+    green, so a version can sit on main untagged; a version a rollback moved away from is exactly the
+    one no tag may name. `bot_closed` is already the bot's own pull requests (bot_pulls)."""
+    versions = set()
+    for pr in bot_closed:
+        if not pr["merged"]:
+            continue
+        match = PIN_BRANCH.fullmatch(pr["head"]) or ROLLBACK_BRANCH.fullmatch(pr["head"])
+        if match:
+            versions.add(match.group(1))
+    return versions
+
+
 def edit_pin(raw: str, plan: dict) -> str:
     """Forward and rollback change exactly source.version and metadata.integrity of the ai-tc entry."""
     doc = load_stable(raw, MANIFEST)
@@ -380,7 +396,12 @@ def plan_forward(ctx: Context) -> dict:
         raise Refused(f"rollback PR #{rollbacks[0]['number']} is open: the scheduled import opens nothing "
                       "until it merges or closes", red=False)
     pinned = set(release_checks.pinned_versions(ctx.repo_dir))
-    highest = max(pinned, key=vkey)
+    # What "above every version ever pinned" means: main and the fleet-v tags (`pinned`, which is also what
+    # validate computes a rollback-safety entry from), and the versions the bot's merged pull requests put
+    # on main or took it back from, which no tag need name.
+    bot_closed = bot_pulls(list_pulls(ctx.gh, "closed"))
+    ever = pinned | merged_bot_versions(bot_closed)
+    highest = max(ever, key=vkey)
     refused: list[dict] = []
     if ctx.target:
         if not SEMVER.fullmatch(ctx.target):
@@ -389,14 +410,17 @@ def plan_forward(ctx: Context) -> dict:
             raise Refused(f"{ctx.target} is not above main's pin {ctx.current}; moving the pin down is a "
                           "rollback-mode dispatch")
         if not ctx.reimport and not vkey(ctx.target) > vkey(highest):
-            raise Refused(f"{ctx.target} is not above {highest}, the highest version main or a fleet-v tag has "
-                          "pinned; re-promoting a version a rollback moved away from takes reimport: true")
+            raise Refused(f"{ctx.target} is not above {highest}, the highest version main, a fleet-v tag or a "
+                          "merged release-bot pull request has pinned; re-promoting a version a rollback moved "
+                          "away from takes reimport: true")
         release = verify(ctx.target)
     else:
         if ctx.reimport:
             raise Refused("reimport: true needs an explicit target version")
         release = None
-        for candidate in reversed(release_checks.npm_candidates(pinned)):
+        # npm_candidates takes the floor from `ever`; the filter is the same rule stated again, so a
+        # version at or below it is never walked, whatever the list holds.
+        for candidate in reversed([v for v in release_checks.npm_candidates(ever) if vkey(v) > vkey(highest)]):
             try:
                 release = release_checks.verify_release(candidate)
                 break
@@ -424,7 +448,7 @@ def plan_forward(ctx: Context) -> dict:
     if same:
         raise Refused(f"PR #{same[0]['number']} for {version} is already open", red=False)
     if not ctx.reimport:
-        closed = [p for p in bot_pulls(list_pulls(ctx.gh, "closed")) if p["head"] == branch and not p["merged"]]
+        closed = [p for p in bot_closed if p["head"] == branch and not p["merged"]]
         if closed:
             raise Refused(f"a bot PR for {version} (#{closed[0]['number']}) was closed unmerged; that rejection "
                           "stands until a dispatch with reimport: true", red=not scheduled)

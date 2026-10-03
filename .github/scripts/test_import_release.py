@@ -486,6 +486,68 @@ class TestPlanForward(PlanCase):
         self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.15"])
         self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.15"], ATTESTED["0.9.16"])
 
+    def merged_bot_prs(self, *heads: str, author: str = BOT) -> None:
+        """Merged pull requests into main from `heads`, the way the closed listing returns them."""
+        for number, head in enumerate(heads, start=30):
+            self.pulls.append(pull(number, head, state="closed", merged=True, author=author))
+
+    ROLLED_BACK_PRS = (("a merged pin", ("bot/pin-ai-tc-0.9.15",)),
+                       ("a merged rollback away from it", ("bot/rollback-ai-tc-0.9.15-to-0.9.14",)),
+                       ("both", ("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")))
+
+    def test_a_version_a_merged_bot_pr_pinned_is_not_offered_again_on_schedule(self):
+        # No fleet-v tag names 0.9.15 (it was merged, then rolled back before a tag was cut, or the tag run
+        # was red), so the tag ledger alone would offer it again as the next release.
+        self.candidates = ["0.9.15"]
+        for label, heads in self.ROLLED_BACK_PRS:
+            with self.subTest(label):
+                self.pulls.clear()
+                self.merged_bot_prs(*heads)
+                with self.assertRaisesRegex(ir.Refused, "npm has no exact release above 0.9.15") as caught:
+                    self.plan()
+                self.assertFalse(caught.exception.red)
+                self.stubs["verify_release"].assert_not_called()
+
+    def test_the_candidate_floor_includes_the_versions_merged_bot_prs_pinned(self):
+        self.candidates = ["0.9.16"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        self.assertEqual(self.plan()["version"], "0.9.16")
+        self.stubs["npm_candidates"].assert_called_once_with({"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+
+    def test_a_dispatch_to_a_version_a_merged_bot_pr_pinned_needs_reimport(self):
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        with self.assertRaisesRegex(ir.Refused, "reimport: true") as caught:
+            self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(caught.exception.red)
+        self.assertEqual(self.plan(event="workflow_dispatch", target="0.9.16")["version"], "0.9.16")
+
+    def test_with_reimport_it_proceeds_and_the_entry_is_computed_from_the_tag_ledger(self):
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        plan = self.plan(event="workflow_dispatch", target="0.9.15", reimport=True)
+        self.assertEqual((plan["version"], plan["reimport"], plan["highest_pinned"]), ("0.9.15", True, "0.9.15"))
+        # validate computes the entry from the highest version a fleet-v tag or main pins below this one
+        # (0.9.14 here), so the importer must too, whatever merged bot PRs say.
+        self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.14"])
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+
+    def test_the_next_release_after_an_untagged_merged_pin_still_computes_its_entry_from_the_tag_ledger(self):
+        self.candidates = ["0.9.16"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        plan = self.plan()
+        self.assertEqual((plan["version"], plan["highest_pinned"]), ("0.9.16", "0.9.15"))
+        self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.14"])
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.16"])
+
+    def test_a_merged_pr_someone_else_opened_from_a_bot_name_does_not_count(self):
+        self.candidates = ["0.9.15"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14", author="some-writer")
+        self.assertEqual(self.plan()["version"], "0.9.15")
+
+    def test_only_the_bots_pin_and_rollback_branches_count(self):
+        self.candidates = ["0.9.15"]
+        self.merged_bot_prs("bot/other-ai-tc-0.9.15", "bot/pin-ai-tc-0.9.15-rc1", "feature/pin-ai-tc-0.9.15")
+        self.assertEqual(self.plan()["version"], "0.9.15")
+
     def test_a_dispatched_target_that_fails_verification_is_red(self):
         self.bad = {"0.9.15": ("commit-on-main", "behind")}
         with self.assertRaisesRegex(ir.Refused, "0.9.15 fails the release checks: commit-on-main: behind") as caught:

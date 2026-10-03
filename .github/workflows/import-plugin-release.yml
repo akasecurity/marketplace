@@ -26,8 +26,10 @@ name: import-plugin-release
 # workflow token causes start no pull_request_target or push runs.
 #
 # Direction. The schedule only moves the pin up, and only above every version
-# ever pinned: a version a rollback moved away from, or whose PR a code owner
-# closed unmerged, comes back only through a dispatch with reimport: true.
+# ever pinned (on main, by a fleet-v tag, or by a merged pull request of the
+# release bot's, since a merged pin may be untagged): a version a rollback moved
+# away from, or whose PR a code owner closed unmerged, comes back only through a
+# dispatch with reimport: true.
 # Moving the pin down is mode rollback, to a version a fleet-v tag has pinned
 # and not below the rollback floor in rollback-safety.json (below_floor opens the
 # PR anyway; validate then fails it, so only an org owner's break-glass merge
