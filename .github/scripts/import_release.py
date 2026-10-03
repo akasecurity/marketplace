@@ -32,7 +32,8 @@ from typing import Any, Callable
 import release_checks
 from ghapi import GitHub, GitHubError
 from gitrepo import Git
-from release_checks import FLEET_TAG, INTEGRITY, MANIFEST, PACKAGE, SAFETY_FILE, SEMVER, SHA40, dump_json, vkey
+from release_checks import (FLEET_TAG, INTEGRITY, MANIFEST, MIGRATION_TAG, PACKAGE, RUN_URL, SAFETY_FILE, SEMVER,
+                            SHA40, SHASUM, dump_json, vkey)
 
 # The paths, patterns, version order and JSON writer above are release_checks.py's, the
 # module validate runs, so the importer and validate cannot disagree about them. These
@@ -170,30 +171,69 @@ def add_safety_entry(raw: str, version: str, entry: dict) -> str | None:
     return dump_json(doc)
 
 
+# The title is built here, from the mode and the versions, by the planner and again by open-pr: a plan's own
+# "title" field is never read back, so nothing in it can reach the commit message or the PR.
 MODE_RULES: dict[str, dict] = {
     "forward": {"branch": lambda plan: f"bot/pin-ai-tc-{plan['version']}",
-                "required": ("version", "from_version", "integrity", "git_commit")},
+                "title": lambda plan: f"feat: advance the ai-tc pin to {plan['version']}",
+                "required": ("version", "from_version", "integrity", "git_commit", "shasum", "run_url",
+                             "highest_pinned")},
     "rollback": {"branch": lambda plan: f"bot/rollback-ai-tc-{plan['from_version']}-to-{plan['version']}",
-                 "required": ("version", "from_version", "integrity", "git_commit")},
+                 "title": lambda plan: f"fix: roll the ai-tc pin back from {plan['from_version']} to {plan['version']}",
+                 "required": ("version", "from_version", "integrity", "git_commit", "shasum", "run_url",
+                              "highest_pinned")},
 }
+CLASSIFICATIONS = ("additive", "not-rollback-safe")
 
 
 def check_plan(plan: dict) -> None:
-    """The verify job's output crosses a job boundary: re-check its shape before acting on it."""
+    """The verify job's output crosses a job boundary: re-check it before acting on it. Every field that
+    reaches the commit, the branch, the labels or the PR text is checked here or built by open-pr itself."""
     rules = MODE_RULES.get(plan.get("mode"))
     if rules is None:
         raise Refused(f"the plan names mode {plan.get('mode')!r}, which open-pr does not handle")
     for key in rules["required"]:
         if not plan.get(key):
             raise Refused(f"the plan has no {key}")
-    for key, pattern in (("version", SEMVER), ("from_version", SEMVER), ("integrity", INTEGRITY), ("git_commit", SHA40)):
+    # A value of None is allowed where the key is not required: floor and target_tag are None unless a
+    # rollback names them.
+    for key, pattern in (("version", SEMVER), ("from_version", SEMVER), ("integrity", INTEGRITY), ("git_commit", SHA40),
+                         ("shasum", SHASUM), ("run_url", RUN_URL), ("highest_pinned", SEMVER), ("floor", SEMVER),
+                         ("target_tag", FLEET_TAG)):
         value = plan.get(key)
         if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
             raise Refused(f"the plan's {key} {value!r} is malformed")
+    for key, pattern in (("migrations", MIGRATION_TAG), ("crossed", SEMVER)):
+        value = plan.get(key)
+        if not (isinstance(value, list) and all(isinstance(item, str) and pattern.fullmatch(item) for item in value)):
+            raise Refused(f"the plan's {key} {value!r} is malformed")
+    if plan.get("classification") not in CLASSIFICATIONS:
+        raise Refused(f"the plan's classification {plan.get('classification')!r} is malformed")
+    for key in ("reimport", "below_floor"):
+        if not isinstance(plan.get(key), bool):
+            raise Refused(f"the plan's {key} {plan.get(key)!r} is malformed")
     if plan.get("branch") != rules["branch"](plan):
         raise Refused(f"the plan's branch {plan.get('branch')!r} does not match its mode and versions")
     if not set(plan.get("labels", [])) <= LABELS:
         raise Refused(f"the plan's labels {plan.get('labels')!r} are not the importer's")
+    check_plan_safety_entry(plan)
+
+
+def check_plan_safety_entry(plan: dict) -> None:
+    """The entry the plan asks open-pr to write into rollback-safety.json: none for a rollback, and for a
+    forward import a well-formed entry for the plan's version that agrees with the plan's own
+    classification, migrations and attested commit."""
+    entry = plan.get("safety_entry")
+    if entry is None:
+        return
+    if plan["mode"] != "forward":
+        raise Refused(f"the plan's safety_entry {entry!r} is malformed: only a forward import writes one")
+    if release_checks.safety_problems({"versions": {plan["version"]: entry}}):
+        raise Refused(f"the plan's safety_entry {entry!r} is malformed")
+    if (entry["classification"], entry["migrations"], entry["to"]) != (
+            plan["classification"], plan["migrations"], plan["git_commit"]):
+        raise Refused(f"the plan's safety_entry {entry!r} does not agree with the plan's classification, "
+                      "migrations and commit")
 
 
 def pr_body(plan: dict, run_url: str) -> str:
@@ -410,7 +450,7 @@ def plan_forward(ctx: Context) -> dict:
     else:
         safety_entry = computed
         classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
-    return {**facts(release), "branch": branch, "title": f"feat: advance the ai-tc pin to {version}",
+    return {**facts(release), "branch": branch, "title": MODE_RULES["forward"]["title"]({"version": version}),
             "labels": [], "classification": classification, "migrations": migrations,
             "safety_entry": safety_entry, "refused": refused, "highest_pinned": highest}
 
@@ -455,7 +495,8 @@ def plan_rollback(ctx: Context) -> dict:
                       if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(ctx.current)
                       and entry.get("classification") == "not-rollback-safe"), key=vkey)
     return {**facts(release), "branch": branch,
-            "title": f"fix: roll the ai-tc pin back from {ctx.current} to {version}", "labels": ["rollback"],
+            "title": MODE_RULES["rollback"]["title"]({"version": version, "from_version": ctx.current}),
+            "labels": ["rollback"],
             "classification": "not-rollback-safe" if crossed else "additive", "migrations": [],
             "highest_pinned": highest, "floor": floor, "crossed": crossed, "target_tag": target_tag}
 
@@ -656,6 +697,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
     check_plan(plan)
     bot_login()
     actions = ACTIONS[plan["mode"]]
+    title = MODE_RULES[plan["mode"]]["title"](plan)
     main_sha = gh.get(gh.repo_path("git/ref/heads/main"))["object"]["sha"]
     raw = read_file(gh, MANIFEST, main_sha)
     if raw is None:
@@ -693,7 +735,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
         added = add_safety_entry(safety_raw, plan["version"], plan["safety_entry"])
         if added is not None:
             files[SAFETY_FILE] = added
-    commit = create_commit(gh, main_sha, files, plan["title"])
+    commit = create_commit(gh, main_sha, files, title)
     try:
         gh.post(gh.repo_path("git/refs"), {"ref": f"refs/heads/{branch}", "sha": commit})
     except GitHubError as error:
@@ -703,7 +745,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
         if branch_exists(gh, branch):
             raise Refused(f"{branch} was created by another run first", red=False) from error
         raise Refused(f"GitHub refused to create {branch}, and it does not exist: {error.body[:500]}") from error
-    pr = gh.post(gh.repo_path("pulls"), {"title": plan["title"], "head": branch, "base": "main",
+    pr = gh.post(gh.repo_path("pulls"), {"title": title, "head": branch, "base": "main",
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
         gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})

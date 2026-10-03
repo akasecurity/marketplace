@@ -169,6 +169,70 @@ class TestCheckPlan(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ir.Refused):
                 ir.check_plan(plan)
 
+    HOSTILE = "x`](https://evil.example)"
+
+    def test_every_published_field_is_rechecked(self):
+        # open-pr does not trust the verify job's output: whatever reaches the PR's text, its commit or
+        # its branch is matched against the pattern the release checks use, with a markdown or backtick
+        # payload where a name or a number belongs.
+        for key, bad, make in (
+            ("shasum", self.HOSTILE, forward_plan),
+            ("shasum", "a" * 39, forward_plan),
+            ("run_url", "[validate passed](https://evil.example)", forward_plan),
+            ("run_url", "https://github.com/someone/else/actions/runs/1", forward_plan),
+            ("classification", self.HOSTILE, forward_plan),
+            ("classification", None, forward_plan),
+            ("migrations", [self.HOSTILE], forward_plan),
+            ("migrations", "0036_add_column", forward_plan),
+            ("migrations", [7], forward_plan),
+            ("highest_pinned", self.HOSTILE, forward_plan),
+            ("highest_pinned", "0.9.014", forward_plan),
+            ("floor", self.HOSTILE, rollback_plan),
+            ("crossed", [self.HOSTILE], rollback_plan),
+            ("crossed", "0.9.14", rollback_plan),
+            ("target_tag", self.HOSTILE, rollback_plan),
+            ("target_tag", "fleet-v0", rollback_plan),
+            ("reimport", "yes", forward_plan),
+            ("below_floor", 1, rollback_plan),
+        ):
+            with self.subTest(key=key, bad=bad):
+                plan = make()
+                plan[key] = bad
+                with self.assertRaisesRegex(ir.Refused, rf"the plan's {key} .* is malformed"):
+                    ir.check_plan(plan)
+
+    def test_the_fields_a_real_plan_always_carries_are_required(self):
+        for key in ("shasum", "run_url", "highest_pinned"):
+            for make in (forward_plan, rollback_plan):
+                with self.subTest(key=key, plan=make.__name__):
+                    plan = make()
+                    del plan[key]
+                    with self.assertRaisesRegex(ir.Refused, f"the plan has no {key}"):
+                        ir.check_plan(plan)
+
+    def test_a_safety_entry_must_be_well_formed_and_agree_with_the_plan(self):
+        good = safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",))
+        ir.check_plan(forward_plan(safety_entry=good))
+        ir.check_plan(forward_plan(safety_entry=None))
+        for label, entry in (
+            ("another class", {**good, "classification": "not-rollback-safe"}),
+            ("other migrations", {**good, "migrations": ["0099_other"]}),
+            ("a hostile migration name", {**good, "migrations": [self.HOSTILE]}),
+            ("another attested commit", {**good, "to": "b" * 40}),
+            ("a commit that is not one", {**good, "from": self.HOSTILE}),
+            ("keys out of order", dict(reversed(list(good.items())))),
+            ("an extra key", {**good, "note": "x"}),
+            ("not an object", "additive"),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ir.Refused, "the plan's safety_entry .* (is malformed|does not agree)"):
+                    ir.check_plan(forward_plan(safety_entry=entry))
+
+    def test_a_rollback_plan_carries_no_safety_entry(self):
+        entry = safety_entry("0.9.13", "0.9.12", "not-rollback-safe", ())
+        with self.assertRaisesRegex(ir.Refused, "only a forward import writes one"):
+            ir.check_plan(rollback_plan(safety_entry=entry))
+
 
 class TestPrBody(unittest.TestCase):
     def test_a_forward_body_carries_the_verified_facts_and_the_checklist(self):
@@ -671,6 +735,13 @@ class TestOpenPrForward(OpenPrCase):
         self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
         self.assertEqual(self.gh.called("POST", R("issues/12/labels")), [])
 
+    def test_the_title_is_built_from_the_mode_and_the_versions_not_read_from_the_plan(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan(title="[a title](https://evil.example)"))
+        title = "feat: advance the ai-tc pin to 0.9.15"
+        self.assertEqual(self.gh.called("POST", R("pulls"))[0][2]["title"], title)
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"], title)
+
     def test_a_commit_github_committed_but_did_not_sign_gets_no_branch(self):
         self.route_branch("bot/pin-ai-tc-0.9.15")
         self.gh.routes[("POST", R("git/commits"))] = {
@@ -875,6 +946,14 @@ class TestOpenPrRollback(OpenPrCase):
         self.assertEqual([item["path"] for item in self.gh.called("POST", R("git/trees"))[0][2]["tree"]], [MANIFEST])
         self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"],
                          "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13")
+
+    def test_the_title_is_built_from_the_mode_and_the_versions_not_read_from_the_plan(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.open(rollback_plan(title="[a title](https://evil.example)"))
+        title = "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13"
+        self.assertEqual(self.gh.called("POST", R("pulls"))[0][2]["title"], title)
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"], title)
 
     def test_a_stale_rollback_branch_without_a_pr_is_replaced(self):
         self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13", exists=True)
