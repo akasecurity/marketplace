@@ -16,7 +16,8 @@ it fails, and 2 on a usage error, when no verdict could be reached (network, npm
 GitHub API trouble), or on any unexpected error (reported as the check "internal"). Only
 a verdict exits 1, so a caller that fails on any non-zero status never reads a defect in
 this tool as a release that failed its checks. The argument parser reports its own usage
-errors on stderr alone, with no JSON. Human-readable detail goes to stderr.
+errors on stderr alone, with no JSON; a version that is not an exact x.y.z, or a commit id
+that is not 40 lower-case hex, is one of them. Human-readable detail goes to stderr.
 """
 
 from __future__ import annotations
@@ -99,6 +100,31 @@ MIGRATION_TAG = re.compile(r"[0-9]{4}_[a-z0-9_]+")
 ATTEMPTS = 5
 RETRY_SECONDS = 20
 
+# How long one HTTP request may run before it counts as no answer.
+HTTP_TIMEOUT = 60
+
+# The worst case for ONE version, if every call runs to its bound and every retry is used:
+#   the registry read of the version    5 x 60 s + 4 x 20 s waits     =  380 s
+#   npm init and npm --version          2 x 120 s                     =  240 s
+#   npm install                         5 x 300 s + 4 x 20 s waits    = 1580 s
+#   npm audit signatures                5 x 120 s + 4 x 20 s waits    =  680 s
+#   the two GitHub reads                2 x 60 s                      =  120 s
+#                                                                      -------
+#                                                                       3000 s, 50 minutes
+# A caller verifies more than one version, and the migration reads that classify_migrations
+# makes sit outside verify_release altogether, so a run cannot rely on those bounds alone: a
+# workflow job would be killed by GitHub before this script said "no verdict" itself. One
+# budget bounds the whole run instead. An entry point starts it once (start_budget); every
+# HTTP request and npm call is clipped to what remains of it, and a wait between attempts that
+# would use up the rest ends the run with InfraError("deadline") rather than start an attempt
+# that cannot finish. Each figure is below the limit of the job that runs the checks, so the
+# script's own "no verdict" comes first, and leaves the job room to set itself up: validate and
+# the importer's verify job are allowed 30 minutes, staleness 45 minutes for every candidate it
+# verifies, and a person at a terminal is given 20.
+BUDGET_CLI = 20 * 60  # the command line
+BUDGET_JOB = 25 * 60  # validate and the importer's verify job
+BUDGET_STALENESS = 40 * 60  # the staleness check
+
 
 class _CheckFailure(Exception):
     """What every release-check failure carries: the check's name and a detail. It exists
@@ -119,6 +145,70 @@ class InfraError(_CheckFailure):
     """No verdict: the network, npm, git or an API failed (CLI exit 2). Deliberately NOT a
     ReleaseCheckError: a handler written for a verdict never catches an outage, so an
     unhandled one stops the run instead of reading as a refusal."""
+
+
+class _Budget:
+    """The time one run may take, counted on a monotonic clock."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float]) -> None:
+        self.seconds = seconds
+        self.clock = clock
+        self.end = clock() + seconds
+
+    def left(self) -> float:
+        return self.end - self.clock()
+
+
+_budget: _Budget | None = None
+
+
+def start_budget(seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+    """Give this run `seconds` to finish, counted from now. Each entry point calls this once,
+    first thing; calling it again would start the count over. `clock` is for tests."""
+    global _budget
+    _budget = _Budget(seconds, clock)
+
+
+def clear_budget() -> None:
+    """End the budget: every call is bounded by its own timeout alone again."""
+    global _budget
+    _budget = None
+
+
+def time_left() -> float | None:
+    """Seconds of the budget that remain (negative once it has run out), or None when no
+    budget was started."""
+    return None if _budget is None else _budget.left()
+
+
+def _out_of_time(when: str) -> InfraError:
+    seconds = _budget.seconds if _budget is not None else 0
+    return InfraError("deadline", f"this run's {seconds:g} s time budget ran out {when}: no verdict (NOT a failed check)")
+
+
+def _time_for(seconds: float, what: str) -> float:
+    """How long `what` may run: `seconds`, or what remains of the budget when that is less.
+    With nothing remaining it is not started: InfraError("deadline")."""
+    left = time_left()
+    if left is None:
+        return seconds
+    if left <= 0:
+        raise _out_of_time(f"before {what} could start")
+    return min(seconds, left)
+
+
+def _budget_spent() -> bool:
+    left = time_left()
+    return left is not None and left <= 0
+
+
+def _wait(sleep: Callable, before: str) -> None:
+    """The pause between two attempts. When the budget would be used up by the pause (or has
+    been), the attempt after it could not start, so the run ends here instead."""
+    left = time_left()
+    if left is not None and left <= RETRY_SECONDS:
+        raise _out_of_time(f"before {before} could start")
+    sleep(RETRY_SECONDS)
 
 
 def _reject_duplicates(pairs):
@@ -279,10 +369,14 @@ def _tag_pin(repo_dir: str, tag: str) -> str | None:
     return entry_version(pins[0]) if len(pins) == 1 else None
 
 
-def pins_by_ref(repo_dir: str) -> dict:
-    """{"main": <pin>, "fleet-v1": <pin>, ...}. Strict for main, lenient for history."""
+def pins_by_ref(repo_dir: str, *, main_rev: str | None = None) -> dict:
+    """{"main": <pin>, "fleet-v1": <pin>, ...}. Strict for main, lenient for history.
+
+    Main's pin is read at `main_rev` when a caller that resolved main once passes the
+    commit, so the pins and the caller's other reads of main come from one commit. Without
+    it, main is resolved here, by name."""
     try:
-        main_doc = _read_manifest(repo_dir, main_ref(repo_dir))
+        main_doc = _read_manifest(repo_dir, main_ref(repo_dir) if main_rev is None else main_rev)
     except ValueError as exc:
         raise ReleaseCheckError("manifest", f"main's {MANIFEST} does not parse: {exc}") from exc
     pins = {"main": entry_version(find_ai_tc_entry(main_doc))}
@@ -310,7 +404,8 @@ Fetch = Callable[[str, dict], tuple]
 
 
 def _sends_token_to(url: str) -> bool:
-    """Only api.github.com ever sees the job's token; the registry is read anonymously."""
+    """Only api.github.com ever sees the job's token, and never across a redirect (http_fetch
+    follows none); the registry is read anonymously."""
     return urllib.parse.urlsplit(url).hostname == "api.github.com"
 
 
@@ -324,19 +419,36 @@ def _headers_for(url: str, extra: dict) -> dict:
     return headers
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Follows no redirect, so a 30x comes back as its own status. urllib's default handler
+    copies the request's headers onto the follow-up request, Authorization included, even
+    when it goes to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised; no answer at all is InfraError,
-    and so is an answer that stops partway: http.client raises its own errors from the status
-    line and the body, which urllib does not wrap, and reading an error status's body can
-    fail the same way."""
+    """GET url. An HTTP error status is returned, not raised, and a redirect is not followed
+    (its status is returned like any other); no answer at all is InfraError, and so is an
+    answer that stops partway: http.client raises its own errors from the status line and
+    the body, which urllib does not wrap, and reading an error status's body can fail the
+    same way. The request is cut to what remains of the run's budget (start_budget), and is
+    not started at all when nothing remains: InfraError("deadline")."""
+    timeout = _time_for(HTTP_TIMEOUT, f"GET {url}")
     request = urllib.request.Request(url, headers=_headers_for(url, headers))
     try:
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        if _budget_spent():
+            raise _out_of_time(f"during GET {url}") from exc
         raise InfraError("network", f"GET {url} failed: {exc}") from exc
 
 
@@ -384,10 +496,12 @@ NPM_TIMEOUT = {"init": 120, "--version": 120, "install": 300, "audit": 120}
 
 
 def _npm(run, args: list, work: str):
-    seconds = NPM_TIMEOUT[args[0]]
+    seconds = _time_for(NPM_TIMEOUT[args[0]], f"npm {args[0]}")
     try:
         return run(["npm", *args], cwd=work, capture_output=True, text=True, timeout=seconds)
     except subprocess.TimeoutExpired as exc:
+        if _budget_spent():
+            raise _out_of_time(f"during npm {args[0]}") from exc
         raise InfraError("toolchain", f"npm {args[0]} did not finish within {seconds} s (NOT a signature result)") from exc
     except OSError as exc:
         raise InfraError("toolchain", f"could not run npm {args[0]}: {exc}") from exc
@@ -446,7 +560,7 @@ def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
 
     audit_once() returns npm's report, or None when npm printed nothing. judge(report)
     returns the result, or raises _NotIndexedYet when the release has no verified attestation
-    YET. Nothing printed and not-yet-indexed are waited out alike, from one budget: on the
+    YET. Nothing printed and not-yet-indexed are waited out alike, from one count of attempts: on the
     last audit each ends as its own error (InfraError, or _NotIndexedYet for the caller to
     turn into a verdict). Any other outcome of judge is final."""
     for attempt in range(1, ATTEMPTS + 1):
@@ -463,7 +577,7 @@ def _audit_until_judged(audit_once: Callable, judge: Callable, sleep) -> object:
             except _NotIndexedYet:
                 if attempt == ATTEMPTS:
                     raise
-        sleep(RETRY_SECONDS)
+        _wait(sleep, "the next audit")
 
 
 def npm_audit_signatures(
@@ -478,9 +592,19 @@ def npm_audit_signatures(
     it. The install happens ONCE: a lagging registry is waited out by auditing again, and each
     audit passes --prefer-online so that it asks the registry instead of reading npm's cached
     copy of the packument (cacheable for five minutes, which would make the retries pointless).
+    That skips npm's local cache only. npmjs' CDN answers from its own copy (max-age 300)
+    whatever the client sends, so the retries, about 80 s apart in all, may all be served the
+    same edge copy: do not count on them to outlast a stale one.
     Needs an npm that honours --include-attestations (11.12 or later). An older one prints no
     `verified` list at all, which is reported as a toolchain failure, not as a missing
-    attestation."""
+    attestation.
+
+    The install and every audit name npmjs as the package's registry on their own command
+    line. `npm audit signatures` takes each package's registry from npm's configuration, which
+    includes a user-level ~/.npmrc and NPM_CONFIG_USERCONFIG, and it fetches the registry's
+    signing keys, the packument and the attestations from there. Left to that configuration,
+    a caller's own registry setting would redirect those reads, and a release that is fine
+    could be refused for lack of attestations."""
     registry_flag = f"--{package.split('/')[0]}:registry={REGISTRY}"
     with tempfile.TemporaryDirectory() as work:
         init = _npm(run, ["init", "-y"], work)
@@ -501,12 +625,17 @@ def npm_audit_signatures(
                     f"npm could not install {package}@{version} after {ATTEMPTS} attempts "
                     f"(a registry or network problem, NOT a signature result): {install.stderr[:2000]}",
                 )
-            sleep(RETRY_SECONDS)
+            _wait(sleep, "the next install")
 
         def audit_once():
             # npm exits 1 when anything is invalid or missing: the JSON is the verdict, the
-            # exit status is not.
-            audit = _npm(run, ["audit", "signatures", "--json", "--include-attestations", "--prefer-online"], work)
+            # exit status is not. --prefer-online skips npm's local cache, not npmjs' CDN's
+            # (see the docstring).
+            audit = _npm(
+                run,
+                ["audit", "signatures", "--json", "--include-attestations", "--prefer-online", registry_flag],
+                work,
+            )
             return _npm_report(audit.stdout) if audit.stdout.strip() else None
 
         return _audit_until_judged(audit_once, judge, sleep)
@@ -539,7 +668,7 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
             if status == 404:
                 raise ReleaseCheckError("dist", f"{REGISTRY} does not serve {PACKAGE}@{version}")
             raise InfraError("dist", f"{REGISTRY} answered {status} for {PACKAGE}@{version}")
-        sleep(RETRY_SECONDS)
+        _wait(sleep, "the next read of the registry")
     try:
         doc = parse_json(body.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
@@ -870,8 +999,15 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
     except (ValueError, RecursionError) as exc:
         raise ReleaseCheckError("provenance", f"the SLSA bundle's statement is unreadable: {exc}") from exc
     subjects = statement.get("subject")
+    # Only text can be the digest of the tarball. A list or an object in a later subject (npm
+    # checks only the first) is unhashable, and putting it in this set would raise TypeError
+    # here, before the certificate's identity is checked below, and lose that refusal.
     attested = {
-        _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        digest
+        for digest in (
+            _field(subject, "digest", "sha512") for subject in (subjects if isinstance(subjects, list) else [])
+        )
+        if isinstance(digest, str)
     }
     dist_hex = base64.b64decode(integrity.split("-", 1)[1]).hex()
     wrong = {name: value for name, value in required_signer(version).items() if signer[name] != value}
@@ -1127,6 +1263,15 @@ def _statements(sql: str) -> list:
     return [statement for chunk in STATEMENT_BREAKPOINT.split(sql) for statement in _chunk_statements(chunk)]
 
 
+# One SQLite name: quoted with backticks, double quotes or brackets (a doubled quote inside stands
+# for one quote), or a run with no quote, space or dot in it. A table and a column are read the
+# same way, so a quoted name that holds the words ADD or DROP stays one name instead of
+# starting a clause; the table may carry a schema in front of it. The dot is left out of the
+# bare run so the schema's dot has one reading and the match stays linear on a long token.
+_SQL_NAME = r"(?:`(?:[^`]|``)*`|\"(?:[^\"]|\"\")*\"|\[[^\]]*\]|[^\s`\"\[\].]+)"
+_SQL_TABLE = rf"(?:{_SQL_NAME}\.)?{_SQL_NAME}"
+
+
 def _non_additive_reason(statement: str) -> str | None:
     upper = statement.upper()
     if upper.startswith("PRAGMA "):
@@ -1141,17 +1286,21 @@ def _non_additive_reason(statement: str) -> str | None:
         return None
     if re.match(r"CREATE UNIQUE INDEX ", upper):
         return "a UNIQUE index, a new constraint an older build's writes can violate"
-    added = re.match(r"ALTER TABLE \S+ ADD (?:COLUMN )?(?:`[^`]*`|\"[^\"]*\"|\[[^\]]*\]|\S+)(.*)", upper)
+    added = re.match(rf"ALTER TABLE {_SQL_TABLE} ADD (?:COLUMN )?{_SQL_NAME}(.*)", upper)
     if added:
         # Only the words after the column's name count, and only as words: the name itself
         # (`is_default`, `x default`) and any quoted name further on are not keywords.
         definition = re.sub(r"`[^`]*`|\"[^\"]*\"|\[[^\]]*\]", " ", added.group(1))
         if re.search(r"\bNOT NULL\b", definition) and not re.search(r"\b(?:DEFAULT|GENERATED)\b", definition):
             return "a NOT NULL column without a default"
+        if re.search(r"\bCHECK\b", definition):
+            return "a CHECK constraint an older build's writes can fail"
+        if re.search(r"\bREFERENCES\b", definition):
+            return "a foreign key an older build's deletes can fail"
         return None
-    if re.match(r"ALTER TABLE \S+ RENAME", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} RENAME", upper):
         return "a rename"
-    if re.match(r"ALTER TABLE \S+ DROP", upper):
+    if re.match(rf"ALTER TABLE {_SQL_TABLE} DROP", upper):
         return "a dropped column"
     if upper.startswith("DROP "):
         return "a drop (" + " ".join(upper.split()[:2]).lower() + ")"
@@ -1211,13 +1360,27 @@ CONTENTS_LISTING_CAP = 1000
 EDITED_IN_PLACE = "non-additive: modified in place since the earlier release"
 UNREADABLE_FILE = "non-additive: the migration file cannot be read"
 
+# ai-tc also changes the store in code, not only through its migration journal: every time it
+# opens a store it runs steps in migrations.ts after the journal loop (add a column, create a
+# trigger, rebuild an index, run a one-time UPDATE), and the trigger's condition comes from
+# sync-failure.ts. A release whose only store change is in these files has no new journal tag.
+# They are compared as whole files (their git blob shas at the two attested commits) and
+# never read: the statements are TypeScript with interpolated names and helper calls, and a
+# shape a reader of that missed would read as additive, the direction this check exists to
+# prevent. migrations.ts is the one file the store cannot be opened without.
+STORE_CODE_DIR = "packages/persistence/src"
+STORE_CODE_ENTRY = "migrations.ts"
+STORE_CODE_FILES = (STORE_CODE_ENTRY, "sync-failure.ts")
+STORE_CODE_CHANGED = "non-additive: the store code ai-tc runs when it opens a store changed outside the migration journal"
+STORE_CODE_MISSING = "non-additive: the store code ai-tc runs at open cannot be found"
 
-def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
-    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
-    or None when that directory is not there. One request however many files it holds.
-    The raw media type the file reads use returns bytes with no sha, so this asks for the
-    JSON listing instead."""
-    url = f"{AI_TC_API}/contents/{MIGRATIONS_DIR}?ref={commit}"
+
+def _directory_listing(directory: str, commit: str, fetch: Fetch) -> list | None:
+    """The entries of one ai-tc directory at commit, or None when that directory is not
+    there. One request however many files it holds. The raw media type the file reads use
+    returns bytes with no sha, so this asks for the JSON listing instead. A listing that
+    fails, is malformed or may be cut short is no verdict."""
+    url = f"{AI_TC_API}/contents/{directory}?ref={commit}"
     status, body = fetch(url, {"Accept": "application/vnd.github+json"})
     if status == 404:
         return None
@@ -1233,6 +1396,15 @@ def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
         raise InfraError(
             "classify", f"GET {url} lists {len(listing)} entries, the API's cap, so the listing may be incomplete"
         )
+    return listing
+
+
+def _migration_blobs(commit: str, fetch: Fetch) -> dict | None:
+    """{tag: git blob sha} for every <tag>.sql in ai-tc's migrations directory at commit,
+    or None when that directory is not there."""
+    listing = _directory_listing(MIGRATIONS_DIR, commit, fetch)
+    if listing is None:
+        return None
     return {
         entry["name"][: -len(".sql")]: entry.get("sha")
         for entry in listing
@@ -1268,9 +1440,49 @@ def _edited_in_place(tags: list, from_commit: str, to_commit: str, fetch: Fetch)
     return kinds
 
 
+def _store_code_blobs(commit: str, fetch: Fetch) -> dict:
+    """{file name: git blob sha} for each of STORE_CODE_FILES that is a plain file in ai-tc's
+    persistence source at commit. A file that is not there, or a directory that is not there,
+    is left out."""
+    listing = _directory_listing(STORE_CODE_DIR, commit, fetch) or []
+    blobs = {}
+    for entry in listing:
+        name = entry.get("name")
+        if name not in STORE_CODE_FILES or entry.get("type") != "file":
+            continue
+        sha = entry.get("sha")
+        if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+            raise InfraError("classify", f"ai-tc's listing gave {sha!r} as the blob sha of {name}")
+        blobs[name] = sha
+    return blobs
+
+
+def _store_code_changes(from_commit: str, to_commit: str, fetch: Fetch) -> dict:
+    """{path: kind} for each store-code file that is not the same blob at the two commits,
+    appeared or vanished, and for the entry file when the later commit has none (ai-tc may
+    have moved it, and then nothing here can say what the store does at open). Empty when
+    the files are the same at both. A listing that fails or is malformed is no verdict."""
+    before, after = (_store_code_blobs(commit, fetch) for commit in (from_commit, to_commit))
+    kinds = {}
+    for name in STORE_CODE_FILES:
+        if name == STORE_CODE_ENTRY and name not in after:
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_MISSING
+        elif before.get(name) != after.get(name):
+            kinds[f"{STORE_CODE_DIR}/{name}"] = STORE_CODE_CHANGED
+    return kinds
+
+
 def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http_fetch) -> Classification:
     """Classify the local-store migrations ai-tc added, removed from the journal or edited
-    in place between two attested commits."""
+    in place between two attested commits, and any change to the store code it runs at open
+    outside that journal (STORE_CODE_FILES).
+
+    The store code is seen as a changed file, not by kind, so an edit to a comment alone
+    flags a release. It is recorded in `kinds` under the file's path and never in
+    `migrations`, which stays a list of journal tags. Some inputs to the store are out of
+    view: the list of event types a one-time UPDATE counts (repositories/history-sync.ts),
+    the adopt-or-replay logic under db/migrations, and the generated schema in
+    packages/schema (ai-tc's own test holds it to the journal's .sql files)."""
     for commit in (from_commit, to_commit):
         if not isinstance(commit, str) or not SHA40.fullmatch(commit):
             raise ReleaseCheckError("classify", f"{commit!r} is not a 40-hex commit id")
@@ -1294,15 +1506,21 @@ def classify_migrations(from_commit: str, to_commit: str, *, fetch: Fetch = http
     edited = _edited_in_place([t for t in after if t in before], from_commit, to_commit, fetch)
     kinds.update(edited)
     migrations = added + removed + list(edited)
+    # Before the early returns: a release whose only store change is in code has no journal
+    # tag, and counts whatever EVERY_MIGRATION_COUNTS says.
+    store_code = _store_code_changes(from_commit, to_commit, fetch)
+    kinds.update(store_code)
+    notes = []
+    if migrations and EVERY_MIGRATION_COUNTS:
+        notes.append(
+            "every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated"
+        )
+    if store_code:
+        notes.append("the store code ai-tc runs when it opens a store changed outside the migration journal")
+    if notes:
+        return Classification("not-rollback-safe", migrations, kinds, note="; ".join(notes))
     if not migrations:
         return Classification("additive", [], kinds)
-    if EVERY_MIGRATION_COUNTS:
-        return Classification(
-            "not-rollback-safe",
-            migrations,
-            kinds,
-            note="every migration counts as not rollback-safe until an older build is measured on a store the newer one migrated",
-        )
     flagged = any(kind != "additive" for kind in kinds.values())
     return Classification("not-rollback-safe" if flagged else "additive", migrations, kinds)
 
@@ -1348,12 +1566,13 @@ def safety_entry(version: str, pinned: set, *, verify=verify_release, classify=c
     return {"classification": result.classification, "from": start, "to": end, "migrations": list(result.migrations)}
 
 
-def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned=()) -> str | None:
+def rollback_floor(safety: dict, target: str, highest_pinned: str, *, pinned) -> str | None:
     """The lowest version V flagged not rollback-safe with target < V <= highest_pinned,
     or None. Anything but an explicit, well-formed "additive" entry counts as flagged, and
     so does a version in `pinned` with no entry at all: a pin that reached main without a
     computed entry (a break-glass merge, a restore, a hand-run import) is no evidence of
-    safety. An entry is judged on its own: one malformed entry flags its own version and
+    safety. `pinned` has no default: leaving it out would drop that rule without saying so.
+    An entry is judged on its own: one malformed entry flags its own version and
     does not stop the others being read, because refusing the file would block every
     rollback."""
     versions = safety.get("versions") if isinstance(safety, dict) else None
@@ -1397,14 +1616,22 @@ def _integrity_only(metadata) -> bool:
     )
 
 
+def description_ok(entry) -> bool:
+    """An entry's description is a non-empty string. Claude Code refuses a manifest whose
+    plugin description is anything else, and a malformed manifest breaks `/plugin
+    marketplace add` for every user. One test, shared by the restore shape below and by
+    validate's check of a person's description edit, so the two cannot drift."""
+    description = entry.get("description") if isinstance(entry, dict) else None
+    return isinstance(description, str) and description.strip() != ""
+
+
 def _restore_shape(entry: dict) -> bool:
     """{name: ai-tc, source: {npm, PACKAGE, x.y.z, REGISTRY}, description, metadata: {integrity}}."""
     source = entry.get("source")
     return (
         set(entry) == {"name", "source", "description", "metadata"}
         and entry["name"] == ENTRY_NAME
-        and isinstance(entry["description"], str)
-        and entry["description"].strip() != ""
+        and description_ok(entry)
         and isinstance(source, dict)
         and set(source) == {"source", "package", "version", "registry"}
         and source["source"] == "npm"
@@ -1424,9 +1651,10 @@ def _without_pin(entry: dict) -> dict:
 
 def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     """Which importer mode a manifest change is EXACTLY. 'none' means the ai-tc entry is
-    unchanged; 'human' means any other change to it."""
+    unchanged; 'human' means any other change to it. The entry is compared as JSON, as the rest
+    of the manifest is, so true, 1 and 1.0 are three different values (Python's == says one)."""
     base, head = find_ai_tc_entry(base_manifest), find_ai_tc_entry(head_manifest)
-    if base == head:
+    if _canonical(base) == _canonical(head):
         return "none"
     if _rest_of(base_manifest) != _rest_of(head_manifest):
         return "human"
@@ -1437,7 +1665,7 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
     old, new = entry_version(base), entry_version(head)
     if old is None or new is None or old == new:
         return "human"
-    if _without_pin(base) != _without_pin(head) or not _integrity_only(head.get("metadata")):
+    if _canonical(_without_pin(base)) != _canonical(_without_pin(head)) or not _integrity_only(head.get("metadata")):
         return "human"
     if "metadata" in base and not _integrity_only(base["metadata"]):
         return "human"
@@ -1460,8 +1688,9 @@ EXPECTED_RULESETS = {
 # retargeted away from its refs keeps rules that still read correctly while it protects
 # nothing, so the patterns are audited too. main is named, never ~DEFAULT_BRANCH: a
 # default-branch switch must not move it. Rulesets match with FNM_PATHNAME (`*` stops at
-# `/`), so bot-branches and tags-locked each list both depths. tags-locked never uses ~ALL:
-# GitHub documents it as every branch, and on a tag ruleset it could lock no tag.
+# `/`), so bot-branches and tags-locked each list both depths. tags-locked must list those two
+# globs, for explicitness: ~ALL also covers every tag (GitHub's own tag-ruleset recipes use it),
+# but each pattern list is audited exactly, so what the ruleset covers is spelled out, not implied.
 # x4 is one level on purpose: the branches it protects are named x4/<name>, and a tag that
 # shadows one carries the same name. Any deeper tag is covered by tags-locked.
 EXPECTED_REF_PATTERNS = {
@@ -1688,25 +1917,46 @@ def _emit(document, code: int) -> int:
     return code
 
 
+def _version(text: str) -> str:
+    """An argument that must be an exact x.y.z. Malformed is a usage error (exit 2, reported by
+    the argument parser on stderr alone), not a verdict about any release."""
+    if not SEMVER.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not an exact x.y.z")
+    return text
+
+
+def _commit_id(text: str) -> str:
+    """An argument that must be a full lower-case commit id, with the same usage-error status."""
+    if not SHA40.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a 40-hex commit id")
+    return text
+
+
+def _in_repo(repo: str, given: str | None, default: str) -> str:
+    """The path the caller gave, else `default` inside the repository --repo names. Never a
+    path relative to whatever directory the command was started from."""
+    return given if given is not None else os.path.join(repo, default)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="release_checks.py", description="Release checks for the ai-tc pin.")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version")
+    sub.add_parser("verify-version", help="verify one npm release end to end").add_argument("version", type=_version)
     candidates = sub.add_parser("candidates", help="exact npm versions above everything pinned")
     candidates.add_argument("--repo", default=".")
     classify = sub.add_parser("classify", help="classify ai-tc's store migrations between two commits")
-    classify.add_argument("from_commit")
-    classify.add_argument("to_commit")
+    classify.add_argument("from_commit", type=_commit_id)
+    classify.add_argument("to_commit", type=_commit_id)
     entry = sub.add_parser("safety-entry", help="the rollback-safety.json entry for a version")
-    entry.add_argument("version")
+    entry.add_argument("version", type=_version)
     entry.add_argument("--repo", default=".")
     floor = sub.add_parser("floor", help="the rollback floor a target would cross")
-    floor.add_argument("target")
+    floor.add_argument("target", type=_version)
     floor.add_argument("--repo", default=".")
-    floor.add_argument("--safety", default=SAFETY_FILE)
+    floor.add_argument("--safety", default=None, help=f"default: {SAFETY_FILE} in --repo")
     audit = sub.add_parser("audit-tags", help="audit the fleet-v tags and the rulesets")
     audit.add_argument("--repo", default=".")
-    audit.add_argument("--frozen", default=FROZEN_TAGS_FILE)
+    audit.add_argument("--frozen", default=None, help=f"default: {FROZEN_TAGS_FILE} in --repo")
     audit.add_argument("--no-rulesets", action="store_true")
     sub.add_parser("snapshot-tags", help="the fleet-v tags in the frozen list's shape").add_argument("--repo", default=".")
     mode = sub.add_parser("diff-mode", help="classify a manifest change")
@@ -1745,7 +1995,7 @@ def _command(args) -> int:
     if args.command == "safety-entry":
         return _emit({"version": args.version, "entry": safety_entry(args.version, pinned_versions(args.repo))}, 0)
     if args.command == "floor":
-        safety = _load(args.safety)
+        safety = _load(_in_repo(args.repo, args.safety, SAFETY_FILE))
         pinned = pinned_versions(args.repo)
         if not pinned:
             raise ReleaseCheckError("floor", "nothing is pinned, so there is no rollback to judge")
@@ -1759,7 +2009,9 @@ def _command(args) -> int:
         result["error"] = {"check": "floor", "detail": detail}
         return _emit(result, 1)
     if args.command == "audit-tags":
-        problems = audit_tags(args.repo, args.frozen, check_rulesets=not args.no_rulesets)
+        problems = audit_tags(
+            args.repo, _in_repo(args.repo, args.frozen, FROZEN_TAGS_FILE), check_rulesets=not args.no_rulesets
+        )
         for problem in problems:
             print(f"::error::{problem}", file=sys.stderr)
         return _emit({"problems": problems}, 1 if problems else 0)
@@ -1773,6 +2025,7 @@ def main(argv=None) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
+    start_budget(BUDGET_CLI)  # one budget for the whole command; cleared below however it ends
     try:
         return _command(args)
     except InfraError as exc:
@@ -1791,6 +2044,8 @@ def main(argv=None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         print(f"::error::internal: {detail}", file=sys.stderr)
         return _emit({"error": {"check": "internal", "detail": detail}}, 2)
+    finally:
+        clear_budget()
 
 
 if __name__ == "__main__":
