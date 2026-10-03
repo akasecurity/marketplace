@@ -62,6 +62,9 @@ class ImporterWorkflow(WorkflowCase):
         self.assertRegex(self.head, r"(?s)\n      below_floor:\n.*?type: boolean\n")
 
     def test_each_mode_queues_in_its_own_concurrency_group(self):
+        # The schedule and forward dispatches share the first group on purpose: open-pr replaces a branch
+        # no PR ever used, which is safe only while no other forward run is live. A scheduled tick can
+        # therefore cancel a pending forward dispatch, and the workflow's header says so.
         self.assertIn("  group: ${{ github.event_name == 'schedule' && 'import-forward' || "
                       "format('import-{0}', inputs.mode) }}\n", self.head)
         self.assertIn("  cancel-in-progress: false\n", self.head)
