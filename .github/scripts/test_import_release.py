@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -1043,6 +1045,30 @@ class TestMainNet(PlanCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::no verdict on 0.9.15: network: down", output)
         self.assertIn("proceed=false", output)
+
+
+class TestWriteOutput(unittest.TestCase):
+    """write_output is what keeps a value read from npm or GitHub from adding a line of its own to the
+    job's output file. tag_audit.py writes its outputs through it too."""
+
+    def test_a_line_break_in_a_value_is_refused_and_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = os.path.join(directory, "output")
+            with mock.patch.dict(ir.os.environ, {"GITHUB_OUTPUT": out}):
+                for value in ("a\nproceed=true", "a\rproceed=true", "a\r\nproceed=true", "\n", "\r"):
+                    with self.subTest(value=value), self.assertRaisesRegex(ir.Refused, "the plan output is not one line"):
+                        ir.write_output("plan", value)
+                self.assertFalse(os.path.exists(out), "a refused value must leave the file untouched")
+                ir.write_output("proceed", "true")
+            with open(out, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "proceed=true\n")
+
+    def test_without_an_output_file_the_line_goes_to_standard_output_and_a_line_break_is_still_refused(self):
+        with mock.patch.dict(ir.os.environ, {}, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            ir.write_output("proceed", "false")
+            with self.assertRaises(ir.Refused):
+                ir.write_output("plan", "x\ny")
+        self.assertEqual(out.getvalue(), "proceed=false\n")
 
 
 class TestDescribe(unittest.TestCase):
