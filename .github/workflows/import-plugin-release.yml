@@ -67,10 +67,17 @@ on:
 # Scheduled and forward runs share one group, so two imports never race for one
 # branch; rollback (and remove and restore, once built) each queue in their own
 # group, so a scheduled run can never replace a pending rollback. A group keeps
-# one pending run and drops the rest; a dropped scheduled run is harmless, since
-# the next tick re-evaluates. The groups do not wait for each other, so a forward run
-# looks for an open rollback PR before it enables auto-merge and again after, and
-# turns auto-merge off if one opened meanwhile.
+# one pending run and cancels the rest in favour of the newest. A scheduled run
+# dropped that way is harmless, since the next tick re-evaluates. A forward
+# dispatch dropped that way is not: one still pending when the next tick queues
+# (which happens only while a scheduled run is still running, so on a slow run)
+# shows as cancelled, and is dispatched again. Dispatches could have a group of
+# their own, but then a dispatch and a scheduled run could be live together, and
+# open-pr's clean-up of a branch no PR ever used (it deletes the branch and creates
+# it again) is safe only because no other forward run is live. The groups do not
+# wait for each other, so a forward run looks for an open rollback PR before it
+# enables auto-merge and again after, and turns auto-merge off if one opened
+# meanwhile.
 concurrency:
   group: ${{ github.event_name == 'schedule' && 'import-forward' || format('import-{0}', inputs.mode) }}
   cancel-in-progress: false

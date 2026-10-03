@@ -745,8 +745,9 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
                               "deleted its branch); that rejection stands, and a dispatch with reimport: true "
                               "replaces it", red=False)
             # No PR ever used it, so an earlier run died between creating the branch and opening the PR.
-            # Forward runs share one concurrency group, so no live run owns it. Delete and create, as a
-            # reimport does; the ref is still never force-pushed.
+            # Scheduled runs and forward dispatches share one concurrency group (the workflow's header says
+            # why they must), so no live run owns it. Delete and create, as a reimport does; the ref is still
+            # never force-pushed.
             leftover = True
         gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
         print(f"::notice::deleted {branch}, left with no pull request by an earlier run, and created it again"
