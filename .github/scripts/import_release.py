@@ -754,8 +754,10 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
             # never force-pushed.
             leftover = True
         gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
-        print(f"::notice::deleted {branch}, left with no pull request by an earlier run, and created it again"
-              if leftover else f"deleted {branch}, which had no open PR, before creating it again")
+        # Said as what happens next, not as done: the commit and the ref are still to be made, and a failure
+        # there ends the run red before anything has been created.
+        print(f"::notice::deleted {branch}, left with no pull request by an earlier run; creating it again"
+              if leftover else f"deleted {branch}, which had no open PR; creating it again")
     files = {MANIFEST: actions["edit"](raw, plan)}
     if plan.get("safety_entry"):
         safety_raw = read_file(gh, SAFETY_FILE, main_sha)

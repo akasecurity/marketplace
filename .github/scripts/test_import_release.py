@@ -923,9 +923,21 @@ class TestOpenPrForward(OpenPrCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
         self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
-        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run, "
-                      "and created it again", out.getvalue())
+        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run; "
+                      "creating it again", out.getvalue())
+        self.assertNotIn("and created it again", out.getvalue())
         self.assertEqual([call for call in self.gh.calls if call[0] == "PATCH"], [])
+
+    def test_the_notice_of_a_replaced_branch_does_not_claim_the_new_one_exists_when_the_commit_fails(self):
+        # The notice comes after the delete and before the commit and the ref, so it says what is next.
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        self.gh.routes[("POST", R("git/commits"))] = GitHubError(403, "POST", R("git/commits"), "forbidden")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out, self.assertRaises(GitHubError):
+            self.open(forward_plan())
+        self.assertEqual(self.gh.called("POST", R("git/refs")), [])
+        self.assertIn("; creating it again", out.getvalue())
+        self.assertNotIn("created it again", out.getvalue())
 
     def test_a_branch_whose_bot_pr_was_closed_is_skipped_unless_reimport(self):
         # The rejection stands until a reimport, and the branch is the evidence a closed PR leaves.
