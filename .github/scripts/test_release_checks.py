@@ -2218,6 +2218,13 @@ class TestDiffMode(unittest.TestCase):
             with self.subTest(description=good):
                 self.assertTrue(rc.description_ok({"description": good}))
 
+    def test_description_ok_docstring_gives_the_reason_that_is_true(self):
+        doc = " ".join((rc.description_ok.__doc__ or "").split())
+        self.assertIn("The marketplace requires that.", doc)
+        self.assertIn("Claude Code itself refuses only a null or non-string description", doc)
+        self.assertIn("accepts an empty or blank one or none", doc)
+        self.assertNotIn("anything else", doc)
+
     def test_a_restore_with_an_extra_key_is_human(self):
         head = ts.manifest("0.9.14")
         ts.ai_tc(head)["strict"] = False
