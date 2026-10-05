@@ -227,6 +227,19 @@ class TestSweep(unittest.TestCase):
         gh.routes[("GET", R("commits/b/pulls"))] = lambda body, params: answers.pop(0)
         self.assertEqual(tr.merged_pull(gh, "b", sleep=lambda seconds: None)["number"], 13)
 
+    def test_the_association_hands_back_the_answer_that_decided_it(self):
+        elsewhere = {"number": 13, "merge_commit_sha": "c", "merged_at": "2026-10-02T00:00:00Z", "base": {"ref": "main"}}
+        own = {**elsewhere, "number": 14, "merge_commit_sha": "b"}
+        gh = sweep_github()
+        gh.routes[("GET", R("commits/b/pulls"))] = [elsewhere]
+        # No PR has this commit as its merge commit: the list the last ask returned comes back with None, and the
+        # three asks are the whole cost, so a caller that wants the list does not ask a fourth time.
+        self.assertEqual(tr.pull_association(gh, "b", sleep=lambda seconds: None), (None, [elsewhere]))
+        self.assertEqual(len(gh.called("GET", R("commits/b/pulls"))), tr.ASSOCIATION_ATTEMPTS)
+        answers = [[], [elsewhere, own]]
+        gh.routes[("GET", R("commits/b/pulls"))] = lambda body, params: answers.pop(0)
+        self.assertEqual(tr.pull_association(gh, "b", sleep=lambda seconds: None), (own, [elsewhere, own]))
+
     def test_a_pr_merged_into_another_branch_is_not_mains_merge(self):
         gh = sweep_github()
         gh.routes[("GET", R("commits/b/pulls"))] = [

@@ -161,19 +161,31 @@ def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
     return entry.get("classification", "unknown") if isinstance(entry, dict) else "unknown"
 
 
-def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep) -> dict | None:
-    """The PR into main whose merge commit is `sha`, or None. A PR merged into another branch whose merge
-    commit later reached main is not main's merge. The association can lag a merge by seconds, so an
-    empty answer is asked again before it stands."""
+def merged_into_main(pull: dict) -> bool:
+    """Whether the API lists `pull` as merged into main. A PR merged into another branch whose commits later
+    reached main is not main's merge."""
+    return bool(pull.get("merged_at")) and (pull.get("base") or {}).get("ref") == "main"
+
+
+def pull_association(gh: GitHub, sha: str,
+                     sleep: Callable[[float], None] = time.sleep) -> tuple[dict | None, list[dict]]:
+    """The PR into main whose merge commit is `sha`, or None, and every PR GitHub linked to `sha` in the answer
+    that decided it. The association can lag a merge by seconds, so an empty answer is asked again before it
+    stands; the list is the last answer read, which a caller can use without asking again."""
+    pulls: list[dict] = []
     for attempt in range(ASSOCIATION_ATTEMPTS):
         pulls = gh.get(gh.repo_path(f"commits/{sha}/pulls"))
-        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and p.get("merged_at")
-                  and (p.get("base") or {}).get("ref") == "main"]
+        merged = [p for p in pulls if p.get("merge_commit_sha") == sha and merged_into_main(p)]
         if merged:
-            return merged[0]
+            return merged[0], pulls
         if attempt < ASSOCIATION_ATTEMPTS - 1:
             sleep(ASSOCIATION_WAIT)
-    return None
+    return None, pulls
+
+
+def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep) -> dict | None:
+    """The PR into main whose merge commit is `sha`, or None (see pull_association)."""
+    return pull_association(gh, sha, sleep)[0]
 
 
 def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
