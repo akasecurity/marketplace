@@ -10,14 +10,17 @@ records the version, integrity, PR, approver and store-migration class, plus
 rollback-from, drill and approver-note when they apply. The approver-note also
 says when the PR's final head had no passing `validate` run (none at all, or its
 latest one failed or had not finished), whoever approved it, so a merge past a
-failed check is in the permanent record. That read uses the workflow's own
-token, which can read checks, not the App's. A commit that GitHub links to no
-merged PR is left untagged, and so is everything after it, until it is an hour
-old: a slow link must not become a permanent `pr: none` tag. After that hour
-it is tagged as a push without a PR. A commit dated more than
-five minutes ahead of the runner's clock is not young either (only a direct
-push can carry one, and waiting for its date would hold every later tag back):
-it is tagged at once, as an old one would be. The owners that decide
+failed check is in the permanent record. Only a run of validate.yml that the
+`pull_request_target` event started, at or before the time the PR merged, counts:
+a job of that name in another workflow passes nothing, and a run made after the
+merge (an edit of the closed PR, a manual re-run) decides nothing. That read uses
+the workflow's own token, which can read checks and workflow runs, not the App's.
+A commit that GitHub links to no merged PR is left untagged, and so is everything
+after it, until it is an hour old: a slow link must not become a permanent
+`pr: none` tag. After that hour it is tagged as a push without a PR. A commit
+dated more than five minutes ahead of the runner's clock is not young either
+(only a direct push can carry one, and waiting for its date would hold every
+later tag back): it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
 no later pull request can change, so a parent whose file is anything else (a
@@ -38,6 +41,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Callable
 
 from ghapi import GitHub, GitHubError
@@ -53,6 +57,12 @@ FILE_MODES = ("100644", "100755")
 ENTRY_KINDS = {"120000": "a symbolic link", "160000": "a submodule", "040000": "a directory"}
 # The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
 VALIDATE_CHECK = "validate"
+# Only a check run of that workflow file, run for the event below, is the required check. A job of any other
+# name-alike workflow (another file, a push or pull_request run of validate.yml itself) can report the same
+# check name. validate.yml runs for pull_request_target, so GitHub takes the workflow from main and not from
+# the pull request, which is what makes its answer one a pull request cannot write for itself.
+VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
+VALIDATE_EVENT = "pull_request_target"
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
@@ -193,25 +203,70 @@ def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[s
             and login in owners and login not in exclude]
 
 
-def validate_conclusion(reader: GitHub, head: str) -> str | None:
-    """How the latest `validate` run from GitHub Actions on `head` ended, or None when none ran. A run that has
-    not finished has no conclusion, so its status stands in for it (`queued`, `in_progress`); the two sets of
-    words do not overlap, and only `success` is a pass.
+def timestamp(text) -> datetime | None:
+    """A GitHub timestamp ("2026-10-02T00:00:00Z") as a datetime, or None when it is missing or in any other form."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ") if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def is_validate_workflow_run(reader: GitHub, run: dict, suites: dict[int, list]) -> bool:
+    """Whether check run `run` was reported by a run of validate.yml that the `pull_request_target` event started.
+
+    A check run names its check suite, and GitHub Actions makes one check suite for each workflow run, so the
+    workflow runs listed for the suite say what the check run belongs to (`check_suite_id` is a documented
+    filter of the repository's workflow-run list, and each run there states its `event` and the `path` of its
+    workflow file). A check run with no suite, or one whose suite lists no workflow run or more than one, is not
+    counted: nothing says what it belongs to. `suites` keeps the answers of one call, so a suite is asked once."""
+    suite = (run.get("check_suite") or {}).get("id")
+    if not isinstance(suite, int) or isinstance(suite, bool):
+        return False
+    if suite not in suites:
+        answer = reader.get(reader.repo_path("actions/runs"), {"check_suite_id": suite})
+        listed = answer.get("workflow_runs") if isinstance(answer, dict) else None
+        suites[suite] = listed if isinstance(listed, list) else []
+    if len(suites[suite]) != 1 or not isinstance(suites[suite][0], dict):
+        return False
+    workflow = suites[suite][0]
+    # The path is the workflow file's; a trailing "@<ref>" is accepted, as GitHub's own examples show one.
+    return (workflow.get("event") == VALIDATE_EVENT
+            and isinstance(workflow.get("path"), str) and workflow["path"].split("@", 1)[0] == VALIDATE_WORKFLOW)
+
+
+def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str | None:
+    """How the latest `validate` run on `head` that counts ended, or None when none counts. A run that has not
+    finished has no conclusion, so its status stands in for it (`queued`, `in_progress`); the two sets of words
+    do not overlap, and only `success` is a pass.
 
     The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
-    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that failed
-    after an earlier pass leaves the head unvalidated. `filter=all` asks for every run, not just the latest of
-    each name."""
+    name and app and checked again here. Of those, a run counts only if it
+    (1) started at or before `merged_at`, the time its pull request merged: a run made afterwards (an edit of the
+        closed pull request starts one, and so does a manual re-run) neither fails a head that was validated nor
+        passes one that was not. A run queued before the merge and started after it started after it. A run with
+        no start time, or a merge with no time, cannot be placed before the merge and does not count; and
+    (2) belongs to a run of .github/workflows/validate.yml started by `pull_request_target`
+        (is_validate_workflow_run), so a job of that name in any other workflow, or in a push or pull_request run,
+        passes nothing and fails nothing.
+    Of the runs that count the latest (the highest id) decides: a re-run that failed after an earlier pass leaves
+    the head unvalidated. They are tried newest first, so the workflow run behind a check run is asked about only
+    until one counts. `filter=all` asks for every run, not just the latest of each name.
+
+    The reader needs `checks: read` and `actions: read`. A failed read raises, as any read of GitHub does."""
+    merged = timestamp(merged_at)
     runs = [run for run in reader.paginate(reader.repo_path(f"commits/{head}/check-runs"),
                                            {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID,
                                             "filter": "all"})
             if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
-    if not runs:
-        return None
-    latest = max(runs, key=lambda run: run.get("id") or 0)
-    if latest.get("status") != "completed":
-        return latest.get("status") or "unfinished"
-    return latest.get("conclusion") or "without a result"
+    suites: dict[int, list] = {}
+    for run in sorted(runs, key=lambda run: run.get("id") or 0, reverse=True):
+        started = timestamp(run.get("started_at"))
+        if merged is not None and started is not None and started <= merged \
+                and is_validate_workflow_run(reader, run, suites):
+            if run.get("status") != "completed":
+                return run.get("status") or "unfinished"
+            return run.get("conclusion") or "without a result"
+    return None
 
 
 def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
@@ -241,7 +296,7 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[fl
         approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
         approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
         bypass = not approvers
-    conclusion = validate_conclusion(gh if reader is None else reader, head)
+    conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "
                        f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")

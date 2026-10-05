@@ -27,15 +27,44 @@ def R(suffix):
     return f"repos/{REPO}/{suffix}"
 
 
-def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID) -> dict:
-    """A check run as the API lists it: by default the green `validate` run of GitHub Actions."""
-    return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app}}
+MERGED_AT = "2026-10-02T00:00:00Z"  # when PR 13 merged, in sweep_github and in TestValidateOnTheFinalHead.facts
+BEFORE_THE_MERGE = "2026-10-01T23:59:00Z"
+AFTER_THE_MERGE = "2026-10-02T00:00:01Z"
 
 
-def checks(head: str, runs: list | None = None) -> dict:
-    """The route answering the check-run list of `head`: one green `validate` run unless `runs` says otherwise
-    (an empty list is a head nothing ran on)."""
-    return {("GET", R(f"commits/{head}/check-runs")): [validate_run()] if runs is None else runs}
+def suite_of(run_id: int) -> int:
+    """The id of the check suite a test check run is in: one suite for each run, as GitHub Actions makes them."""
+    return 9000 + run_id
+
+
+def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID,
+                 started_at=BEFORE_THE_MERGE, suite=None) -> dict:
+    """A check run as the API lists it: by default the green `validate` run of GitHub Actions, started a minute
+    before the merge, in a check suite of its own (`checks` makes that suite a pull_request_target run of validate.yml)."""
+    return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app},
+            "started_at": started_at, "check_suite": {"id": suite_of(run_id) if suite is None else suite}}
+
+
+def workflow_run(suite: int, *, event="pull_request_target", path=tr.VALIDATE_WORKFLOW,
+                 created_at="2026-10-01T23:50:00Z") -> dict:
+    """A workflow run as the API lists it for a check suite. `created_at` is when the run was queued, which may
+    be long before the job started; the code under test never reads it."""
+    return {"id": suite - 1000, "check_suite_id": suite, "name": "validate", "event": event, "path": path,
+            "created_at": created_at, "run_started_at": created_at}
+
+
+def checks(head: str, runs: list | None = None, workflows: dict | None = None) -> dict:
+    """The routes answering the check-run list of `head` (one green `validate` run unless `runs` says otherwise; an
+    empty list is a head nothing ran on) and the workflow-run list asked for by `check_suite_id`. `workflows` maps
+    a check suite's id to the workflow runs the API lists for it (a suite it does not name lists none); left out,
+    every suite is one pull_request_target run of validate.yml."""
+    def listed(body, params):
+        suite = params["check_suite_id"]
+        found = [workflow_run(suite)] if workflows is None else workflows.get(suite, [])
+        return {"total_count": len(found), "workflow_runs": found}
+
+    return {("GET", R(f"commits/{head}/check-runs")): [validate_run()] if runs is None else runs,
+            ("GET", R("actions/runs")): listed}
 
 
 def scratch_repository(directory: str):
@@ -75,7 +104,7 @@ def sweep_github() -> FakeGitHub:
         ("GET", R("git/ref/tags/fleet-v9")): not_found(),
         ("GET", R("git/ref/tags/fleet-v10")): not_found(),
         ("GET", R("git/ref/tags/fleet-v11")): not_found(),
-        ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+        ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": MERGED_AT,
                                         "base": {"ref": "main"}}],
         ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
         ("GET", R("pulls/13/reviews")): [
@@ -474,14 +503,17 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
     MERGER = "org-owner-example"
     APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}]
 
-    def facts(self, runs, reviews=None, owners=("Vaishnav-OM", "venuverse"), unreadable=""):
-        """The facts for PR 13 (final head h13, merged by an org owner) whose head carries `runs`, and the client."""
+    def facts(self, runs, reviews=None, owners=("Vaishnav-OM", "venuverse"), unreadable="", workflows=None,
+              merged_at=MERGED_AT):
+        """The facts for PR 13 (final head h13, merged by an org owner at `merged_at`) whose head carries `runs`
+        (in the check suites `workflows` describes, by default one pull_request_target run of validate.yml each),
+        and the client."""
         gh = FakeGitHub({
-            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": merged_at,
                                              "base": {"ref": "main"}}],
             ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": self.MERGER}},
             ("GET", R("pulls/13/reviews")): self.APPROVED if reviews is None else reviews,
-            **checks("h13", runs)})
+            **checks("h13", runs, workflows)})
         facts = tr.pr_facts(gh, "b", None if owners is None else list(owners), sleep=lambda seconds: None,
                             unreadable=unreadable)
         return facts, gh
@@ -580,23 +612,195 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         self.assertEqual(len(asked), 1)
         self.assertEqual(asked[0][3], {"check_name": "validate", "app_id": 15368, "filter": "all"})
 
-    def test_the_api_envelope_and_every_page_of_runs_are_read_through_the_real_client(self):
+    def test_a_run_of_another_workflow_file_counts_for_nothing(self):
+        # A job named validate in any other file reports the same check name; only validate.yml is the check.
+        for path in (".github/workflows/ci.yml", ".github/workflows/validate.yaml", ".github/workflows/validate.yml.bak",
+                     ".github/workflows/sub/validate.yml", ".github/scripts/validate.yml", "validate.yml",
+                     ".github/workflows/Validate.yml", "", None):
+            with self.subTest(path):
+                facts, _ = self.facts([validate_run(5)], workflows={suite_of(5): [workflow_run(suite_of(5), path=path)]})
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_run_of_validate_yml_that_another_event_started_counts_for_nothing(self):
+        # validate.yml answers for pull_request_target, whose workflow GitHub takes from main. The same file run for
+        # a pull request, a push or by hand is the file as the branch has it, which the branch's author wrote.
+        for event in ("pull_request", "push", "workflow_dispatch", "schedule", "workflow_run", "pull_request_review",
+                      "", None):
+            with self.subTest(event):
+                facts, _ = self.facts([validate_run(5)], workflows={suite_of(5): [workflow_run(suite_of(5), event=event)]})
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_workflow_run_the_api_gives_no_event_or_path_for_counts_for_nothing(self):
+        for label, workflow in {"no event": {"id": 1, "path": tr.VALIDATE_WORKFLOW},
+                                "no path": {"id": 1, "event": "pull_request_target"},
+                                "not an object": "validate.yml"}.items():
+            with self.subTest(label):
+                facts, _ = self.facts([validate_run(5)], workflows={suite_of(5): [workflow]})
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_the_workflow_file_is_the_file_whatever_ref_follows_its_path(self):
+        facts, _ = self.facts([validate_run(5)], workflows={
+            suite_of(5): [workflow_run(suite_of(5), path=f"{tr.VALIDATE_WORKFLOW}@refs/heads/main")]})
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_pass_from_another_workflow_cannot_stand_in_for_a_failed_validate(self):
+        # What the rule is for: a pull request can add a workflow with a job named validate, and its green run is
+        # newer than the real one. It must not turn a head the real check failed on into a validated one.
+        failed, impostor = validate_run(7, conclusion="failure"), validate_run(9)
+        for what, workflow in {"another file": workflow_run(suite_of(9), path=".github/workflows/ci.yml"),
+                               "validate.yml run for a push": workflow_run(suite_of(9), event="push"),
+                               "validate.yml run for a pull request": workflow_run(suite_of(9), event="pull_request")}.items():
+            for label, runs in {"oldest first": [failed, impostor], "newest first": [impostor, failed]}.items():
+                with self.subTest(f"{what}, {label}"):
+                    facts, _ = self.facts(runs, workflows={suite_of(7): [workflow_run(suite_of(7))],
+                                                           suite_of(9): [workflow]})
+                    self.assertEqual(facts["note"], f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
+
+    def test_a_failure_from_another_workflow_does_not_fail_a_validated_head(self):
+        passed, impostor = validate_run(7), validate_run(9, conclusion="failure")
+        facts, _ = self.facts([passed, impostor], workflows={
+            suite_of(7): [workflow_run(suite_of(7))],
+            suite_of(9): [workflow_run(suite_of(9), path=".github/workflows/ci.yml")]})
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_run_that_started_after_the_merge_does_not_fail_a_head_that_was_validated(self):
+        # An edit of the closed pull request, or a manual re-run, starts validate again on the same head.
+        passed, later = validate_run(7), validate_run(9, conclusion="failure", started_at=AFTER_THE_MERGE)
+        for label, runs in {"oldest first": [passed, later], "newest first": [later, passed]}.items():
+            with self.subTest(label):
+                facts, _ = self.facts(runs)
+                self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_run_that_started_after_the_merge_does_not_pass_a_head_that_was_not_validated(self):
+        failed, later = validate_run(7, conclusion="failure"), validate_run(9, started_at=AFTER_THE_MERGE)
+        for label, runs in {"oldest first": [failed, later], "newest first": [later, failed]}.items():
+            with self.subTest(label):
+                facts, _ = self.facts(runs)
+                self.assertEqual(facts["note"], f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
+
+    def test_a_head_whose_only_run_started_after_the_merge_had_no_run(self):
+        facts, _ = self.facts([validate_run(9, started_at=AFTER_THE_MERGE)])
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_run_queued_before_the_merge_and_started_after_it_does_not_count(self):
+        # The workflow run was created (queued) before the merge, as every re-run's is; the job started after it.
+        # Its start is what counts, so a re-run of a passing validate cannot pass a head that failed it.
+        failed, rerun = validate_run(7, conclusion="failure"), validate_run(9, started_at=AFTER_THE_MERGE)
+        facts, _ = self.facts([failed, rerun], workflows={
+            suite_of(7): [workflow_run(suite_of(7))],
+            suite_of(9): [workflow_run(suite_of(9), created_at="2026-10-01T23:30:00Z")]})
+        self.assertEqual(facts["note"], f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
+
+    def test_a_run_that_started_in_the_second_of_the_merge_counts_and_one_a_second_later_does_not(self):
+        facts, _ = self.facts([validate_run(7, started_at=MERGED_AT)])
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+        facts, _ = self.facts([validate_run(7, started_at="2026-10-02T00:00:01Z")])
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_the_merge_time_is_the_time_the_pull_request_merged(self):
+        # The same run is before one merge and after another.
+        run = validate_run(7, started_at="2026-10-02T00:00:30Z")
+        facts, _ = self.facts([run], merged_at="2026-10-02T00:01:00Z")
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+        facts, _ = self.facts([run], merged_at="2026-10-02T00:00:00Z")
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_run_with_no_usable_start_time_counts_for_nothing(self):
+        for started in (None, "", "yesterday", "2026-10-01", "2026-10-01T23:59:00+00:00", "2026-10-01 23:59:00", 1790000000):
+            with self.subTest(started):
+                facts, _ = self.facts([validate_run(7, started_at=started)])
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+        run = validate_run(7)
+        del run["started_at"]
+        facts, _ = self.facts([run])
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_merge_with_no_usable_time_leaves_no_run_to_count(self):
+        for merged_at in (None, "", "last week", "2026-10-02", "2026-10-02T00:00:00+00:00", 1790000000):
+            with self.subTest(merged_at):
+                gh = FakeGitHub(checks("h13", [validate_run(7)]))
+                self.assertIsNone(tr.validate_conclusion(gh, "h13", merged_at))
+
+    def test_a_check_run_with_no_check_suite_counts_for_nothing(self):
+        for label, suite in {"none": None, "empty": {}, "no id": {"id": None}, "a text id": {"id": "9007"},
+                             "a true id": {"id": True}}.items():
+            with self.subTest(label):
+                run = dict(validate_run(7), check_suite=suite)
+                facts, gh = self.facts([run])
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+                self.assertEqual(gh.called("GET", R("actions/runs")), [])
+        run = validate_run(7)
+        del run["check_suite"]
+        facts, _ = self.facts([run])
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_a_check_suite_that_lists_no_workflow_run_or_two_counts_for_nothing(self):
+        # Nothing then says which workflow the check run belongs to. A suite is one workflow run's.
+        valid = workflow_run(suite_of(7))
+        for label, listed in {"none": [], "two": [valid, workflow_run(suite_of(7), path=".github/workflows/ci.yml")],
+                              "the same twice": [valid, valid]}.items():
+            with self.subTest(label):
+                facts, _ = self.facts([validate_run(7)], workflows={suite_of(7): listed})
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_an_answer_that_is_not_a_list_of_workflow_runs_counts_for_nothing(self):
+        for label, answer in {"a list": [], "text": "none", "no list": {"total_count": 1},
+                              "a null list": {"workflow_runs": None}, "text for the list": {"workflow_runs": "x"}}.items():
+            with self.subTest(label):
+                gh = FakeGitHub({**checks("h13", [validate_run(7)]), ("GET", R("actions/runs")): answer})
+                self.assertIsNone(tr.validate_conclusion(gh, "h13", MERGED_AT))
+
+    def test_the_workflow_run_is_asked_for_through_the_check_suite_of_the_run_that_decides(self):
+        # Newest first, and only until one counts: the older runs are not asked about.
+        _, gh = self.facts([validate_run(5), validate_run(9), validate_run(7)])
+        asked = gh.called("GET", R("actions/runs"))
+        self.assertEqual([call[3] for call in asked], [{"check_suite_id": suite_of(9)}])
+
+    def test_older_runs_are_asked_about_only_while_the_newer_ones_do_not_count(self):
+        workflows = {suite_of(9): [workflow_run(suite_of(9), path=".github/workflows/ci.yml")],
+                     suite_of(7): [workflow_run(suite_of(7))]}
+        facts, gh = self.facts([validate_run(5), validate_run(9, conclusion="failure"),
+                                validate_run(7, conclusion="cancelled")], workflows=workflows)
+        self.assertEqual(facts["note"], f"{self.NOTE} (latest run: cancelled); merged by {self.MERGER}")
+        self.assertEqual([call[3] for call in gh.called("GET", R("actions/runs"))],
+                         [{"check_suite_id": suite_of(9)}, {"check_suite_id": suite_of(7)}])
+
+    def test_a_check_suite_is_asked_about_once(self):
+        # Two attempts of one job share a suite.
+        runs = [validate_run(7, suite=9100), validate_run(9, suite=9100), validate_run(8, suite=9100)]
+        facts, gh = self.facts(runs, workflows={9100: [workflow_run(9100, path=".github/workflows/ci.yml")]})
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+        self.assertEqual([call[3] for call in gh.called("GET", R("actions/runs"))], [{"check_suite_id": 9100}])
+
+    def test_no_workflow_run_is_asked_about_for_a_head_nothing_validated_before_the_merge(self):
+        _, gh = self.facts([validate_run(9, started_at=AFTER_THE_MERGE), validate_run(7, name="lint")])
+        self.assertEqual(gh.called("GET", R("actions/runs")), [])
+
+    def test_the_api_envelopes_and_every_page_of_runs_are_read_through_the_real_client(self):
         pages = {1: [validate_run(run_id, conclusion="failure") for run_id in range(101, 201)],
                  2: [validate_run(300)]}
         asked = []
 
         def transport(method, url, headers, data):
-            asked.append(urllib.parse.urlparse(url))
-            page = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["page"][0])
-            return 200, json.dumps({"total_count": 101, "check_runs": pages[page]}).encode()
+            parsed = urllib.parse.urlparse(url)
+            asked.append(parsed)
+            query = urllib.parse.parse_qs(parsed.query)
+            if parsed.path == f"/repos/{REPO}/actions/runs":
+                # The envelope the workflow-run list is answered in.
+                found = [workflow_run(int(query["check_suite_id"][0]))]
+                return 200, json.dumps({"total_count": len(found), "workflow_runs": found}).encode()
+            return 200, json.dumps({"total_count": 101, "check_runs": pages[int(query["page"][0])]}).encode()
 
         client = GitHub("token", REPO, transport=transport)
         # 100 failed runs on the first page and the latest, a pass, on the second: the highest id decides.
-        self.assertEqual(tr.validate_conclusion(client, "h13"), "success")
-        self.assertEqual([call.path for call in asked], [f"/repos/{REPO}/commits/h13/check-runs"] * 2)
+        self.assertEqual(tr.validate_conclusion(client, "h13", MERGED_AT), "success")
+        self.assertEqual([call.path for call in asked],
+                         [f"/repos/{REPO}/commits/h13/check-runs"] * 2 + [f"/repos/{REPO}/actions/runs"])
         self.assertEqual(urllib.parse.parse_qs(asked[0].query),
                          {"check_name": ["validate"], "app_id": ["15368"], "filter": ["all"],
                           "per_page": ["100"], "page": ["1"]})
+        # Only the run that decides is looked up, through its check suite.
+        self.assertEqual(urllib.parse.parse_qs(asked[2].query), {"check_suite_id": [str(suite_of(300))]})
 
     def test_no_pull_request_means_no_check_read(self):
         # The routes hold no check-runs answer: a read of one fails the test.
@@ -617,6 +821,22 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         parsed = release_checks.parse_tag_message(message)
         self.assertEqual((parsed["pr"], parsed["approver"]), ("13", "venuverse"))
 
+    def test_the_tag_for_a_merge_whose_only_validate_run_belongs_to_another_workflow_carries_the_note(self):
+        gh = sweep_github()
+        gh.routes.update(checks("h13", [validate_run(7)], {
+            suite_of(7): [workflow_run(suite_of(7), path=".github/workflows/ci.yml")]}))
+        tr.sweep(history(chain=("t8", "b")), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        message = gh.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertIn(f"approver-note: {self.NOTE} (no run); merged by venuverse\n", message)
+
+    def test_a_run_made_after_the_merge_changes_nothing_in_the_tag(self):
+        # PR 13 merged at MERGED_AT: a failed run that started after it is not what the tag records.
+        gh = sweep_github()
+        gh.routes.update(checks("h13", [validate_run(7), validate_run(9, conclusion="failure",
+                                                                    started_at=AFTER_THE_MERGE)]))
+        tr.sweep(history(chain=("t8", "b")), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        self.assertNotIn("approver-note", gh.called("POST", R("git/tags"))[0][2]["message"])
+
     def test_the_note_is_added_only_to_the_tag_whose_head_did_not_pass(self):
         gh = sweep_github()
         gh.routes.update(checks("h14", [validate_run(conclusion="failure")]))
@@ -628,7 +848,9 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
 
     def test_the_checks_are_read_with_the_workflow_token_and_the_tags_are_written_with_the_apps(self):
         writer = sweep_github()
-        del writer.routes[("GET", R("commits/h13/check-runs"))]  # a read of the checks through this client fails
+        # A read of the checks or of their workflow runs through this client fails.
+        del writer.routes[("GET", R("commits/h13/check-runs"))]
+        del writer.routes[("GET", R("actions/runs"))]
         reader = FakeGitHub(checks("h13", [validate_run(conclusion="failure")]))
         clients = {"app-token": writer, "workflow-token": reader}
         env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "app-token", "GITHUB_TOKEN": "workflow-token"}
@@ -637,7 +859,8 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
                 mock.patch.object(tr, "GitHub", lambda token, repo: clients[token]), contextlib.redirect_stdout(out):
             code = tr.main(["sweep"])
         self.assertEqual(code, 0, out.getvalue())
-        self.assertEqual([(call[0], call[1]) for call in reader.calls], [("GET", R("commits/h13/check-runs"))])
+        self.assertEqual([(call[0], call[1]) for call in reader.calls],
+                         [("GET", R("commits/h13/check-runs")), ("GET", R("actions/runs"))])
         self.assertEqual(reader.writes(), [])
         message = writer.called("POST", R("git/tags"))[0][2]["message"]
         self.assertIn(f"approver-note: {self.NOTE} (latest run: failure); merged by venuverse\n", message)
@@ -989,6 +1212,7 @@ class TestGitHubFailures(unittest.TestCase):
             "tag lookup": (history(chain=("t8", "b")), reads(R("git/ref/tags/fleet-v9"), 500)),
             "pull request read": (history(chain=("t8", "b")), reads(R("pulls/13"))),
             "check run read": (history(chain=("t8", "b")), reads(R("commits/h13/check-runs"), 403)),
+            "workflow run read": (history(chain=("t8", "b")), reads(R("actions/runs"), 403)),
             "git failure": (Broken("fleet_tags", GitError("git for-each-ref failed: bad object"), chain=["t8"]),
                             sweep_github()),
             "no main in the checkout": (Broken("main", InfraError("git", "no main ref"), chain=["t8"],
