@@ -12,7 +12,7 @@
       "description": "An independent multi-model review crew for coding agents (two blind cross-family reads plus an independent judge that filters false positives, report-only), plus secure-research: cited web research spread across several search engines."
     },
     {
-      "name": "claude-tools",
+      "name": "aka-claude-tools",
       "url": "https://github.com/akasecurity/claude-tools",
       "category": "Security",
       "status": "available",
