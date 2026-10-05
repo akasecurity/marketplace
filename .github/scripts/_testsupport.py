@@ -530,3 +530,18 @@ class VerifyMixin:
             self.verify(**kwargs)
         self.assertEqual(caught.exception.check, check)
         return caught.exception
+
+
+def assert_off_tag_text_is_truthful(test, detail):
+    """What the off-tag refusal may claim. The certificate shows ai-tc's own workflow
+    published the version, so an npm token alone did not. A run on a branch still needs
+    write access to ai-tc, so a stolen GitHub credential is not ruled out, and the text
+    must say so and must never say the certificate rules out a stolen credential."""
+    for said in (
+        "so an npm token alone did not",
+        "still needs write access to ai-tc",
+        "a stolen GitHub credential is not ruled out",
+    ):
+        test.assertIn(said, detail)
+    test.assertNotIn("not a stolen npm credential", detail)
+    test.assertNotIn("is not a stolen", detail)

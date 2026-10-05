@@ -821,9 +821,10 @@ def provenance_verdict(sig: dict, version: str, integrity: str) -> SignedStateme
                 f"{PACKAGE}@{version} was signed by {PROV_REPO} :: {pipeline['workflow']} at the branch "
                 f"{branch!r}, not at its tag {required_signer(version)['ref']!r}. ai-tc's release "
                 f"workflow publishes only from a tag push, so {happened}. An attestation is "
-                "immutable, so this version can never be imported. This is not a stolen npm "
-                "credential: the signing certificate names ai-tc's own workflow. Tell ai-tc's "
-                "maintainers.",
+                "immutable, so this version can never be imported. The signing certificate shows "
+                "ai-tc's own release workflow published it, so an npm token alone did not. A run "
+                "on a branch still needs write access to ai-tc, so a stolen GitHub credential is "
+                "not ruled out. Tell ai-tc's maintainers.",
             )
         raise ReleaseCheckError(
             "provenance",
