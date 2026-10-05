@@ -14,6 +14,7 @@ import unittest
 
 import _testsupport as ts
 import release_checks
+import tag_audit
 
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
 
@@ -500,6 +501,31 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertLess(job.index("tag_audit.py check"), job.index("actions/create-github-app-token@"))
         self.assertLess(job.index("actions/create-github-app-token@"), job.index("tag_release.py sweep"))
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
+
+    def audit_step(self) -> str:
+        """The step whose command runs tag-audit's checks."""
+        steps = [block for block in re.split(r"(?m)^      - ", self.jobs["tag"]) if "tag_audit.py check" in block]
+        self.assertEqual(len(steps), 1, "exactly one step runs tag_audit.py check")
+        return steps[0]
+
+    def test_the_audit_step_can_stop_the_job(self):
+        # `check --results` always exits 0 (the red goes to the step's outputs for a later job to file), and
+        # `continue-on-error` lets a failed step pass: either turns "stops, red, creating nothing" off while the
+        # step order still reads right.
+        audit = self.audit_step()
+        self.assertNotIn("--results", audit)
+        self.assertNotIn("continue-on-error", self.jobs["tag"])
+
+    def test_the_audit_step_asks_for_no_comparison_with_an_earlier_run(self):
+        # --previous needs a snapshot this workflow never downloads, and --no-baseline applies the coverage rule,
+        # which would refuse the first tag it creates (the frozen list cannot record it yet). The comparison is
+        # tag-audit's own; tag-release runs the ledger, ruleset and environment checks only.
+        audit = self.audit_step()
+        self.assertNotIn("--previous", audit)
+        self.assertNotIn("--no-baseline", audit)
+
+    def test_the_job_enters_the_environment_the_audit_checks(self):
+        self.assertEqual(re.findall(r"(?m)^    environment: (\S+)$", self.text), [tag_audit.ENVIRONMENT])
 
     def test_branch_clean_up_follows_the_sweep_and_never_runs_after_a_failed_one(self):
         job = self.jobs["tag"]
