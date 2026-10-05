@@ -558,6 +558,22 @@ class TestUnreadableManifests(StalenessCase):
                 self.assertFalse(rules["staleness-iii"].red)
                 self.stubs["pinned_versions"].assert_not_called()
 
+    def test_the_issue_title_is_true_of_a_missing_entry_and_of_a_manifest_that_cannot_be_read(self):
+        # One rule, one issue, whichever way main has no usable entry: the title has to say both, since the
+        # router titles an issue when it opens it and never again.
+        missing = self.rules(repo(main_entry=False))["staleness-entry"]
+        broken_git = repo()
+        broken_git.files[("b", MANIFEST)] = "{"
+        broken = self.rules(broken_git)["staleness-entry"]
+        self.assertIn("has no ai-tc entry", missing.detail)
+        self.assertIn("cannot be read", broken.detail)
+        for case in (missing, broken):
+            with self.subTest(case.detail[:40]):
+                self.assertTrue(case.red)
+                self.assertIn("ai-tc entry is missing from main", case.title)
+                self.assertIn("manifest cannot be read", case.title)
+        self.assertEqual(missing.title, broken.title)
+
     def test_main_is_resolved_from_its_full_ref_before_its_manifest_is_read(self):
         git = full_ref_only(repo())
         git.files[("b", MANIFEST)] = "{"
