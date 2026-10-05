@@ -318,7 +318,7 @@ class TestRunCheck(unittest.TestCase):
     def test_with_no_snapshot_every_tag_must_be_in_the_frozen_list(self):
         short = frozen_file(self, [self.row(1)])
         with mock.patch.object(release_checks, "audit_tags", return_value=[]):
-            problems = ta.run_check(self.two_tags(), github(good_rulesets()), short, None, baseline_expected=True)
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), short, None, no_baseline=True)
         self.assertEqual(problems, [
             "no snapshot from an earlier green run to compare against, and the frozen list does not record fleet-v2; "
             "re-freeze every fleet-v tag in a reviewed pull request to set a new baseline"])
@@ -327,7 +327,7 @@ class TestRunCheck(unittest.TestCase):
         complete = frozen_file(self, [self.row(1), self.row(2)])
         with mock.patch.object(release_checks, "audit_tags", return_value=[]):
             self.assertEqual(
-                ta.run_check(self.two_tags(), github(good_rulesets()), complete, None, baseline_expected=True), [])
+                ta.run_check(self.two_tags(), github(good_rulesets()), complete, None, no_baseline=True), [])
 
     def test_a_caller_that_does_not_ask_for_a_baseline_gets_neither_rule(self):
         short = frozen_file(self, [self.row(1)])
@@ -337,7 +337,7 @@ class TestRunCheck(unittest.TestCase):
     def test_an_unreadable_frozen_list_adds_no_coverage_problem_of_its_own(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "frozen.json")
         with mock.patch.object(release_checks, "audit_tags", return_value=["the frozen tag list is unreadable"]):
-            problems = ta.run_check(self.two_tags(), github(good_rulesets()), missing, None, baseline_expected=True)
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), missing, None, no_baseline=True)
         self.assertEqual(problems, ["tag ledger: the frozen tag list is unreadable"])
 
     def test_a_clean_audit_is_green(self):
@@ -349,13 +349,13 @@ class TestRunCheck(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
-    """main(): which invocations ask for a baseline. tag-release passes no --previous, and must never be
-    refused for a tag that only a snapshot (not the frozen list) records."""
+    """main(): which invocations ask for a baseline, and what it writes. tag-release passes neither --previous
+    nor --no-baseline, and must never be refused for a tag that only a snapshot (not the frozen list) records."""
 
-    def run_main(self, argv, rows):
+    def run_main(self, argv, rows, *, results_file=None):
         git = FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
         frozen = frozen_file(self, rows)
-        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
+        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t", **({"GITHUB_OUTPUT": results_file} if results_file else {})}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(ta, "Git", return_value=git), \
                 mock.patch.object(ta, "GitHub", return_value=github(good_rulesets())), \
@@ -365,35 +365,87 @@ class TestMain(unittest.TestCase):
         return code, out.getvalue()
 
     ONLY_V1 = [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT}]
+    BOTH = ONLY_V1 + [{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}]
+    NO_COVERAGE = ("::error::no snapshot from an earlier green run to compare against, and the frozen list does "
+                   "not record fleet-v2")
+
+    def scratch(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        return root.name
+
+    def snapshot_file(self, rows):
+        path = os.path.join(self.scratch(), "previous.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+        return path
 
     def test_tag_releases_invocation_never_asks_for_a_baseline(self):
         code, out = self.run_main([], self.ONLY_V1)
         self.assertEqual((code, out), (0, ""))
 
-    def test_a_missing_snapshot_file_asks_for_a_complete_frozen_list(self):
-        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
-        code, out = self.run_main(["--previous", absent], self.ONLY_V1)
+    def test_no_baseline_asks_for_a_complete_frozen_list(self):
+        code, out = self.run_main(["--no-baseline"], self.ONLY_V1)
         self.assertEqual(code, 1)
-        self.assertIn("::notice::no snapshot from an earlier green tag-audit run", out)
-        self.assertIn("::error::no snapshot from an earlier green run to compare against, and the frozen list does "
-                      "not record fleet-v2", out)
+        self.assertIn(self.NO_COVERAGE, out)
 
-    def test_a_missing_snapshot_file_with_a_complete_frozen_list_is_green(self):
-        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
-        rows = self.ONLY_V1 + [{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}]
-        code, out = self.run_main(["--previous", absent], rows)
-        self.assertEqual(code, 0)
-        self.assertNotIn("::error::", out)
+    def test_no_baseline_with_a_complete_frozen_list_is_green(self):
+        code, out = self.run_main(["--no-baseline"], self.BOTH)
+        self.assertEqual((code, out), (0, ""))
+
+    def test_a_snapshot_file_that_is_not_there_is_red_whatever_the_frozen_list_holds(self):
+        # The workflow only passes --previous when its fetch step downloaded a snapshot. A file that is
+        # then missing is a break between the two steps; reading it as "no baseline" would switch the
+        # comparison off for good (and a complete frozen list would let it pass green).
+        absent = os.path.join(self.scratch(), "no-such-dir", "previous.json")
+        for rows in (self.ONLY_V1, self.BOTH):
+            with self.subTest(len(rows)):
+                code, out = self.run_main(["--previous", absent], rows)
+                self.assertEqual(code, 1)
+                self.assertIn(f"::error::the snapshot the workflow downloaded ({absent}) is missing", out)
+                self.assertNotIn(self.NO_COVERAGE, out)
 
     def test_a_snapshot_that_exists_is_compared_not_replaced_by_the_coverage_rule(self):
         # fleet-v2 is not in the frozen list, but the snapshot knows it unchanged: the comparison is enough.
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        previous = os.path.join(root.name, "previous.json")
-        with open(previous, "w", encoding="utf-8") as handle:
-            json.dump([{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}], handle)
+        previous = self.snapshot_file([{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}])
         code, out = self.run_main(["--previous", previous], self.ONLY_V1)
         self.assertEqual((code, out), (0, ""))
+
+    def test_previous_and_no_baseline_exclude_each_other(self):
+        previous = self.snapshot_file([])
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
+            self.run_main(["--previous", previous, "--no-baseline"], self.BOTH)
+        self.assertEqual(raised.exception.code, 2)
+
+    def outputs(self, path):
+        with open(path, encoding="utf-8") as handle:
+            return dict(line.rstrip("\n").split("=", 1) for line in handle)
+
+    def test_results_report_red_for_a_moved_tag(self):
+        moved = self.snapshot_file([{"tag": "fleet-v2", "object": "9" * 40, "commit": COMMIT}])
+        output = os.path.join(self.scratch(), "github-output")
+        code, _ = self.run_main(["--previous", moved, "--results"], self.ONLY_V1, results_file=output)
+        written = self.outputs(output)
+        self.assertEqual((code, written["red"]), (0, "true"))
+        self.assertIn("fleet-v2 moved since the last green run", written["results"])
+        self.assertTrue(json.loads(written["results"])[0]["red"])
+
+    def test_results_report_green_when_nothing_moved(self):
+        same = self.snapshot_file(self.BOTH)
+        output = os.path.join(self.scratch(), "github-output")
+        code, _ = self.run_main(["--previous", same, "--results"], self.BOTH, results_file=output)
+        written = self.outputs(output)
+        self.assertEqual((code, written["red"]), (0, "false"))
+        self.assertFalse(json.loads(written["results"])[0]["red"])
+
+    def test_the_snapshot_it_writes_is_the_current_tags(self):
+        # What the next run compares with: written whether the run is red or green, uploaded only when green.
+        written = os.path.join(self.scratch(), "snapshot", "fleet-tags.snapshot.json")
+        code, _ = self.run_main(["--no-baseline", "--snapshot", written], self.BOTH)
+        self.assertEqual(code, 0)
+        with open(written, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT},
+                                                 {"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}])
 
 
 if __name__ == "__main__":
