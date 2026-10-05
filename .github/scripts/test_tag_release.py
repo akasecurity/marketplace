@@ -1,21 +1,23 @@
 """Tests for tag_release.py: the sweep, the tag message, the PR facts and the branch clean-up."""
 import contextlib
 import io
+import json
 import os
 import re
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 import release_checks
 import tag_release as tr
 from fakes import (CODEOWNERS, INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, not_found, pull,
                    pulls_route, safety, safety_entry)
-from ghapi import GitHubError
+from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused
-from release_checks import MANIFEST, SAFETY_FILE, InfraError
+from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, InfraError
 
 
 NOW = 1_790_000_000
@@ -23,6 +25,17 @@ NOW = 1_790_000_000
 
 def R(suffix):
     return f"repos/{REPO}/{suffix}"
+
+
+def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID) -> dict:
+    """A check run as the API lists it: by default the green `validate` run of GitHub Actions."""
+    return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app}}
+
+
+def checks(head: str, runs: list | None = None) -> dict:
+    """The route answering the check-run list of `head`: one green `validate` run unless `runs` says otherwise
+    (an empty list is a head nothing ran on)."""
+    return {("GET", R(f"commits/{head}/check-runs")): [validate_run()] if runs is None else runs}
 
 
 def scratch_repository(directory: str):
@@ -77,6 +90,8 @@ def sweep_github() -> FakeGitHub:
             {"state": "APPROVED", "commit_id": "stale14", "user": {"login": "Vaishnav-OM"}},
             {"state": "APPROVED", "commit_id": "h14", "user": {"login": "writer-example"}}],
         ("GET", R("commits/d/pulls")): [],
+        **checks("h13"),
+        **checks("h14"),
         ("POST", R("git/tags")): lambda body, params: {"sha": "object-" + body["tag"]},
         ("POST", R("git/refs")): {"ref": "created"},
     })
@@ -310,7 +325,8 @@ class TestRestore(unittest.TestCase):
             ("GET", R("commits/e/pulls")): [{"number": 16, "merge_commit_sha": "e", "merged_at": "2026-10-04T00:00:00Z",
                                              "base": {"ref": "main"}}],
             ("GET", R("pulls/16")): {"head": {"sha": "h16"}, "labels": [], "merged_by": {"login": "venuverse"}},
-            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}}]})
+            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}}],
+            **checks("h16")})
         return git, gh
 
     def messages(self, git, gh) -> list[str]:
@@ -376,7 +392,8 @@ class TestApprover(unittest.TestCase):
             ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
             ("GET", R("pulls/13/reviews")): [
                 {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}]})
+                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}],
+            **checks("h13")})
         facts = tr.pr_facts(gh, "b", ["Vaishnav-OM", "venuverse"], sleep=lambda seconds: None)
         self.assertEqual(facts["approver"], "Vaishnav-OM")
 
@@ -386,7 +403,8 @@ class TestApprover(unittest.TestCase):
                                              "base": {"ref": "main"}}],
             ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [{"name": "drill"}],
                                      "merged_by": {"login": "org-owner-example"}},
-            ("GET", R("pulls/13/reviews")): reviews})
+            ("GET", R("pulls/13/reviews")): reviews,
+            **checks("h13")})
         return tr.pr_facts(gh, "b", None if owners is None else list(owners), sleep=lambda seconds: None,
                            unreadable=unreadable)
 
@@ -446,6 +464,195 @@ class TestApprover(unittest.TestCase):
         message = gh.called("POST", R("git/tags"))[0][2]["message"]
         self.assertIn("approver: none\n", message)
         self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
+
+
+class TestValidateOnTheFinalHead(unittest.TestCase):
+    """A code owner's approval says nothing about the required `validate` check: an org owner can merge past a
+    failed or missing one. The tag for such a merge says so in its approver-note, whoever approved it."""
+
+    NOTE = "validate had not passed on the PR's final head"
+    MERGER = "org-owner-example"
+    APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}]
+
+    def facts(self, runs, reviews=None, owners=("Vaishnav-OM", "venuverse"), unreadable=""):
+        """The facts for PR 13 (final head h13, merged by an org owner) whose head carries `runs`, and the client."""
+        gh = FakeGitHub({
+            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
+                                             "base": {"ref": "main"}}],
+            ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": self.MERGER}},
+            ("GET", R("pulls/13/reviews")): self.APPROVED if reviews is None else reviews,
+            **checks("h13", runs)})
+        facts = tr.pr_facts(gh, "b", None if owners is None else list(owners), sleep=lambda seconds: None,
+                            unreadable=unreadable)
+        return facts, gh
+
+    def test_an_approved_merge_whose_head_has_no_validate_run_is_noted(self):
+        facts, _ = self.facts([])
+        self.assertEqual((facts["pr"], facts["approver"]), ("13", "venuverse"))
+        self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+
+    def test_an_approved_merge_whose_latest_validate_run_did_not_succeed_is_noted_with_how_it_ended(self):
+        for conclusion in ("failure", "cancelled", "timed_out", "skipped", "neutral", "action_required", "stale"):
+            with self.subTest(conclusion):
+                facts, _ = self.facts([validate_run(conclusion=conclusion)])
+                self.assertEqual(facts["approver"], "venuverse")
+                self.assertEqual(facts["note"], f"{self.NOTE} (latest run: {conclusion}); merged by {self.MERGER}")
+
+    def test_a_validate_run_that_had_not_finished_is_noted_by_its_status(self):
+        # An unfinished run has no conclusion; its status is what the note says, and it is not a pass.
+        for status in ("queued", "in_progress", "waiting", "pending"):
+            with self.subTest(status):
+                facts, _ = self.facts([validate_run(status=status, conclusion=None)])
+                self.assertEqual(facts["note"], f"{self.NOTE} (latest run: {status}); merged by {self.MERGER}")
+
+    def test_a_rerun_that_failed_after_a_pass_leaves_the_head_unvalidated_whatever_order_they_are_listed_in(self):
+        passed, failed = validate_run(7), validate_run(9, conclusion="failure")
+        for label, runs in {"oldest first": [passed, failed], "newest first": [failed, passed]}.items():
+            with self.subTest(label):
+                facts, _ = self.facts(runs)
+                self.assertEqual(facts["note"], f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
+
+    def test_a_pass_after_a_failure_validates_the_head_whatever_order_they_are_listed_in(self):
+        failed, passed = validate_run(7, conclusion="failure"), validate_run(9)
+        for label, runs in {"oldest first": [failed, passed], "newest first": [passed, failed]}.items():
+            with self.subTest(label):
+                facts, _ = self.facts(runs)
+                self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_an_approved_merge_with_a_passing_validate_run_adds_no_note(self):
+        facts, _ = self.facts([validate_run()])
+        self.assertEqual(facts, {"pr": "13", "approver": "venuverse", "note": None, "drill": False})
+
+    def test_a_bypass_with_a_failed_run_joins_both_notes_and_names_the_merger_once(self):
+        facts, _ = self.facts([validate_run(conclusion="failure")], reviews=[])
+        self.assertEqual(facts["approver"], "none")
+        self.assertEqual(facts["note"], f"ruleset bypass by {self.MERGER}; {self.NOTE} (latest run: failure)")
+        self.assertEqual(facts["note"].count(self.MERGER), 1)
+        facts, _ = self.facts([], reviews=[])
+        self.assertEqual(facts["note"], f"ruleset bypass by {self.MERGER}; {self.NOTE} (no run)")
+        self.assertEqual(facts["note"].count(self.MERGER), 1)
+
+    def test_a_bypass_with_a_passing_run_keeps_its_own_note_only(self):
+        facts, _ = self.facts([validate_run()], reviews=[])
+        self.assertEqual((facts["approver"], facts["note"]), ("none", f"ruleset bypass by {self.MERGER}"))
+
+    def test_an_unknown_approver_with_a_failed_run_keeps_both_notes_and_names_the_merger(self):
+        facts, _ = self.facts([validate_run(conclusion="failure")], owners=None, unreadable="the file names a team")
+        self.assertEqual(facts["approver"], "unknown")
+        self.assertEqual(facts["note"], "code owners could not be read: the file names a team; "
+                                        f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
+        self.assertEqual(facts["note"].count(self.MERGER), 1)
+
+    def test_an_unknown_approver_with_a_passing_run_keeps_only_the_unreadable_note(self):
+        facts, _ = self.facts([validate_run()], owners=None, unreadable="the file names a team")
+        self.assertEqual((facts["approver"], facts["note"]),
+                         ("unknown", "code owners could not be read: the file names a team"))
+
+    def test_runs_from_another_app_or_under_another_name_are_ignored(self):
+        # Only the job named validate that GitHub Actions reports is the required check. A green run of that name
+        # from another app, or a green run of another name, passes nothing; and a red one of either does not fail
+        # a head whose real validate run is green.
+        not_the_check = {
+            "a green run from another app": [validate_run(5, app=1234)],
+            "a green run of another name": [validate_run(5, name="lint")],
+            "a green run of a longer name": [validate_run(5, name="validate / extra")],
+            "a green run with no app": [{"id": 5, "name": "validate", "status": "completed", "conclusion": "success"}],
+            "a green run whose app is null": [dict(validate_run(5), app=None)],
+        }
+        for label, runs in not_the_check.items():
+            with self.subTest(label):
+                facts, _ = self.facts(runs)
+                self.assertEqual(facts["note"], f"{self.NOTE} (no run); merged by {self.MERGER}")
+        beside_the_real_run = {
+            "a later red run from another app": validate_run(9, conclusion="failure", app=1234),
+            "a later red run of another name": validate_run(9, conclusion="failure", name="lint"),
+            "a later unfinished run of another name": validate_run(9, status="in_progress", conclusion=None, name="build"),
+        }
+        for label, other in beside_the_real_run.items():
+            with self.subTest(label):
+                facts, _ = self.facts([validate_run(5), other])
+                self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_the_runs_are_asked_for_by_name_and_app_and_all_of_them(self):
+        # filter=all: the default lists only the latest run of each name, which would hide a later re-run's result.
+        _, gh = self.facts([validate_run()])
+        asked = gh.called("GET", R("commits/h13/check-runs"))
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(asked[0][3], {"check_name": "validate", "app_id": 15368, "filter": "all"})
+
+    def test_the_api_envelope_and_every_page_of_runs_are_read_through_the_real_client(self):
+        pages = {1: [validate_run(run_id, conclusion="failure") for run_id in range(101, 201)],
+                 2: [validate_run(300)]}
+        asked = []
+
+        def transport(method, url, headers, data):
+            asked.append(urllib.parse.urlparse(url))
+            page = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["page"][0])
+            return 200, json.dumps({"total_count": 101, "check_runs": pages[page]}).encode()
+
+        client = GitHub("token", REPO, transport=transport)
+        # 100 failed runs on the first page and the latest, a pass, on the second: the highest id decides.
+        self.assertEqual(tr.validate_conclusion(client, "h13"), "success")
+        self.assertEqual([call.path for call in asked], [f"/repos/{REPO}/commits/h13/check-runs"] * 2)
+        self.assertEqual(urllib.parse.parse_qs(asked[0].query),
+                         {"check_name": ["validate"], "app_id": ["15368"], "filter": ["all"],
+                          "per_page": ["100"], "page": ["1"]})
+
+    def test_no_pull_request_means_no_check_read(self):
+        # The routes hold no check-runs answer: a read of one fails the test.
+        gh = FakeGitHub({("GET", R("commits/d/pulls")): []})
+        facts = tr.pr_facts(gh, "d", None, sleep=lambda seconds: None)
+        self.assertEqual((facts["pr"], facts["approver"]), ("none", "none"))
+        self.assertEqual(facts["note"], "no pull request merged this commit")
+
+    def test_the_tag_for_a_merge_past_a_failed_validate_carries_the_note(self):
+        gh = sweep_github()
+        gh.routes.update(checks("h13", [validate_run(7), validate_run(9, conclusion="failure")]))
+        tr.sweep(history(chain=("t8", "b")), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        message = gh.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertEqual(message, "fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\n"
+                         f"integrity: {INTEGRITY['0.9.15']}\npr: 13\napprover: venuverse\nstore-migration: additive\n"
+                         f"approver-note: {self.NOTE} (latest run: failure); merged by venuverse\n")
+        # The audit reads the same message: one pr, one approver.
+        parsed = release_checks.parse_tag_message(message)
+        self.assertEqual((parsed["pr"], parsed["approver"]), ("13", "venuverse"))
+
+    def test_the_note_is_added_only_to_the_tag_whose_head_did_not_pass(self):
+        gh = sweep_github()
+        gh.routes.update(checks("h14", [validate_run(conclusion="failure")]))
+        tr.sweep(history(chain=("t8", "b", "c")), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        first, second = (call[2]["message"] for call in gh.called("POST", R("git/tags")))
+        self.assertNotIn("approver-note", first)
+        self.assertIn("approver-note: ruleset bypass by org-owner-example; "
+                      f"{self.NOTE} (latest run: failure)\n", second)
+
+    def test_the_checks_are_read_with_the_workflow_token_and_the_tags_are_written_with_the_apps(self):
+        writer = sweep_github()
+        del writer.routes[("GET", R("commits/h13/check-runs"))]  # a read of the checks through this client fails
+        reader = FakeGitHub(checks("h13", [validate_run(conclusion="failure")]))
+        clients = {"app-token": writer, "workflow-token": reader}
+        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "app-token", "GITHUB_TOKEN": "workflow-token"}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(tr, "Git", lambda path: history(chain=("t8", "b"))), \
+                mock.patch.object(tr, "GitHub", lambda token, repo: clients[token]), contextlib.redirect_stdout(out):
+            code = tr.main(["sweep"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual([(call[0], call[1]) for call in reader.calls], [("GET", R("commits/h13/check-runs"))])
+        self.assertEqual(reader.writes(), [])
+        message = writer.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertIn(f"approver-note: {self.NOTE} (latest run: failure); merged by venuverse\n", message)
+
+    def test_a_check_read_that_fails_stops_the_sweep_before_that_commit_is_tagged(self):
+        # A tag is permanent, so a read that cannot say how validate ended must not become a tag without the note.
+        gh = sweep_github()
+        path = R("commits/h13/check-runs")
+        gh.routes[("GET", path)] = GitHubError(403, "GET", path, "Resource not accessible by integration")
+        code, out = run_main("sweep", history(chain=("t8", "b", "c")), gh)
+        self.assertEqual(code, 1)
+        self.assertTrue(out.startswith("::error::"), out)
+        self.assertIn("HTTP 403", out)
+        self.assertEqual(out.count("\n"), 1)
+        self.assertEqual(gh.writes(), [])
 
 
 class TestCodeOwners(unittest.TestCase):
@@ -664,6 +871,7 @@ class TestSweepOwners(unittest.TestCase):
         gh.routes[("GET", R("pulls/17"))] = {"head": {"sha": "h17"}, "labels": [], "merged_by": {"login": "venuverse"}}
         gh.routes[("GET", R("pulls/17/reviews"))] = [
             {"state": "APPROVED", "commit_id": "h17", "user": {"login": "Vaishnav-OM"}}]
+        gh.routes.update(checks("h17"))
         self.assertEqual(len(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)), 3)
         approvers = [re.search(r"(?m)^approver: (.*)$", call[2]["message"]).group(1)
                      for call in gh.called("POST", R("git/tags"))]
@@ -780,6 +988,7 @@ class TestGitHubFailures(unittest.TestCase):
         cases = {
             "tag lookup": (history(chain=("t8", "b")), reads(R("git/ref/tags/fleet-v9"), 500)),
             "pull request read": (history(chain=("t8", "b")), reads(R("pulls/13"))),
+            "check run read": (history(chain=("t8", "b")), reads(R("commits/h13/check-runs"), 403)),
             "git failure": (Broken("fleet_tags", GitError("git for-each-ref failed: bad object"), chain=["t8"]),
                             sweep_github()),
             "no main in the checkout": (Broken("main", InfraError("git", "no main ref"), chain=["t8"],
