@@ -194,6 +194,12 @@ class TestHumanRules(unittest.TestCase):
                 self.assertIn("this marketplace requires one", messages[0])
                 self.assertIn("Claude Code itself refuses a null or non-string description", messages[0])
                 self.assertNotIn("anything else", messages[0])
+                # Claude Code still adds a marketplace whose entry has such a description (checked
+                # against a real install), and lists that one entry as unsupported with a schema
+                # error, so the message must not say the manifest breaks the add for every user.
+                self.assertIn("lists ai-tc as unsupported with a schema error", messages[0])
+                self.assertNotIn("breaks", messages[0])
+                self.assertNotIn("every user", messages[0])
 
     def test_a_description_that_is_a_string_with_words_in_it_passes(self):
         for good in ("Clearer words.", "  padded  ", "x", "Ünïcode ✓"):
@@ -712,9 +718,11 @@ class TestDeepJson(unittest.TestCase):
         self.assertLess(vp._depth(ts.manifest()), vp.MAX_JSON_DEPTH // 4)
 
     def test_nesting_past_the_parser_and_nesting_inside_it_both_fail_to_parse(self):
-        # 100,000 levels end the JSON parser itself in RecursionError. 2,000 parse, and would
-        # end the code that reads the parsed value (comparisons, the rename search) instead.
+        # 100,000 levels end the JSON parser itself in RecursionError, which rc.parse_json reports
+        # as a ValueError of its own. 2,000 parse, and would end the code that reads the parsed
+        # value (comparisons, the rename search) instead, so validate's depth limit refuses them.
         for levels in (vp.MAX_JSON_DEPTH + 1, 2000, 100_000):
+            reason = "too deeply nested" if levels == 100_000 else "nests deeper"
             with self.subTest(levels=levels):
                 deep = '{"renames": %s, "plugins": []}' % nested(levels)
                 for path in (rc.MANIFEST, ".agents/plugins/marketplace.json", "plugins.json"):
@@ -722,7 +730,7 @@ class TestDeepJson(unittest.TestCase):
                     head[path] = deep
                     report = run(pull(**HUMAN), files(ts.manifest()), head, [path])
                     failed_with(self, report, f"{path} does not parse at the PR head")
-                    failed_with(self, report, "nests deeper")
+                    failed_with(self, report, reason)
                     self.assertEqual((report.exit_code, report.infra), (1, ""))
                 head = files(ts.manifest())
                 head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(levels)
@@ -739,6 +747,216 @@ class TestDeepJson(unittest.TestCase):
         report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, rc.SAFETY_FILE])
         failed_with(self, report, "rollback-safety.json does not parse at the PR head")
         failed_with(self, report, "a human PR may change only")
+
+
+EXTRA = ".github/workflows/extra.yml"
+WORKFLOWS_DIR = pathlib.Path(__file__).resolve().parents[1] / "workflows"
+
+
+def workflow_text(job="build", *, name=None, top="", job_extra="", step="- run: echo hello"):
+    """A small workflow in the plain block style this repository's own workflows use."""
+    lines = ["name: extra", "", "on: pull_request", ""]
+    if top:
+        lines += [top, ""]
+    lines += ["jobs:", f"  {job}:"]
+    if name is not None:
+        lines.append(f"    name: {name}")
+    lines.append("    runs-on: ubuntu-latest")
+    if job_extra:
+        lines.append(job_extra)
+    lines += ["    steps:", f"      {step}", ""]
+    return "\n".join(lines)
+
+
+def workflow_pr(text, *, path=EXTRA, pr=None, extra_changed=()):
+    """validate's report for a PR that adds one workflow file and nothing else."""
+    head = files(ts.manifest())
+    head[path] = text
+    return run(pr or pull(**HUMAN), files(ts.manifest()), head, [path, *extra_changed])
+
+
+class TestWorkflowFiles(unittest.TestCase):
+    """A workflow file a PR adds or changes is read as text, never run. Any job named validate
+    satisfies the required check, so a PR that defines one, or that lets a job create a check
+    run or status of that name, fails; a file the scan cannot read with confidence fails too."""
+
+    def assert_refused(self, text, fragment, *, path=EXTRA):
+        report = workflow_pr(text, path=path)
+        failed_with(self, report, fragment)
+        self.assertEqual((report.exit_code, report.infra), (1, ""))
+        return report
+
+    def test_a_job_id_of_validate_fails_in_both_extensions(self):
+        for path in (".github/workflows/extra.yml", ".github/workflows/extra.yaml", ".github/workflows/EXTRA.YML"):
+            with self.subTest(path=path):
+                report = self.assert_refused(workflow_text("validate"), "defines a job with the id validate", path=path)
+                failed_with(self, report, f"`{path}` defines")
+                failed_with(self, report, "so only .github/workflows/validate.yml may have one")
+
+    def test_a_job_id_spelled_another_way_still_fails(self):
+        for job in ('"validate"', "'validate'", "Validate", "VALIDATE", "validate "):
+            with self.subTest(job=job):
+                self.assert_refused(workflow_text(job), "defines a job with the id validate")
+
+    def test_a_job_name_of_validate_fails_in_both_extensions(self):
+        for path in (".github/workflows/extra.yml", ".github/workflows/extra.yaml"):
+            with self.subTest(path=path):
+                self.assert_refused(workflow_text(name="validate"), "names job `build` validate", path=path)
+
+    def test_a_job_name_spelled_another_way_still_fails(self):
+        for name in ('"validate"', "'validate'", "Validate", "validate # the required one", "&label validate", "!!str validate", '" validate "'):
+            with self.subTest(name=name):
+                self.assert_refused(workflow_text(name=name), "names job `build` validate")
+
+    def test_the_failure_quotes_a_job_id_the_pr_wrote(self):
+        report = workflow_pr(workflow_text("a`b|c", name="validate"))
+        failed_with(self, report, "names job `a'b|c` validate")
+        self.assertFalse(any("`a`b" in failure for failure in report.failures))
+
+    def test_a_workflow_that_may_create_a_check_run_or_status_fails(self):
+        grants = {
+            "top level": dict(top="permissions:\n  checks: write"),
+            "statuses": dict(top="permissions:\n  statuses: write"),
+            "one job": dict(job_extra="    permissions:\n      checks: write"),
+            "mixed in": dict(top="permissions:\n  contents: read\n  statuses: write\n  issues: read"),
+            "flow": dict(top="permissions: {checks: write}"),
+            "flow, quoted": dict(top="permissions: { 'statuses': \"write\", contents: read }"),
+            "quoted key": dict(top='permissions:\n  "checks": "write"'),
+            "write-all": dict(top="permissions: write-all"),
+            "write-all, job": dict(job_extra="    permissions: write-all"),
+            "app token action input": dict(step="- uses: actions/create-github-app-token@v3\n        with:\n          permission-checks: write"),
+            "app token action input, statuses": dict(step="- uses: actions/create-github-app-token@v3\n        with:\n          permission-statuses: write"),
+        }
+        for label, kwargs in grants.items():
+            with self.subTest(label):
+                self.assert_refused(workflow_text(**kwargs), "grants checks: write, statuses: write or write-all")
+
+    def test_forms_the_scan_cannot_read_with_confidence_fail(self):
+        unreadable = {
+            "jobs in flow style": "name: x\non: push\njobs: {build: {runs-on: ubuntu-latest}}\n",
+            "jobs as an alias": "name: x\non: push\njobs: *shared\n",
+            "the whole file as JSON": '{"on": "push", "jobs": {"build": {"runs-on": "ubuntu-latest"}}}',
+            "an escaped top-level key": 'on: push\n"\\x6aobs":\n  build:\n    runs-on: x\n',
+            "a job in flow style": "on: push\njobs:\n  build: {runs-on: ubuntu-latest, name: validate}\n",
+            "a job as an alias": "on: push\njobs:\n  build: *base\n",
+            "a merge key among the jobs": "on: push\njobs:\n  <<: *base\n",
+            "a merge key in a job": "on: push\njobs:\n  build:\n    <<: *base\n    runs-on: x\n",
+            "an escaped job id": 'on: push\njobs:\n  "\\x76alidate":\n    runs-on: x\n',
+            "an escaped job name": workflow_text(name='"\\x76alidate"'),
+            "an escaped job name, unicode": workflow_text(name='"\\u0076alidate"'),
+            "a job name that is an alias": workflow_text(name="*label"),
+            "a job name on the next line": "on: push\njobs:\n  build:\n    name:\n      validate\n    runs-on: x\n",
+            "a job name that is a block scalar": "on: push\njobs:\n  build:\n    name: |\n      validate\n    runs-on: x\n",
+            "a job name with an open quote": 'on: push\njobs:\n  build:\n    name: "validate\n    runs-on: x\n',
+            "a complex key": "on: push\njobs:\n  ? build\n  : runs-on: x\n",
+            "tab indentation": "on: push\njobs:\n\tbuild:\n\t\truns-on: x\n",
+            "jobs indented unevenly": "on: push\njobs:\n    build:\n      runs-on: x\n  other:\n    runs-on: x\n",
+        }
+        for label, text in unreadable.items():
+            with self.subTest(label):
+                self.assert_refused(text, "is written in a form this check does not read")
+
+    def test_the_unreadable_failure_names_the_reason_and_the_fix(self):
+        report = workflow_pr("name: x\non: push\njobs: {build: {runs-on: x}}\n")
+        failed_with(self, report, "(its jobs are given in flow style or as an alias)")
+        failed_with(self, report, "write its jobs in plain block style")
+
+    def test_a_problem_found_before_an_unreadable_part_is_still_reported(self):
+        text = "on: push\njobs:\n  validate:\n    runs-on: x\n  other: {runs-on: x}\n"
+        report = workflow_pr(text)
+        failed_with(self, report, "defines a job with the id validate")
+        failed_with(self, report, "is written in a form this check does not read")
+
+    def test_ordinary_workflows_pass(self):
+        passing = {
+            "a step named validate": workflow_text(step="- name: validate\n        run: echo hello"),
+            "a name that only starts with validate": workflow_text(name="validate (docs)"),
+            "an id that only starts with validate": workflow_text("validate-docs"),
+            "an expression name": workflow_text(name="${{ matrix.name }}"),
+            "read permissions": workflow_text(top="permissions:\n  checks: read\n  statuses: read\n  contents: write"),
+            "no permissions": workflow_text(top="permissions: {}"),
+            "write to others": workflow_text(job_extra="    permissions:\n      contents: write\n      pull-requests: write"),
+            "a comment about it": workflow_text() + "# name: validate\n# checks: write\n# permissions: write-all\n",
+            "a trailing comment": workflow_text(top="permissions:\n  checks: read # never write"),
+            "a shell script that says so": workflow_text(step="- run: |\n          echo 'name: validate'\n          echo 'checks: read'"),
+            "no jobs at all": "name: nothing\non: push\n",
+            "an empty file": "",
+            "documents with markers": "---\nname: x\non: push\njobs:\n  build:\n    runs-on: x\n...\n",
+            "an anchor on a job": "on: push\njobs:\n  build: &base\n    runs-on: x\n    name: build\n",
+            "a keyed matrix": "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        name: [validate, other]\n    runs-on: x\n",
+            "jobs before another key": "jobs:\n  build:\n    runs-on: x\nconcurrency:\n  group: g\n",
+            "everything indented": "  on: push\n  jobs:\n    build:\n      runs-on: x\n",
+        }
+        for label, text in passing.items():
+            with self.subTest(label):
+                report = workflow_pr(text)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+
+    def test_the_repositorys_own_workflows_pass_and_the_scan_sees_validate_in_validate_yml(self):
+        for workflow in sorted(WORKFLOWS_DIR.glob("*.yml")):
+            if workflow.name == "validate.yml":
+                continue
+            with self.subTest(workflow.name):
+                self.assertEqual(vp.workflow_problems(f".github/workflows/{workflow.name}", workflow.read_text(encoding="utf-8")), [])
+        text = (WORKFLOWS_DIR / "validate.yml").read_text(encoding="utf-8")
+        copied = vp.workflow_problems(".github/workflows/copy.yml", text)
+        self.assertEqual(len(copied), 2, copied)
+        self.assertTrue(any("defines a job with the id validate" in problem for problem in copied), copied)
+        self.assertTrue(any("names job `validate` validate" in problem for problem in copied), copied)
+
+    def test_validate_yml_may_define_the_job_but_not_grant_check_writes(self):
+        path = ".github/workflows/validate.yml"
+        text = (WORKFLOWS_DIR / "validate.yml").read_text(encoding="utf-8")
+        report = workflow_pr(text, path=path)
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+        self.assertTrue(any(path in note for note in report.notes), report.notes)  # still called out for review
+        for grant in ("permissions: write-all", "permissions:\n  checks: write"):
+            with self.subTest(grant):
+                changed = text.replace("permissions:\n  contents: read", grant, 1)
+                self.assertNotEqual(changed, text)
+                failed_with(self, workflow_pr(changed, path=path), "grants checks: write")
+
+    def test_only_workflow_files_in_the_prs_diff_are_read(self):
+        bad = workflow_text("validate")
+        for path in ("docs/validate.yml", ".github/workflows/sub/extra.yml", ".github/workflows/extra.txt", ".github/validate.yml", "workflows/extra.yml"):
+            with self.subTest(path=path):
+                report = workflow_pr(bad, path=path)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+        head = files(ts.manifest())
+        head[EXTRA] = bad  # present at the head, but the PR's diff does not touch it
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST])
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+        deleted = files(ts.manifest())  # a deleted file has no text at the head
+        report = run(pull(**HUMAN), files(ts.manifest()), deleted, [EXTRA])
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+
+    def test_each_changed_workflow_is_read_and_a_bad_one_fails_a_bot_pr_too(self):
+        head = files(ts.manifest())
+        head[".github/workflows/one.yml"] = workflow_text("validate")
+        head[".github/workflows/two.yaml"] = workflow_text(name="validate")
+        head[".github/workflows/three.yml"] = workflow_text()
+        changed = [".github/workflows/one.yml", ".github/workflows/two.yaml", ".github/workflows/three.yml"]
+        report = run(pull(**HUMAN), files(ts.manifest()), head, changed)
+        failed_with(self, report, "`.github/workflows/one.yml` defines a job with the id validate")
+        failed_with(self, report, "`.github/workflows/two.yaml` names job `build` validate")
+        self.assertFalse(any("three.yml" in failure for failure in report.failures), report.failures)
+        report = run(pull(), files(ts.manifest()), head, changed)  # the bot's PR: it may change no workflow at all
+        failed_with(self, report, "`.github/workflows/one.yml` defines a job with the id validate")
+        failed_with(self, report, "a bot PR must be exactly one importer mode")
+
+    def test_a_workflow_problem_does_not_hide_a_manifest_problem_or_the_reverse(self):
+        head = files(ts.manifest())
+        head[EXTRA] = workflow_text("validate")
+        head[rc.SAFETY_FILE] = "{"
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [EXTRA, rc.SAFETY_FILE])
+        failed_with(self, report, "defines a job with the id validate")
+        failed_with(self, report, "rollback-safety.json does not parse at the PR head")
+        head = files(ts.manifest())
+        head[EXTRA] = workflow_text("validate")
+        head[rc.MANIFEST] = "{"
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [EXTRA, rc.MANIFEST])
+        failed_with(self, report, "defines a job with the id validate")
+        failed_with(self, report, f"{rc.MANIFEST} does not parse at the PR head")
 
 
 class TestWorkflow(unittest.TestCase):
@@ -1116,6 +1334,44 @@ class TestMain(unittest.TestCase):
                 text = self.summary_text()
                 self.assertIn("## validate: PR #7: FAIL", text)
                 self.assertIn("claude-plugin/marketplace.json does not parse at the PR head", text)
+
+    def branch(self, name, files=None, *, remove=()):
+        """A commit on a new branch off main, then back to main: the PR head."""
+        ts.git(self.repo.path, "checkout", "-q", "-b", name)
+        for path in remove:
+            os.remove(os.path.join(self.repo.path, path))
+        head = self.repo.commit(files=files or {})
+        ts.git(self.repo.path, "checkout", "-q", "main")
+        return head
+
+    def test_a_workflow_with_a_job_named_validate_fails_with_a_summary(self):
+        for name, path in (("yml", ".github/workflows/extra.yml"), ("yaml", ".github/workflows/extra.yaml")):
+            with self.subTest(path):
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)
+                head = self.branch(f"wf-{name}", {path: workflow_text("validate")})
+                self.assertEqual(self.main(head, self.commits(head)), 1)
+                text = self.summary_text()
+                self.assertIn("## validate: PR #7: FAIL", text)
+                self.assertIn(f"`{path}` defines a job with the id validate", text)
+        if os.path.exists(self.summary):
+            os.remove(self.summary)
+        head = self.branch("wf-name", {".github/workflows/named.yml": workflow_text(name="validate")})
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn("`.github/workflows/named.yml` names job `build` validate", self.summary_text())
+
+    def test_workflows_a_pr_adds_deletes_or_renames_are_read_where_they_stand_at_the_head(self):
+        self.repo.commit(files={".github/workflows/old.yml": workflow_text()})
+        added = self.branch("wf-add-ok", {".github/workflows/new.yml": workflow_text("other")})
+        self.assertEqual(self.main(added, self.commits(added)), 0, self.summary_text())
+        deleted = self.branch("wf-delete", remove=[".github/workflows/old.yml"])
+        self.assertEqual(self.main(deleted, self.commits(deleted)), 0, self.summary_text())
+        renamed = self.branch("wf-rename", {".github/workflows/renamed.yml": workflow_text("validate")}, remove=[".github/workflows/old.yml"])
+        os.remove(self.summary)
+        self.assertEqual(self.main(renamed, self.commits(renamed)), 1)
+        text = self.summary_text()
+        self.assertIn("`.github/workflows/renamed.yml` defines a job with the id validate", text)
+        self.assertNotIn("old.yml` defines", text)
 
     def test_an_unexpected_error_is_no_verdict_with_a_summary(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
