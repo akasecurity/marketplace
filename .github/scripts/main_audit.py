@@ -83,7 +83,7 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
         return None
     return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
             f"({', '.join(owners) or 'none listed'}) on its final head `{head}` by someone other than its last "
-            f"pusher ({', '.join(sorted(pushers)) or 'unknown'}).")
+            f"pusher ({', '.join(sorted(pushers))}).")
 
 
 def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
