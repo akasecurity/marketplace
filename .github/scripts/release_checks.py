@@ -467,7 +467,9 @@ def registry_dist(version: str, *, fetch: Fetch = http_fetch, sleep=time.sleep) 
 
 
 class _CertError(ValueError):
-    """The signing certificate could not be read as a Fulcio leaf certificate."""
+    """The signing certificate could not be read as a Fulcio leaf certificate. The release is
+    refused for it. When every new release is, suspect a change in Fulcio's certificate
+    format first (see signer_identity)."""
 
 
 # What the release checks read from the signing certificate beyond its subject alternative
@@ -597,7 +599,12 @@ def signer_identity(der: bytes) -> dict:
     one key per SIGNER_FIELDS name}. Reads the standard library only, verifies nothing
     cryptographic (npm did: the chain to Fulcio's CA, the signed certificate timestamp,
     Rekor, and the envelope signature made with this leaf's key), and refuses anything it
-    does not expect with _CertError."""
+    does not expect with _CertError.
+
+    A certificate the reader cannot read is a refusal, so it fails closed. If every new
+    release starts to read as refused for that reason, suspect a change in Fulcio's
+    certificate format first, before a run of bad releases: the refusal names the first thing
+    the reader did not expect, and the certificate of an earlier release still reads."""
     tag, start, stop = _der(der, 0, len(der))
     if tag != 0x30 or stop != len(der):
         raise _CertError("not exactly one certificate SEQUENCE")
