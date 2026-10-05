@@ -2,6 +2,9 @@
 import contextlib
 import datetime as dt
 import io
+import json
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -12,6 +15,9 @@ import staleness as st
 from fakes import INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, pull, pulls_route
 from release_checks import MANIFEST
 
+# StalenessCase replaces release_checks.npm_candidates for every test; the tests that read the registry
+# through the real one keep a reference to it.
+REAL_NPM_CANDIDATES = release_checks.npm_candidates
 NOW = dt.datetime(2026, 10, 5, 12, 0, tzinfo=dt.timezone.utc)
 FROZEN = [{"tag": "fleet-v7", "object": "o7", "commit": "t7"}, {"tag": "fleet-v8", "object": "o8", "commit": "t8"}]
 
@@ -40,8 +46,10 @@ class StalenessCase(unittest.TestCase):
         self.candidates, self.bad, self.down, self.pulls, self.times = [], {}, {}, [], {}
         self.log = io.StringIO()
         self.gh = FakeGitHub({("GET", R("pulls")): pulls_route(self.pulls)})
+        # The reader of the one package document that npm_candidates is handed; the stub below ignores it.
+        self.packument = lambda url, headers: (200, b"{}")
         stubs = {"pinned_versions": lambda repo_dir: {"0.9.13", "0.9.14", "0.9.15"},
-                 "npm_candidates": lambda pinned: list(self.candidates),
+                 "npm_candidates": lambda pinned, fetch=None: list(self.candidates),
                  "verify_release": self.fake_verify}
         self.stubs = {}
         for name, function in stubs.items():
@@ -59,7 +67,8 @@ class StalenessCase(unittest.TestCase):
     def rules(self, git=None, refs=("refs/heads/main", "refs/tags/fleet-v8", "refs/tags/fleet-v8^{}"), drill=False):
         with contextlib.redirect_stdout(self.log):
             results = st.evaluate(git=git or repo(), gh=self.gh, repo_dir="/fake/marketplace", frozen=FROZEN, now=NOW,
-                                  times=self.times, remote_refs=list(refs), drill=drill, actor="venuverse")
+                                  times=self.times, packument=self.packument, remote_refs=list(refs), drill=drill,
+                                  actor="venuverse")
         return {item.rule: item for item in results}
 
 
@@ -260,13 +269,78 @@ class TestMainIsReadByItsFullRef(StalenessCase):
             with self.subTest(main_entry=main_entry):
                 with contextlib.redirect_stdout(self.log):
                     entry = st.entry_and_rule_i(full_ref_only(repo(main_entry=main_entry)), "/fake/marketplace",
-                                                NOW, {})[0]
+                                                NOW, {}, self.packument)[0]
                 self.assertEqual(entry.red, not main_entry)
 
     def test_the_untagged_pin_change_walk_starts_from_the_full_ref(self):
         rule = st.rule_iii(full_ref_only(repo()), FROZEN, NOW)
         self.assertTrue(rule.red)
         self.assertIn("`b` (ai-tc 0.9.15", rule.detail)
+
+
+class Reply:
+    """What the opener behind release_checks.http_fetch hands back for a 200 answer."""
+
+    status = 200
+
+    def __init__(self, document):
+        self.body = json.dumps(document).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class RunMain(StalenessCase):
+    """staleness.main() over fakes: the git checkout and the GitHub API are fakes, the registry is whatever the
+    test routes the opener to, and the results are the ones it hands the issue router."""
+
+    def run_main(self, git=None):
+        written = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen = os.path.join(tmp, "frozen.json")
+            with open(frozen, "w", encoding="utf-8") as handle:
+                json.dump(FROZEN, handle)
+            with mock.patch.object(st, "Git", return_value=git or repo(pin_change_age=dt.timedelta(minutes=30))), \
+                    mock.patch.object(st, "GitHub", return_value=self.gh), \
+                    mock.patch.object(st, "write_output", side_effect=lambda key, value: written.update({key: value})), \
+                    mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO}), \
+                    contextlib.redirect_stdout(self.log):
+                code = st.main(["--repo-dir", "/fake/marketplace", "--frozen", frozen])
+        return code, {item.rule: item for item in issue_router.results_from_json(written["results"])}
+
+
+class TestOnePackumentRead(RunMain):
+    """The registry serves the package document from a CDN cache, so a second read a moment after a publish can
+    show a version the first did not. The publish times and the list of versions come from one read."""
+
+    def test_one_packument_read_feeds_the_times_and_the_candidates(self):
+        self.stubs["npm_candidates"].side_effect = REAL_NPM_CANDIDATES
+        published = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        before = {"versions": {"0.9.15": {}}, "time": {"0.9.15": "2026-10-01T00:00:00.000Z"}}
+        after = {"versions": {"0.9.15": {}, "0.9.16": {}},
+                 "time": {"0.9.15": "2026-10-01T00:00:00.000Z", "0.9.16": published}}
+        with mock.patch.object(release_checks._OPENER, "open", side_effect=[Reply(before), Reply(after)]) as opened:
+            code, rules = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [st.REGISTRY_URL])
+        for rule in ("staleness-i", "staleness-i-refused", "staleness-i-no-verdict"):
+            with self.subTest(rule):
+                self.assertFalse(rules[rule].red)
+        self.assertNotIn("0.9.16", "".join(item.detail for item in rules.values() if item.red))
+
+    def test_the_one_read_is_served_for_the_package_document_only(self):
+        with mock.patch.object(release_checks, "http_fetch", return_value=(200, b"{}")) as fetched:
+            reader = st.read_packument()
+        fetched.assert_called_once_with(st.REGISTRY_URL, {"Accept": "application/json"})
+        self.assertEqual(reader(st.REGISTRY_URL, {}), (200, b"{}"))
+        with self.assertRaises(ValueError):
+            reader("https://registry.npmjs.org/some-other-package", {})
 
 
 class TestOtherRules(StalenessCase):
