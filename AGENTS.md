@@ -258,9 +258,11 @@ true only once it is.
   anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
   that declares no permissions and so takes the repository's default token; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
-  PR's own run. Code-owner review of workflow changes stays the control for all of these, and the
-  detection is the check after the merge: `tag-release`'s note and `main-audit` count only a
-  `validate` check run that belongs to a `pull_request_target` run of `validate.yml`. That check
+  PR's own run. Code-owner review of workflow changes stays the control for what a PR's own diff
+  carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
+  outside with some other token are not in that diff, so the check after the merge is what catches
+  those, and it is the detection for the rest too: `tag-release`'s note and `main-audit` count only
+  a `validate` check run that belongs to a `pull_request_target` run of `validate.yml`. That check
   ties a check run to `validate.yml` through its check suite, so a check run created through the API
   with a workflow token and filed by GitHub under that suite could still count (not reproduced; a
   known limit). On a bot PR every commit must also carry GitHub's verified signature. The summary's
