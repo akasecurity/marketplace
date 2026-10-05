@@ -213,6 +213,84 @@ class TestUnreadableCertificates(ts.VerifyMixin, unittest.TestCase):
                 pass
 
 
+def name_carriers(*names):
+    """Extensions that are not the subject alternative name, each holding in its value the
+    encoding of one: {where: (extension, the bytes it holds)}. The whole extension, OID and
+    all, and the bare names are the two shapes a reader that searched the certificate for a
+    name, instead of walking to the one extension that holds it, would pick up. The OIDs are
+    ones a leaf from ts.leaf_extensions does not already carry."""
+    whole = ts.san_extension(*names)
+    bare = ts.der(0x30, b"".join(names))
+    return {
+        "basic constraints": (ts.extension("2.5.29.19", whole, critical=True), whole),
+        "extended key usage": (ts.extension("2.5.29.37", whole), whole),
+        "an unassigned Fulcio arc": (ts.extension(ts.FULCIO + "98", whole), whole),
+        "an unassigned Fulcio arc, in a list of extensions": (
+            ts.extension(ts.FULCIO + "98", ts.der(0x30, whole)),
+            whole,
+        ),
+        "an unassigned Fulcio arc, as the bare names": (ts.extension(ts.FULCIO + "97", bare), bare),
+    }
+
+
+def hiding_places(extensions, *names):
+    """{where and in what position: (certificate, the bytes hidden in it)}: a certificate
+    with these extensions and one more that holds the encoding of `names`, put before the
+    others and after them."""
+    places = {}
+    for where, (carrier, hidden) in name_carriers(*names).items():
+        places[f"{where}, first"] = (ts.der_cert([carrier, *extensions]), hidden)
+        places[f"{where}, last"] = (ts.der_cert([*extensions, carrier]), hidden)
+    return places
+
+
+class TestNameInAnotherExtension(ts.VerifyMixin, unittest.TestCase):
+    """The name is whatever the extension with OID 2.5.29.17 holds, and nothing else in the
+    certificate is read for it, even bytes that are exactly that extension."""
+
+    def test_a_name_in_another_extension_does_not_stand_in_for_a_missing_one(self):
+        right = ts.san_uri(workflow_uri())
+        places = hiding_places(ts.leaf_extensions(VERSION, san=None), right)
+        self.assertEqual(len(places), 10)
+        for name, (cert, hidden) in places.items():
+            with self.subTest(name):
+                self.assertIn(hidden, cert)
+                with self.assertRaises(rc._CertError) as caught:
+                    rc.signer_identity(cert)
+                self.assertIn("does not carry certificate subject alternative name", str(caught.exception))
+                error = self.refused("provenance", audits=[ts.audit_output(VERSION, cert=cert)])
+                self.assertIn("signing certificate is unreadable", error.detail)
+                self.assertIn("does not carry certificate subject alternative name", error.detail)
+
+    def test_a_name_in_another_extension_does_not_replace_a_different_real_one(self):
+        right = ts.san_uri(workflow_uri())
+        for real_name, real in {
+            "another versions tag": workflow_uri("0.9.13"),
+            "another repository": workflow_uri(repository=OTHER),
+        }.items():
+            for name, (cert, hidden) in hiding_places(ts.leaf_extensions(VERSION, san=real), right).items():
+                with self.subTest(f"{real_name}; {name}"):
+                    self.assertIn(hidden, cert)
+                    self.assertEqual(rc.signer_identity(cert)["san"], real)
+                    error = self.refused("provenance", audits=[ts.audit_output(VERSION, cert=cert)])
+                    self.assertIn("certificate subject alternative name", error.detail)
+                    self.assertIn(real, error.detail)
+
+    def test_the_real_extension_with_the_right_name_is_accepted_whatever_another_holds(self):
+        wrong = ts.san_uri(workflow_uri(repository=OTHER))
+        for hidden_name, names in {
+            "someone else's workflow": (wrong,),
+            "two names": (wrong, wrong),
+            "a name that is not a URI": (ts.der(0x82, b"example.com"),),
+        }.items():
+            for name, (cert, hidden) in hiding_places(ts.leaf_extensions(VERSION), *names).items():
+                with self.subTest(f"{hidden_name}; {name}"):
+                    self.assertIn(hidden, cert)
+                    self.assertEqual(rc.signer_identity(cert)["san"], workflow_uri())
+                    release, _ = self.verify(audits=[ts.audit_output(VERSION, cert=cert)])
+                    self.assertEqual(release.git_commit, ts.ATTESTED[VERSION])
+
+
 class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
     def test_a_release_signed_by_the_real_certificate_passes(self):
         release, _ = self.verify(audits=[ts.audit_output(VERSION, cert=real_leaf())])
