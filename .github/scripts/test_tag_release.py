@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import release_checks
 import tag_release as tr
 from fakes import (CODEOWNERS, INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, not_found, pull,
                    pulls_route, safety, safety_entry)
@@ -209,6 +210,72 @@ class TestSweep(unittest.TestCase):
     def test_a_forward_version_without_a_safety_entry_records_unknown(self):
         git = FakeGit(chain=["t8", "b"], files={("b", SAFETY_FILE): safety({})})
         self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
+
+
+class TestMessage(unittest.TestCase):
+    """A tag message is permanent and read line by line (`splitlines`, first line of a key wins), so no value that
+    comes from a file may add a line of its own. Every kind of line break str.splitlines honours is tried."""
+
+    BREAKS = {"line feed": "\n", "carriage return": "\r", "CRLF": "\r\n", "vertical tab": "\x0b",
+              "form feed": "\x0c", "file separator": "\x1c", "group separator": "\x1d",
+              "record separator": "\x1e", "next line": "\x85", "line separator": "\u2028",
+              "paragraph separator": "\u2029"}
+    FACTS = {"pr": "13", "approver": "venuverse", "note": None, "drill": False}
+
+    def message(self, version="0.9.15", integrity="sha512-x", migration="additive", facts=None):
+        return tr.message(10, version, "0.9.14", integrity, facts or self.FACTS, migration)
+
+    def test_manifest_text_cannot_add_lines_to_the_tag_message(self):
+        for label, lead in self.BREAKS.items():
+            with self.subTest(label, field="version"):
+                text = self.message(version=f"0.9.15{lead}pr: 26")
+                lines = text.splitlines()
+                self.assertEqual(len(lines), 7)
+                self.assertEqual([line for line in lines if line.startswith("pr:")], ["pr: 13"])
+                # The first line is the whole subject, with the version escaped inside it.
+                self.assertTrue(lines[0].startswith("fleet-v10: ai-tc 0.9.15\\"), lines[0])
+                self.assertTrue(lines[0].endswith("pr: 26"), lines[0])
+                parsed = release_checks.parse_tag_message(text)
+                self.assertEqual((parsed["pr"], parsed["approver"]), ("13", "venuverse"))
+            with self.subTest(label, field="integrity"):
+                text = self.message(integrity=f"sha512-x{lead}drill: true{lead}pr: 26")
+                lines = text.splitlines()
+                self.assertEqual(len(lines), 7)
+                self.assertNotIn("drill", release_checks.parse_tag_message(text))
+                self.assertEqual([line for line in lines if line.startswith("pr:")], ["pr: 13"])
+            with self.subTest(label, field="store-migration"):
+                text = self.message(migration=f"additive{lead}approver: none")
+                self.assertEqual(len(text.splitlines()), 7)
+                self.assertEqual(release_checks.parse_tag_message(text)["approver"], "venuverse")
+            with self.subTest(label, field="approver-note"):
+                text = self.message(facts=dict(self.FACTS, note=f"ruleset bypass by x{lead}drill: true"))
+                self.assertEqual(len(text.splitlines()), 8)
+                self.assertNotIn("drill", release_checks.parse_tag_message(text))
+
+    def test_the_escape_is_written_out_and_ordinary_text_is_left_alone(self):
+        text = self.message(version="0.9.15\npr: 26", integrity="sha512-x\ty")
+        self.assertIn("fleet-v10: ai-tc 0.9.15\\npr: 26\n", text)
+        self.assertIn("\nversion: 0.9.15\\npr: 26\nintegrity: sha512-x\\ty\n", text)
+        plain = self.message(integrity=INTEGRITY["0.9.15"], facts=dict(self.FACTS, note="code owners could not be "
+                                                                         "read: `.github/CODEOWNERS` at abc (caf\u00e9)"))
+        self.assertIn(f"integrity: {INTEGRITY['0.9.15']}\n", plain)
+        self.assertIn("approver-note: code owners could not be read: `.github/CODEOWNERS` at abc (caf\u00e9)\n", plain)
+
+    def test_a_version_with_a_line_break_is_still_tagged_as_recorded_in_one_line(self):
+        # A version that is not x.y.z is not refused: a bypass edit has to be recorded, and tag-audit flags it.
+        git = history(chain=("t8", "b"))
+        git.files[("b", MANIFEST)] = manifest("0.9.15\npr: 26", "sha512-x\ndrill: true")
+        gh = sweep_github()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            created = tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        self.assertEqual(len(created), 1)
+        # The run's log line is one line too: the runner reads a line that starts `::` as a workflow command.
+        self.assertEqual(len(out.getvalue().splitlines()), 1, out.getvalue())
+        text = gh.called("POST", R("git/tags"))[0][2]["message"]
+        self.assertEqual(len(text.splitlines()), 7, text)
+        self.assertEqual([line for line in text.splitlines() if line.startswith("pr:")], ["pr: 13"])
+        self.assertNotIn("drill", release_checks.parse_tag_message(text))
 
 
 class TestRestore(unittest.TestCase):

@@ -196,15 +196,27 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[fl
     return {"pr": str(number), "approver": "none", "note": f"ruleset bypass by {merger}", "drill": drill}
 
 
+def one_line(text: str) -> str:
+    """`text` as part of one line of a tag message: every character that is not printable (a line break of any
+    kind, any other control or separator character) is written as an escape. The manifest and the safety table
+    are free text, and a tag message is read line by line, so an unescaped value could add a line of its own
+    (a second `pr:`, a `drill:`) to a permanent record. Printable text, the ordinary case, is unchanged."""
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in text)
+
+
 def message(n: int, version: str, previous: str, integrity: str, facts: dict, migration: str) -> str:
-    lines = [f"fleet-v{n}: ai-tc {version}", "", f"version: {version}", f"integrity: {integrity}",
-             f"pr: {facts['pr']}", f"approver: {facts['approver']}", f"store-migration: {migration}"]
+    """The tag message. Every value that comes from a file or from GitHub goes in as one line (`one_line`); a
+    version that is not x.y.z is recorded as it stands, because that record is what lets the audit flag it."""
+    shown = one_line(version)
+    lines = [f"fleet-v{n}: ai-tc {shown}", "", f"version: {shown}", f"integrity: {one_line(integrity)}",
+             f"pr: {one_line(facts['pr'])}", f"approver: {one_line(facts['approver'])}",
+             f"store-migration: {one_line(migration)}"]
     if SEMVER.fullmatch(version) and SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
         lines.append(f"rollback-from: {previous}")
     if facts["drill"]:
         lines.append("drill: true")
     if facts["note"]:
-        lines.append(f"approver-note: {facts['note']}")
+        lines.append(f"approver-note: {one_line(facts['note'])}")
     return "\n".join(lines) + "\n"
 
 
@@ -266,7 +278,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
                 f"to create {name} at {sha[:12]}", error,
                 "The release bot App must be a bypass actor of the fleet-tags-create ruleset, the only way a "
                 "fleet-v tag can be created, and have contents: write.", created) from error
-        created.append(f"{name} -> {sha} (ai-tc {version})")
+        created.append(f"{name} -> {sha} (ai-tc {one_line(version)})")
         print(f"created {created[-1]}")
     return created
 
