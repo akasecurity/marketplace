@@ -262,8 +262,8 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
         if not rc.description_ok(head_entry):
             report.fail(
                 "the ai-tc entry's description must be a non-empty string: this marketplace requires one, "
-                "and Claude Code itself refuses a null or non-string description (a manifest it refuses "
-                "breaks `/plugin marketplace add` for every user)"
+                "and Claude Code itself refuses a null or non-string description (it still adds the "
+                "marketplace, but lists ai-tc as unsupported with a schema error)"
             )
         report.note("ai-tc description changed: change all four files (AGENTS.md, 'Four files, one set of facts')")
     else:
