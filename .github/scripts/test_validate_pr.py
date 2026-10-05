@@ -194,6 +194,12 @@ class TestHumanRules(unittest.TestCase):
                 self.assertIn("this marketplace requires one", messages[0])
                 self.assertIn("Claude Code itself refuses a null or non-string description", messages[0])
                 self.assertNotIn("anything else", messages[0])
+                # Claude Code still adds a marketplace whose entry has such a description (checked
+                # against a real install), and lists that one entry as unsupported with a schema
+                # error, so the message must not say the manifest breaks the add for every user.
+                self.assertIn("lists ai-tc as unsupported with a schema error", messages[0])
+                self.assertNotIn("breaks", messages[0])
+                self.assertNotIn("every user", messages[0])
 
     def test_a_description_that_is_a_string_with_words_in_it_passes(self):
         for good in ("Clearer words.", "  padded  ", "x", "Ünïcode ✓"):
