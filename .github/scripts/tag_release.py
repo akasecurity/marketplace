@@ -12,9 +12,12 @@ says when the PR's final head had no passing `validate` run (none at all, or its
 latest one failed or had not finished), whoever approved it, so a merge past a
 failed check is in the permanent record. Only a run of validate.yml that the
 `pull_request_target` event started, at or before the time the PR merged, counts:
-a job of that name in another workflow passes nothing, and a run made after the
-merge (an edit of the closed PR, a manual re-run) decides nothing. That read uses
-the workflow's own token, which can read checks and workflow runs, not the App's.
+a job of that name in another workflow passes nothing (the known exception is a
+check run created through the API with a workflow token and filed by GitHub under
+validate.yml's check suite, since the tie is made through the suite), and a run
+made after the merge (an edit of the closed PR, a manual re-run) decides nothing.
+That read uses the workflow's own token, which can read checks and workflow runs,
+not the App's.
 A commit that GitHub links to no merged PR is left untagged, and so is everything
 after it, until it is an hour old: a slow link must not become a permanent
 `pr: none` tag. After that hour it is tagged as a push without a PR. A commit
@@ -364,7 +367,9 @@ def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str
         no start time, or a merge with no time, cannot be placed before the merge and does not count; and
     (2) belongs to a run of .github/workflows/validate.yml started by `pull_request_target`
         (is_validate_workflow_run), so a job of that name in any other workflow, or in a push or pull_request run,
-        passes nothing and fails nothing.
+        passes nothing and fails nothing. The known exception is a check run created through the API with a
+        workflow token and filed by GitHub under validate.yml's check suite: the tie is made through the suite,
+        so it counts (validate_pr.py states the same limit).
     Of the runs that count the latest (the highest id) decides: a re-run that failed after an earlier pass leaves
     the head unvalidated. They are tried newest first, so the workflow run behind a check run is asked about only
     until one counts. `filter=all` asks for every run, not just the latest of each name.
