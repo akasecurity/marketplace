@@ -112,12 +112,12 @@ code owner whose latest review approves the PR's final head; with none, the mess
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
 or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
 `pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
-in another workflow passes nothing, and a run made after the merge (an edit of the closed PR, a
-manual re-run) decides nothing. A commit no pull request merged has no head to look at, so it gets
-`pr: none` and no such note. Each value is written on one line, with a character that is not
-printable written as an escape, so text from a manifest cannot add a line of its own to the message.
-Rulesets let only the release bot create a `fleet-v` tag and nobody at all move or delete one, and
-refuse every other tag name.
+in another workflow passes nothing (a known limit of that rule is stated under `validate`, below),
+and a run made after the merge (an edit of the closed PR, a manual re-run) decides nothing. A commit
+no pull request merged has no head to look at, so it gets `pr: none` and no such note. Each value is
+written on one line, with a character that is not printable written as an escape, so text from a
+manifest cannot add a line of its own to the message. Rulesets let only the release bot create a
+`fleet-v` tag and nobody at all move or delete one, and refuse every other tag name.
 
 - **Only a tag cut by hand is signed.** `fleet-v1` through `fleet-v9`, cut before `tag-release`
   existed, are SSH-signed by a person; the tags `tag-release` cuts are annotated but **not
@@ -194,7 +194,11 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
 `staleness` and `tag-audit`, the three that run on a schedule, cannot report their own silence.
 `gh workflow list --all` shows each workflow's state, and
 `gh workflow enable import-plugin-release.yml` turns one back on (likewise `staleness.yml` and
-`tag-audit.yml`).
+`tag-audit.yml`). `import-plugin-release` is the last to go back on: once the version of the
+workflow that opens its pull requests as the release bot is on `main`, and `BOT_LOGIN`, the
+release-bot App and the `marketplace-bot` environment are live (before then it cannot open a pull
+request as the bot). `gh workflow list --all` confirms it is on, and "every 15 minutes" below is
+true only once it is.
 
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
   no secret: it takes the highest exact npm version above every version `main`, a `fleet-v` tag or
@@ -242,19 +246,28 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   another branch is judged against `main` too. An approver confirms the check run is
   `validate.yml`'s run from `main`, and trusts its summary over the PR body. A check that cannot
   finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
-  rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text, and
-  fails the PR if the file grants `checks: write`, `statuses: write` or `write-all`, or defines a
-  job whose id or `name:` is `validate` (in any file but `validate.yml` itself), since either could
-  report a `validate` check of its own; a file whose jobs it cannot read with confidence is refused
-  too (write them in plain block style). That is a partial control: it does not see a job name
-  built from an expression or a matrix value, so what counts as the `validate` check is also
-  decided where the result is read, after the merge (see `tag-release` and `main-audit`), and
-  code-owner review of workflow changes stays the control. On a bot PR every commit must also carry
-  GitHub's verified signature. The summary's `Main read at` row names the `main` commit whose pins
-  and rollback floor it read, and every free-text value taken from the PR appears in it inside a
-  code span. `validate` does not run again when `main` moves, so if `rollback-safety.json` changed
-  on `main` after a rollback PR's run, its approver re-runs the check before approving (the PR's
-  checklist says so).
+  rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text and
+  never runs it, and fails the PR if the file grants `checks: write`, `statuses: write` or
+  `write-all` written out plainly, or defines a job whose id or `name:` is `validate` (in any file
+  but `validate.yml` itself), since either could report a `validate` check of its own; a file that
+  mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot read with
+  confidence, is refused too (write them in plain block style). That is a partial control, a
+  best-effort read of the text and not a YAML parser. It does not see: a flow-style or complex-key
+  file whose `jobs` key is itself spelled with an escape; a change to `validate.yml` itself, such
+  as another trigger (it is only called out for review); a permission grant written with an
+  anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
+  that declares no permissions and so takes the repository's default token; a check run or status
+  posted with some other token or secret; a push-triggered workflow on another branch; or a fork
+  PR's own run. Code-owner review of workflow changes stays the control for all of these, and the
+  detection is the check after the merge: `tag-release`'s note and `main-audit` count only a
+  `validate` check run that belongs to a `pull_request_target` run of `validate.yml`. That check
+  ties a check run to `validate.yml` through its check suite, so a check run created through the API
+  with a workflow token and filed by GitHub under that suite could still count (not reproduced; a
+  known limit). On a bot PR every commit must also carry GitHub's verified signature. The summary's
+  `Main read at` row names the `main` commit whose pins and rollback floor it read, and every
+  free-text value taken from the PR appears in it inside a code span. `validate` does not run again
+  when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
+  approver re-runs the check before approving (the PR's checklist says so).
 - **`tag-release`** (every push to `main`, and by manual dispatch to re-run a sweep) runs
   `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the last green
   run's snapshot of the tags) and stops, red and creating nothing, while any of them fails. That
@@ -273,24 +286,30 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   deeply, a repeated key, an ambiguous ai-tc entry) is no pin change and never stops the sweep: a
   commit already on `main` cannot be mended, so a stop would last for good. The run logs a warning
   for it and goes on, comparing each later commit with the nearest earlier one that reads. A
-  `rollback-safety.json` that cannot be read gives `store-migration: unknown`. A tag or a branch
-  deletion that GitHub refuses ends the run with one error naming the ruleset, not a traceback, and
-  a failed sweep runs no clean-up.
+  `rollback-safety.json` that cannot be read gives `store-migration: unknown`. A value that parses
+  but has the wrong type is recorded as `unknown` too: a classification that is not a string (on a
+  rollback, a crossed entry that is not an object, or whose classification is not a string) gives
+  `store-migration: unknown`, and a `metadata.integrity` that is not a string gives
+  `integrity: unknown`. Each adds its reason to the tag's `approver-note` and the sweep goes on;
+  only a push that skipped `validate` can leave one. A tag or a branch deletion that GitHub refuses
+  ends the run with one error naming the ruleset, not a traceback, and a failed sweep runs no
+  clean-up.
 - **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
   included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
   only the check that refused it, and the run log holds the reason), the release checks reached no
   verdict on a version that has been on npm for over an hour, or whose publish time is unknown (its
   own issue, naming the version and the check that did not finish), a bot PR is open for 24 hours,
   a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
-  ai-tc entry is gone from `main` or `main`'s manifest cannot be read (the reason is in the issue;
-  nothing is imported until a PR mends it); it posts a "rolled back, awaiting fix-forward" notice
-  while the latest tag is a rollback. A commit whose manifest cannot be read is no pin change, as
-  for `tag-release`: the run logs a warning for it and the untagged-pin-change rule goes on past
-  it. While such a version has no verdict, the unpinned-release and refused-version rules can still
-  go red from the versions that did finish, but they are not cleared. A younger version is left
-  out, because neither rule can name it yet, so an outage never closes the issue of a version they
-  could name. Every script that reads `main` uses its full ref, so a tag named `main` cannot stand
-  in for the branch before the stray-ref rule reports it.
+  ai-tc entry is gone from `main` or `main`'s manifest cannot be read (one issue for both, titled
+  for both, with the reason in its detail; nothing is imported until a PR mends it); it posts a
+  "rolled back, awaiting fix-forward" notice while the latest tag is a rollback. A commit whose
+  manifest cannot be read is no pin change, as for `tag-release`: the run logs a warning for it and
+  the untagged-pin-change rule goes on past it. While such a version has no verdict, the
+  unpinned-release and refused-version rules can still go red from the versions that did finish, but
+  they are not cleared. A younger version is left out, because neither rule can name it yet, so an
+  outage never closes the issue of a version they could name. Every script that reads `main` uses
+  its full ref, so a tag named `main` cannot stand in for the branch before the stray-ref rule
+  reports it.
 - **`tag-audit`** (daily, on every tag push, on the deletion of a tag or a branch, and by hand)
   checks the `fleet-v` ledger against the frozen list, the last green run and `main`'s history,
   that the rulesets are active as configured, and that the `marketplace-bot` environment admits
