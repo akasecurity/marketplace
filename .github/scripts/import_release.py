@@ -460,7 +460,14 @@ def plan_forward(ctx: Context) -> dict:
     # Computed whether or not main already records the version, by the computation validate repeats
     # (release_checks.safety_entry): the migrations since the highest version main or a fleet-v tag
     # has pinned below this one, which after a rollback is the release rolled back from, not main's
-    # pin. The candidate is not re-verified.
+    # pin. The candidate is not re-verified. That older release is, on every run that gets this far,
+    # because its attested commit is where the migration range starts. If it stops verifying (npm or
+    # GitHub answers differently than when it was pinned) the importer goes red here, as no verdict for
+    # an outage or "could not compute" for a refusal, and opens no pull request until it verifies again.
+    # That is wanted: a range that starts at a commit nobody can attest would put an unchecked entry in
+    # the safety file, and validate reads the same commit when it checks the pin PR. Pinned by
+    # test_an_outage_verifying_the_version_below_is_no_verdict and
+    # test_a_verdict_computing_the_safety_entry_still_says_could_not_compute.
     try:
         computed = release_checks.safety_entry(
             version, pinned,

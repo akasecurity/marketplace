@@ -1,16 +1,16 @@
 """Opens, updates and closes the marketplace's alert issues.
 
-staleness, tag-audit and main-audit evaluate their rules in a job that cannot
-write issues, and hand the results to a job that can do nothing else. Each
-rule has one issue, found by a hidden rule marker among those the workflow's token filed; it is
-assigned to the release approvers in .github/release-approvers.json and
-mentions the code owners in .github/CODEOWNERS (a file that is missing or is
-not UTF-8 text costs the mention, never the issue). A red rule comments only when
-its detail changes, or once a day; after 48 hours the escalation owner is
-assigned; a rule that clears closes its issue, unless its result says
-otherwise (main-audit's results never do: the next run audits only its own push, so
-a person closes them; its failed-job result is keyed to the push as well). GitHub mails a failed scheduled run only to whoever last edited
-its cron line, which is why red goes to an issue.
+staleness, tag-audit and main-audit evaluate their rules in a job that cannot write
+issues, and hand the results to a job that can do nothing else. Each rule has one issue,
+found by a hidden rule marker among those the workflow's token filed; it is assigned to
+the release approvers in .github/release-approvers.json and mentions the code owners in
+.github/CODEOWNERS (a file that is missing or is not UTF-8 text costs the mention, never
+the issue). A red rule comments only when its detail changes, or once a day; after 48
+hours the escalation owner is assigned; a rule that clears closes its issue, unless its
+result says otherwise (main-audit's results never do: the next run audits only its own
+push, so a person closes them; its failed-job result is keyed to the push as well).
+GitHub mails a failed scheduled run only to whoever last edited its cron line or last
+re-enabled the workflow, which is why red goes to an issue.
 """
 from __future__ import annotations
 
@@ -38,7 +38,8 @@ ESCALATE_AFTER = dt.timedelta(hours=48)
 # the push it failed on (route), so a later run neither reuses nor closes it.
 PER_PUSH_LABELS = {"main-audit"}
 # GitHub refuses an issue body or a comment longer than 65,536 characters, and a refused post loses the alert.
-# The detail is cut well below that, which leaves room for everything else the post holds.
+# The quoted block (the text, both fences and, when the text is cut, the note) is held to this many characters,
+# which leaves room for everything else the post holds.
 DETAIL_LIMIT = 60_000
 
 
@@ -111,27 +112,43 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _units(text: str) -> int:
+    """UTF-16 code units, the larger of the two ways GitHub could count a character."""
+    return len(text) + sum(1 for character in text if ord(character) > 0xFFFF)
+
+
 def quoted(detail: str, run_url: str) -> str:
     """The detail as a code block, with a note when it had to be cut.
 
     Part of a detail is text a person chose, a tag's name or the subject of its message. In a code block
     it cannot mention anyone, link back from another repository's issue or render as a link in an alert
     that reads as the project's own. The fence is one backtick longer than the longest run of backticks in
-    the text, and at least three, so the text cannot end the block. The cut counts UTF-16 code units, which
-    is the larger of the two ways GitHub could count a character. The digest is taken from the whole detail
-    (see _refresh), so a cut never makes a comment of its own."""
-    units, end = 0, len(detail)
-    for index, character in enumerate(detail):
-        units += 2 if ord(character) > 0xFFFF else 1
-        if units > DETAIL_LIMIT:
-            end = index
-            break
-    text = detail[:end]
-    fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
-    block = f"{fence}\n{text}\n{fence}"
-    if end == len(detail):
-        return block
-    return f"{block}\n… truncated; the full detail is in the run log ({run_url})"
+    the text, and at least three, so the text cannot end the block. The whole block, both fences and the
+    note included, is held to DETAIL_LIMIT UTF-16 code units. The fence depends on the text that is kept (a
+    long run of backticks makes a long fence, twice), so the text is cut as long as will still fit with the
+    fence its own cut gives it. The digest is taken from the whole detail (see _refresh), so a cut never
+    makes a comment of its own."""
+    note = f"\n… truncated; the full detail is in the run log ({run_url})"
+
+    def render(end: int) -> str:
+        text = detail[:end]
+        fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+        block = f"{fence}\n{text}\n{fence}"
+        return block if end == len(detail) else block + note
+
+    # A character is at least one code unit, so a detail longer than the limit never fits as it is.
+    if len(detail) <= DETAIL_LIMIT and _units(render(len(detail))) <= DETAIL_LIMIT:
+        return render(len(detail))
+    # Keeping one more character never shortens the block (the fence only grows or stays), so the longest
+    # text that fits is found by bisection.
+    low, high = 0, min(len(detail) - 1, DETAIL_LIMIT)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _units(render(middle)) <= DETAIL_LIMIT:
+            low = middle
+        else:
+            high = middle - 1
+    return render(low)
 
 
 def when(text: str) -> dt.datetime:
