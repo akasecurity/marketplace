@@ -2032,8 +2032,11 @@ def main(argv=None) -> int:
         print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
         return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 1)
     except OSError as exc:
-        # A file the command line named could not be opened: the caller's mistake. Network and
-        # git failures are InfraError by now, so this is not one of those.
+        # Mostly a file the command line named that could not be opened: the caller's mistake.
+        # Network and git failures that go through the wrappers above are InfraError by now, but a
+        # few local calls are not wrapped (git missing from PATH when main_ref probes for a branch,
+        # no temporary directory for the signature audit), and an OSError from one of those lands
+        # here too, labelled `usage`. Either way no verdict was reached, and the exit code is 2.
         print(f"::error::{exc}", file=sys.stderr)
         return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
     except Exception as exc:
