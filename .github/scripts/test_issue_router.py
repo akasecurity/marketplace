@@ -182,6 +182,18 @@ class TestRouter(RouterCase):
         self.assertIn("npm has 0.9.15", comments[0][2]["body"])
         self.assertIn(RUN, comments[0][2]["body"])
 
+    def test_a_rule_red_again_just_inside_48_hours_still_reopens_its_issue(self):
+        # The window is pinned from below as well as from above: an issue cleared 47 hours ago, whose update
+        # time is inside the listing's window and whose marker is inside the age check, is reopened.
+        for label, cleared in (("47 hours", "2026-09-29T13:00:00Z"), ("47 hours 59 minutes", "2026-09-29T12:01:00Z")):
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [cleared_issue(cleared)]
+                self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+                self.assertEqual(self.gh.called("POST", R("issues")), [])
+                comment = self.gh.called("POST", R("issues/40/comments"))[0][2]["body"]
+                self.assertIn(f"(cleared at {cleared})", comment)
+
     def test_a_rule_red_again_after_48_hours_opens_a_new_issue(self):
         # 49 hours ago. The listing may still return the issue (a comment since then moves its update time),
         # so the marker, not only the listing's window, rules it out.
@@ -240,6 +252,73 @@ class TestRouter(RouterCase):
     def test_a_rule_not_evaluated_touches_nothing(self):
         self.router().apply(rt.Result(rule="staleness-i", label="staleness", title="t", red=None))
         self.assertEqual(self.gh.calls, [])
+
+
+class TestQuoted(RouterCase):
+    """The detail goes into the issue as a code block: it holds text a person chose, and it can be long."""
+
+    HOSTILE = ("- fleet-v10's subject 'ping @someone and @org/team, see org/repo#1 and [x](https://e.example)' "
+               "then a run of seven: " + "`" * 7)
+
+    def assert_inside_a_fence(self, text, detail, width):
+        fence = "`" * width
+        self.assertIn(fence + "\n" + detail + "\n" + fence, text)
+        self.assertEqual(text.count(detail), 1, "the detail appears once, inside the fence")
+
+    def test_the_fence_is_longer_than_any_run_of_backticks_in_the_detail_and_at_least_three(self):
+        for detail, width in (("none", 3), ("one ` here", 3), ("two `` here", 3), ("three ``` here", 4),
+                              (self.HOSTILE, 8), ("a ` and a `````` run", 7)):
+            with self.subTest(detail):
+                self.assertEqual(rt.quoted(detail, RUN), "`" * width + "\n" + detail + "\n" + "`" * width)
+
+    def test_a_new_issue_holds_the_detail_only_inside_a_fence(self):
+        self.router().apply(red(detail=self.HOSTILE))
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_comment_on_a_changed_detail_holds_it_only_inside_a_fence(self):
+        self.issues.append(existing(detail="npm has 0.9.15"))
+        self.router().apply(red(detail=self.HOSTILE))
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues/40/comments"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_comment_on_a_reopened_issue_holds_the_detail_only_inside_a_fence(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red(detail=self.HOSTILE)), "staleness-i: red again; reopened #40")
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues/40/comments"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_detail_past_the_limit_is_cut_and_points_at_the_run_log(self):
+        detail = "- " + "x" * 70_000
+        self.router().apply(red(detail=detail))
+        body = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.assertLessEqual(len(body), 65_536)
+        self.assertIn("\n```\n… truncated; the full detail is in the run log (" + RUN + ")", body)
+        self.assertNotIn(detail, body)
+        self.assertIn("x" * (rt.DETAIL_LIMIT - 2), body)
+
+    def test_the_limit_counts_the_larger_way_github_could_count_a_character(self):
+        # 40,000 characters outside the basic plane are 80,000 UTF-16 code units.
+        detail = "\U0001F600" * 40_000
+        self.router().apply(red(detail=detail))
+        body = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65_536)
+        self.assertIn("… truncated", body)
+
+    def test_a_detail_just_inside_the_limit_is_not_cut(self):
+        detail = "y" * rt.DETAIL_LIMIT
+        self.assertEqual(rt.quoted(detail, RUN), "```\n" + detail + "\n```")
+        self.assertIn("… truncated", rt.quoted(detail + "y", RUN))
+
+    def test_the_same_long_detail_does_not_comment_again_on_another_run(self):
+        # The note names the run, so a digest taken from the quoted text would differ on every run.
+        detail = "- " + "x" * 70_000
+        self.router().apply(red(detail=detail))
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.issues.append({"number": 40, "body": opened["body"], "created_at": "2026-10-01T10:00:00Z",
+                            "labels": [{"name": "staleness"}], "assignees": []})
+        del self.gh.calls[:]
+        later = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None, owners=["Vaishnav-OM"],
+                          now=NOW + dt.timedelta(hours=1), run_url=RUN + "0")
+        self.assertEqual(later.apply(red(detail=detail)), "staleness-i: #40 unchanged")
+        self.assertEqual(self.gh.writes(), [])
 
 
 class TestRoute(RouterCase):
@@ -324,8 +403,13 @@ class TestNoResults(RouterCase):
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 
-    def run_main(self, *, job_result, results_json=None, label="staleness"):
-        gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+    OWNERS = b"* @Vaishnav-OM\n"
+
+    def run_main(self, *, job_result, results_json=None, label="staleness", codeowners=OWNERS, issues=()):
+        """`codeowners` is the file's bytes, or None for no file. Leaves the fake GitHub and what main printed
+        on self for a test that wants more than the exit code and the titles."""
+        gh = FakeGitHub({("GET", R("issues")): list(issues), ("POST", R("issues")): {"number": 41},
+                         ("POST", R("issues/40/comments")): {"id": 1}, ("PATCH", R("issues/40")): {"number": 40}})
         env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "9",
                "JOB_RESULT": job_result}
         if results_json is not None:
@@ -334,16 +418,18 @@ class TestMain(unittest.TestCase):
             os.makedirs(os.path.join(root, ".github"))
             with open(os.path.join(root, ".github", "release-approvers.json"), "w", encoding="utf-8") as handle:
                 json.dump({"approvers": ["Vaishnav-OM"], "escalation": None}, handle)
-            with open(os.path.join(root, ".github", "CODEOWNERS"), "w", encoding="utf-8") as handle:
-                handle.write("* @Vaishnav-OM\n")
+            if codeowners is not None:
+                with open(os.path.join(root, ".github", "CODEOWNERS"), "wb") as handle:
+                    handle.write(codeowners)
             cwd = os.getcwd()
             os.chdir(root)
             try:
                 with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(rt, "GitHub", return_value=gh), \
-                        mock.patch("sys.stdout", new_callable=io.StringIO):
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out:
                     code = rt.main(["apply", "--label", label])
             finally:
                 os.chdir(cwd)
+        self.gh, self.printed = gh, out.getvalue()
         return code, [call[2]["title"] for call in gh.called("POST", R("issues"))]
 
     def test_a_success_with_no_results_output_is_red(self):
@@ -381,6 +467,34 @@ class TestMain(unittest.TestCase):
     def test_a_job_that_did_not_finish_is_red(self):
         self.assertEqual(self.run_main(job_result="cancelled", results_json="[]"),
                          (1, ["staleness: the evaluation job did not finish"]))
+
+    def test_the_code_owners_are_mentioned_when_the_file_reads(self):
+        self.run_main(job_result="success", results_json=rt.results_to_json([red()]))
+        self.assertIn("Filed by https://github.com/akasecurity/marketplace/actions/runs/9. cc @Vaishnav-OM\n",
+                      self.gh.called("POST", R("issues"))[0][2]["body"])
+
+    def test_a_codeowners_file_that_is_missing_or_not_text_costs_only_the_mention(self):
+        # The alert is the point: a CODEOWNERS file nobody can read must not stop it being filed.
+        unreadable = {"missing": None, "not UTF-8": b"* @Vaishnav-OM \xff\xfe\n", "empty": b""}
+        for label, codeowners in unreadable.items():
+            with self.subTest(label):
+                code, titles = self.run_main(job_result="success", results_json=rt.results_to_json([red()]),
+                                             codeowners=codeowners)
+                self.assertEqual((code, titles), (1, ["staleness: an unpinned release"]))
+                body = self.gh.called("POST", R("issues"))[0][2]["body"]
+                self.assertNotIn("@", body)
+                self.assertIn("/actions/runs/9.\n", body)
+                self.assertEqual("::warning::" in self.printed, codeowners != b"")
+
+    def test_a_codeowners_file_that_cannot_be_read_still_closes_a_cleared_rules_issue(self):
+        issue = existing()
+        clear = rt.results_to_json([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)])
+        for label, codeowners in {"missing": None, "not UTF-8": b"\xff\xfe"}.items():
+            with self.subTest(label):
+                code, titles = self.run_main(job_result="success", results_json=clear, codeowners=codeowners,
+                                             issues=[issue])
+                self.assertEqual((code, titles), (0, []))
+                self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
 
 
 class TestHelpers(unittest.TestCase):

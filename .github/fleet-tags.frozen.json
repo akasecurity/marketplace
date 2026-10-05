@@ -38,5 +38,10 @@
     "tag": "fleet-v8",
     "object": "df4ce5f19f42cddc3beea2e7126912fa7a437291",
     "commit": "31e4249caf50050d7787dc6462954fef42afe6e7"
+  },
+  {
+    "tag": "fleet-v9",
+    "object": "766a93cbde3a1299663d9884d6f55d60e76b8ce9",
+    "commit": "89e8fd499fbe7e151e0d41500ec9766dfdeecaf7"
   }
 ]

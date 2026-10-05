@@ -49,6 +49,13 @@ class Git:
             return None
         return self.run("show", f"{commit}:{path}")
 
+    def entry_mode(self, rev: str, path: str) -> str | None:
+        """The mode git records for `path` in commit `rev`: 100644 or 100755 for a file, 120000 for a symbolic
+        link, 160000 for a submodule (a commit, with nothing to read), 040000 for a directory. None when that
+        commit's tree has no entry there."""
+        line = self.run("ls-tree", self.rev_parse(rev), "--", path).strip()
+        return line.split(None, 1)[0] if line else None
+
     def fleet_tags(self) -> list[dict]:
         """Every fleet-v<N> tag as {tag, object, commit, n}, N ascending: release_checks.snapshot_tags'
         rows (object is the tag object, commit the peeled commit) with the number added."""

@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -167,6 +169,70 @@ class TestCheckPlan(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ir.Refused):
                 ir.check_plan(plan)
 
+    HOSTILE = "x`](https://evil.example)"
+
+    def test_every_published_field_is_rechecked(self):
+        # open-pr does not trust the verify job's output: whatever reaches the PR's text, its commit or
+        # its branch is matched against the pattern the release checks use, with a markdown or backtick
+        # payload where a name or a number belongs.
+        for key, bad, make in (
+            ("shasum", self.HOSTILE, forward_plan),
+            ("shasum", "a" * 39, forward_plan),
+            ("run_url", "[validate passed](https://evil.example)", forward_plan),
+            ("run_url", "https://github.com/someone/else/actions/runs/1", forward_plan),
+            ("classification", self.HOSTILE, forward_plan),
+            ("classification", None, forward_plan),
+            ("migrations", [self.HOSTILE], forward_plan),
+            ("migrations", "0036_add_column", forward_plan),
+            ("migrations", [7], forward_plan),
+            ("highest_pinned", self.HOSTILE, forward_plan),
+            ("highest_pinned", "0.9.014", forward_plan),
+            ("floor", self.HOSTILE, rollback_plan),
+            ("crossed", [self.HOSTILE], rollback_plan),
+            ("crossed", "0.9.14", rollback_plan),
+            ("target_tag", self.HOSTILE, rollback_plan),
+            ("target_tag", "fleet-v0", rollback_plan),
+            ("reimport", "yes", forward_plan),
+            ("below_floor", 1, rollback_plan),
+        ):
+            with self.subTest(key=key, bad=bad):
+                plan = make()
+                plan[key] = bad
+                with self.assertRaisesRegex(ir.Refused, rf"the plan's {key} .* is malformed"):
+                    ir.check_plan(plan)
+
+    def test_the_fields_a_real_plan_always_carries_are_required(self):
+        for key in ("shasum", "run_url", "highest_pinned"):
+            for make in (forward_plan, rollback_plan):
+                with self.subTest(key=key, plan=make.__name__):
+                    plan = make()
+                    del plan[key]
+                    with self.assertRaisesRegex(ir.Refused, f"the plan has no {key}"):
+                        ir.check_plan(plan)
+
+    def test_a_safety_entry_must_be_well_formed_and_agree_with_the_plan(self):
+        good = safety_entry("0.9.15", "0.9.14", "additive", ("0036_add_column",))
+        ir.check_plan(forward_plan(safety_entry=good))
+        ir.check_plan(forward_plan(safety_entry=None))
+        for label, entry in (
+            ("another class", {**good, "classification": "not-rollback-safe"}),
+            ("other migrations", {**good, "migrations": ["0099_other"]}),
+            ("a hostile migration name", {**good, "migrations": [self.HOSTILE]}),
+            ("another attested commit", {**good, "to": "b" * 40}),
+            ("a commit that is not one", {**good, "from": self.HOSTILE}),
+            ("keys out of order", dict(reversed(list(good.items())))),
+            ("an extra key", {**good, "note": "x"}),
+            ("not an object", "additive"),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ir.Refused, "the plan's safety_entry .* (is malformed|does not agree)"):
+                    ir.check_plan(forward_plan(safety_entry=entry))
+
+    def test_a_rollback_plan_carries_no_safety_entry(self):
+        entry = safety_entry("0.9.13", "0.9.12", "not-rollback-safe", ())
+        with self.assertRaisesRegex(ir.Refused, "only a forward import writes one"):
+            ir.check_plan(rollback_plan(safety_entry=entry))
+
 
 class TestPrBody(unittest.TestCase):
     def test_a_forward_body_carries_the_verified_facts_and_the_checklist(self):
@@ -181,8 +247,26 @@ class TestPrBody(unittest.TestCase):
             self.assertIn(text, body)
         self.assertNotIn("git tag -s", body)
 
+    def test_the_provenance_line_follows_the_release_pipeline_the_check_reads(self):
+        pipeline = {**release_checks.RELEASE_PIPELINE[release_checks.PACKAGE],
+                    "workflow": ".github/workflows/release-other.yml", "tag_prefix": "other-v"}
+        with mock.patch.dict(release_checks.RELEASE_PIPELINE, {release_checks.PACKAGE: pipeline}), \
+                mock.patch.object(release_checks, "PROV_REPO", "https://github.com/example-org/example-repo"):
+            body = ir.pr_body(forward_plan(), "u")
+        self.assertIn("- provenance: SLSA, built by `.github/workflows/release-other.yml` in example-org/example-repo "
+                      "at `refs/tags/other-v0.9.15` on a GitHub-hosted runner", body)
+        for stale in ("release-plugin-claude.yml", "plugin-claude-v", "akasecurity/ai-tc "):
+            self.assertNotIn(stale, body)
+
     def test_a_reimport_says_so(self):
         self.assertIn("**Re-import**", ir.pr_body(forward_plan(reimport=True), "u"))
+
+    def test_a_reimport_body_names_a_merged_bot_pull_request_among_the_reasons(self):
+        # A version the bot merged and a rollback then undid, never tagged, is above main and above
+        # every tag, and no pull request for it was closed unmerged. The refusal that makes it need
+        # reimport names a merged release-bot pull request, so the body gives that reason too.
+        self.assertIn("a `fleet-v` tag or a merged release-bot pull request has pinned",
+                      ir.pr_body(forward_plan(reimport=True), "u"))
 
     def test_a_rollback_body_states_the_floor_and_a_below_floor_dispatch(self):
         body = ir.pr_body(rollback_plan(floor="0.9.14", below_floor=True), "u")
@@ -192,13 +276,14 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("`validate` fails this PR", body)
         self.assertIn("claude plugin marketplace add akasecurity/marketplace#bot/rollback-ai-tc-0.9.14-to-0.9.13", body)
 
-    def test_a_below_floor_body_says_what_reports_the_merge_and_when_the_tag_records_it(self):
-        # A code owner can approve a PR that an org owner then merges past a failed validate: the tag
-        # names that owner and records no bypass, so only main-audit reports the merge.
+    def test_a_below_floor_body_says_the_tag_and_the_audit_both_record_the_merge(self):
+        # tag-release notes a merge whose final head has no passing validate run, whoever approved it,
+        # and main-audit opens an issue for the same merge. The body promises exactly those two.
         body = ir.pr_body(rollback_plan(floor="0.9.14", below_floor=True), "u")
-        self.assertIn("`main-audit` opens an issue for that merge", body)
-        self.assertIn("Its tag records a bypass only if no code owner had approved the PR.", body)
-        self.assertNotIn("its tag will record the bypass", body)
+        self.assertIn("only an org owner's break-glass merge can land it. The merge is recorded twice: its "
+                      "`fleet-v<N>` tag notes that `validate` had not passed on the PR's final head, and "
+                      "`main-audit` opens an issue for the merge.", body)
+        self.assertNotIn("only if no code owner had approved", body)
         self.assertNotIn("main-audit", ir.pr_body(rollback_plan(floor="0.9.14"), "u"))
 
     def test_a_rollback_body_asks_the_approver_to_rerun_validate_after_the_safety_file_moves(self):
@@ -350,7 +435,9 @@ class TestPlanForward(PlanCase):
         self.candidates = ["0.9.15"]
         self.assertEqual(self.plan()["version"], "0.9.15")
 
-    def test_a_pin_named_pr_from_anyone_else_does_not_block_the_version(self):
+    def test_a_pin_named_pr_from_anyone_else_does_not_stop_the_plan_for_the_version(self):
+        # The plan only. open-pr still refuses, red, to delete that PR's branch while the branch exists
+        # (TestOpenPrForward.test_a_branch_another_authors_pr_is_open_from_is_not_deleted).
         self.candidates = ["0.9.15"]
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
         self.assertEqual(self.plan()["version"], "0.9.15")
@@ -407,6 +494,68 @@ class TestPlanForward(PlanCase):
         plan = self.plan(repo(entries=entries))
         self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.15"])
         self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.15"], ATTESTED["0.9.16"])
+
+    def merged_bot_prs(self, *heads: str, author: str = BOT) -> None:
+        """Merged pull requests into main from `heads`, the way the closed listing returns them."""
+        for number, head in enumerate(heads, start=30):
+            self.pulls.append(pull(number, head, state="closed", merged=True, author=author))
+
+    ROLLED_BACK_PRS = (("a merged pin", ("bot/pin-ai-tc-0.9.15",)),
+                       ("a merged rollback away from it", ("bot/rollback-ai-tc-0.9.15-to-0.9.14",)),
+                       ("both", ("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")))
+
+    def test_a_version_a_merged_bot_pr_pinned_is_not_offered_again_on_schedule(self):
+        # No fleet-v tag names 0.9.15 (it was merged, then rolled back before a tag was cut, or the tag run
+        # was red), so the tag ledger alone would offer it again as the next release.
+        self.candidates = ["0.9.15"]
+        for label, heads in self.ROLLED_BACK_PRS:
+            with self.subTest(label):
+                self.pulls.clear()
+                self.merged_bot_prs(*heads)
+                with self.assertRaisesRegex(ir.Refused, "npm has no exact release above 0.9.15") as caught:
+                    self.plan()
+                self.assertFalse(caught.exception.red)
+                self.stubs["verify_release"].assert_not_called()
+
+    def test_the_candidate_floor_includes_the_versions_merged_bot_prs_pinned(self):
+        self.candidates = ["0.9.16"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        self.assertEqual(self.plan()["version"], "0.9.16")
+        self.stubs["npm_candidates"].assert_called_once_with({"0.9.12", "0.9.13", "0.9.14", "0.9.15"})
+
+    def test_a_dispatch_to_a_version_a_merged_bot_pr_pinned_needs_reimport(self):
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        with self.assertRaisesRegex(ir.Refused, "reimport: true") as caught:
+            self.plan(event="workflow_dispatch", target="0.9.15")
+        self.assertTrue(caught.exception.red)
+        self.assertEqual(self.plan(event="workflow_dispatch", target="0.9.16")["version"], "0.9.16")
+
+    def test_with_reimport_it_proceeds_and_the_entry_is_computed_from_the_tag_ledger(self):
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        plan = self.plan(event="workflow_dispatch", target="0.9.15", reimport=True)
+        self.assertEqual((plan["version"], plan["reimport"], plan["highest_pinned"]), ("0.9.15", True, "0.9.15"))
+        # validate computes the entry from the highest version a fleet-v tag or main pins below this one
+        # (0.9.14 here), so the importer must too, whatever merged bot PRs say.
+        self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.14"])
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.15"])
+
+    def test_the_next_release_after_an_untagged_merged_pin_still_computes_its_entry_from_the_tag_ledger(self):
+        self.candidates = ["0.9.16"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14")
+        plan = self.plan()
+        self.assertEqual((plan["version"], plan["highest_pinned"]), ("0.9.16", "0.9.15"))
+        self.assertEqual(plan["safety_entry"]["from"], ATTESTED["0.9.14"])
+        self.stubs["classify_migrations"].assert_called_once_with(ATTESTED["0.9.14"], ATTESTED["0.9.16"])
+
+    def test_a_merged_pr_someone_else_opened_from_a_bot_name_does_not_count(self):
+        self.candidates = ["0.9.15"]
+        self.merged_bot_prs("bot/pin-ai-tc-0.9.15", "bot/rollback-ai-tc-0.9.15-to-0.9.14", author="some-writer")
+        self.assertEqual(self.plan()["version"], "0.9.15")
+
+    def test_only_the_bots_pin_and_rollback_branches_count(self):
+        self.candidates = ["0.9.15"]
+        self.merged_bot_prs("bot/other-ai-tc-0.9.15", "bot/pin-ai-tc-0.9.15-rc1", "feature/pin-ai-tc-0.9.15")
+        self.assertEqual(self.plan()["version"], "0.9.15")
 
     def test_a_dispatched_target_that_fails_verification_is_red(self):
         self.bad = {"0.9.15": ("commit-on-main", "behind")}
@@ -657,6 +806,13 @@ class TestOpenPrForward(OpenPrCase):
         self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
         self.assertEqual(self.gh.called("POST", R("issues/12/labels")), [])
 
+    def test_the_title_is_built_from_the_mode_and_the_versions_not_read_from_the_plan(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan(title="[a title](https://evil.example)"))
+        title = "feat: advance the ai-tc pin to 0.9.15"
+        self.assertEqual(self.gh.called("POST", R("pulls"))[0][2]["title"], title)
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"], title)
+
     def test_a_commit_github_committed_but_did_not_sign_gets_no_branch(self):
         self.route_branch("bot/pin-ai-tc-0.9.15")
         self.gh.routes[("POST", R("git/commits"))] = {
@@ -774,9 +930,21 @@ class TestOpenPrForward(OpenPrCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
         self.assertTrue(self.deleted_before_created("bot/pin-ai-tc-0.9.15"))
-        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run, "
-                      "and created it again", out.getvalue())
+        self.assertIn("::notice::deleted bot/pin-ai-tc-0.9.15, left with no pull request by an earlier run; "
+                      "creating it again", out.getvalue())
+        self.assertNotIn("and created it again", out.getvalue())
         self.assertEqual([call for call in self.gh.calls if call[0] == "PATCH"], [])
+
+    def test_the_notice_of_a_replaced_branch_does_not_claim_the_new_one_exists_when_the_commit_fails(self):
+        # The notice comes after the delete and before the commit and the ref, so it says what is next.
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.gh.routes[("DELETE", R("git/refs/heads/bot/pin-ai-tc-0.9.15"))] = None
+        self.gh.routes[("POST", R("git/commits"))] = GitHubError(403, "POST", R("git/commits"), "forbidden")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out, self.assertRaises(GitHubError):
+            self.open(forward_plan())
+        self.assertEqual(self.gh.called("POST", R("git/refs")), [])
+        self.assertIn("; creating it again", out.getvalue())
+        self.assertNotIn("created it again", out.getvalue())
 
     def test_a_branch_whose_bot_pr_was_closed_is_skipped_unless_reimport(self):
         # The rejection stands until a reimport, and the branch is the evidence a closed PR leaves.
@@ -862,6 +1030,14 @@ class TestOpenPrRollback(OpenPrCase):
         self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"],
                          "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13")
 
+    def test_the_title_is_built_from_the_mode_and_the_versions_not_read_from_the_plan(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.open(rollback_plan(title="[a title](https://evil.example)"))
+        title = "fix: roll the ai-tc pin back from 0.9.14 to 0.9.13"
+        self.assertEqual(self.gh.called("POST", R("pulls"))[0][2]["title"], title)
+        self.assertEqual(self.gh.called("POST", R("git/commits"))[0][2]["message"], title)
+
     def test_a_stale_rollback_branch_without_a_pr_is_replaced(self):
         self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13", exists=True)
         self.gh.routes[("DELETE", R("git/refs/heads/bot/rollback-ai-tc-0.9.14-to-0.9.13"))] = None
@@ -932,6 +1108,61 @@ class TestMain(unittest.TestCase):
         self.assertNotIn("proceed=", out.getvalue())
 
 
+class TestMainBudget(unittest.TestCase):
+    """The verify job's checks run inside one time budget, started once and ended with the run."""
+
+    PLAN_ENV = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule"}
+    OPEN_PR_ENV = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
+                   "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+
+    def run_main(self, command: str, env: dict, **patched):
+        with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO):
+            with mock.patch.object(ir, "make_plan", **patched.get("make_plan", {"return_value": forward_plan()})), \
+                    mock.patch.object(ir, "open_pr", **patched.get("open_pr", {"return_value": "opened"})):
+                return ir.main([command])
+
+    def test_the_plan_starts_one_budget_of_about_twenty_five_minutes(self):
+        seen = []
+
+        def watching(*args, **kwargs):
+            seen.append(release_checks.time_left())
+            return forward_plan()
+
+        with mock.patch.object(release_checks, "start_budget", wraps=release_checks.start_budget) as started:
+            self.assertEqual(self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": watching}), 0)
+        started.assert_called_once_with(release_checks.BUDGET_JOB)
+        self.assertEqual(release_checks.BUDGET_JOB, 25 * 60)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "no budget was running while the plan worked")
+        self.assertTrue(release_checks.BUDGET_JOB - 60 < seen[0] <= release_checks.BUDGET_JOB)
+
+    def test_the_budget_ends_with_the_plan_however_it_ends(self):
+        for error in (ir.Refused("nothing new", red=False), ir.Refused("no", red=True),
+                      release_checks.InfraError("network", "down"), release_checks.ReleaseCheckError("safety", "no")):
+            with self.subTest(error=type(error).__name__):
+                self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": error})
+                self.assertIsNone(release_checks.time_left())
+        for error in (KeyError("status"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(type(error)):
+                    self.run_main("plan", self.PLAN_ENV, make_plan={"side_effect": error})
+                self.assertIsNone(release_checks.time_left())
+        self.run_main("plan", self.PLAN_ENV)
+        self.assertIsNone(release_checks.time_left())
+
+    def test_open_pr_runs_no_release_check_and_starts_no_budget(self):
+        seen = []
+
+        def watching(*args, **kwargs):
+            seen.append(release_checks.time_left())
+            return "opened"
+
+        with mock.patch.object(release_checks, "start_budget") as started:
+            self.assertEqual(self.run_main("open-pr", self.OPEN_PR_ENV, open_pr={"side_effect": watching}), 0)
+        started.assert_not_called()
+        self.assertEqual(seen, [None])
+
+
 class TestMainNet(PlanCase):
     """Calls into release_checks that a planner leaves unwrapped: an outage or a malformed file there
     ends the run as one annotation and `proceed=false`, so open-pr is skipped, not as a traceback."""
@@ -977,6 +1208,30 @@ class TestMainNet(PlanCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::no verdict on 0.9.15: network: down", output)
         self.assertIn("proceed=false", output)
+
+
+class TestWriteOutput(unittest.TestCase):
+    """write_output is what keeps a value read from npm or GitHub from adding a line of its own to the
+    job's output file. tag_audit.py writes its outputs through it too."""
+
+    def test_a_line_break_in_a_value_is_refused_and_nothing_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = os.path.join(directory, "output")
+            with mock.patch.dict(ir.os.environ, {"GITHUB_OUTPUT": out}):
+                for value in ("a\nproceed=true", "a\rproceed=true", "a\r\nproceed=true", "\n", "\r"):
+                    with self.subTest(value=value), self.assertRaisesRegex(ir.Refused, "the plan output is not one line"):
+                        ir.write_output("plan", value)
+                self.assertFalse(os.path.exists(out), "a refused value must leave the file untouched")
+                ir.write_output("proceed", "true")
+            with open(out, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "proceed=true\n")
+
+    def test_without_an_output_file_the_line_goes_to_standard_output_and_a_line_break_is_still_refused(self):
+        with mock.patch.dict(ir.os.environ, {}, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            ir.write_output("proceed", "false")
+            with self.assertRaises(ir.Refused):
+                ir.write_output("plan", "x\ny")
+        self.assertEqual(out.getvalue(), "proceed=false\n")
 
 
 class TestDescribe(unittest.TestCase):
