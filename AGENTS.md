@@ -147,7 +147,12 @@ move or delete one, and refuse every other tag name:
 Every change reaches `main` through a pull request. `.github/CODEOWNERS` names the code owners of
 every file, and the `main` ruleset requires one of them to approve (someone other than the PR's
 last pusher) and the `validate` check to pass, so a code owner's own PR needs the other code
-owner. Merges are squash merges. Keep `.github/CODEOWNERS` as one `*` line naming users:
+owner. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
+audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
+repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
+missing or differs, and `tag-release` creates no tag meanwhile.
+
+Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
 login only to a user, so a team, an email address, a path rule, a second rule or a file that is
 not UTF-8 text is not read. A PR merged on top of such a file gets `approver: unknown` in its tag,
