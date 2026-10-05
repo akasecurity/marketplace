@@ -322,7 +322,11 @@ you mean, and decide what no verdict does there (`validate` fails, the importer 
 `staleness` reports it on its own rule). Every run also has a time budget, started by its entry
 point (20 minutes on the command line, 25 for `validate` and the importer's `verify` job, 40 for
 `staleness`): each request, npm call and wait is cut to what remains of it, and one that cannot
-finish inside it ends the run as no verdict (`deadline`, exit 2) instead of starting.
+finish inside it is no verdict (`deadline`) instead of starting. It is then handled as any other
+no verdict is, by its caller: the command line exits 2, `validate` reports it and fails the
+required check, the importer's `verify` job ends red (exit 1) and opens no pull request, and
+`staleness` carries on with the other versions and reports that one in its no-verdict issue (once
+it has been on npm for an hour).
 
 Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners
 (an issue is still filed, with no mention, when CODEOWNERS is missing or is not UTF-8 text). An
