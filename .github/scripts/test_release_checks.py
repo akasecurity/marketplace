@@ -645,14 +645,14 @@ class TestVerifyRelease(unittest.TestCase):
     def test_npm_reporting_invalid_is_refused(self):
         self.refused("provenance", audits=[ts.audit_output("0.9.14", invalid=[{"code": "EINTEGRITYSIGNATURE"}])])
 
-    def test_an_off_tag_branch_publish_is_refused_without_crying_theft(self):
+    def test_an_off_tag_branch_publish_does_not_rule_out_a_stolen_github_credential(self):
         # The certificate and the statement both say the workflow ran from a branch.
         ref = "refs/heads/release/0.9.x"
         uri = f"{rc.PROV_REPO}/{ts.WORKFLOW}@{ref}"
         stmt = ts.statement("0.9.14", ref=ref)
         cert = ts.signing_cert("0.9.14", san=uri, build_signer=uri, build_config=uri, ref=ref, trigger="workflow_dispatch")
         error = self.refused("provenance", audits=[ts.audit_output("0.9.14", stmt, cert=cert)])
-        self.assertIn("not a stolen npm credential", error.detail)
+        ts.assert_off_tag_text_is_truthful(self, error.detail)
 
     def test_another_repository_is_refused(self):
         other = "https://github.com/someone/ai-tc"
