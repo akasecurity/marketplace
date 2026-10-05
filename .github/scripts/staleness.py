@@ -50,7 +50,9 @@ DAY = dt.timedelta(hours=24)
 REGISTRY_URL = release_checks.packument_url()
 SHADOWS = ("refs/main", "refs/tags/main", "refs/remotes/main", "refs/remotes/main/HEAD")
 TITLES = {
-    "staleness-entry": "staleness: the ai-tc entry is missing from main",
+    # One rule, one issue, for both ways main can have no usable ai-tc entry (the detail says which): the entry is
+    # missing, or the manifest cannot be read at all. The router titles an issue once, when it opens it.
+    "staleness-entry": "staleness: the ai-tc entry is missing from main, or main's manifest cannot be read",
     "staleness-i": "staleness: npm has had a passing ai-tc release above every pin for over 24 hours",
     "staleness-i-refused": "staleness: npm has an ai-tc version the importer refuses",
     "staleness-i-no-verdict": "staleness: the release checks reached no verdict on an ai-tc version",
