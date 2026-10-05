@@ -261,6 +261,13 @@ class TestPrBody(unittest.TestCase):
     def test_a_reimport_says_so(self):
         self.assertIn("**Re-import**", ir.pr_body(forward_plan(reimport=True), "u"))
 
+    def test_a_reimport_body_names_a_merged_bot_pull_request_among_the_reasons(self):
+        # A version the bot merged and a rollback then undid, never tagged, is above main and above
+        # every tag, and no pull request for it was closed unmerged. The refusal that makes it need
+        # reimport names a merged release-bot pull request, so the body gives that reason too.
+        self.assertIn("a `fleet-v` tag or a merged release-bot pull request has pinned",
+                      ir.pr_body(forward_plan(reimport=True), "u"))
+
     def test_a_rollback_body_states_the_floor_and_a_below_floor_dispatch(self):
         body = ir.pr_body(rollback_plan(floor="0.9.14", below_floor=True), "u")
         self.assertIn("**Rollback.**", body)
