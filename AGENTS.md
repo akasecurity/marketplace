@@ -224,22 +224,34 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   rollback jobs do not wait for each other, so a forward job looks for an open rollback PR before
   it enables auto-merge and again after, and turns auto-merge off if one opened meanwhile. A
   candidate that fails a check is logged once and skipped, so it never hides a release above or
-  below it. A candidate the checks cannot finish on (no verdict, below) is not skipped: the run
-  stops there, red, and does not fall back to a lower version, because the one it could not check
-  may be the real newest. The next run tries again, and a dispatch naming a lower `target` that is
-  still above every pin imports that release meanwhile, since that path reads no candidate list. A
-  dispatched `target` or rollback target with no verdict ends red the same way.
+  below it. Every run that gets as far as the safety entry also verifies the highest pinned version
+  below the candidate again, because that release's attested commit is where the store-migration
+  range starts: if it stops verifying the importer goes red and opens no pull request until it
+  does, since a range that starts at a commit nobody can attest would put an unchecked entry in
+  `rollback-safety.json`. A candidate the checks cannot finish on (no verdict, below) is not
+  skipped: the run stops there, red, and does not fall back to a lower version, because the one it
+  could not check may be the real newest. The next run tries again, and a dispatch naming a lower
+  `target` that is still above every pin imports that release meanwhile, since that path reads no
+  candidate list. A dispatched `target` or rollback target with no verdict ends red the same way.
 - **`validate`** (`pull_request_target`, required) checks every PR with `main`'s copy of its
   script, reading the PR's files as data: since 8 December 2025 GitHub takes a
   `pull_request_target` workflow from the default branch whatever the PR's base, so a PR into
   another branch is judged against `main` too. An approver confirms the check run is
   `validate.yml`'s run from `main`, and trusts its summary over the PR body. A check that cannot
   finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
-  rule. On a bot PR every commit must also carry GitHub's verified signature. The summary's
-  `Main read at` row names the `main` commit whose pins and rollback floor it read, and every
-  free-text value taken from the PR appears in it inside a code span. `validate` does not run again
-  when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
-  approver re-runs the check before approving (the PR's checklist says so).
+  rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text, and
+  fails the PR if the file grants `checks: write`, `statuses: write` or `write-all`, or defines a
+  job whose id or `name:` is `validate` (in any file but `validate.yml` itself), since either could
+  report a `validate` check of its own; a file whose jobs it cannot read with confidence is refused
+  too (write them in plain block style). That is a partial control: it does not see a job name
+  built from an expression or a matrix value, so what counts as the `validate` check is also
+  decided where the result is read, after the merge (see `tag-release` and `main-audit`), and
+  code-owner review of workflow changes stays the control. On a bot PR every commit must also carry
+  GitHub's verified signature. The summary's `Main read at` row names the `main` commit whose pins
+  and rollback floor it read, and every free-text value taken from the PR appears in it inside a
+  code span. `validate` does not run again when `main` moves, so if `rollback-safety.json` changed
+  on `main` after a rollback PR's run, its approver re-runs the check before approving (the PR's
+  checklist says so).
 - **`tag-release`** (every push to `main`, and by manual dispatch to re-run a sweep) runs
   `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the last green
   run's snapshot of the tags) and stops, red and creating nothing, while any of them fails. That
@@ -277,17 +289,20 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   so the daily run is what sees those. A tag that changed since the last green run stays red until
   a reviewed PR re-freezes the list
   (`python3 .github/scripts/tag_audit.py freeze --out .github/fleet-tags.frozen.json`, run with the
-  tags fetched), which is how a person records that the change is explained; a deleted tag has to be
-  put back at its commit first. When there is no snapshot to compare with (none was kept, it expired
-  after 90 days, or it was deleted), the frozen list has to record every `fleet-v` tag, so the
-  baseline is re-set in a reviewed PR and not by the passage of time. That rule sees only tags that
-  exist: a tag cut after the frozen list and deleted since the snapshot was lost is not seen by this
-  audit (`staleness` reports its pin change as untagged once it has stood for an hour, and
-  `tag-release` cuts the tag again, but neither says that a tag was deleted). The newest green
-  run's commit has to be on `main`'s own history to supply the baseline; if it is not, the audit
-  fails instead of comparing with it. Keep artifact retention at 90 days, and dispatch `tag-audit`
-  once after turning it on so a baseline exists before `tag-release` cuts the first tag after the
-  frozen list; `tag-release` asks for no comparison.
+  tags fetched), which is how a person records that the change is explained. The command prints
+  every row it adds, changes or drops, and it changes or drops a row the list already holds only
+  when that tag is named with `--accept fleet-vN` (once for each tag), so the pull request shows
+  which tags moved and each was named on purpose; it writes nothing when it refuses. A deleted tag
+  has to be put back at its commit first. When there is no snapshot to compare with (none was
+  kept, it expired after 90 days, or it was deleted), the frozen list has to record every
+  `fleet-v` tag, so the baseline is re-set in a reviewed PR and not by the passage of time. That
+  rule sees only tags that exist: a tag cut after the frozen list and deleted since the snapshot
+  was lost is not seen by this audit (`staleness` reports its pin change as untagged once it has
+  stood for an hour, and `tag-release` cuts the tag again, but neither says that a tag was
+  deleted). The newest green run's commit has to be on `main`'s own history to supply the
+  baseline; if it is not, the audit fails instead of comparing with it. Keep artifact retention at
+  90 days, and dispatch `tag-audit` once after turning it on so a baseline exists before
+  `tag-release` cuts the first tag after the frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
   added that is not the merge of a PR with a code owner's approval of its final head, from someone
   other than the head's last pusher and not since withdrawn, and a passing `validate` check from
