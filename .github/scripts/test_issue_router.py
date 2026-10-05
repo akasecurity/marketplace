@@ -182,6 +182,18 @@ class TestRouter(RouterCase):
         self.assertIn("npm has 0.9.15", comments[0][2]["body"])
         self.assertIn(RUN, comments[0][2]["body"])
 
+    def test_a_rule_red_again_just_inside_48_hours_still_reopens_its_issue(self):
+        # The window is pinned from below as well as from above: an issue cleared 47 hours ago, whose update
+        # time is inside the listing's window and whose marker is inside the age check, is reopened.
+        for label, cleared in (("47 hours", "2026-09-29T13:00:00Z"), ("47 hours 59 minutes", "2026-09-29T12:01:00Z")):
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.issues[:] = [cleared_issue(cleared)]
+                self.assertEqual(self.router().apply(red()), "staleness-i: red again; reopened #40")
+                self.assertEqual(self.gh.called("POST", R("issues")), [])
+                comment = self.gh.called("POST", R("issues/40/comments"))[0][2]["body"]
+                self.assertIn(f"(cleared at {cleared})", comment)
+
     def test_a_rule_red_again_after_48_hours_opens_a_new_issue(self):
         # 49 hours ago. The listing may still return the issue (a comment since then moves its update time),
         # so the marker, not only the listing's window, rules it out.
