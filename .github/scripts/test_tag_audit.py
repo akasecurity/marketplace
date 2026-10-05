@@ -1,15 +1,17 @@
-"""Tests for tag_audit.py: the ruleset read, the previous-run comparison and the frozen list."""
+"""Tests for tag_audit.py: the ruleset and environment reads, the previous-run comparison and the frozen list."""
 import copy
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
 
 import release_checks
 import tag_audit as ta
-from fakes import REPO, FakeGit, FakeGitHub, fleet_tag
+from fakes import REPO, FakeGit, FakeGitHub, fleet_tag, not_found
+from ghapi import GitHubError
 
 UPDATE = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
 LOCKED = [{"type": "creation"}, UPDATE, {"type": "deletion"}]
@@ -58,8 +60,23 @@ def frozen_file(testcase, rows):
     return path
 
 
-def github(rulesets):
-    routes = {("GET", R("rulesets")): [{"id": number, "name": body["name"]} for number, body in rulesets.items()]}
+def good_environment():
+    return {"name": "marketplace-bot", "deployment_branch_policy": {"protected_branches": False,
+                                                                     "custom_branch_policies": True}}
+
+
+def good_branch_rules():
+    return {"total_count": 1, "branch_policies": [{"id": 7, "node_id": "x", "name": "main", "type": "branch"}]}
+
+
+def github(rulesets, *, environment=None, rules=None):
+    """A GitHub whose rulesets are `rulesets` and whose release bot environment is the specified one, unless
+    `environment` (its document, or the error its read raises) or `rules` (its deployment branch rules) say
+    otherwise."""
+    routes = {("GET", R("rulesets")): [{"id": number, "name": body["name"]} for number, body in rulesets.items()],
+              ("GET", R("environments/marketplace-bot")): good_environment() if environment is None else environment,
+              ("GET", R("environments/marketplace-bot/deployment-branch-policies")):
+                  good_branch_rules() if rules is None else rules}
     for number, body in rulesets.items():
         routes[("GET", R(f"rulesets/{number}"))] = body
     return FakeGitHub(routes)
@@ -118,6 +135,99 @@ class TestRulesets(unittest.TestCase):
         sets = good_rulesets()
         del sets[3]["conditions"]
         self.assertEqual(ta.check_rulesets(github(sets)), ["ruleset 'fleet-tags-create': its ref conditions are not readable"])
+
+
+class TestEnvironment(unittest.TestCase):
+    """The `marketplace-bot` environment holds the release bot's key and must admit deployments from main alone."""
+
+    def problems(self, **kwargs):
+        return ta.check_environment(github(good_rulesets(), **kwargs))
+
+    def test_the_specified_environment_passes(self):
+        gh = github(good_rulesets())
+        self.assertEqual(ta.check_environment(gh), [])
+        # Both documents are read, and nothing is written.
+        self.assertEqual([call[1] for call in gh.calls if "environments" in call[1]],
+                         [R("environments/marketplace-bot"), R("environments/marketplace-bot/deployment-branch-policies")])
+        self.assertEqual(gh.writes(), [])
+
+    def test_it_audits_the_environment_the_importer_enters(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "import-plugin-release.yml")
+        with open(path, encoding="utf-8") as handle:
+            entered = re.findall(r"(?m)^    environment: (\S+)$", handle.read())
+        self.assertEqual(entered, [ta.ENVIRONMENT])
+
+    def test_an_environment_that_does_not_exist_is_a_problem_and_nothing_more_is_read(self):
+        gh = github(good_rulesets(), environment=not_found("environments/marketplace-bot"))
+        self.assertEqual(ta.check_environment(gh), ["the marketplace-bot environment does not exist"])
+        self.assertEqual(len([call for call in gh.calls if "environments" in call[1]]), 1)
+
+    def test_a_read_that_fails_otherwise_is_an_error_not_a_problem(self):
+        # A token that cannot read the environment must fail the run, not report a drift that did not happen.
+        for status in (401, 403, 500):
+            with self.subTest(status):
+                failure = GitHubError(status, "GET", "environments/marketplace-bot", "{}")
+                with self.assertRaises(GitHubError):
+                    self.problems(environment=failure)
+        with self.assertRaises(GitHubError):
+            self.problems(rules=GitHubError(403, "GET", "environments/marketplace-bot/deployment-branch-policies", "{}"))
+
+    def test_deployment_branches_other_than_a_custom_list_are_a_problem(self):
+        cases = {
+            "any branch": None,
+            "protected branches": {"protected_branches": True, "custom_branch_policies": False},
+            "both": {"protected_branches": True, "custom_branch_policies": True},
+            "neither": {"protected_branches": False, "custom_branch_policies": False},
+        }
+        for label, policy in cases.items():
+            with self.subTest(label):
+                gh = github(good_rulesets(), environment={"name": "marketplace-bot", "deployment_branch_policy": policy})
+                problems = ta.check_environment(gh)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("the marketplace-bot environment's deployment_branch_policy is "))
+                # GitHub answers 404 for the rule list of an environment with no custom rules: it is not read.
+                self.assertEqual(len([call for call in gh.calls if "deployment-branch-policies" in call[1]]), 0)
+
+    def test_anything_but_the_one_branch_rule_for_main_is_a_problem(self):
+        def rules(*entries):
+            return {"total_count": len(entries), "branch_policies": [dict(id=n, name=name, type=kind)
+                                                                      for n, (name, kind) in enumerate(entries)]}
+
+        cases = {
+            "no rule": rules(),
+            "a second branch": rules(("main", "branch"), ("release", "branch")),
+            "a pattern": rules(("*", "branch")),
+            "another branch": rules(("release", "branch")),
+            "a tag rule": rules(("main", "branch"), ("v*", "tag")),
+            "main as a tag": rules(("main", "tag")),
+            "a count that disagrees": dict(rules(("main", "branch")), total_count=2),
+        }
+        for label, listed in cases.items():
+            with self.subTest(label):
+                problems = self.problems(rules=listed)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("the marketplace-bot environment's deployment branch rules are "))
+
+    def test_the_rules_may_be_listed_in_any_order_with_the_extra_fields_github_adds(self):
+        self.assertEqual(self.problems(rules={"total_count": 1, "branch_policies": [
+            {"id": 3, "node_id": "n", "name": "main", "type": "branch"}]}), [])
+
+    def test_a_run_check_reports_the_environment_with_the_other_problems(self):
+        git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
+        gh = github(good_rulesets(), environment=not_found())
+        with mock.patch.object(release_checks, "audit_tags", return_value=["fleet-v9 names PR 13, not a bot PR"]):
+            problems = ta.run_check(git, gh, ".github/fleet-tags.frozen.json", None)
+        self.assertEqual(problems, ["tag ledger: fleet-v9 names PR 13, not a bot PR",
+                                    "the marketplace-bot environment does not exist"])
+
+    def test_a_caller_that_asks_for_no_baseline_is_still_held_to_the_environment(self):
+        # tag-release asks for no comparison, and runs in this environment.
+        git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
+        gh = github(good_rulesets(), rules={"total_count": 0, "branch_policies": []})
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            problems = ta.run_check(git, gh, ".github/fleet-tags.frozen.json", None)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("deployment branch rules", problems[0])
 
 
 class TestSnapshots(unittest.TestCase):

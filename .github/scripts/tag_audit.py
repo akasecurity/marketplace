@@ -2,14 +2,18 @@
 comparison with the last green run's snapshot of the tag objects); only tag-audit's own run makes that comparison.
 
 Detection, not prevention: the rulesets prevent, and this notices an edit to
-one of them, a moved or deleted fleet-v tag, or a tag that should not exist.
+one of them, a change to the deployment branches of the `marketplace-bot`
+environment, a moved or deleted fleet-v tag, or a tag that should not exist.
 release_checks.audit_tags holds the tag-ledger rules: the frozen list, the
 fleet-v<N> name rule, and, for every tag after the frozen list, contiguous
 numbering, its place on main's first-parent history, its message's version
 and the merged bot PR it names. This script adds what audit_tags's inputs
-cannot carry: the tag objects the last green run saw, and the rulesets'
-presence, enforcement, targets, rules and conditions. Bypass lists are
-visible only to admins; the probe and an admin's read-back cover those.
+cannot carry: the tag objects the last green run saw, the rulesets'
+presence, enforcement, targets, rules and conditions, and that environment's
+existence and deployment branches (the one place the release bot's key is
+released, and only to a job running from main). Bypass lists, and where the
+bot's secrets are stored, are visible only to admins; the probe and an
+admin's read-back cover those.
 
 A change to a tag since the last green run stays red until a reviewed pull
 request re-freezes the tag list (`freeze`), which is how a person records
@@ -28,7 +32,7 @@ import os
 import sys
 
 import release_checks
-from ghapi import GitHub
+from ghapi import GitHub, GitHubError
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
@@ -40,6 +44,12 @@ RULESETS: dict[str, dict] = {
            "exclude": [release_checks.EXPECTED_REF_PATTERNS[name][1]]}
     for name, (target, rules) in release_checks.EXPECTED_RULESETS.items()
 }
+# The environment the release bot's key is stored in; import-plugin-release.yml's open-pr job enters it by
+# this name (a test reads the workflow). It must admit deployments from main alone: a custom list of
+# branch rules, none for protected branches, holding the branch main and nothing else, no tag rule.
+ENVIRONMENT = "marketplace-bot"
+ENVIRONMENT_POLICY = {"protected_branches": False, "custom_branch_policies": True}
+ENVIRONMENT_RULES = [{"name": "main", "type": "branch"}]
 MAIN_REVIEW = {"required_approving_review_count": 1, "require_code_owner_review": True,
                "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
                "allowed_merge_methods": ["squash"]}
@@ -100,6 +110,32 @@ def check_rulesets(gh: GitHub) -> list[str]:
     return problems
 
 
+def check_environment(gh: GitHub) -> list[str]:
+    """What is wrong with the `marketplace-bot` environment's deployment branches, from GitHub's own answer.
+    An environment that does not exist (404) is a problem; any other failure to read it is an error, never
+    a problem, so a token that cannot read it fails the run instead of reporting drift that did not happen.
+    The rule list is read only when the environment says it has custom rules: GitHub answers 404 for the
+    list of an environment that has none. Not checked here: where the secrets are stored."""
+    path = gh.repo_path(f"environments/{ENVIRONMENT}")
+    try:
+        environment = gh.get(path)
+    except GitHubError as error:
+        if error.status == 404:
+            return [f"the {ENVIRONMENT} environment does not exist"]
+        raise
+    policy = environment.get("deployment_branch_policy")
+    if policy != ENVIRONMENT_POLICY:
+        return [f"the {ENVIRONMENT} environment's deployment_branch_policy is {policy!r}, "
+                f"not {ENVIRONMENT_POLICY!r}"]
+    listed = gh.get(f"{path}/deployment-branch-policies", params={"per_page": 100})
+    rules = sorted(({"name": rule.get("name"), "type": rule.get("type")} for rule in listed.get("branch_policies") or []),
+                   key=lambda rule: (str(rule["name"]), str(rule["type"])))
+    if rules != ENVIRONMENT_RULES or listed.get("total_count") != len(ENVIRONMENT_RULES):
+        return [f"the {ENVIRONMENT} environment's deployment branch rules are {rules!r} "
+                f"(total_count {listed.get('total_count')!r}), not {ENVIRONMENT_RULES!r}"]
+    return []
+
+
 def snapshot(git: Git) -> list[dict]:
     return [{"tag": tag["tag"], "object": tag["object"], "commit": tag["commit"]} for tag in git.fleet_tags()]
 
@@ -154,9 +190,11 @@ def uncovered(current: list[dict], frozen: list[dict] | None) -> list[str]:
 
 def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
               baseline_expected: bool = False) -> list[str]:
-    """Every problem. `baseline_expected` says the caller asked for the comparison (a snapshot path was
-    given): if the snapshot is then absent (previous None), the frozen list has to cover every tag. A caller
-    that never asks, as tag-release does not, gets neither the comparison nor the coverage rule."""
+    """Every problem: the ledger's, the rulesets', the bot environment's, and then the snapshot comparison's.
+    `baseline_expected` says the caller asked for the comparison (a snapshot path was given): if the snapshot
+    is then absent (previous None), the frozen list has to cover every tag. A caller that never asks, as
+    tag-release does not, gets neither the comparison nor the coverage rule, and still gets the rest: it
+    runs in the same environment, so it refuses on drift in it too."""
     # The rulesets are checked once, by check_rulesets below (it adds exactly-one-per-name and
     # the fetch-and-merge rule); release_checks.audit_tags would otherwise check them a second
     # time and file every ruleset problem twice. test_the_configured_rulesets_pass pins RULESETS
@@ -164,6 +202,7 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
     problems = [f"tag ledger: {problem}"
                 for problem in release_checks.audit_tags(git.repo_dir, frozen, check_rulesets=False)]
     problems += check_rulesets(gh)
+    problems += check_environment(gh)
     if previous is not None or baseline_expected:
         # An unreadable list is already a ledger problem above, and accepts nothing here.
         rows = release_checks._tag_rows(frozen, "frozen tag list", [])
@@ -176,7 +215,7 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
 
 def as_result(problems: list[str]) -> Result:
     return Result(rule="tag-audit", label="tag-audit",
-                  title="tag-audit: the fleet-v tag ledger or the marketplace rulesets changed", red=bool(problems),
+                  title="tag-audit: the fleet-v tag ledger, the marketplace rulesets or the release bot's environment changed", red=bool(problems),
                   detail="\n".join(f"- {problem}" for problem in problems) if problems else "Every tag-audit check passes.")
 
 
