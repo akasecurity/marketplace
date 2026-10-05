@@ -7,10 +7,14 @@ that carries no fleet-v tag yet. GitHub keeps one pending run per concurrency
 group and drops the rest, so a dropped run loses nothing: the next one tags
 what it missed, in commit order. Each tag is annotated, and its message
 records the version, integrity, PR, approver and store-migration class, plus
-rollback-from, drill and approver-note when they apply. A commit that GitHub
-links to no merged PR is left untagged, and so is everything after it, until
-it is an hour old: a slow link must not become a permanent `pr: none` tag.
-After that hour it is tagged as a push without a PR. A commit dated more than
+rollback-from, drill and approver-note when they apply. The approver-note also
+says when the PR's final head had no passing `validate` run (none at all, or its
+latest one failed or had not finished), whoever approved it, so a merge past a
+failed check is in the permanent record. That read uses the workflow's own
+token, which can read checks, not the App's. A commit that GitHub links to no
+merged PR is left untagged, and so is everything after it, until it is an hour
+old: a slow link must not become a permanent `pr: none` tag. After that hour
+it is tagged as a push without a PR. A commit dated more than
 five minutes ahead of the runner's clock is not young either (only a direct
 push can carry one, and waiting for its date would hold every later tag back):
 it is tagged at once, as an old one would be. The owners that decide
@@ -40,13 +44,15 @@ from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
 from issue_router import CODEOWNERS_FILE
-from release_checks import MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
+from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
 
 ABSENT = "entry removed"
 # The modes git gives a regular file; any other mode at the CODEOWNERS path (120000 a symbolic link, 160000 a
 # submodule, 040000 a directory) holds nothing a reader can take rules from.
 FILE_MODES = ("100644", "100755")
 ENTRY_KINDS = {"120000": "a symbolic link", "160000": "a submodule", "040000": "a directory"}
+# The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
+VALIDATE_CHECK = "validate"
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
@@ -187,12 +193,38 @@ def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[s
             and login in owners and login not in exclude]
 
 
+def validate_conclusion(reader: GitHub, head: str) -> str | None:
+    """How the latest `validate` run from GitHub Actions on `head` ended, or None when none ran. A run that has
+    not finished has no conclusion, so its status stands in for it (`queued`, `in_progress`); the two sets of
+    words do not overlap, and only `success` is a pass.
+
+    The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
+    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that failed
+    after an earlier pass leaves the head unvalidated. `filter=all` asks for every run, not just the latest of
+    each name."""
+    runs = [run for run in reader.paginate(reader.repo_path(f"commits/{head}/check-runs"),
+                                           {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID,
+                                            "filter": "all"})
+            if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    if not runs:
+        return None
+    latest = max(runs, key=lambda run: run.get("id") or 0)
+    if latest.get("status") != "completed":
+        return latest.get("status") or "unfinished"
+    return latest.get("conclusion") or "without a result"
+
+
 def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
-             unreadable: str = "") -> dict:
+             unreadable: str = "", reader: GitHub | None = None) -> dict:
     """What the tag records about the PR that merged `sha`. `owners` is None when CODEOWNERS could not be read
     at the commit's parent, and `unreadable` says why: the PR is still named, but nobody can be matched to an
     approval, so the approver is unknown and no bypass is claimed. With no PR there is no approval to match,
-    so the owners do not matter."""
+    so the owners do not matter.
+
+    Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
+    to any other note: a below-floor rollback or any other merge past a red or missing check is then in the
+    record. `reader` is the client for that read (the workflow's token, which can read checks; the App's cannot
+    and does not need to); it defaults to `gh`."""
     pull = merged_pull(gh, sha, sleep)
     if pull is None:
         return {"pr": "none", "approver": "none", "note": "no pull request merged this commit", "drill": False}
@@ -200,14 +232,23 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[fl
     full = gh.get(gh.repo_path(f"pulls/{number}"))
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
-    if owners is None:
-        return {"pr": str(number), "approver": "unknown", "drill": drill,
-                "note": f"code owners could not be read: {unreadable or 'CODEOWNERS is not one line of users'}"}
-    approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
-    if approvers:
-        return {"pr": str(number), "approver": approvers[-1], "note": None, "drill": drill}
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    return {"pr": str(number), "approver": "none", "note": f"ruleset bypass by {merger}", "drill": drill}
+    bypass = False
+    if owners is None:
+        approver = "unknown"
+        note = f"code owners could not be read: {unreadable or 'CODEOWNERS is not one line of users'}"
+    else:
+        approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
+        approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
+        bypass = not approvers
+    conclusion = validate_conclusion(gh if reader is None else reader, head)
+    if conclusion != "success":
+        unvalidated = ("validate had not passed on the PR's final head "
+                       f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")
+        # The merger is already named by a bypass note; otherwise the note names who merged past the check.
+        unvalidated += "" if bypass else f"; merged by {merger}"
+        note = f"{note}; {unvalidated}" if note else unvalidated
+    return {"pr": str(number), "approver": approver, "note": note, "drill": drill}
 
 
 def one_line(text: str) -> str:
@@ -253,7 +294,9 @@ def tag_exists(gh: GitHub, name: str) -> bool:
 
 
 def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
-          now: Callable[[], float] = time.time) -> list[str]:
+          now: Callable[[], float] = time.time, reader: GitHub | None = None) -> list[str]:
+    """Tag every untagged pin change on main, oldest first. `gh` writes (the App's token); `reader` reads the
+    checks of a merged PR's head (the workflow token) and defaults to `gh`."""
     todo = pending(git)
     number = git.fleet_tags()[-1]["n"]
     created = []
@@ -274,7 +317,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
             owners, unreadable = (code_owners(git, parent) if parent else []), ""
         except Refused as refusal:
             owners, unreadable = None, " ".join(str(refusal).split())
-        facts = pr_facts(gh, sha, owners, sleep, unreadable)
+        facts = pr_facts(gh, sha, owners, sleep, unreadable, reader)
         if facts["pr"] == "none" and -CLOCK_SKEW <= now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
@@ -333,7 +376,9 @@ def main(argv: list[str] | None = None) -> int:
     gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
     try:
         if args.command == "sweep":
-            created = sweep(Git(args.repo_dir), gh)
+            # The App's token writes the tags; the workflow's own token (GITHUB_TOKEN, `checks: read`) reads checks.
+            reader = GitHub(os.environ.get("GITHUB_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
+            created = sweep(Git(args.repo_dir), gh, reader=reader)
             print(f"tagged {len(created)} commit(s)" if created
                   else "nothing to tag: every pin change on main has its fleet-v tag")
         else:
