@@ -404,8 +404,10 @@ jobs:
               # An off-tag publish from our OWN repository and workflow is a different
               # event from a tarball built somewhere else. Both are refused — this
               # import binds a release to its own tag — but "anyone can publish with
-              # provenance" would send the reader hunting a stolen token that is not
-              # there.
+              # provenance" would send the reader hunting a publisher outside ai-tc.
+              # An npm token alone cannot publish with provenance from ai-tc's workflow,
+              # but a run on a branch still needs write access to ai-tc, so a stolen
+              # GitHub credential is not ruled out and the text must not say it is.
               if (got.get("repository") == want["repository"]
                       and got.get("path") == want["path"]
                       and str(got.get("ref", "")).startswith("refs/heads/")):
@@ -414,8 +416,10 @@ jobs:
                            f"{want['ref']!r}. A manual run of the release workflow "
                            "(publish=true) publishes off-tag, and an attestation is immutable, "
                            "so this version can never satisfy the tag binding: re-release it "
-                           "from its tag, or advance the pin by hand. This is NOT a "
-                           "stolen-token signal.")
+                           "from its tag, or advance the pin by hand. The attestation names "
+                           "ai-tc's own release workflow, so an npm token alone did not "
+                           "publish it, but a run on a branch still needs write access to "
+                           "ai-tc, so a stolen GitHub credential is not ruled out.")
               sys.exit("FAIL: the attestation does not bind this tarball to ai-tc's release "
                        "workflow:\n  - " + "\n  - ".join(bad) + "\n  A cryptographically valid "
                        "attestation is NOT sufficient — anyone can publish with provenance from "
