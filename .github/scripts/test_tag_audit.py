@@ -1,15 +1,17 @@
-"""Tests for tag_audit.py: the ruleset read, the previous-run comparison and the frozen list."""
+"""Tests for tag_audit.py: the ruleset and environment reads, the previous-run comparison and the frozen list."""
 import copy
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
 
 import release_checks
 import tag_audit as ta
-from fakes import REPO, FakeGit, FakeGitHub, fleet_tag
+from fakes import REPO, FakeGit, FakeGitHub, fleet_tag, not_found
+from ghapi import GitHubError
 
 UPDATE = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
 LOCKED = [{"type": "creation"}, UPDATE, {"type": "deletion"}]
@@ -58,8 +60,23 @@ def frozen_file(testcase, rows):
     return path
 
 
-def github(rulesets):
-    routes = {("GET", R("rulesets")): [{"id": number, "name": body["name"]} for number, body in rulesets.items()]}
+def good_environment():
+    return {"name": "marketplace-bot", "deployment_branch_policy": {"protected_branches": False,
+                                                                     "custom_branch_policies": True}}
+
+
+def good_branch_rules():
+    return {"total_count": 1, "branch_policies": [{"id": 7, "node_id": "x", "name": "main", "type": "branch"}]}
+
+
+def github(rulesets, *, environment=None, rules=None):
+    """A GitHub whose rulesets are `rulesets` and whose release bot environment is the specified one, unless
+    `environment` (its document, or the error its read raises) or `rules` (its deployment branch rules) say
+    otherwise."""
+    routes = {("GET", R("rulesets")): [{"id": number, "name": body["name"]} for number, body in rulesets.items()],
+              ("GET", R("environments/marketplace-bot")): good_environment() if environment is None else environment,
+              ("GET", R("environments/marketplace-bot/deployment-branch-policies")):
+                  good_branch_rules() if rules is None else rules}
     for number, body in rulesets.items():
         routes[("GET", R(f"rulesets/{number}"))] = body
     return FakeGitHub(routes)
@@ -120,6 +137,99 @@ class TestRulesets(unittest.TestCase):
         self.assertEqual(ta.check_rulesets(github(sets)), ["ruleset 'fleet-tags-create': its ref conditions are not readable"])
 
 
+class TestEnvironment(unittest.TestCase):
+    """The `marketplace-bot` environment holds the release bot's key and must admit deployments from main alone."""
+
+    def problems(self, **kwargs):
+        return ta.check_environment(github(good_rulesets(), **kwargs))
+
+    def test_the_specified_environment_passes(self):
+        gh = github(good_rulesets())
+        self.assertEqual(ta.check_environment(gh), [])
+        # Both documents are read, and nothing is written.
+        self.assertEqual([call[1] for call in gh.calls if "environments" in call[1]],
+                         [R("environments/marketplace-bot"), R("environments/marketplace-bot/deployment-branch-policies")])
+        self.assertEqual(gh.writes(), [])
+
+    def test_it_audits_the_environment_the_importer_enters(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "import-plugin-release.yml")
+        with open(path, encoding="utf-8") as handle:
+            entered = re.findall(r"(?m)^    environment: (\S+)$", handle.read())
+        self.assertEqual(entered, [ta.ENVIRONMENT])
+
+    def test_an_environment_that_does_not_exist_is_a_problem_and_nothing_more_is_read(self):
+        gh = github(good_rulesets(), environment=not_found("environments/marketplace-bot"))
+        self.assertEqual(ta.check_environment(gh), ["the marketplace-bot environment does not exist"])
+        self.assertEqual(len([call for call in gh.calls if "environments" in call[1]]), 1)
+
+    def test_a_read_that_fails_otherwise_is_an_error_not_a_problem(self):
+        # A token that cannot read the environment must fail the run, not report a drift that did not happen.
+        for status in (401, 403, 500):
+            with self.subTest(status):
+                failure = GitHubError(status, "GET", "environments/marketplace-bot", "{}")
+                with self.assertRaises(GitHubError):
+                    self.problems(environment=failure)
+        with self.assertRaises(GitHubError):
+            self.problems(rules=GitHubError(403, "GET", "environments/marketplace-bot/deployment-branch-policies", "{}"))
+
+    def test_deployment_branches_other_than_a_custom_list_are_a_problem(self):
+        cases = {
+            "any branch": None,
+            "protected branches": {"protected_branches": True, "custom_branch_policies": False},
+            "both": {"protected_branches": True, "custom_branch_policies": True},
+            "neither": {"protected_branches": False, "custom_branch_policies": False},
+        }
+        for label, policy in cases.items():
+            with self.subTest(label):
+                gh = github(good_rulesets(), environment={"name": "marketplace-bot", "deployment_branch_policy": policy})
+                problems = ta.check_environment(gh)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("the marketplace-bot environment's deployment_branch_policy is "))
+                # GitHub answers 404 for the rule list of an environment with no custom rules: it is not read.
+                self.assertEqual(len([call for call in gh.calls if "deployment-branch-policies" in call[1]]), 0)
+
+    def test_anything_but_the_one_branch_rule_for_main_is_a_problem(self):
+        def rules(*entries):
+            return {"total_count": len(entries), "branch_policies": [dict(id=n, name=name, type=kind)
+                                                                      for n, (name, kind) in enumerate(entries)]}
+
+        cases = {
+            "no rule": rules(),
+            "a second branch": rules(("main", "branch"), ("release", "branch")),
+            "a pattern": rules(("*", "branch")),
+            "another branch": rules(("release", "branch")),
+            "a tag rule": rules(("main", "branch"), ("v*", "tag")),
+            "main as a tag": rules(("main", "tag")),
+            "a count that disagrees": dict(rules(("main", "branch")), total_count=2),
+        }
+        for label, listed in cases.items():
+            with self.subTest(label):
+                problems = self.problems(rules=listed)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertTrue(problems[0].startswith("the marketplace-bot environment's deployment branch rules are "))
+
+    def test_the_rules_may_be_listed_in_any_order_with_the_extra_fields_github_adds(self):
+        self.assertEqual(self.problems(rules={"total_count": 1, "branch_policies": [
+            {"id": 3, "node_id": "n", "name": "main", "type": "branch"}]}), [])
+
+    def test_a_run_check_reports_the_environment_with_the_other_problems(self):
+        git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
+        gh = github(good_rulesets(), environment=not_found())
+        with mock.patch.object(release_checks, "audit_tags", return_value=["fleet-v9 names PR 13, not a bot PR"]):
+            problems = ta.run_check(git, gh, ".github/fleet-tags.frozen.json", None)
+        self.assertEqual(problems, ["tag ledger: fleet-v9 names PR 13, not a bot PR",
+                                    "the marketplace-bot environment does not exist"])
+
+    def test_a_caller_that_asks_for_no_baseline_is_still_held_to_the_environment(self):
+        # tag-release asks for no comparison, and runs in this environment.
+        git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
+        gh = github(good_rulesets(), rules={"total_count": 0, "branch_policies": []})
+        with mock.patch.object(release_checks, "audit_tags", return_value=[]):
+            problems = ta.run_check(git, gh, ".github/fleet-tags.frozen.json", None)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("deployment branch rules", problems[0])
+
+
 class TestSnapshots(unittest.TestCase):
     def test_freeze_lists_every_annotated_fleet_tag_in_order(self):
         git = FakeGit(chain=["c1", "c2"], tags=[fleet_tag(2, "c2"), fleet_tag(1, "c1")])
@@ -160,6 +270,21 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(len(ta.compare_previous(previous, current, None)), 1)
 
 
+class TestCommittedFrozenList(unittest.TestCase):
+    """The list this repository commits, read the way the audit reads it."""
+
+    def test_it_records_every_tag_cut_by_hand(self):
+        # fleet-v1 to fleet-v9 were cut by hand, so they carry no `version:` or `pr:` line, and the audit
+        # judges a tag outside this list by those lines: a hand-cut tag missing here is three problems.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fleet-tags.frozen.json")
+        problems = []
+        rows = release_checks._tag_rows(path, "frozen tag list", problems)
+        self.assertEqual(problems, [])
+        names = [row["tag"] for row in rows]
+        self.assertEqual(names, [f"fleet-v{n}" for n in range(1, len(names) + 1)])
+        self.assertGreaterEqual(len(names), 9)
+
+
 class TestRunCheck(unittest.TestCase):
     def test_every_source_of_problems_is_reported(self):
         git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
@@ -193,7 +318,7 @@ class TestRunCheck(unittest.TestCase):
     def test_with_no_snapshot_every_tag_must_be_in_the_frozen_list(self):
         short = frozen_file(self, [self.row(1)])
         with mock.patch.object(release_checks, "audit_tags", return_value=[]):
-            problems = ta.run_check(self.two_tags(), github(good_rulesets()), short, None, baseline_expected=True)
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), short, None, no_baseline=True)
         self.assertEqual(problems, [
             "no snapshot from an earlier green run to compare against, and the frozen list does not record fleet-v2; "
             "re-freeze every fleet-v tag in a reviewed pull request to set a new baseline"])
@@ -202,7 +327,7 @@ class TestRunCheck(unittest.TestCase):
         complete = frozen_file(self, [self.row(1), self.row(2)])
         with mock.patch.object(release_checks, "audit_tags", return_value=[]):
             self.assertEqual(
-                ta.run_check(self.two_tags(), github(good_rulesets()), complete, None, baseline_expected=True), [])
+                ta.run_check(self.two_tags(), github(good_rulesets()), complete, None, no_baseline=True), [])
 
     def test_a_caller_that_does_not_ask_for_a_baseline_gets_neither_rule(self):
         short = frozen_file(self, [self.row(1)])
@@ -212,7 +337,7 @@ class TestRunCheck(unittest.TestCase):
     def test_an_unreadable_frozen_list_adds_no_coverage_problem_of_its_own(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "frozen.json")
         with mock.patch.object(release_checks, "audit_tags", return_value=["the frozen tag list is unreadable"]):
-            problems = ta.run_check(self.two_tags(), github(good_rulesets()), missing, None, baseline_expected=True)
+            problems = ta.run_check(self.two_tags(), github(good_rulesets()), missing, None, no_baseline=True)
         self.assertEqual(problems, ["tag ledger: the frozen tag list is unreadable"])
 
     def test_a_clean_audit_is_green(self):
@@ -224,13 +349,13 @@ class TestRunCheck(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
-    """main(): which invocations ask for a baseline. tag-release passes no --previous, and must never be
-    refused for a tag that only a snapshot (not the frozen list) records."""
+    """main(): which invocations ask for a baseline, and what it writes. tag-release passes neither --previous
+    nor --no-baseline, and must never be refused for a tag that only a snapshot (not the frozen list) records."""
 
-    def run_main(self, argv, rows):
+    def run_main(self, argv, rows, *, results_file=None):
         git = FakeGit(chain=[COMMIT], tags=[fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
         frozen = frozen_file(self, rows)
-        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
+        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t", **({"GITHUB_OUTPUT": results_file} if results_file else {})}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(ta, "Git", return_value=git), \
                 mock.patch.object(ta, "GitHub", return_value=github(good_rulesets())), \
@@ -240,35 +365,87 @@ class TestMain(unittest.TestCase):
         return code, out.getvalue()
 
     ONLY_V1 = [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT}]
+    BOTH = ONLY_V1 + [{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}]
+    NO_COVERAGE = ("::error::no snapshot from an earlier green run to compare against, and the frozen list does "
+                   "not record fleet-v2")
+
+    def scratch(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        return root.name
+
+    def snapshot_file(self, rows):
+        path = os.path.join(self.scratch(), "previous.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+        return path
 
     def test_tag_releases_invocation_never_asks_for_a_baseline(self):
         code, out = self.run_main([], self.ONLY_V1)
         self.assertEqual((code, out), (0, ""))
 
-    def test_a_missing_snapshot_file_asks_for_a_complete_frozen_list(self):
-        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
-        code, out = self.run_main(["--previous", absent], self.ONLY_V1)
+    def test_no_baseline_asks_for_a_complete_frozen_list(self):
+        code, out = self.run_main(["--no-baseline"], self.ONLY_V1)
         self.assertEqual(code, 1)
-        self.assertIn("::notice::no snapshot from an earlier green tag-audit run", out)
-        self.assertIn("::error::no snapshot from an earlier green run to compare against, and the frozen list does "
-                      "not record fleet-v2", out)
+        self.assertIn(self.NO_COVERAGE, out)
 
-    def test_a_missing_snapshot_file_with_a_complete_frozen_list_is_green(self):
-        absent = os.path.join(tempfile.gettempdir(), "no-such-dir-for-tag-audit", "previous.json")
-        rows = self.ONLY_V1 + [{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}]
-        code, out = self.run_main(["--previous", absent], rows)
-        self.assertEqual(code, 0)
-        self.assertNotIn("::error::", out)
+    def test_no_baseline_with_a_complete_frozen_list_is_green(self):
+        code, out = self.run_main(["--no-baseline"], self.BOTH)
+        self.assertEqual((code, out), (0, ""))
+
+    def test_a_snapshot_file_that_is_not_there_is_red_whatever_the_frozen_list_holds(self):
+        # The workflow only passes --previous when its fetch step downloaded a snapshot. A file that is
+        # then missing is a break between the two steps; reading it as "no baseline" would switch the
+        # comparison off for good (and a complete frozen list would let it pass green).
+        absent = os.path.join(self.scratch(), "no-such-dir", "previous.json")
+        for rows in (self.ONLY_V1, self.BOTH):
+            with self.subTest(len(rows)):
+                code, out = self.run_main(["--previous", absent], rows)
+                self.assertEqual(code, 1)
+                self.assertIn(f"::error::the snapshot the workflow downloaded ({absent}) is missing", out)
+                self.assertNotIn(self.NO_COVERAGE, out)
 
     def test_a_snapshot_that_exists_is_compared_not_replaced_by_the_coverage_rule(self):
         # fleet-v2 is not in the frozen list, but the snapshot knows it unchanged: the comparison is enough.
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        previous = os.path.join(root.name, "previous.json")
-        with open(previous, "w", encoding="utf-8") as handle:
-            json.dump([{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}], handle)
+        previous = self.snapshot_file([{"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}])
         code, out = self.run_main(["--previous", previous], self.ONLY_V1)
         self.assertEqual((code, out), (0, ""))
+
+    def test_previous_and_no_baseline_exclude_each_other(self):
+        previous = self.snapshot_file([])
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
+            self.run_main(["--previous", previous, "--no-baseline"], self.BOTH)
+        self.assertEqual(raised.exception.code, 2)
+
+    def outputs(self, path):
+        with open(path, encoding="utf-8") as handle:
+            return dict(line.rstrip("\n").split("=", 1) for line in handle)
+
+    def test_results_report_red_for_a_moved_tag(self):
+        moved = self.snapshot_file([{"tag": "fleet-v2", "object": "9" * 40, "commit": COMMIT}])
+        output = os.path.join(self.scratch(), "github-output")
+        code, _ = self.run_main(["--previous", moved, "--results"], self.ONLY_V1, results_file=output)
+        written = self.outputs(output)
+        self.assertEqual((code, written["red"]), (0, "true"))
+        self.assertIn("fleet-v2 moved since the last green run", written["results"])
+        self.assertTrue(json.loads(written["results"])[0]["red"])
+
+    def test_results_report_green_when_nothing_moved(self):
+        same = self.snapshot_file(self.BOTH)
+        output = os.path.join(self.scratch(), "github-output")
+        code, _ = self.run_main(["--previous", same, "--results"], self.BOTH, results_file=output)
+        written = self.outputs(output)
+        self.assertEqual((code, written["red"]), (0, "false"))
+        self.assertFalse(json.loads(written["results"])[0]["red"])
+
+    def test_the_snapshot_it_writes_is_the_current_tags(self):
+        # What the next run compares with: written whether the run is red or green, uploaded only when green.
+        written = os.path.join(self.scratch(), "snapshot", "fleet-tags.snapshot.json")
+        code, _ = self.run_main(["--no-baseline", "--snapshot", written], self.BOTH)
+        self.assertEqual(code, 0)
+        with open(written, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), [{"tag": "fleet-v1", "object": fleet_tag(1, COMMIT)["object"], "commit": COMMIT},
+                                                 {"tag": "fleet-v2", "object": fleet_tag(2, COMMIT)["object"], "commit": COMMIT}])
 
 
 if __name__ == "__main__":
