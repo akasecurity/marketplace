@@ -53,7 +53,8 @@ records that version's npm integrity in the entry's free-form `metadata.integrit
 does not read it; fleet checks compare installed bytes against it). Claude Code honours the pin on
 install and in its plugin auto-update pass, so a new `@akasecurity/ai-tc-claude-code` publish
 reaches nobody through this marketplace until a code-owner-approved pull request moves the pin (an
-org owner's break-glass merge aside, which `main-audit` reports). That is the
+org owner's break-glass merge aside, which `main-audit` reports unless that same push also changed
+the audit; see "The workflows"). That is the
 point: the pin is the audit trail, and it is what stops a fleet from advancing because a publish
 happened. It holds for `main` and for `fleet-v2` onward; `fleet-v1` predates it — its ai-tc entry
 names only the package — so a marketplace registered at `fleet-v1` (or any pre-pin commit) with
@@ -101,8 +102,13 @@ annotated `fleet-v<N>` tag at its commit. The message records the version, integ
 and store-migration class, and for a rollback the version it rolled back from. The approver is the
 code owner whose latest review approves the PR's final head; with none, the message says
 `approver: none` and who merged it, and when CODEOWNERS at the commit's parent could not be read
-the PR is still named but the approver is `unknown`, with the reason. Rulesets let only the release
-bot create a `fleet-v` tag and nobody at all move or delete one, and refuse every other tag name:
+(or is not a file) the PR is still named but the approver is `unknown`, with the reason. Whoever
+approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
+or had not finished) also gets an `approver-note` saying so; a commit no pull request merged has no
+head to look at, so it gets `pr: none` and no such note. Each value is written on one line, with a
+character that is not printable written as an escape, so text from a manifest cannot add a line of
+its own to the message. Rulesets let only the release bot create a `fleet-v` tag and nobody at all
+move or delete one, and refuse every other tag name:
 
 - **Only a tag cut by hand is signed.** The `fleet-v` tags cut before `tag-release` existed were
   signed by hand; the tags `tag-release` cuts are annotated but **not signed**, because the release
@@ -115,10 +121,10 @@ bot create a `fleet-v` tag and nobody at all move or delete one, and refuse ever
   `.github/fleet-tags.frozen.json` records the tags as of the last reviewed freeze, and a reviewed
   re-freeze is how a changed tag is accepted and the baseline reset.
 - Managed fleets either follow `main`, which moves only through a code-owner-approved pull request
-  (an org owner's break-glass merge aside, which `main-audit` reports), or register this
-  marketplace at a `fleet-v<N>` tag, which never moves; a fleet on a tag moves only when its own
-  configuration names a later one. A tag is also the only way to hold a fleet on one release,
-  since a marketplace ref cannot be a raw commit.
+  (an org owner's break-glass merge aside, which `main-audit` reports unless that same push also
+  changed the audit), or register this marketplace at a `fleet-v<N>` tag, which never moves; a
+  fleet on a tag moves only when its own configuration names a later one. A tag is also the only
+  way to hold a fleet on one release, since a marketplace ref cannot be a raw commit.
 - **Checking a version by hand, registry-explicit.** The importer and `validate` run these checks
   as code. To repeat them, confirm the version on the **public** registry with the scope mapping
   pinned — a scoped `.npmrc` in your cwd can silently route `@akasecurity` to another registry that
@@ -181,7 +187,8 @@ may use.
   `additive` where the computation says not-rollback-safe, since `validate` would fail the PR.
   `mode: rollback` with a `target` opens a rollback PR labelled `rollback`, turns off auto-merge on
   open forward pin PRs, and closes other rollback PRs; `below_floor: true` opens one below the
-  rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it.
+  rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it,
+  and its tag and a `main-audit` issue both record that `validate` had not passed.
   While a rollback PR is open, the scheduled import opens nothing, and a pull request that a forward
   dispatch opens gets no auto-merge. The forward and rollback jobs do not wait for each other, so a
   forward job looks for an open rollback PR before it enables auto-merge and again after, and turns
@@ -239,20 +246,25 @@ may use.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
   added that is not the merge of a PR with a code owner's approval of its final head, from someone
   other than the head's last pusher and not since withdrawn, and a passing `validate` check from
-  GitHub Actions on that head. The branch commits a merge-commit merge brings in are not on that
-  line and are not checked, and a rebase merge would report each rebased commit but the last, which
-  is why merges are squash-only. The last pusher is the author or committer of the head commit
-  (`web-flow` aside): the audit does not use GitHub's activity API, which does record pushers,
-  because what it records for a push made by the App or by auto-merge is unverified, and a head
-  that names neither is reported, since an approval could then be the pusher's own. CODEOWNERS is
-  read strictly at the commit's parent, and a file that cannot be read (a team, a path rule, no
-  file, or bytes that are not UTF-8 text) is that commit's problem: a red result for it while the
-  rest of the push is still audited. A push that moves `main` without extending it (the old tip is
+  GitHub Actions on that head (its latest run decides). The branch commits a merge-commit merge
+  brings in are not on that line and are not checked, and a rebase merge puts every rebased commit
+  on it, so each but the last is reported, worded as probably part of a rebase merge of the pull
+  request GitHub links it to, which is why merges are squash-only. The last pusher is the author
+  or committer of the head commit (`web-flow` aside): the audit does not use GitHub's activity API,
+  which does record pushers, because what it records for a push made by the App or by auto-merge is
+  unverified, and a head that names neither is reported, since an approval could then be the
+  pusher's own. CODEOWNERS is read strictly at the commit's parent, and a file that cannot be read
+  (a team, a path rule, no file, an entry that is not a file, or bytes that are not UTF-8 text) is
+  that commit's problem: a red result for it while the rest of the push is still audited. A push
+  that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for
   instance, the old tip is no longer in the checkout) and when nothing comes after the merge base (a
   reset back to an ancestor). A push the audit could not finish, and a job that failed, each get an
-  issue of their own, keyed to the push; a person closes every `main-audit` issue.
+  issue of their own, keyed to the push; a person closes every `main-audit` issue. **It cannot
+  vouch for itself.** `main-audit` runs from the pushed commit, so a push that bypasses the `main`
+  ruleset can also change, disable or remove it; that push is then audited by the changed copy, or
+  not at all, and no later run looks at it again.
 
 **No verdict is not a refusal.** `release_checks.py` keeps two outcomes apart. A check that reached
 a verdict and said no raises `ReleaseCheckError` (the command exits 1). A check that could not

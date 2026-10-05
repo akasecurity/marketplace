@@ -75,11 +75,14 @@ register this marketplace at a `fleet-v<N>` tag and move only when their own con
 later one.
 
 The one exception is break-glass: a few organisation owners can merge past the `main` ruleset's
-approval or `validate` requirement when no code owner is reachable, for example to roll a bad
-release back. An automated audit of `main` opens an issue for every commit that reached it without a
-code-owner-approved pull request whose final head passed `validate`. If the merge moved the ai-tc pin
-and no code owner had approved it, its `fleet-v<N>` tag also records `approver: none` and who merged
-it.
+approval and `validate` requirements when no code owner is reachable, for example to roll a bad
+release back. An automated audit of `main` opens an issue for each commit that reached it without a
+code-owner-approved pull request whose final head passed `validate`. The audit runs from the pushed
+commit, so a push that bypasses the `main` ruleset can also change, disable or remove it; that push
+is then audited by the changed copy, or not at all, and no later run looks at it again. If the merge
+moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and who merged it, or a
+note that `validate` had not passed on the final head (`approver: unknown` when CODEOWNERS could not
+be read at the parent).
 
 `preflight` and `claude-tools` still float on their default branches.
 
