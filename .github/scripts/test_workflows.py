@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 
+import _testsupport as ts
 import release_checks
 
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
@@ -155,7 +156,9 @@ class ImporterWorkflow(WorkflowCase):
         self.assertNotIn("npm 11 (node 24)", self.text.lower())
 
 
-RUN_77 = '[{"databaseId": 77, "event": "schedule"}]'
+# @ON_MAIN@, @TIP@ and @OFF_MAIN@ stand for commits in the throwaway repository run_fetch builds: an earlier commit of
+# main, main's tip, and one that is not on main's history.
+RUN_77 = '[{"databaseId": 77, "event": "schedule", "headSha": "@ON_MAIN@"}]'
 READY = '{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}'
 
 
@@ -257,6 +260,18 @@ class TagAuditWorkflow(WorkflowCase):
                    **({"DOWNLOAD_FAILS": "1"} if download_fails else {})}
             work = os.path.join(root, "work")
             os.makedirs(work)
+            # What the checkout leaves: full history of main (and origin/main), plus a commit that is not on it.
+            ts.git(work, "init", "-q", "-b", "main")
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "first")
+            on_main = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "second")
+            ts.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+            tip = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "checkout", "-q", "-b", "elsewhere", on_main)
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "not on main")
+            off_main = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "checkout", "-q", "main")
+            env["RUNS"] = runs.replace("@ON_MAIN@", on_main).replace("@OFF_MAIN@", off_main).replace("@TIP@", tip)
             done = subprocess.run(["bash", "-c", self.fetch_script()], cwd=work, env=env, text=True,
                                   capture_output=True)
             calls = []
@@ -279,15 +294,17 @@ class TagAuditWorkflow(WorkflowCase):
     def test_the_fetch_step_never_takes_a_pull_request_run_as_the_baseline(self):
         # A fork's pull request from its own main lists as a green run on the branch main; only the
         # older scheduled run may supply the baseline.
-        runs = ('[{"databaseId": 99, "event": "pull_request"}, {"databaseId": 88, "event": "pull_request_target"},'
-                ' {"databaseId": 77, "event": "schedule"}]')
+        runs = ('[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"},'
+                ' {"databaseId": 88, "event": "pull_request_target", "headSha": "@OFF_MAIN@"},'
+                ' {"databaseId": 77, "event": "schedule", "headSha": "@ON_MAIN@"}]')
         done, calls = self.run_fetch(runs=runs, artifacts=READY)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(calls[-1], "run download 77 --repo akasecurity/marketplace --name fleet-tags-snapshot --dir previous")
         self.assertFalse([call for call in calls if " 99 " in f" {call} " or " 88 " in f" {call} "])
 
     def test_the_fetch_step_with_only_pull_request_runs_has_no_baseline(self):
-        done, calls = self.run_fetch(runs='[{"databaseId": 99, "event": "pull_request"}]', artifacts=READY)
+        done, calls = self.run_fetch(runs='[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"}]',
+                                     artifacts=READY)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
         # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
@@ -297,7 +314,8 @@ class TagAuditWorkflow(WorkflowCase):
     def test_the_fetch_step_takes_a_manual_or_deletion_run_as_the_baseline(self):
         for event in ("workflow_dispatch", "delete"):
             with self.subTest(event):
-                done, calls = self.run_fetch(runs='[{"databaseId": 55, "event": "%s"}]' % event, artifacts=READY)
+                runs = '[{"databaseId": 55, "event": "%s", "headSha": "@ON_MAIN@"}]' % event
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertTrue(calls[-1].startswith("run download 55 "))
 
@@ -339,7 +357,8 @@ class TagAuditWorkflow(WorkflowCase):
         cases = {
             "a downloaded snapshot": (dict(runs=RUN_77, artifacts=READY), "ready"),
             "no earlier green run": (dict(), "none"),
-            "only pull request runs": (dict(runs='[{"databaseId": 99, "event": "pull_request"}]', artifacts=READY), "none"),
+            "only pull request runs": (dict(runs='[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"}]',
+                                            artifacts=READY), "none"),
             "an expired snapshot": (dict(runs=RUN_77, artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}'), "none"),
             "no snapshot listed": (dict(runs=RUN_77, artifacts='{"artifacts": []}'), "none"),
         }
@@ -411,6 +430,38 @@ class TagAuditWorkflow(WorkflowCase):
         self.assertEqual(written, uploaded)
         self.assertEqual(read, directory + "/" + os.path.basename(uploaded))
         self.assertIn(f"mkdir -p {directory}\n", self.step("name: fetch the snapshot"))
+
+    def test_the_fetch_step_takes_a_run_only_if_its_commit_is_on_main(self):
+        # A run on a tag reports the bare tag name as its branch, so a tag named main passes `--branch main`;
+        # the branch name does not make a run main's, its commit does. Only the newest run is judged: an
+        # older one on main is not a way round it.
+        def run(number, sha, event="schedule"):
+            return '{"databaseId": %d, "event": "%s", "headSha": %s}' % (number, event, sha)
+
+        accepted = {
+            "an earlier commit of main": "[" + run(77, '"@ON_MAIN@"') + "]",
+            "main's tip": "[" + run(77, '"@TIP@"', "workflow_dispatch") + "]",
+        }
+        for label, runs in accepted.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertTrue(calls[-1].startswith("run download 77 "))
+        refused = {
+            "a commit off main": "[" + run(77, '"@OFF_MAIN@"') + "]",
+            "a commit the checkout does not have": "[" + run(77, '"' + "f" * 40 + '"') + "]",
+            "no commit reported": '[{"databaseId": 77, "event": "schedule"}]',
+            "a null commit": "[" + run(77, "null") + "]",
+            "the newest run off main, an older one on it": "[" + run(88, '"@OFF_MAIN@"') + ", " + run(77, '"@ON_MAIN@"') + "]",
+            "a deletion run off main": "[" + run(55, '"@OFF_MAIN@"', "delete") + "]",
+        }
+        for label, runs in refused.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertRegex(done.stdout, r"::error::run \d+ reports branch main, but its commit \S+ is not on main")
+                self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
+                self.assertEqual(self.fetch_outputs, {})
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,

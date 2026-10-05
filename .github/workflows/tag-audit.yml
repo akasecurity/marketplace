@@ -47,7 +47,9 @@ jobs:
       # branch never supplies it, because a branch can carry its own edited copy of this file. The
       # branch name alone is not enough: a pull request from a fork's own main also reports main, so
       # only a run started by the schedule, by hand or by a deletion counts; a pull request never
-      # does. A snapshot that is expired (they last 90 days), or that the green run no longer lists
+      # does. A run on a tag reports the bare tag name as its branch too, so a tag named main would pass
+      # for the branch: the run's commit has to be on main's own history, and if it is not the step fails.
+      # A snapshot that is expired (they last 90 days), or that the green run no longer lists
       # (for instance, deleted), gives no baseline: a notice names which, and tag_audit.py then requires the
       # frozen list to record every fleet-v tag, so the baseline is re-set by a reviewed re-freeze
       # rather than by the passage of time. Every other failure fails the step, so a hiccup cannot
@@ -59,14 +61,22 @@ jobs:
         run: |
           set -eu
           mkdir -p previous
-          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --branch main --status success \
-            --limit 100 --json databaseId,event --jq \
-            '[.[] | select(.event == "schedule" or .event == "workflow_dispatch" or .event == "delete")]
-             | .[0].databaseId // empty')
-          if [ -z "$run_id" ]; then
+          picked=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --branch main --status success \
+            --limit 100 --json databaseId,event,headSha --jq \
+            'first(.[] | select(.event == "schedule" or .event == "workflow_dispatch" or .event == "delete"))
+             | "\(.databaseId) \(.headSha)"')
+          if [ -z "$picked" ]; then
             echo "::notice::no earlier green tag-audit run on main; the frozen list has to record every fleet-v tag"
             echo "baseline=none" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          run_id=${picked%% *}
+          head_sha=${picked#* }
+          # The checkout is full history of main (fetch-depth 0), so a commit that is not an ancestor of it, or
+          # that is not here at all, is a run from somewhere else.
+          if ! git merge-base --is-ancestor "$head_sha" origin/main; then
+            echo "::error::run $run_id reports branch main, but its commit $head_sha is not on main"
+            exit 1
           fi
           kept=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" --jq \
             '[.artifacts[] | select(.name == "fleet-tags-snapshot")]
