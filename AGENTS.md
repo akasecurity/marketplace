@@ -43,7 +43,8 @@ Don't "fix" it by copying entries across.
 5. The `ai-tc` entry is the exception for its package and its name: `validate` fails a human change
    to either, so such a change is a rare, fleet-wide act an org owner merges under break-glass,
    together with the matching release-pipeline change in `.github/scripts/release_checks.py`. Its
-   `description` changes like any other plugin's, through a reviewed pull request.
+   `description` changes like any other plugin's, through a reviewed pull request, and `validate`
+   fails an edit that leaves it anything but a non-empty string.
 
 ## ai-tc is pinned; `fleet-v<N>` tags
 
@@ -80,11 +81,15 @@ field — so "change all four" does not apply to a version change.
   `description` (see "Adding or renaming a plugin", step 5).
 - **A `rollback-safety.json` entry is computed, never typed.** A release PR adds its version's
   entry, and `validate` recomputes it from the store migrations between the previous pinned
-  release's attested commit and this one's. It recomputes an entry `main` already records for the
+  release's attested commit and this one's, and from the two store-code files that sit outside the
+  migration journal (`migrations.ts` and `sync-failure.ts` in `packages/persistence/src`): a release
+  in which either one differs, appears or vanishes is not rollback-safe even with no new migration,
+  a comment-only edit included. It recomputes an entry `main` already records for the
   version too, and fails one that runs up to another commit than the release's attested one or that
   is weaker than the computation (a stronger recorded class stands). A person changes an entry only
-  in a code-owner-reviewed PR, and `validate` calls a change toward `additive` out as lowering the
-  rollback floor; a person may not add an entry for a version nothing pins.
+  in a code-owner-reviewed PR; `validate` calls a change toward `additive` out as lowering the
+  rollback floor, and an edit that keeps the class names the fields it changes. A person may not
+  add an entry for a version nothing pins.
 
 **Who signed a release is read from its signing certificate, never from the statement.**
 `npm audit signatures` checks the signature and the certificate's chain, but no identity: a release
@@ -138,7 +143,8 @@ move or delete one, and refuse every other tag name:
   verifies, but not who signed it (see above). To repeat every check, identity included, run
   `python3 .github/scripts/release_checks.py verify-version <v>` with npm 11.12 or later, the first
   npm that prints the attestations; an older one gives no verdict. It exits 0 when the release
-  passes, 1 when a check refuses it, and 2 when no verdict could be reached.
+  passes, 1 when a check refuses it, and 2 when no verdict could be reached or the arguments are
+  wrong (a version that is not an exact `x.y.z` is a usage error, not a refusal).
 
 `preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
 
@@ -154,11 +160,12 @@ missing or differs, and `tag-release` creates no tag meanwhile.
 
 Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
-login only to a user, so a team, an email address, a path rule, a second rule or a file that is
-not UTF-8 text is not read. A PR merged on top of such a file gets `approver: unknown` in its tag,
-if it moved the pin, and a `main-audit` issue, rather than a guess; once a commit is merged, the
-file at its parent can no longer change. The unit tests run on a PR that changes the file and fail
-one the reader cannot read. Before pushing, validate the JSON and run the scripts' tests:
+login only to a user, so a team, an email address, a path rule, a second rule, an entry that is
+not a file or a file that is not UTF-8 text is not read. A PR merged on top of such a file gets
+`approver: unknown` in its tag, if it moved the pin, and a `main-audit` issue, rather than a
+guess; once a commit is merged, the file at its parent can no longer change. The unit tests run on
+every pull request, one that changes only the file included, and fail one the reader cannot read.
+Before pushing, validate the JSON and run the scripts' tests:
 
 ```bash
 for f in plugins.json .claude-plugin/marketplace.json .agents/plugins/marketplace.json; do
@@ -186,9 +193,11 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
 `tag-audit.yml`).
 
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
-  no secret: it takes the highest exact npm version above every version `main` or a `fleet-v` tag
-  has pinned that passes the release checks, never npm `latest` on trust. Its `open-pr` job creates
-  the bot branch with a create-only ref, never a force-push, opens the PR and enables auto-merge.
+  no secret: it takes the highest exact npm version above every version `main`, a `fleet-v` tag or
+  a merged release-bot pull request has pinned or rolled back from (a merged pin may not be tagged
+  yet) that passes the release checks, never npm `latest` on trust. Its `open-pr` job re-checks
+  every field of the plan it is handed, writes the PR's title itself, creates the bot branch with a
+  create-only ref, never a force-push, opens the PR and enables auto-merge.
   What it does with a branch that already exists depends on what used it: one with an open bot PR
   is skipped; one the bot's closed PR used is skipped on a plain forward run, and deleted and
   created again only by a `reimport` or rollback dispatch; one no PR ever used was left by a run
@@ -206,15 +215,19 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   rollback floor, which `validate` then fails, so only an org owner's break-glass merge lands it,
   and its tag and a `main-audit` issue both record that `validate` had not passed.
   While a rollback PR is open, the scheduled import opens nothing, and a pull request that a forward
-  dispatch opens gets no auto-merge. The forward and rollback jobs do not wait for each other, so a
-  forward job looks for an open rollback PR before it enables auto-merge and again after, and turns
-  auto-merge off if one opened meanwhile. A candidate that fails a check is logged once and skipped,
-  so it never hides a release above or below it. A candidate the checks cannot finish on (no
-  verdict, below) is not skipped: the run stops there, red, and does not fall back to a lower
-  version, because the one it could not check may be the real newest. The next run tries again, and
-  a dispatch naming a lower `target` that is still above every pin imports that release meanwhile,
-  since that path reads no candidate list. A dispatched `target` or rollback target with no verdict
-  ends red the same way.
+  dispatch opens gets no auto-merge. Scheduled and forward runs share one concurrency group, so two
+  imports never race for one branch, and a group keeps one pending run and cancels the rest. A
+  scheduled run dropped that way is harmless, since the next tick re-evaluates. A forward dispatch
+  still pending when the next scheduled tick queues (which happens only while another forward run
+  is still running) shows as cancelled, and has to be dispatched again by hand. The forward and
+  rollback jobs do not wait for each other, so a forward job looks for an open rollback PR before
+  it enables auto-merge and again after, and turns auto-merge off if one opened meanwhile. A
+  candidate that fails a check is logged once and skipped, so it never hides a release above or
+  below it. A candidate the checks cannot finish on (no verdict, below) is not skipped: the run
+  stops there, red, and does not fall back to a lower version, because the one it could not check
+  may be the real newest. The next run tries again, and a dispatch naming a lower `target` that is
+  still above every pin imports that release meanwhile, since that path reads no candidate list. A
+  dispatched `target` or rollback target with no verdict ends red the same way.
 - **`validate`** (`pull_request_target`, required) checks every PR with `main`'s copy of its
   script, reading the PR's files as data: since 8 December 2025 GitHub takes a
   `pull_request_target` workflow from the default branch whatever the PR's base, so a PR into
@@ -243,8 +256,9 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   `rollback-from`. A tag or a branch deletion that GitHub refuses ends the run with one error naming
   the ruleset, not a traceback, and a failed sweep runs no clean-up.
 - **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
-  included) has been on npm for 24 hours, npm has a version the importer refuses, the release
-  checks reached no verdict on a version that has been on npm for over an hour, or whose publish
+  included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
+  only the check that refused it, and the run log holds the reason), the release checks reached no
+  verdict on a version that has been on npm for over an hour, or whose publish
   time is unknown (its own issue, naming the version and the check that did not finish), a bot PR
   is open for 24 hours, a pin change is untagged for an hour, a stray tag or a second ref named
   `main` exists, or the ai-tc entry is gone; it posts a "rolled back, awaiting fix-forward" notice
@@ -305,15 +319,23 @@ finish, because the registry, the network, npm, git or the GitHub API failed, ra
 catches an outage by accident, and a caller that forgets to handle one fails the run closed and
 visibly instead of reading the outage as a verdict. Write new callers the same way: name the class
 you mean, and decide what no verdict does there (`validate` fails, the importer stops red, and
-`staleness` reports it on its own rule).
+`staleness` reports it on its own rule). Every run also has a time budget, started by its entry
+point (20 minutes on the command line, 25 for `validate` and the importer's `verify` job, 40 for
+`staleness`): each request, npm call and wait is cut to what remains of it, and one that cannot
+finish inside it ends the run as no verdict (`deadline`, exit 2) instead of starting.
 
-Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners.
-Each rule has one issue, found by a hidden marker among the issues the workflow's own token filed,
-whatever labels it carries, so an issue a person filed never stands in for it. A rule that clears
-closes its issue, and one that goes red again within 48 hours reopens that issue instead of opening a
-new one, so its escalation clock keeps running; once an issue has been open for 48 hours the
-escalation owner is assigned, once. An issue a person closed is never reopened; if its rule is still
-red, the next run opens a new one. `main-audit`'s issues, which are keyed to a commit or a push, are
+Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners
+(an issue is still filed, with no mention, when CODEOWNERS is missing or is not UTF-8 text). An
+alert's detail is quoted as code, so text taken from a tag or a PR cannot mention anyone or render
+as a link, and it is cut, with a note naming the run, before it passes GitHub's size limit for an
+issue body. Each rule has one issue, found by a hidden marker among the issues the workflow's own
+token filed, whatever labels it carries, so an issue a person filed never stands in for it. A rule
+that clears closes its issue, and one that goes red again within 48 hours reopens that issue
+instead of opening a new one, so its escalation clock keeps running; once an issue has been open
+for 48 hours the escalation owner is assigned, once. An issue a person closed is never reopened;
+if its rule is still red, the next run opens a new one. (One edge: an issue the router closed,
+which a person then reopened and closed again, is still reopened if its rule goes red within 48
+hours of the router's own close.) `main-audit`'s issues, which are keyed to a commit or a push, are
 closed only by a person.
 
 **The release path covers one plugin.** `release_checks.py` names one package and one release
