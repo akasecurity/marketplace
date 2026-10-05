@@ -15,6 +15,7 @@ import unittest
 import _testsupport as ts
 import release_checks
 import tag_audit
+import tag_release
 
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
 
@@ -534,6 +535,22 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertTrue(self.audit_step().startswith("name: tag-audit's ledger, ruleset and environment checks (stop,"),
                         self.audit_step())
 
+    def test_the_header_says_which_validate_runs_the_note_counts(self):
+        # The sweep counts a run of this workflow file, started by this event, that began at or before the merge. A
+        # header that named something else would be a claim the code has outgrown.
+        header = re.sub(r"\s*\n#\s*", " ", self.head)
+        self.assertIn(f"only a run of {os.path.basename(tag_release.VALIDATE_WORKFLOW)} started by "
+                      f"{tag_release.VALIDATE_EVENT}, at or before the PR merged, counts", header)
+
+    def test_the_comment_on_the_permissions_gives_the_reason_for_each_read(self):
+        # `checks` reads the validate check runs and `actions` the workflow runs behind them. tag-audit's job holds
+        # `actions: read` for the same environment check too, which is not the reason this job needs it.
+        comment = re.sub(r"\s*\n\s*#\s*", " ", self.jobs["tag"])
+        self.assertIn("validate check runs (`checks`) and the workflow runs behind them (`actions`)", comment)
+        self.assertIn("tag-audit's audit job, which runs the same environment check, holds `actions: read` too",
+                      comment)
+        self.assertNotIn("is what tag-audit's own job holds", comment)
+
     def step(self, needle: str) -> str:
         """The one step of the job that contains `needle`."""
         steps = [block for block in re.split(r"(?m)^      - ", self.jobs["tag"]) if needle in block]
@@ -541,9 +558,10 @@ class TagReleaseWorkflow(WorkflowCase):
         return steps[0]
 
     def test_the_workflow_token_can_read_checks_and_can_write_nothing(self):
-        # The sweep reads the `validate` runs of each merged PR with the workflow's own token, so the job needs
-        # `checks: read`. `actions: read` is what tag-audit's own job holds for the environment check that this job
-        # runs too. Every permission here is a read; the tags are written with the App's token.
+        # The sweep reads the `validate` check runs of each merged PR with the workflow's own token, so the job needs
+        # `checks: read`, and the workflow runs behind them, so it needs `actions: read`. tag-audit's audit job,
+        # which runs the same environment check, holds `actions: read` too. Every permission here is a read; the
+        # tags are written with the App's token.
         block = re.search(r"(?m)^    permissions:\n((?:      [a-z-]+: \w+\n)+)", self.jobs["tag"])
         self.assertIsNotNone(block, "the job lists its permissions")
         granted = dict(line.strip().split(": ") for line in block.group(1).splitlines())
@@ -683,6 +701,16 @@ class MainAuditWorkflow(WorkflowCase):
     def test_the_audit_job_may_read_checks_to_see_that_validate_passed(self):
         self.assertIn("      checks: read\n", self.jobs["audit"])
         self.assertNotIn("checks: write", self.text)
+
+    def test_the_audit_job_reads_the_workflow_runs_behind_those_checks_and_nothing_can_write(self):
+        # A check run counts as validate's only if the workflow run behind it is validate.yml's, so the job reads
+        # workflow runs (`actions`) as well as checks. Every permission in the file is a read, apart from the
+        # issues the second job files.
+        granted = re.search(r"(?m)^    permissions:\n((?:      [a-z-]+: \w+\n)+)", self.jobs["audit"])
+        self.assertIsNotNone(granted, "the audit job lists its permissions")
+        self.assertEqual(dict(line.strip().split(": ") for line in granted.group(1).splitlines()),
+                         {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read"})
+        self.assertNotRegex(self.text.replace("      issues: write\n", ""), r"(?m)^\s+[a-z-]+: write\b")
 
     def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
         self.assertNotIn("secrets.", self.text)

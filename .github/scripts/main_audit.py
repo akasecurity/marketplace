@@ -6,8 +6,9 @@ strictly: one `*` line of users, as tag-release reads it, and any other shape
 is that commit's problem rather than a guess) who is not its last pusher and has
 not since withdrawn it (an owner's latest approving, change-requesting or
 dismissed review decides), and whose final head has a passing `validate` check
-from GitHub Actions (its latest run decides). A commit that fails more than one
-of these gets one result. The head commit's author and committer stand in for
+from GitHub Actions (its latest run decides; only a run of validate.yml that
+`pull_request_target` started at or before the PR merged counts, the same rule
+tag-release applies). A commit that fails more than one of these gets one result. The head commit's author and committer stand in for
 the last pusher (web-flow, GitHub's committer for web edits, is skipped), and a
 head for which they name nobody is red, since an approval could then be the
 pusher's own.
@@ -86,17 +87,22 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
             f"pusher ({', '.join(sorted(pushers))}).")
 
 
-def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
+def validate_problem(gh: GitHub, sha: str, number: int, head: str, merged_at: str | None) -> str | None:
     """Why `head` has no passing `validate` check from GitHub Actions, or None when its latest run succeeded.
 
     The runs are read by the helper tag-release uses for the same question, so the two cannot disagree about
-    which run counts: the job named `validate` that GitHub Actions reports, the latest of them deciding."""
-    conclusion = validate_conclusion(gh, head)
+    which run counts: the job named `validate` that GitHub Actions reports for a run of validate.yml that
+    `pull_request_target` started, at or before the time the PR merged (`merged_at`), the latest of them
+    deciding. A job of that name in any other workflow passes nothing, and a run made after the merge (an
+    edit of the closed PR, a manual re-run) decides nothing, so a green re-run cannot clear a merge past a
+    failed check. The audit reads checks and workflow runs, so its job holds `checks: read` and `actions: read`."""
+    conclusion = validate_conclusion(gh, head, merged_at)
     if conclusion == "success":
         return None
     lead = (f"`{sha}` merged PR #{number} without a passing `{VALIDATE_CHECK}` check from GitHub Actions on its "
             f"final head `{head}`: ")
-    return lead + ("none ran." if conclusion is None else f"its latest run: {conclusion}.")
+    return lead + ("none ran before it merged from validate.yml's pull_request_target workflow."
+                   if conclusion is None else f"its latest run: {conclusion}.")
 
 
 def no_merge_problem(sha: str, linked: list[dict]) -> str:
@@ -123,7 +129,8 @@ def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None])
     number = pull["number"]
     head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
     problems = [problem for problem in (approval_problem(gh, git, sha, number, head),
-                                        validate_problem(gh, sha, number, head)) if problem]
+                                        validate_problem(gh, sha, number, head, pull.get("merged_at")))
+                if problem]
     return " ".join(problems) or None
 
 

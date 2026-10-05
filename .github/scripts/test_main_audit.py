@@ -50,17 +50,46 @@ def scratch_repo():
         yield root, sh, commit
 
 
-def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID) -> dict:
-    """A check run as the API lists it: by default the green `validate` run of GitHub Actions."""
-    return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app}}
+MERGED_AT = "2026-10-05T10:00:00Z"  # when pr_routes' pull request merged
+BEFORE_THE_MERGE = "2026-10-05T09:59:00Z"
+AFTER_THE_MERGE = "2026-10-05T10:00:01Z"
 
 
-def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=BOT, reviews=None, runs=None) -> dict:
-    """The routes main-audit reads for the pull request that merged `sha`."""
+def suite_of(run_id: int) -> int:
+    """The id of the check suite a test check run is in: one suite for each run, as GitHub Actions makes them."""
+    return 9000 + run_id
+
+
+def validate_run(run_id=7, *, conclusion="success", status="completed", name="validate", app=GITHUB_ACTIONS_APP_ID,
+                 started_at=BEFORE_THE_MERGE, suite=None) -> dict:
+    """A check run as the API lists it: by default the green `validate` run of GitHub Actions, started a minute
+    before the merge, in a check suite of its own (pr_routes makes that suite a pull_request_target run of validate.yml)."""
+    return {"id": run_id, "name": name, "status": status, "conclusion": conclusion, "app": {"id": app},
+            "started_at": started_at, "check_suite": {"id": suite_of(run_id) if suite is None else suite}}
+
+
+def workflow_run(suite: int, *, event=tr.VALIDATE_EVENT, path=tr.VALIDATE_WORKFLOW) -> dict:
+    """A workflow run as the API lists it for a check suite."""
+    return {"id": suite - 1000, "check_suite_id": suite, "name": "validate", "event": event, "path": path,
+            "created_at": "2026-10-05T09:50:00Z"}
+
+
+def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=BOT, reviews=None, runs=None,
+              workflows=None, merged_at=MERGED_AT) -> dict:
+    """The routes main-audit reads for the pull request that merged `sha`. `workflows` maps a check suite's id to
+    the workflow runs the API lists for it (a suite it does not name lists none); left out, every suite is one
+    pull_request_target run of validate.yml."""
     runs = [validate_run()] if runs is None else runs
+
+    def listed(body, params):
+        suite = params["check_suite_id"]
+        found = [workflow_run(suite)] if workflows is None else workflows.get(suite, [])
+        return {"total_count": len(found), "workflow_runs": found}
+
     return {
+        ("GET", R("actions/runs")): listed,
         ("GET", R(f"commits/{sha}/pulls")): pulls if pulls is not None else [
-            {"number": number, "merge_commit_sha": sha, "merged_at": "2026-10-05T10:00:00Z", "base": {"ref": "main"}}],
+            {"number": number, "merge_commit_sha": sha, "merged_at": merged_at, "base": {"ref": "main"}}],
         ("GET", R(f"pulls/{number}")): {"head": {"sha": head}},
         ("GET", R(f"commits/{head}")): {"author": {"login": author}, "committer": {"login": committer}},
         ("GET", R(f"pulls/{number}/reviews")): reviews if reviews is not None else [
@@ -376,6 +405,87 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("without a passing `validate` check", results[0].detail)
         self.assertIn("none ran", results[0].detail)
+
+    def test_a_run_of_another_workflow_file_or_started_by_another_event_does_not_count(self):
+        # A job named validate in any other workflow, or in validate.yml run for a push or a pull request, reports
+        # the same check name. Only validate.yml run by pull_request_target is the required check.
+        for label, workflow in {
+                "another file": workflow_run(suite_of(7), path=".github/workflows/ci.yml"),
+                "a lookalike path": workflow_run(suite_of(7), path=".github/workflows/validate.yml.bak"),
+                "a push": workflow_run(suite_of(7), event="push"),
+                "a pull request": workflow_run(suite_of(7), event="pull_request"),
+                "no event": {"path": tr.VALIDATE_WORKFLOW}}.items():
+            with self.subTest(label):
+                results = self.audit(github(workflows={suite_of(7): [workflow]}))
+                self.assertEqual(len(results), 1)
+                self.assertIn("none ran before it merged", results[0].detail)
+
+    def test_a_pass_from_another_workflow_cannot_stand_in_for_a_failed_validate(self):
+        failed, impostor = validate_run(7, conclusion="failure"), validate_run(9)
+        for label, runs in (("oldest first", [failed, impostor]), ("newest first", [impostor, failed])):
+            with self.subTest(label):
+                results = self.audit(github(runs=runs, workflows={
+                    suite_of(7): [workflow_run(suite_of(7))],
+                    suite_of(9): [workflow_run(suite_of(9), path=".github/workflows/ci.yml")]}))
+                self.assertEqual(len(results), 1)
+                self.assertIn("its latest run: failure.", results[0].detail)
+
+    def test_a_failure_from_another_workflow_does_not_fail_a_validated_merge(self):
+        runs = [validate_run(7), validate_run(9, conclusion="failure")]
+        self.assertEqual(self.audit(github(runs=runs, workflows={
+            suite_of(7): [workflow_run(suite_of(7))],
+            suite_of(9): [workflow_run(suite_of(9), path=".github/workflows/ci.yml")]})), [])
+
+    def test_a_green_run_after_the_merge_does_not_clear_a_merge_past_a_failed_validate(self):
+        # An edit of the closed PR, or a manual re-run, starts validate again on the same head.
+        failed, rerun = validate_run(7, conclusion="failure"), validate_run(9, started_at=AFTER_THE_MERGE)
+        for label, runs in (("oldest first", [failed, rerun]), ("newest first", [rerun, failed])):
+            with self.subTest(label):
+                results = self.audit(github(runs=runs))
+                self.assertEqual(len(results), 1)
+                self.assertIn("its latest run: failure.", results[0].detail)
+
+    def test_a_failed_run_after_the_merge_does_not_fail_a_validated_merge(self):
+        later = validate_run(9, conclusion="failure", started_at=AFTER_THE_MERGE)
+        self.assertEqual(self.audit(github(runs=[validate_run(7), later])), [])
+
+    def test_a_head_whose_only_run_started_after_the_merge_had_none_before_it(self):
+        results = self.audit(github(runs=[validate_run(9, started_at=AFTER_THE_MERGE)]))
+        self.assertEqual(len(results), 1)
+        self.assertIn("none ran before it merged", results[0].detail)
+
+    def test_a_run_queued_before_the_merge_and_started_after_it_does_not_count(self):
+        # The workflow run was created before the merge, as a re-run's is; the job started after it.
+        rerun = validate_run(9, started_at=AFTER_THE_MERGE)
+        self.assertEqual(len(self.audit(github(runs=[validate_run(7, conclusion="failure"), rerun]))), 1)
+
+    def test_a_run_that_started_in_the_second_of_the_merge_counts(self):
+        self.assertEqual(self.audit(github(runs=[validate_run(7, started_at=MERGED_AT)])), [])
+
+    def test_the_time_the_pull_request_merged_is_the_one_the_runs_are_compared_with(self):
+        run = validate_run(7, started_at="2026-10-05T10:03:00Z")
+        self.assertEqual(self.audit(github(runs=[run], merged_at="2026-10-05T10:05:00Z")), [])
+        self.assertEqual(len(self.audit(github(runs=[run], merged_at="2026-10-05T10:01:00Z"))), 1)
+
+    def test_a_merge_whose_time_cannot_be_read_leaves_no_run_to_count(self):
+        # The check cannot be placed before a merge whose time is unknown, so it is not taken to have passed.
+        for merged_at in ("yesterday", "2026-10-05", "2026-10-05T10:00:00+00:00"):
+            with self.subTest(merged_at):
+                results = self.audit(github(merged_at=merged_at))
+                self.assertEqual(len(results), 1)
+                self.assertIn("none ran before it merged", results[0].detail)
+
+    def test_the_workflow_run_is_asked_for_through_the_check_suite_of_the_run_that_decides(self):
+        gh = github(runs=[validate_run(5), validate_run(9)])
+        self.assertEqual(self.audit(gh), [])
+        self.assertEqual([call[3] for call in gh.called("GET", R("actions/runs"))], [{"check_suite_id": suite_of(9)}])
+
+    def test_a_workflow_run_read_that_fails_is_a_push_the_audit_could_not_finish(self):
+        gh = github()
+        gh.routes[("GET", R("actions/runs"))] = GitHubError(403, "GET", R("actions/runs"), "Resource not accessible")
+        results = [item for item in ma.audit(repo(), gh, "p", "s1", sleep=lambda seconds: None) if item.red]
+        self.assertEqual([item.rule for item in results], ["main-audit-unaudited-s1"])
+        self.assertIn("403", results[0].detail)
 
     def test_a_validate_run_from_another_app_does_not_count(self):
         # The API is asked for GitHub Actions' runs only, and the answer is checked again: a check with the

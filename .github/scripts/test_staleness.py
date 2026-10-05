@@ -12,7 +12,8 @@ from unittest import mock
 import issue_router
 import release_checks
 import staleness as st
-from fakes import INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, pull, pulls_route
+from fakes import (INTEGRITY, REPO, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest, pull,
+                   pulls_route)
 from release_checks import MANIFEST
 
 # StalenessCase replaces release_checks.npm_candidates for every test; the tests that read the registry
@@ -381,6 +382,23 @@ class TestOnePackumentRead(RunMain):
                 self.assertFalse(rules[rule].red)
         self.assertNotIn("0.9.16", "".join(item.detail for item in rules.values() if item.red))
 
+    def test_the_publish_times_come_from_the_one_read(self):
+        # The one read lists 0.9.16, published two minutes ago, and its checks pass. Its age is what keeps rule (i)
+        # clear: had the times been dropped or read from anywhere else, 0.9.16 would read as published at an unknown
+        # time, which counts as older than a day, and the rule would go red on a release minutes old.
+        self.stubs["npm_candidates"].side_effect = REAL_NPM_CANDIDATES
+        published = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        document = {"versions": {"0.9.15": {}, "0.9.16": {}},
+                    "time": {"0.9.15": "2026-10-01T00:00:00.000Z", "0.9.16": published}}
+        with mock.patch.object(release_checks._OPENER, "open", side_effect=[Reply(document)]) as opened:
+            code, rules = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [st.REGISTRY_URL])
+        self.stubs["verify_release"].assert_called_once_with("0.9.16")
+        for rule in ("staleness-i", "staleness-i-refused", "staleness-i-no-verdict"):
+            with self.subTest(rule):
+                self.assertFalse(rules[rule].red)
+
     def test_the_one_read_is_served_for_the_package_document_only(self):
         with mock.patch.object(release_checks, "http_fetch", return_value=(200, b"{}")) as fetched:
             reader = st.read_packument()
@@ -501,6 +519,65 @@ class TestOtherRules(StalenessCase):
         times = st.publish_times(lambda url: seen.append(url) or {"time": {"0.9.16": "2026-10-04T10:00:00.000Z"}})
         self.assertEqual(seen, ["https://registry.npmjs.org/@akasecurity%2Fai-tc-claude-code"])
         self.assertEqual(times, {"0.9.16": "2026-10-04T10:00:00.000Z"})
+
+
+class TestUnreadableManifests(StalenessCase):
+    """A commit already on main never gets better, so a manifest that cannot be read must not fail every run."""
+
+    def test_rule_iii_goes_on_past_a_commit_whose_manifest_cannot_be_read(self):
+        for label, text in UNREADABLE_MANIFESTS.items():
+            with self.subTest(label):
+                git = repo()
+                git.files[("a", MANIFEST)] = text
+                self.log = io.StringIO()
+                rule = self.rules(git)["staleness-iii"]
+                self.assertTrue(rule.red)
+                self.assertIn("`b` (ai-tc 0.9.15", rule.detail)
+                self.assertNotIn("`a`", rule.detail)
+                # The reason goes to the run log, one warning for the commit; the issue's text does not carry it.
+                self.assertRegex(self.log.getvalue(), r"(?m)^::warning::.*at a cannot be read.*not counted")
+                self.assertNotIn("cannot be read", rule.detail)
+
+    def test_a_manifest_broken_for_one_commit_and_mended_to_the_same_version_is_no_pin_change(self):
+        git = repo()
+        git.files[("a", MANIFEST)] = "{"
+        git.files[("b", MANIFEST)] = manifest("0.9.14")
+        self.assertFalse(self.rules(git)["staleness-iii"].red)
+
+    def test_a_manifest_on_main_that_cannot_be_read_is_red_and_rule_i_is_not_evaluated(self):
+        for label, text in UNREADABLE_MANIFESTS.items():
+            with self.subTest(label):
+                git = repo()
+                git.files[("b", MANIFEST)] = text
+                rules = self.rules(git)
+                self.assertTrue(rules["staleness-entry"].red)
+                self.assertIn("at b cannot be read", rules["staleness-entry"].detail)
+                self.assertNotIn("has no ai-tc entry", rules["staleness-entry"].detail)
+                for rule in ("staleness-i", "staleness-i-refused", "staleness-i-no-verdict"):
+                    self.assertIsNone(rules[rule].red)
+                self.assertFalse(rules["staleness-iii"].red)
+                self.stubs["pinned_versions"].assert_not_called()
+
+    def test_main_is_resolved_from_its_full_ref_before_its_manifest_is_read(self):
+        git = full_ref_only(repo())
+        git.files[("b", MANIFEST)] = "{"
+        with contextlib.redirect_stdout(self.log):
+            entry = st.entry_and_rule_i(git, "/fake/marketplace", NOW, {}, self.packument)[0]
+        self.assertTrue(entry.red)
+        self.assertIn("cannot be read", entry.detail)
+
+
+class TestUnreadableManifestsRun(RunMain):
+    def test_a_run_over_a_manifest_that_cannot_be_read_reports_it_and_ends_green(self):
+        git = repo(pin_change_age=dt.timedelta(minutes=30))
+        git.files[("a", MANIFEST)] = "[" * 100_000
+        git.files[("b", MANIFEST)] = "{"
+        with mock.patch.object(release_checks._OPENER, "open", side_effect=[Reply({"versions": {}, "time": {}})]):
+            code, rules = self.run_main(git)
+        self.assertEqual(code, 0)
+        self.assertTrue(rules["staleness-entry"].red)
+        self.assertIsNone(rules["staleness-i"].red)
+        self.assertFalse(rules["staleness-iii"].red)
 
 
 if __name__ == "__main__":

@@ -14,14 +14,17 @@ Each rule is its own result, filed as its own issue by issue_router.py:
         issue of a version either rule could name;
   (ii)  a bot PR has been open for more than 24 hours;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
-        than an hour old, changed the ai-tc version and carries no fleet-v tag;
+        than an hour old, changed the ai-tc version and carries no fleet-v tag
+        (a commit whose manifest cannot be read is no pin change: the run logs
+        a warning for it and goes on, as tag-release does);
   (iv)  a tag other than fleet-v<N> (N a positive integer without a leading
         zero) exists, or a ref other than refs/heads/main answers to the name
         main.
-Also: the ai-tc entry missing from main (red until a restore merges), the
-"rolled back, awaiting fix-forward" notice while the latest fleet-v tag is a
-rollback (rule (i) stays live then, so a fix-forward the importer fails to pin
-still goes red), and a drill result a manual run raises to test the path.
+Also: the ai-tc entry missing from main, or main's manifest unreadable (red
+until a PR that restores or mends it merges), the "rolled back, awaiting
+fix-forward" notice while the latest fleet-v tag is a rollback (rule (i) stays
+live then, so a fix-forward the importer fails to pin still goes red), and a
+drill result a manual run raises to test the path.
 """
 from __future__ import annotations
 
@@ -36,10 +39,10 @@ from typing import Callable
 import release_checks
 from ghapi import GitHub
 from gitrepo import Git
-from import_release import describe, entry_of, list_pulls, write_output
+from import_release import describe, list_pulls, write_output
 from issue_router import Result, results_to_json
 from release_checks import MANIFEST, vkey
-from tag_release import version_at
+from tag_release import Unreadable, entry_at, pin_changes, version_at
 
 LABEL = "staleness"
 HOUR = dt.timedelta(hours=1)
@@ -100,9 +103,15 @@ def result(rule: str, red: bool | None, detail: str = "", **extra) -> Result:
 def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str, str],
                      packument: release_checks.Fetch) -> list[Result]:
     # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
-    raw = git.show(git.main(), MANIFEST)
-    present = raw is not None and entry_of(json.loads(raw)) is not None
+    # A manifest on main that cannot be read (it does not parse, is nested too deeply, or names ai-tc twice) is
+    # reported as this rule too, not left to crash the run: nothing can be imported from it either.
+    try:
+        present, unreadable = entry_at(git, git.rev_parse(git.main())) is not None, ""
+    except Unreadable as problem:
+        present, unreadable = False, str(problem)
     entry = result("staleness-entry", not present,
+                   f"{unreadable}. Nothing is imported, and the expected version reads unknown, until a PR that "
+                   "mends it merges." if unreadable else
                    "main's `.claude-plugin/marketplace.json` has no ai-tc entry. Nothing is imported, and the "
                    "expected version reads unknown, until a restore PR merges.")
     if not present:
@@ -172,17 +181,16 @@ def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
 
 def rule_iii(git: Git, frozen: list[dict], now: dt.datetime) -> Result:
     last = max(frozen, key=lambda tag: int(tag["tag"][len("fleet-v"):]))
-    tagged = {tag["commit"] for tag in git.fleet_tags()}
+    changed, unreadable = pin_changes(git, last["commit"])
+    for why in unreadable.values():
+        # A commit already on main whose manifest cannot be read is no pin change, and this rule goes on past it:
+        # stopping would fail every run for good. The full reason goes to the run log only.
+        print(f"::warning::{why}. It is not counted as a pin change.")
     missing = []
-    for sha in git.first_parent_after(last["commit"], git.main()):
-        if sha in tagged:
-            continue
-        version = version_at(git, sha)
-        if version == version_at(git, git.first_parent(sha)):
-            continue
+    for sha in changed:
         committed = dt.datetime.fromtimestamp(git.commit_time(sha), dt.timezone.utc)
         if now - committed > HOUR:
-            missing.append(f"- `{sha}` (ai-tc {version}, committed {committed:%Y-%m-%dT%H:%M:%SZ})")
+            missing.append(f"- `{sha}` (ai-tc {version_at(git, sha)}, committed {committed:%Y-%m-%dT%H:%M:%SZ})")
     return result("staleness-iii", bool(missing),
                   f"Pin changes on main after {last['tag']} with no fleet-v tag for more than an hour:\n"
                   + "\n".join(missing) + "\n\ntag-release tags them on its next run: dispatch it, and read why "
