@@ -110,16 +110,19 @@ character that is not printable written as an escape, so text from a manifest ca
 its own to the message. Rulesets let only the release bot create a `fleet-v` tag and nobody at all
 move or delete one, and refuse every other tag name:
 
-- **Only a tag cut by hand is signed.** The `fleet-v` tags cut before `tag-release` existed were
-  signed by hand; the tags `tag-release` cuts are annotated but **not signed**, because the release
-  bot creates them through GitHub's API. What protects every `fleet-v` tag is the rulesets and
-  `tag-audit`, not a signature, and no check reads one: not this repository's, and not the fleet
-  configuration that registers this marketplace at a tag, which compares the tag's commit with the
-  one it recorded.
+- **Only a tag cut by hand is signed.** `fleet-v1` through `fleet-v9`, cut before `tag-release`
+  existed, are SSH-signed by a person; the tags `tag-release` cuts are annotated but **not
+  signed**, because the release bot creates them through GitHub's API. What protects every
+  `fleet-v` tag is the rulesets and `tag-audit`, not a signature, and no check reads one: not this
+  repository's, and not the fleet configuration that registers this marketplace at a tag, which
+  compares the tag's commit with the one it recorded.
 - **Never move, delete or re-sign an existing `fleet-v<N>` tag.** `tag-audit` treats a tag that no
   longer resolves to its recorded object as a supply-chain event, not a typo;
   `.github/fleet-tags.frozen.json` records the tags as of the last reviewed freeze, and a reviewed
   re-freeze is how a changed tag is accepted and the baseline reset.
+- **After the freeze, no `fleet-v` tag is cut by hand.** A tag on a pin change that did not come
+  through the release bot's pull request stays red in `tag-audit`, and `tag-release` cuts nothing
+  more, until a reviewed pull request re-freezes the list with it.
 - Managed fleets either follow `main`, which moves only through a code-owner-approved pull request
   (an org owner's break-glass merge aside, which `main-audit` reports unless that same push also
   changed the audit), or register this marketplace at a `fleet-v<N>` tag, which never moves; a
@@ -215,7 +218,8 @@ may use.
   PR merged into `main` counts as a commit's merge. A commit that GitHub links to no merged PR is
   left untagged, and so is everything after it, until it is an hour old, so that a slow link never
   becomes a permanent `pr: none` tag; from then on it is tagged as a push without a PR, which
-  `tag-audit` reports. A commit dated more than five minutes ahead of the runner's clock (only a
+  `tag-audit` reports, and `tag-release` then cuts nothing more until a reviewed pull request
+  re-freezes the list. A commit dated more than five minutes ahead of the runner's clock (only a
   direct push can carry one, for example from a machine with the wrong time) is not waited for: it
   is tagged at once, so its date never holds the tags after it. A restore after the entry was
   removed is compared with the last version pinned before the removal, so a lower one records
