@@ -166,11 +166,19 @@ A malformed manifest breaks `/plugin marketplace add` for every user at once.
 
 ## The workflows
 
-`validate`, `import-plugin-release` and `tag-release` are the release path; `staleness`,
-`tag-audit` and `main-audit` watch it. Their logic lives in `.github/scripts/` (stdlib Python, with
-tests beside it), so the workflow files stay thin. Only `import-plugin-release`'s `open-pr` job and
-`tag-release` act as the release bot, through the `marketplace-bot` environment, which only `main`
-may use.
+There are seven workflows. `validate`, `import-plugin-release` and `tag-release` are the release
+path; `staleness`, `tag-audit` and `main-audit` watch it; `script-tests` runs the scripts' own unit
+tests. Their logic lives in `.github/scripts/` (stdlib Python, with tests beside it), so the
+workflow files stay thin. Only `import-plugin-release`'s `open-pr` job and `tag-release` act as the
+release bot, through the `marketplace-bot` environment, which only `main` may use (`tag-audit`
+checks the environment's deployment branches every day).
+
+GitHub disables a public repository's scheduled workflows after 60 days with no repository
+activity. A disabled workflow makes no failed run and files no issue, so `import-plugin-release`,
+`staleness` and `tag-audit`, the three that run on a schedule, cannot report their own silence.
+`gh workflow list --all` shows each workflow's state, and
+`gh workflow enable import-plugin-release.yml` turns one back on (likewise `staleness.yml` and
+`tag-audit.yml`).
 
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
   no secret: it takes the highest exact npm version above every version `main` or a `fleet-v` tag
@@ -202,20 +210,24 @@ may use.
   a dispatch naming a lower `target` that is still above every pin imports that release meanwhile,
   since that path reads no candidate list. A dispatched `target` or rollback target with no verdict
   ends red the same way.
-- **`validate`** (`pull_request_target`, required) checks every PR with the base branch's copy of
-  its script, reading the PR's files as data. An approver confirms the check run is `validate.yml`'s
-  run from `main`, and trusts its summary over the PR body. A check that cannot finish reports
-  NO VERDICT and fails the required check; it is never reported as the PR breaking a rule. On a bot
-  PR every commit must also carry GitHub's verified signature. The summary's `Main read at` row
-  names the `main` commit whose pins and rollback floor it read, and every free-text value taken
-  from the PR appears in it inside a code span. `validate` does not run again when `main` moves, so
-  if `rollback-safety.json` changed on `main` after a rollback PR's run, its approver re-runs the
-  check before approving (the PR's checklist says so).
-- **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger and ruleset checks (not its
-  comparison with the last green run's snapshot of the tags), tags every first-parent commit whose
-  ai-tc version changed and has no `fleet-v` tag yet, and then deletes the bot's branches that
-  still point at the head of a closed PR (a branch re-created after its PR closed is kept). Only a
-  PR merged into `main` counts as a commit's merge. A commit that GitHub links to no merged PR is
+- **`validate`** (`pull_request_target`, required) checks every PR with `main`'s copy of its
+  script, reading the PR's files as data: since 8 December 2025 GitHub takes a
+  `pull_request_target` workflow from the default branch whatever the PR's base, so a PR into
+  another branch is judged against `main` too. An approver confirms the check run is
+  `validate.yml`'s run from `main`, and trusts its summary over the PR body. A check that cannot
+  finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
+  rule. On a bot PR every commit must also carry GitHub's verified signature. The summary's
+  `Main read at` row names the `main` commit whose pins and rollback floor it read, and every
+  free-text value taken from the PR appears in it inside a code span. `validate` does not run again
+  when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
+  approver re-runs the check before approving (the PR's checklist says so).
+- **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger, ruleset and environment
+  checks (not its comparison with the last green run's snapshot of the tags) and stops, red and
+  creating nothing, while any of them fails. That refusal is a signal, not a control: the workflow
+  runs from the pushed commit. It tags every first-parent commit whose ai-tc version changed and
+  has no `fleet-v` tag yet, and then deletes the bot's branches that still point at the head of a
+  closed PR (a branch re-created after its PR closed is kept). Only a PR merged into `main` counts
+  as a commit's merge. A commit that GitHub links to no merged PR is
   left untagged, and so is everything after it, until it is an hour old, so that a slow link never
   becomes a permanent `pr: none` tag; from then on it is tagged as a push without a PR, which
   `tag-audit` reports, and `tag-release` then cuts nothing more until a reviewed pull request
@@ -236,17 +248,25 @@ may use.
   cleared. A younger version is left out, because neither rule can name it yet, so an outage never
   closes the issue of a version they could name. Every script that reads `main` uses its full ref,
   so a tag named `main` cannot stand in for the branch before the stray-ref rule reports it.
-- **`tag-audit`** (daily, on every tag push or deletion, and by hand) checks the `fleet-v` ledger
-  against the frozen list, the last green run and `main`'s history, and that the rulesets are active
-  as configured. A tag that changed since the last green run stays red until a reviewed PR
-  re-freezes the list
+- **`tag-audit`** (daily, on every tag push, on the deletion of a tag or a branch, and by hand)
+  checks the `fleet-v` ledger against the frozen list, the last green run and `main`'s history,
+  that the rulesets are active as configured, and that the `marketplace-bot` environment admits
+  deployments from `main` alone. GitHub starts no run for a push or a deletion that touches more
+  than three tags at once, nor for a tag pushed at an old commit that has no copy of the workflow,
+  so the daily run is what sees those. A tag that changed since the last green run stays red until
+  a reviewed PR re-freezes the list
   (`python3 .github/scripts/tag_audit.py freeze --out .github/fleet-tags.frozen.json`, run with the
   tags fetched), which is how a person records that the change is explained; a deleted tag has to be
   put back at its commit first. When there is no snapshot to compare with (none was kept, it expired
   after 90 days, or it was deleted), the frozen list has to record every `fleet-v` tag, so the
-  baseline is re-set in a reviewed PR and not by the passage of time. Keep artifact retention at 90
-  days, and dispatch `tag-audit` once after turning it on so a baseline exists before `tag-release`
-  cuts the first tag after the frozen list; `tag-release` asks for no comparison.
+  baseline is re-set in a reviewed PR and not by the passage of time. That rule sees only tags that
+  exist: a tag cut after the frozen list and deleted since the snapshot was lost is not seen by this
+  audit (`staleness` reports its pin change as untagged once it has stood for an hour, and
+  `tag-release` cuts the tag again, but neither says that a tag was deleted). The newest green
+  run's commit has to be on `main`'s own history to supply the baseline; if it is not, the audit
+  fails instead of comparing with it. Keep artifact retention at 90 days, and dispatch `tag-audit`
+  once after turning it on so a baseline exists before `tag-release` cuts the first tag after the
+  frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
   added that is not the merge of a PR with a code owner's approval of its final head, from someone
   other than the head's last pusher and not since withdrawn, and a passing `validate` check from
@@ -269,6 +289,9 @@ may use.
   vouch for itself.** `main-audit` runs from the pushed commit, so a push that bypasses the `main`
   ruleset can also change, disable or remove it; that push is then audited by the changed copy, or
   not at all, and no later run looks at it again.
+- **`script-tests`** runs the scripts' unit tests (standard library only, no outside network) on
+  every pull request, with no path filter, and on every push to `main`. It is not a required check;
+  a red run means the module every release workflow runs has regressed.
 
 **No verdict is not a refusal.** `release_checks.py` keeps two outcomes apart. A check that reached
 a verdict and said no raises `ReleaseCheckError` (the command exits 1). A check that could not
