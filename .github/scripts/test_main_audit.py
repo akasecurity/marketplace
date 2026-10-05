@@ -190,6 +190,31 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(gh.called("GET", R(f"commits/{first}/pulls")), [])
         self.assertEqual(gh.called("GET", R(f"commits/{second}/pulls")), [])
 
+    def test_a_rebase_merge_reports_each_rebased_commit_but_the_last(self):
+        # A rebase merge puts every commit of the pull request on main as a new commit, and names only the last as
+        # the pull request's merge commit. Each earlier one is on the first-parent line with no pull request of its
+        # own, so it is reported; the last is audited as the merge, and passes.
+        with scratch_repo() as (root, sh, commit):
+            commit(".github/CODEOWNERS", CODEOWNERS)
+            sh("switch", "-q", "-c", "feature")
+            first_branch, second_branch = commit("one", "1"), commit("two", "2")
+            sh("switch", "-q", "main")
+            before = commit("moved", "m")  # main moved on while the pull request was open
+            sh("cherry-pick", first_branch)
+            rebased_first = sh("rev-parse", "HEAD")
+            sh("cherry-pick", second_branch)
+            rebased_last = sh("rev-parse", "HEAD")
+            self.assertEqual(len({first_branch, second_branch, rebased_first, rebased_last}), 4)
+            merged = [{"number": 40, "merge_commit_sha": rebased_last, "merged_at": "2026-10-05T10:00:00Z",
+                       "base": {"ref": "main"}}]
+            gh = FakeGitHub({**pr_routes(rebased_last, number=40, head="h40", pulls=merged),
+                             ("GET", R(f"commits/{rebased_first}/pulls")): merged})
+            results = ma.audit(Git(root), gh, before, rebased_last, sleep=lambda seconds: None)
+        self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
+                         [(f"main-audit-{rebased_first[:12]}", True, False), ("main-audit", False, False)])
+        self.assertIn("is not the merge commit of any pull request", results[0].detail)
+        self.assertEqual(results[-1].detail, "2 commit(s) audited in this push, 1 flagged.")
+
     def test_a_rewrite_audits_every_first_parent_commit_after_the_merge_base(self):
         with scratch_repo() as (root, sh, commit):
             commit(".github/CODEOWNERS", CODEOWNERS)
