@@ -324,8 +324,13 @@ class TestNoResults(RouterCase):
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 
-    def run_main(self, *, job_result, results_json=None, label="staleness"):
-        gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
+    OWNERS = b"* @Vaishnav-OM\n"
+
+    def run_main(self, *, job_result, results_json=None, label="staleness", codeowners=OWNERS, issues=()):
+        """`codeowners` is the file's bytes, or None for no file. Leaves the fake GitHub and what main printed
+        on self for a test that wants more than the exit code and the titles."""
+        gh = FakeGitHub({("GET", R("issues")): list(issues), ("POST", R("issues")): {"number": 41},
+                         ("POST", R("issues/40/comments")): {"id": 1}, ("PATCH", R("issues/40")): {"number": 40}})
         env = {"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "9",
                "JOB_RESULT": job_result}
         if results_json is not None:
@@ -334,16 +339,18 @@ class TestMain(unittest.TestCase):
             os.makedirs(os.path.join(root, ".github"))
             with open(os.path.join(root, ".github", "release-approvers.json"), "w", encoding="utf-8") as handle:
                 json.dump({"approvers": ["Vaishnav-OM"], "escalation": None}, handle)
-            with open(os.path.join(root, ".github", "CODEOWNERS"), "w", encoding="utf-8") as handle:
-                handle.write("* @Vaishnav-OM\n")
+            if codeowners is not None:
+                with open(os.path.join(root, ".github", "CODEOWNERS"), "wb") as handle:
+                    handle.write(codeowners)
             cwd = os.getcwd()
             os.chdir(root)
             try:
                 with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(rt, "GitHub", return_value=gh), \
-                        mock.patch("sys.stdout", new_callable=io.StringIO):
+                        mock.patch("sys.stdout", new_callable=io.StringIO) as out:
                     code = rt.main(["apply", "--label", label])
             finally:
                 os.chdir(cwd)
+        self.gh, self.printed = gh, out.getvalue()
         return code, [call[2]["title"] for call in gh.called("POST", R("issues"))]
 
     def test_a_success_with_no_results_output_is_red(self):
@@ -381,6 +388,34 @@ class TestMain(unittest.TestCase):
     def test_a_job_that_did_not_finish_is_red(self):
         self.assertEqual(self.run_main(job_result="cancelled", results_json="[]"),
                          (1, ["staleness: the evaluation job did not finish"]))
+
+    def test_the_code_owners_are_mentioned_when_the_file_reads(self):
+        self.run_main(job_result="success", results_json=rt.results_to_json([red()]))
+        self.assertIn("Filed by https://github.com/akasecurity/marketplace/actions/runs/9. cc @Vaishnav-OM\n",
+                      self.gh.called("POST", R("issues"))[0][2]["body"])
+
+    def test_a_codeowners_file_that_is_missing_or_not_text_costs_only_the_mention(self):
+        # The alert is the point: a CODEOWNERS file nobody can read must not stop it being filed.
+        unreadable = {"missing": None, "not UTF-8": b"* @Vaishnav-OM \xff\xfe\n", "empty": b""}
+        for label, codeowners in unreadable.items():
+            with self.subTest(label):
+                code, titles = self.run_main(job_result="success", results_json=rt.results_to_json([red()]),
+                                             codeowners=codeowners)
+                self.assertEqual((code, titles), (1, ["staleness: an unpinned release"]))
+                body = self.gh.called("POST", R("issues"))[0][2]["body"]
+                self.assertNotIn("@", body)
+                self.assertIn("/actions/runs/9.\n", body)
+                self.assertEqual("::warning::" in self.printed, codeowners != b"")
+
+    def test_a_codeowners_file_that_cannot_be_read_still_closes_a_cleared_rules_issue(self):
+        issue = existing()
+        clear = rt.results_to_json([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)])
+        for label, codeowners in {"missing": None, "not UTF-8": b"\xff\xfe"}.items():
+            with self.subTest(label):
+                code, titles = self.run_main(job_result="success", results_json=clear, codeowners=codeowners,
+                                             issues=[issue])
+                self.assertEqual((code, titles), (0, []))
+                self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
 
 
 class TestHelpers(unittest.TestCase):
