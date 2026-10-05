@@ -627,16 +627,22 @@ class StalenessWorkflow(WorkflowCase):
     # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
     FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
 
+    # The same reading of a version spec as the importer's, with its table of accepted and rejected specs
+    # (ImporterWorkflow.test_the_lowest_release_a_spec_admits): one rule for every workflow that installs Node.
+    lowest_admitted = staticmethod(ImporterWorkflow.lowest_admitted)
+
     def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
         # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
-        # can resolve to an older cached 24.x whose npm the release checks cannot finish on, and every
-        # hourly run would then report the same no-verdict alert. Only an exact version, or a range
-        # that starts at one, cannot.
+        # can resolve to an older cached 24.x whose npm the release checks cannot finish on, and a run
+        # that has a new version to check would then report it as having no verdict. Another major
+        # bundles another npm (Node 25.0.0 through 25.8.2 ship npm 11.6 to 11.11), and a range with no
+        # upper bound resolves to the highest cached copy of any major. Only an exact 24.x.y, or a range
+        # from one up to but not including 25, cannot.
         specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
         self.assertEqual(len(specs), 1, "staleness installs Node exactly once, with a quoted node-version")
-        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
-        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
-        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+        lowest = self.lowest_admitted(specs[0])
+        self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
 
     def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
         self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
