@@ -18,7 +18,10 @@ admin's read-back cover those.
 
 A change to a tag since the last green run stays red until a reviewed pull
 request re-freezes the tag list (`freeze`), which is how a person records
-that it is explained. When the run is told there is no snapshot to compare
+that it is explained. A tag in the list is exempt from the checks a new tag
+gets, so `freeze` does not rewrite a row quietly: it prints every row it adds,
+changes or drops, and it changes or drops a row already in the list only when
+`--accept fleet-vN` names that tag (once for each). When the run is told there is no snapshot to compare
 with (`--no-baseline`: none was ever kept, it expired or it was deleted), the
 comparison is replaced by a stricter rule: the frozen list must record every
 fleet-v tag that exists, so the baseline is re-set in a reviewed pull request
@@ -35,6 +38,7 @@ import argparse
 import json
 import os
 import sys
+from typing import NamedTuple
 
 import release_checks
 from ghapi import GitHub, GitHubError
@@ -154,7 +158,88 @@ def freeze_text(git: Git) -> str:
     return release_checks.dump_json(snapshot(git))
 
 
-REFREEZE = "if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
+def _tag_number(name: str) -> int:
+    return int(name[len("fleet-v"):])
+
+
+def fleet_tag_name(value: str) -> str:
+    """An --accept value: the name of a fleet-v tag."""
+    if not release_checks.FLEET_TAG.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a fleet-v<N> tag name")
+    return value
+
+
+def read_frozen_rows(path: str) -> list[dict]:
+    """The rows the file holds now, or none when there is no such file (the first freeze). A file that is
+    there but cannot be read, or that names a tag twice, is refused: what a freeze would change in it could
+    not be told."""
+    if not os.path.exists(path):
+        return []
+    problems: list[str] = []
+    rows = release_checks._tag_rows(path, "frozen tag list", problems)
+    if rows is None:
+        raise SystemExit(f"refusing to freeze over {path}: {problems[0]}. Fix the file by hand, or delete it to "
+                         "start the list again (every tag then shows as added).")
+    names = [row["tag"] for row in rows]
+    repeated = sorted({name for name in names if names.count(name) > 1}, key=_tag_number)
+    if repeated:
+        raise SystemExit(f"refusing to freeze over {path}: it names {', '.join(repeated)} more than once, so what "
+                         "a freeze would change in it could not be told. Fix the file by hand.")
+    return rows
+
+
+class RowChange(NamedTuple):
+    tag: str
+    kind: str  # "added", "changed" or "removed"
+    text: str
+
+
+def row_changes(existing: list[dict], current: list[dict]) -> list[RowChange]:
+    """Every row a freeze would add, change or drop, in tag order. A row that stays as it is is left out."""
+    before = {row["tag"]: row for row in existing}
+    after = {row["tag"]: row for row in current}
+    changes = []
+    for name in sorted({*before, *after}, key=_tag_number):
+        old, new = before.get(name), after.get(name)
+        if old == new:
+            continue
+        if old is None:
+            changes.append(RowChange(name, "added", f"{name} added: tag object {new['object']}, commit {new['commit']}"))
+        elif new is None:
+            changes.append(RowChange(name, "removed", f"{name} removed: the list holds it (tag object {old['object']}, "
+                                                      f"commit {old['commit']}) and the tag no longer exists"))
+        else:
+            changes.append(RowChange(name, "changed", f"{name} changed: tag object {old['object']} -> {new['object']}, "
+                                                      f"commit {old['commit']} -> {new['commit']}"))
+    return changes
+
+
+def refreeze(git: Git, path: str, accept: list[str]) -> tuple[str, list[str]]:
+    """The new frozen list for `path`, and the lines that say what it changes. A tag in the list is exempt
+    from the checks a new tag gets, so a row already there is not rewritten unless `accept` names its tag: a
+    re-freeze that also carries a tag that moved would otherwise bless the move unread. `accept` may name only
+    a tag whose row changes, so an accept left over from an earlier freeze approves nothing. Adding a row for
+    a tag the list does not hold needs no accept; it is printed all the same. A refusal raises SystemExit
+    carrying the lines and the reason, and the caller writes nothing."""
+    text = freeze_text(git)
+    changes = row_changes(read_frozen_rows(path), json.loads(text))
+    lines = [change.text for change in changes] or ["no row changes"]
+    touched = [change.tag for change in changes if change.kind != "added"]
+    unnamed = [name for name in touched if name not in accept]
+    unused = [name for name in dict.fromkeys(accept) if name not in touched]
+    reasons = []
+    if unnamed:
+        flags = " ".join(f"--accept {name}" for name in unnamed)
+        reasons.append(f"it would change or drop the row of {', '.join(unnamed)}; once each is explained, name it "
+                       f"({flags})")
+    if unused:
+        reasons.append(f"--accept names {', '.join(unused)}, whose row does not change")
+    if reasons:
+        raise SystemExit("\n".join([*lines, f"refusing to freeze: {'; '.join(reasons)}. Nothing was written."]))
+    return text, lines
+
+
+REFREEZE ="if this change is explained, re-freeze it in a reviewed pull request (`tag_audit.py freeze`)"
 
 
 def compare_previous(previous: list[dict], current: list[dict], frozen: list[dict] | None = None) -> list[str]:
@@ -241,11 +326,17 @@ def main(argv: list[str] | None = None) -> int:
     freeze = sub.add_parser("freeze")
     freeze.add_argument("--repo-dir", default=".")
     freeze.add_argument("--out", required=True)
+    freeze.add_argument("--accept", action="append", default=[], type=fleet_tag_name, metavar="fleet-vN",
+                        help="let the freeze change or drop the row this tag already has in the list; give it once "
+                             "for each such tag")
     args = parser.parse_args(argv)
     git = Git(args.repo_dir)
     if args.command == "freeze":
+        text, lines = refreeze(git, args.out, args.accept)
         with open(args.out, "w", encoding="utf-8") as handle:
-            handle.write(freeze_text(git))
+            handle.write(text)
+        for line in lines:
+            print(line)
         print(f"froze {len(git.fleet_tags())} fleet-v tags into {args.out}")
         return 0
     previous, absent = None, []
