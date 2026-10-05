@@ -59,12 +59,29 @@ TITLES = {
 }
 
 
-def fetch_json(url: str) -> dict:
-    """GET url through release_checks.http_fetch, the one HTTP door the release checks use."""
-    status, body = release_checks.http_fetch(url, {"Accept": "application/json"})
+def fetch_json(url: str, fetch: release_checks.Fetch | None = None) -> dict:
+    """GET url through release_checks.http_fetch, the one HTTP door the release checks use, or through
+    `fetch`, a reader shaped like it."""
+    status, body = (fetch or release_checks.http_fetch)(url, {"Accept": "application/json"})
     if status != 200:
         raise release_checks.InfraError("npm", f"GET {url} answered {status}")
     return json.loads(body)
+
+
+def read_packument() -> release_checks.Fetch:
+    """Read the registry's package document once, and return a reader that answers every later read of
+    it with that same answer. The publish times and the list of versions must come from one document:
+    the registry serves it from a CDN cache, so two reads a moment apart can disagree for a few minutes
+    after a publish, and a version in the second but not the first would read as published at an unknown
+    time, which counts as older than a day."""
+    answer = release_checks.http_fetch(REGISTRY_URL, {"Accept": "application/json"})
+
+    def same_answer(url: str, headers: dict) -> tuple:
+        if url != REGISTRY_URL:
+            raise ValueError(f"only {REGISTRY_URL} was read, not {url}")
+        return answer
+
+    return same_answer
 
 
 def publish_times(fetch: Callable[[str], dict] = fetch_json) -> dict[str, str]:
@@ -80,7 +97,8 @@ def result(rule: str, red: bool | None, detail: str = "", **extra) -> Result:
     return Result(rule=rule, label=LABEL, title=TITLES[rule], red=red, detail=detail, **extra)
 
 
-def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str, str]) -> list[Result]:
+def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str, str],
+                     packument: release_checks.Fetch) -> list[Result]:
     # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
     raw = git.show(git.main(), MANIFEST)
     present = raw is not None and entry_of(json.loads(raw)) is not None
@@ -93,7 +111,8 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
     pinned = set(release_checks.pinned_versions(repo_dir))
     highest = max(pinned, key=vkey)
     stale, refused, unverified = [], [], []
-    for version in release_checks.npm_candidates(pinned):
+    # `packument` answers with the one document `times` came from (read_packument).
+    for version in release_checks.npm_candidates(pinned, fetch=packument):
         on_npm = age(now, times.get(version))
         published = times.get(version, "at an unknown time")
         try:
@@ -189,8 +208,9 @@ def rollback_hold(git: Git) -> Result:
 
 
 def evaluate(*, git: Git, gh: GitHub, repo_dir: str, frozen: list[dict], now: dt.datetime,
-             times: dict[str, str], remote_refs: list[str], drill: bool, actor: str) -> list[Result]:
-    results = entry_and_rule_i(git, repo_dir, now, times)
+             times: dict[str, str], packument: release_checks.Fetch, remote_refs: list[str], drill: bool,
+             actor: str) -> list[Result]:
+    results = entry_and_rule_i(git, repo_dir, now, times, packument)
     results += [rule_ii(gh, now), rule_iii(git, frozen, now), rule_iv(remote_refs), rollback_hold(git),
                 result("staleness-drill", drill,
                        f"A manual run with drill: true, by {actor}, to prove red reaches an issue. The next run "
@@ -207,8 +227,10 @@ def main(argv: list[str] | None = None) -> int:
     git = Git(args.repo_dir)
     with open(args.frozen, encoding="utf-8") as handle:
         frozen = json.load(handle)
+    packument = read_packument()
     results = evaluate(git=git, gh=GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]), repo_dir=args.repo_dir,
-                       frozen=frozen, now=dt.datetime.now(dt.timezone.utc), times=publish_times(),
+                       frozen=frozen, now=dt.datetime.now(dt.timezone.utc),
+                       times=publish_times(lambda url: fetch_json(url, packument)), packument=packument,
                        remote_refs=git.ls_remote("origin"), drill=env.get("DRILL") == "true",
                        actor=env.get("ACTOR", "unknown"))
     for item in results:
