@@ -5,9 +5,11 @@ name: main-audit
 # approving review from a code owner other than its last pusher, and a passing
 # validate check from GitHub Actions (AGENTS.md, "The workflows"). The branch
 # commits a merge-commit merge brings in are not on that line and are not checked.
-# Detective only: the main ruleset prevents, and this records a bypass. It runs
-# from the pushed commit's own copy, so a bypass push could change it in the
-# same push. Each offending commit, each push that rewrote main and each push
+# Detective only: the main ruleset prevents, and this records a bypass. It cannot
+# vouch for itself: main-audit runs from the pushed commit, so a push that bypasses
+# the `main` ruleset can also change, disable or remove main-audit. That push is then
+# audited by the changed copy, or not at all, and no later run looks at it again.
+# Each offending commit, each push that rewrote main and each push
 # the audit could not finish gets its own issue, which only a person closes; if
 # the job itself dies (a timeout), that push gets a workflow issue of its own too.
 # No concurrency group: a group drops pending runs, and a dropped run would be

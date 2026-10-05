@@ -77,6 +77,25 @@ class TestGit(Scratch):
         with self.assertRaises(GitError):
             self.git.show(sha, "dir/m.json")
 
+    def test_entry_mode_names_what_git_records_at_a_path_and_none_when_there_is_nothing(self):
+        plain = self.commit("dir/m.json", "{}\n")
+        self.assertEqual(self.git.entry_mode(plain, "dir/m.json"), "100644")
+        self.assertEqual(self.git.entry_mode("main", "dir/m.json"), "100644")
+        self.assertEqual(self.git.entry_mode(plain, "dir"), "040000")
+        self.assertIsNone(self.git.entry_mode(plain, "dir/absent.json"))
+        self.assertIsNone(self.git.entry_mode(plain, "dir/m.json/inside"))
+        self.sh("update-index", "--chmod=+x", "dir/m.json")
+        self.sh("commit", "-q", "-m", "executable")
+        self.assertEqual(self.git.entry_mode("main", "dir/m.json"), "100755")
+        os.symlink("m.json", os.path.join(self.dir, "dir", "link"))
+        self.sh("add", "dir/link")
+        self.sh("update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},dir/sub")
+        self.sh("commit", "-q", "-m", "a symbolic link and a submodule")
+        self.assertEqual(self.git.entry_mode("main", "dir/link"), "120000")
+        self.assertEqual(self.git.entry_mode("main", "dir/sub"), "160000")
+        with self.assertRaises(GitError):
+            self.git.entry_mode("0" * 40, "dir/m.json")
+
     def test_first_parent_history_skips_the_merged_side_branch(self):
         base = self.commit("a.txt", "base\n")
         self.sh("switch", "-q", "-c", "side")

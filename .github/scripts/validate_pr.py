@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """validate.yml's rules for every PR into this repository.
 
-This runs from the BASE branch's copy (pull_request_target). It reads the PR's files as
-data: `git show <sha>:<path>` of the head commit, never a checkout, and it never imports
-or executes anything the PR contains.
+This runs from the default branch's (main's) copy (pull_request_target: since 2025-12-08
+GitHub takes the workflow and the checkout from the default branch, whatever the PR's base).
+It reads the PR's files as data: `git show <sha>:<path>` of the head commit, never a
+checkout, and it never imports or executes anything the PR contains.
 
 It is a correctness check on the automated path, not a security boundary: code-owner
 review of every change is the control.
@@ -63,6 +64,41 @@ class Report:
         return 1 if self.failures else 0
 
 
+# A real manifest nests under ten levels. The code that reads a pull request's JSON recurses one
+# frame per level (a comparison, json.dumps, the search for a renamed ai-tc), so JSON deeper than
+# this is refused before any of that runs, instead of ending in the interpreter's recursion limit.
+MAX_JSON_DEPTH = 64
+
+
+def _depth(value) -> int:
+    """How many containers deep `value` nests. Iterative, so measuring cannot hit the limit."""
+    deepest, pending = 0, [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            children = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        deepest = max(deepest, level)
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
+def parse_pr_json(text: str):
+    """rc.parse_json for a file the pull request supplies. JSON that nests too deeply to read
+    safely is a ValueError, like any other text that does not parse: the file is at fault, so
+    it is a failed check and not a missing verdict."""
+    try:
+        doc = rc.parse_json(text)
+    except RecursionError as exc:
+        raise ValueError("it nests deeper than the JSON parser can read") from exc
+    if _depth(doc) > MAX_JSON_DEPTH:
+        raise ValueError(f"it nests deeper than {MAX_JSON_DEPTH} levels")
+    return doc
+
+
 def _code(value) -> str:
     """Inline code for the summary: PR-controlled text cannot break out of it. Every value a
     pull request supplies (a plugin or key name, a path, a message quoting one) goes through
@@ -98,9 +134,12 @@ def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
             report.fail(f"{path} is missing at {label}")
             continue
         try:
-            doc = rc.parse_json(text)
+            doc = parse_pr_json(text)
         except ValueError as exc:
-            report.fail(f"{path} does not parse at {label} (duplicate keys and NaN are refused): {_code(exc)}")
+            report.fail(
+                f"{path} does not parse at {label} (duplicate keys, NaN and nesting deeper than "
+                f"{MAX_JSON_DEPTH} levels are refused): {_code(exc)}"
+            )
             continue
         plugins = doc.get("plugins") if isinstance(doc, dict) else None
         if not isinstance(plugins, list) or not all(isinstance(p, dict) and isinstance(p.get("name"), str) for p in plugins):
@@ -145,7 +184,7 @@ def safety_versions(text, report: Report, *, label: str):
     if text is None:
         return None
     try:
-        doc = rc.parse_json(text)
+        doc = parse_pr_json(text)
     except ValueError as exc:
         report.fail(f"{rc.SAFETY_FILE} does not parse at {label}: {_code(exc)}")
         return None
@@ -164,6 +203,19 @@ def bot_hint(pr: PullRequest, bot_login) -> str:
             "(release_checks.BOT_LOGIN is None), so it is judged as a human PR."
         )
     return f" Its author {pr.author} is not the marketplace bot App ({bot_login})."
+
+
+def _other_fields(before, after, class_unchanged: bool) -> str:
+    """For an entry edited in place, the fields it changes besides its class, so that an edit
+    which leaves the class alone does not read as "not-rollback-safe -> not-rollback-safe" and
+    nothing else. Empty when the entry was added or removed, or only its class moved."""
+    if not before or not after:
+        return ""
+    fields = [key for key in rc.SAFETY_KEYS if key != "classification" and before.get(key) != after.get(key)]
+    if not fields:
+        return ""
+    names = ", ".join(fields)
+    return f" (class unchanged; changes {names})" if class_unchanged else f" (also changes {names})"
 
 
 def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
@@ -190,7 +242,7 @@ def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
         new = after["classification"] if after else "removed"
         lowers = "LOWERS THE ROLLBACK FLOOR: " if new == "additive" and old != "additive" else ""
         report.note(
-            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}; "
+            f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}{_other_fields(before, after, old == new)}; "
             "the approving code owner owns this classification"
         )
 
@@ -208,6 +260,12 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
         and _without(base_entry, "description") == _without(head_entry, "description")
     ):
         report.row("Mode", "HUMAN PR, ai-tc description edit")
+        if not rc.description_ok(head_entry):
+            report.fail(
+                "the ai-tc entry's description must be a non-empty string: this marketplace requires one, "
+                "and Claude Code itself refuses a null or non-string description (a manifest it refuses "
+                "breaks `/plugin marketplace add` for every user)"
+            )
         report.note("ai-tc description changed: change all four files (AGENTS.md, 'Four files, one set of facts')")
     else:
         report.row("Mode", f"HUMAN PR, refused ({mode})")
@@ -436,14 +494,14 @@ def bot_rules(pr: PullRequest, entries, pins, base_safety, head_safety, tip_safe
 def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins, tip_safety_text, *, bot_login, verify, classify) -> Report:
     """Every rule validate applies to one PR.
 
-    The base files come from the PR's merge base. The tip safety text is main's
-    rollback-safety.json, which alone decides the floor."""
+    The base files come from the merge base of main and the PR head. The tip safety text
+    is main's rollback-safety.json, which alone decides the floor."""
     report = Report()
     head_docs = parse_manifests(head_files, report, label="the PR head")
     for path in (rc.MANIFEST, rc.SAFETY_FILE):
         text = head_files.get(path)
         try:
-            written = rc.dump_json(rc.parse_json(text)) if text is not None else text
+            written = rc.dump_json(parse_pr_json(text)) if text is not None else text
         except ValueError:
             continue  # a parse failure is reported on its own
         if written != text:
@@ -485,8 +543,8 @@ def render_summary(report: Report, number) -> str:
     lines = [
         f"## validate: PR #{number}: {verdict}",
         "",
-        "validate.yml from the base branch, run on pull_request_target. Before trusting a green "
-        "result, open this check run and confirm it is that workflow: any GitHub Actions job "
+        "validate.yml from main (the default branch), run on pull_request_target. Before trusting a "
+        "green result, open this check run and confirm it is that workflow: any GitHub Actions job "
         "named validate satisfies the required check.",
         "",
     ]
@@ -571,13 +629,16 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
     classify = classify or rc.classify_migrations
     number = env.get("PR_NUMBER", "?")
     main_sha = None
+    rc.start_budget(rc.BUDGET_JOB)  # one budget for the whole run; cleared below however it ends
     try:
         head_sha, base_repo = env.get("HEAD_SHA", ""), env.get("BASE_REPO", "")
         if not rc.SHA40.fullmatch(head_sha) or not REPO_NAME.fullmatch(base_repo) or not str(number).isdigit():
             raise rc.InfraError("input", "HEAD_SHA, BASE_REPO and PR_NUMBER must be a 40-hex sha, owner/name and a number")
         # The commit of main this run reads the pins and the rollback floor from, resolved once.
+        # The diff and the base files start at its merge base with the PR head, so nothing
+        # else, such as the work tree's HEAD, can move where the comparison starts.
         main_sha = _run_git(repo, "rev-parse", "--verify", f"{rc.main_ref(repo)}^{{commit}}").strip()
-        start = _run_git(repo, "merge-base", "HEAD", head_sha).strip()
+        start = _run_git(repo, "merge-base", main_sha, head_sha).strip()
         base = {path: read_at(repo, start, path) for path in WATCHED}
         head = {path: read_at(repo, head_sha, path) for path in WATCHED}
         pr = PullRequest(
@@ -594,7 +655,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
             base,
             head,
             changed_files(repo, start, head_sha),
-            rc.pins_by_ref(repo),
+            rc.pins_by_ref(repo, main_rev=main_sha),
             read_at(repo, main_sha, rc.SAFETY_FILE),
             bot_login=rc.BOT_LOGIN,
             verify=verify,
@@ -610,6 +671,8 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
         # this did not expect. No verdict, so exit 2 with the summary written, never a stack
         # trace alone. KeyboardInterrupt and SystemExit are not Exceptions and pass through.
         report = Report(infra=f"internal: {type(exc).__name__}: {exc}")
+    finally:
+        rc.clear_budget()
     if main_sha:
         # main moves without starting this check again, so the summary says which commit it read.
         report.row("Main read at", _code(main_sha[:12]))
