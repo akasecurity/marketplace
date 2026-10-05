@@ -465,8 +465,10 @@ class TestCodeOwners(unittest.TestCase):
                 self.assertEqual(self.owners(text), expected)
 
     def test_the_repositorys_own_codeowners_file_can_be_read(self):
-        # Once a commit is merged, the CODEOWNERS of its parent can no longer change, so a pin change on top of a
-        # file the strict reader cannot read is tagged with an unknown approver. This fails the pull request first.
+        # Once a commit is merged, the CODEOWNERS of its parent can no longer change, so a pin change that a pull
+        # request merged on top of a file the strict reader cannot read is tagged with an unknown approver (a push
+        # with no pull request records `none`, whatever the file holds). This fails on the pull request first; the
+        # workflow that runs it is not a required check, so it does not stop the merge.
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "CODEOWNERS")
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
