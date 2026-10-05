@@ -182,10 +182,19 @@ def code_owners(git: Git, sha: str) -> list[str]:
     return [owner[1:] for owner in owners]
 
 
-def integrity_at(git: Git, sha: str) -> str:
+def integrity_at(git: Git, sha: str) -> tuple[str, str]:
+    """(the integrity the ai-tc entry at `sha` records, "") with "none" when it records none, or ("unknown", why) when
+    metadata.integrity holds something that is not a string. The manifest only has to parse to reach here, so a push
+    that skipped validate can leave a number or a null there; the tag message is text, and the sweep must not stop on
+    a value that cannot be written into it (it would stop on every later run)."""
     entry = entry_at(git, sha)
     metadata = entry.get("metadata") if entry is not None else None
-    return metadata.get("integrity", "none") if isinstance(metadata, dict) else "none"
+    if not isinstance(metadata, dict):
+        return "none", ""
+    integrity = metadata.get("integrity", "none")
+    if isinstance(integrity, str):
+        return integrity, ""
+    return "unknown", "integrity unknown: metadata.integrity of the ai-tc entry is not a string"
 
 
 def pin_changes(git: Git, base: str) -> tuple[list[str], dict[str, str]]:
@@ -222,26 +231,49 @@ def pending(git: Git) -> list[str]:
     return pin_changes(git, last_tag_commit(git))[0]
 
 
-def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
-    """The store-migration class the tag records. `unknown` also when the safety table at `sha` cannot be read:
-    a rollback would otherwise read an empty table and record `additive` across a release that was not safe."""
+def store_migration(git: Git, sha: str, version: str, previous: str) -> tuple[str, str]:
+    """(the store-migration class the tag records, why when that is a fallback the reader should be told about).
+    `unknown` also when the safety table at `sha` cannot be read: a rollback would otherwise read an empty table and
+    record `additive` across a release that was not safe. The same when an entry the answer rests on has the wrong
+    type (an entry that is not an object, a classification that is not a string): the table parses, so only a push
+    that skipped validate leaves one, and the sweep must neither stop on it nor call that release additive. On a
+    rollback a crossed entry that says not-rollback-safe still decides, whatever else is wrong with the table."""
     if not SEMVER.fullmatch(version):
-        return "none"
+        return "none", ""
     raw = git.show(sha, SAFETY_FILE)
     try:
         table = parse_json(raw) if raw else {}
     except ValueError:
-        return "unknown"
+        return "unknown", ""
     known = table.get("versions", {}) if isinstance(table, dict) else None
     if not isinstance(known, dict):
-        return "unknown"
+        return "unknown", ""
     if SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
         crossed = [entry for v, entry in known.items()
                    if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(previous)]
-        return ("not-rollback-safe" if any(entry.get("classification") == "not-rollback-safe" for entry in crossed)
-                else "additive")
+        if any(isinstance(entry, dict) and entry.get("classification") == "not-rollback-safe" for entry in crossed):
+            return "not-rollback-safe", ""
+        if any(not isinstance(entry, dict) or not isinstance(entry.get("classification", ""), str)
+               for entry in crossed):
+            return "unknown", (f"store-migration unknown: {SAFETY_FILE} holds an entry between {version} and "
+                               f"{previous} that is not an object with a string classification")
+        return "additive", ""
     entry = known.get(version)
-    return entry.get("classification", "unknown") if isinstance(entry, dict) else "unknown"
+    if not isinstance(entry, dict):
+        return "unknown", ""
+    classification = entry.get("classification", "unknown")
+    if isinstance(classification, str):
+        return classification, ""
+    return "unknown", f"store-migration unknown: the classification of {version} in {SAFETY_FILE} is not a string"
+
+
+def noted(facts: dict, *reasons: str) -> dict:
+    """`facts` with each non-empty reason added to the note, joined the way pr_facts joins its notes."""
+    note = facts["note"]
+    for reason in reasons:
+        if reason:
+            note = f"{note}; {reason}" if note else reason
+    return {**facts, "note": note}
 
 
 def merged_into_main(pull: dict) -> bool:
@@ -467,8 +499,9 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
                           "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
                           "dispatch of tag-release asks again, and from an hour after the commit an unlinked commit "
                           "is tagged as a push without a pull request.")
-        text = message(number, version, previous, integrity_at(git, sha), facts,
-                       store_migration(git, sha, version, previous))
+        integrity, integrity_why = integrity_at(git, sha)
+        migration, migration_why = store_migration(git, sha, version, previous)
+        text = message(number, version, previous, integrity, noted(facts, integrity_why, migration_why), migration)
         try:
             tag_object = gh.post(gh.repo_path("git/tags"),
                                  {"tag": name, "message": text, "object": sha, "type": "commit"})["sha"]

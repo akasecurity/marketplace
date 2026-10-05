@@ -280,7 +280,7 @@ class TestSweep(unittest.TestCase):
 
     def test_a_forward_version_without_a_safety_entry_records_unknown(self):
         git = FakeGit(chain=["t8", "b"], files={("b", SAFETY_FILE): safety({})})
-        self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
+        self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), ("unknown", ""))
 
 
 class TestUnreadableManifests(unittest.TestCase):
@@ -411,7 +411,7 @@ class TestUnreadableManifests(unittest.TestCase):
 
     def table(self, text, version, previous):
         git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): text})
-        return tr.store_migration(git, "x", version, previous)
+        return tr.store_migration(git, "x", version, previous)[0]
 
     def test_a_safety_table_that_cannot_be_read_records_unknown_for_a_release_and_for_a_rollback(self):
         # An empty table would call a rollback across an unsafe release additive.
@@ -423,8 +423,8 @@ class TestUnreadableManifests(unittest.TestCase):
 
     def test_a_missing_safety_table_keeps_the_answers_it_always_gave(self):
         git = FakeGit(chain=["x"])
-        self.assertEqual(tr.store_migration(git, "x", "0.9.15", "0.9.14"), "unknown")
-        self.assertEqual(tr.store_migration(git, "x", "0.9.14", "0.9.15"), "additive")
+        self.assertEqual(tr.store_migration(git, "x", "0.9.15", "0.9.14"), ("unknown", ""))
+        self.assertEqual(tr.store_migration(git, "x", "0.9.14", "0.9.15"), ("additive", ""))
 
     def test_the_tag_for_a_release_whose_safety_table_cannot_be_read_is_still_cut_as_unknown(self):
         git = history(chain=("t8", "b"))
@@ -557,7 +557,7 @@ class TestRestore(unittest.TestCase):
 class TestStoreMigration(unittest.TestCase):
     def classify(self, version: str, previous: str, table: dict) -> str:
         git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): safety(table)})
-        return tr.store_migration(git, "x", version, previous)
+        return tr.store_migration(git, "x", version, previous)[0]
 
     def test_a_rollback_across_a_not_rollback_safe_release_records_it(self):
         table = {"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": safety_entry("0.9.15", "0.9.14", "additive", ())}
@@ -580,6 +580,127 @@ class TestStoreMigration(unittest.TestCase):
     def test_a_forward_release_records_its_own_classification(self):
         table = {"0.9.15": safety_entry("0.9.15", "0.9.14")}
         self.assertEqual(self.classify("0.9.15", "0.9.14", table), "not-rollback-safe")
+
+
+# What a value that is not a string can be in JSON, for the fields the tag message prints.
+NOT_A_STRING = {"null": None, "a number": 5, "a boolean": True, "a list of numbers": [5], "an object": {"sha512": "x"}}
+
+
+def wrong_entry(version: str, previous: str) -> str:
+    """Why a rollback from `previous` to `version` records unknown when a crossed entry has the wrong type."""
+    return (f"store-migration unknown: rollback-safety.json holds an entry between {version} and {previous} "
+            "that is not an object with a string classification")
+
+
+def with_integrity(version: str, value) -> str:
+    """The manifest for `version` with metadata.integrity set to `value`, whatever its type."""
+    doc = json.loads(manifest(version, INTEGRITY[version]))
+    next(plugin for plugin in doc["plugins"] if plugin["name"] == "ai-tc")["metadata"]["integrity"] = value
+    return release_checks.dump_json(doc)
+
+
+class TestValuesOfTheWrongType(unittest.TestCase):
+    """A manifest or a safety table that parses can still hold a value of the wrong type at a pin change (only a push
+    that skipped validate leaves one). The tag message prints these values, and the sweep stopped on them, so no
+    later pin change was ever tagged. Each now falls back to `unknown` and says why in the tag's note."""
+
+    def classify(self, version: str, previous: str, table: dict) -> tuple[str, str]:
+        git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): safety(table)})
+        return tr.store_migration(git, "x", version, previous)
+
+    def test_an_integrity_that_is_not_a_string_is_unknown_with_the_reason(self):
+        for label, value in NOT_A_STRING.items():
+            with self.subTest(label):
+                git = FakeGit(chain=["x"], files={("x", MANIFEST): with_integrity("0.9.15", value)})
+                self.assertEqual(tr.integrity_at(git, "x"), (
+                    "unknown", "integrity unknown: metadata.integrity of the ai-tc entry is not a string"))
+
+    def test_an_integrity_that_is_a_string_or_absent_is_read_as_before(self):
+        git = FakeGit(chain=["x", "y", "z"], files={("x", MANIFEST): manifest("0.9.15", INTEGRITY["0.9.15"]),
+                                                    ("y", MANIFEST): manifest("0.9.15"),
+                                                    ("z", MANIFEST): manifest(entry=False)})
+        self.assertEqual(tr.integrity_at(git, "x"), (INTEGRITY["0.9.15"], ""))
+        self.assertEqual(tr.integrity_at(git, "y"), ("none", ""))
+        self.assertEqual(tr.integrity_at(git, "z"), ("none", ""))
+
+    def test_a_classification_that_is_not_a_string_is_unknown_for_a_release_with_the_reason(self):
+        for label, value in NOT_A_STRING.items():
+            with self.subTest(label):
+                table = {"0.9.15": dict(safety_entry("0.9.15", "0.9.14"), classification=value)}
+                self.assertEqual(self.classify("0.9.15", "0.9.14", table), (
+                    "unknown", "store-migration unknown: the classification of 0.9.15 in rollback-safety.json "
+                    "is not a string"))
+
+    def test_a_crossed_entry_that_is_not_an_object_is_unknown_on_a_rollback_with_the_reason(self):
+        for label, value in {"a string": "not-rollback-safe", "a number": 5, "null": None, "a list": [],
+                             "a boolean": False}.items():
+            with self.subTest(label):
+                table = {"0.9.14": safety_entry("0.9.14", "0.9.13", "additive", ()), "0.9.15": value}
+                self.assertEqual(self.classify("0.9.14", "0.9.15", table), ("unknown", wrong_entry("0.9.14", "0.9.15")))
+                table = {"0.9.14": value, "0.9.15": safety_entry("0.9.15", "0.9.14", "additive", ())}
+                self.assertEqual(self.classify("0.9.13", "0.9.15", table), ("unknown", wrong_entry("0.9.13", "0.9.15")))
+
+    def test_a_crossed_classification_that_is_not_a_string_is_unknown_on_a_rollback(self):
+        for label, value in NOT_A_STRING.items():
+            with self.subTest(label):
+                table = {"0.9.15": dict(safety_entry("0.9.15", "0.9.14"), classification=value)}
+                self.assertEqual(self.classify("0.9.14", "0.9.15", table), ("unknown", wrong_entry("0.9.14", "0.9.15")))
+
+    def test_a_crossed_entry_that_says_not_rollback_safe_still_decides_beside_a_broken_one(self):
+        table = {"0.9.14": 5, "0.9.15": safety_entry("0.9.15", "0.9.14")}
+        self.assertEqual(self.classify("0.9.13", "0.9.15", table), ("not-rollback-safe", ""))
+
+    def test_an_entry_the_answer_does_not_rest_on_is_not_read(self):
+        # Above the previous pin, at or below the target, and a key that is not a version: none is crossed.
+        table = {"0.9.13": 5, "0.9.15": 5, "later": 5, "0.9.14": safety_entry("0.9.14", "0.9.13", "additive", ())}
+        self.assertEqual(self.classify("0.9.13", "0.9.14", table), ("additive", ""))
+        forward = {"0.9.14": 5, "0.9.15": safety_entry("0.9.15", "0.9.14")}
+        self.assertEqual(self.classify("0.9.15", "0.9.14", forward), ("not-rollback-safe", ""))
+
+    def test_the_sweep_tags_a_pin_change_whose_integrity_is_not_a_string_and_goes_on(self):
+        for label, value in NOT_A_STRING.items():
+            with self.subTest(label):
+                git = history(chain=("t8", "b", "c"))
+                git.files[("b", MANIFEST)] = with_integrity("0.9.15", value)
+                gh = sweep_github()
+                self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
+                                 ["fleet-v9 -> b (ai-tc 0.9.15)", "fleet-v10 -> c (ai-tc 0.9.14)"])
+                tags = [call[2]["message"] for call in gh.called("POST", R("git/tags"))]
+                self.assertEqual(tags[0], "fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\nintegrity: unknown\npr: 13\n"
+                                 "approver: venuverse\nstore-migration: additive\napprover-note: integrity unknown: "
+                                 "metadata.integrity of the ai-tc entry is not a string\n")
+                self.assertIn(f"integrity: {INTEGRITY['0.9.14']}\n", tags[1])
+
+    def test_the_sweep_tags_a_release_whose_classification_is_not_a_string_and_goes_on(self):
+        for label, value in NOT_A_STRING.items():
+            with self.subTest(label):
+                git = history(chain=("t8", "b", "c"))
+                broken = dict(safety_entry("0.9.15", "0.9.14"), classification=value)
+                git.files[("b", SAFETY_FILE)] = safety({"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": broken})
+                gh = sweep_github()
+                self.assertEqual(len(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)), 2)
+                tags = [call[2]["message"] for call in gh.called("POST", R("git/tags"))]
+                self.assertIn("store-migration: unknown\napprover-note: store-migration unknown: the classification "
+                              "of 0.9.15 in rollback-safety.json is not a string\n", tags[0])
+
+    def test_the_sweep_tags_a_rollback_across_an_entry_that_is_not_an_object_and_goes_on(self):
+        for label, value in {"a string": "not-rollback-safe", "null": None, "a number": 5}.items():
+            with self.subTest(label):
+                git = history(chain=("t8", "b", "c"))
+                git.files[("c", SAFETY_FILE)] = safety({"0.9.14": safety_entry("0.9.14", "0.9.13"), "0.9.15": value})
+                gh = sweep_github()
+                self.assertEqual(len(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)), 2)
+                tags = [call[2]["message"] for call in gh.called("POST", R("git/tags"))]
+                self.assertIn("store-migration: unknown\nrollback-from: 0.9.15\ndrill: true\n", tags[1])
+                # Joined to the note the rollback already had.
+                note = f"ruleset bypass by org-owner-example; {wrong_entry('0.9.14', '0.9.15')}"
+                self.assertIn(f"approver-note: {note}\n", tags[1])
+
+    def test_a_reason_is_added_to_a_note_the_tag_already_has_and_to_none(self):
+        self.assertEqual(tr.noted({"note": None, "pr": "1"}, "", "why"), {"note": "why", "pr": "1"})
+        self.assertEqual(tr.noted({"note": "a", "pr": "1"}, "b", "", "c"), {"note": "a; b; c", "pr": "1"})
+        self.assertEqual(tr.noted({"note": "a"}, "", ""), {"note": "a"})
+        self.assertEqual(tr.noted({"note": None}, ""), {"note": None})
 
 
 class TestApprover(unittest.TestCase):
