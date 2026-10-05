@@ -21,6 +21,9 @@ from unittest import mock
 import _testsupport as ts
 import release_checks as rc
 
+# A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
+NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
 
 class TestJsonHelpers(unittest.TestCase):
     def test_duplicate_keys_are_refused(self):
@@ -30,6 +33,19 @@ class TestJsonHelpers(unittest.TestCase):
     def test_nan_is_refused(self):
         with self.assertRaisesRegex(ValueError, "NaN"):
             rc.parse_json('{"n": NaN}')
+
+    def test_nesting_deeper_than_the_parser_reads_is_a_value_error(self):
+        # json.loads raises RecursionError past the interpreter's depth, and RecursionError is
+        # not a ValueError. Every caller of parse_json handles an unreadable document as a
+        # ValueError, so the conversion is made here, once, for all of them.
+        for label, text in (
+            ("arrays inside a manifest", NESTED_TOO_DEEP),
+            ("bare arrays", "[" * 100_000 + "]" * 100_000),
+            ("objects", '{"a":' * 100_000 + "1" + "}" * 100_000),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, "too deeply nested"):
+                    rc.parse_json(text)
 
     def test_the_writer_keeps_non_ascii_and_ends_in_a_newline(self):
         text = rc.dump_json(ts.manifest())
@@ -215,6 +231,35 @@ class TestPinnedVersions(unittest.TestCase):
             ],
         )
         self.assertNotIn("0.9.20", rc.pinned_versions(self.repo.path))
+
+    def test_a_fleet_tag_nested_too_deeply_to_read_pins_nothing(self):
+        # A tag is permanent history, so one tag a parser cannot read must not stop every
+        # caller of pins_by_ref (validate, the importer, the audit): it pins nothing, as a tag
+        # whose manifest does not parse does, and the others read as before.
+        self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        self.repo.tag("fleet-v11")
+        self.repo.commit(ts.manifest("0.9.14"))
+        self.assertIsNone(rc._tag_pin(self.repo.path, "fleet-v11"))
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [
+                ("main", "0.9.14"),
+                ("fleet-v1", None),
+                ("fleet-v2", "0.9.6"),
+                ("fleet-v10", "0.9.12"),
+                ("fleet-v11", None),
+            ],
+        )
+        self.assertEqual(rc.pinned_versions(self.repo.path), {"0.9.6", "0.9.12", "0.9.14"})
+
+    def test_a_main_manifest_nested_too_deeply_to_read_is_refused(self):
+        # Main is read strictly, so this is pins_by_ref's usual refusal for a manifest that
+        # does not parse, not an uncaught RecursionError.
+        self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.pins_by_ref(self.repo.path)
+        self.assertEqual(caught.exception.check, "manifest")
+        self.assertIn("does not parse", caught.exception.detail)
 
     def test_a_repository_without_main_is_infrastructure(self):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
