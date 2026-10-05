@@ -37,8 +37,8 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import Refused, write_output
 from issue_router import Result, results_to_json
-from release_checks import GITHUB_ACTIONS_APP_ID
-from tag_release import code_owners, merged_into_main, owner_approvals, pull_association
+from tag_release import (VALIDATE_CHECK, code_owners, merged_into_main, owner_approvals, pull_association,
+                         validate_conclusion)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -46,8 +46,6 @@ REWRITE_RULE = "main-audit-rewrite-"
 UNAUDITED_RULE = "main-audit-unaudited-"
 ZERO = re.compile(r"0{40}")
 NOT_A_PUSHER = {"web-flow"}
-# The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
-VALIDATE_CHECK = "validate"
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
@@ -89,22 +87,14 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
 def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
     """Why `head` has no passing `validate` check from GitHub Actions, or None when its latest run succeeded.
 
-    The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
-    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that
-    failed after an earlier pass leaves the head unvalidated."""
-    runs = [run for run in gh.paginate(gh.repo_path(f"commits/{head}/check-runs"),
-                                       {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID, "filter": "all"})
-            if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    The runs are read by the helper tag-release uses for the same question, so the two cannot disagree about
+    which run counts: the job named `validate` that GitHub Actions reports, the latest of them deciding."""
+    conclusion = validate_conclusion(gh, head)
+    if conclusion == "success":
+        return None
     lead = (f"`{sha}` merged PR #{number} without a passing `{VALIDATE_CHECK}` check from GitHub Actions on its "
             f"final head `{head}`: ")
-    if not runs:
-        return lead + "none ran."
-    latest = max(runs, key=lambda run: run.get("id") or 0)
-    if latest.get("status") != "completed":
-        return lead + f"the latest run is {latest.get('status') or 'unfinished'}."
-    if latest.get("conclusion") != "success":
-        return lead + f"the latest run ended {latest.get('conclusion') or 'without a result'}."
-    return None
+    return lead + ("none ran." if conclusion is None else f"its latest run: {conclusion}.")
 
 
 def no_merge_problem(sha: str, linked: list[dict]) -> str:
