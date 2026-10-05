@@ -6,6 +6,7 @@ release_checks.dump_json, the one writer."""
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Any, Callable
 
@@ -34,6 +35,25 @@ def manifest(version: str | None = "0.9.14", integrity: str | None = None, *, en
     if not entry:
         doc["plugins"] = [plugin for plugin in doc["plugins"] if plugin is not ai_tc]
     return release_checks.dump_json(doc)
+
+
+def manifest_naming_ai_tc_twice() -> str:
+    """A manifest whose ai-tc entry is ambiguous, which validate refuses."""
+    doc = json.loads(manifest("0.9.14", INTEGRITY["0.9.14"]))
+    doc["plugins"].append(dict(next(plugin for plugin in doc["plugins"] if plugin["name"] == "ai-tc")))
+    return release_checks.dump_json(doc)
+
+
+# What a commit's manifest can hold that the release scripts cannot read, by what is wrong with it.
+UNREADABLE_MANIFESTS = {
+    "text that is not JSON": "{",
+    "an empty file": "",
+    "JSON nested far deeper than the parser reads": "[" * 100_000,
+    "a repeated key": '{"plugins": [], "plugins": []}',
+    "a document with no plugins list": "{}",
+    "a document that is not an object": "[]",
+    "an ai-tc entry named twice": manifest_naming_ai_tc_twice(),
+}
 
 
 def safety(entries: dict) -> str:

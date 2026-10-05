@@ -270,6 +270,149 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(len(ta.compare_previous(previous, current, None)), 1)
 
 
+class TestFreezeCommand(unittest.TestCase):
+    """`freeze` writes the list a person commits. A tag in the list is exempt from the checks a new tag gets, so
+    it prints every row it adds, changes or drops, and it will not change or drop a row that is already there
+    unless --accept names the tag."""
+
+    def setUp(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.path = os.path.join(root.name, "fleet-tags.frozen.json")
+
+    def row(self, n, commit=COMMIT):
+        tag = fleet_tag(n, commit)
+        return {"tag": tag["tag"], "object": tag["object"], "commit": commit}
+
+    def moved(self, n):
+        """Tag n as the repository now has it: another object, at another commit."""
+        return dict(fleet_tag(n, "2" * 40), object="d" * 40)
+
+    def write(self, rows):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(release_checks.dump_json(rows))
+
+    def on_disk(self):
+        with open(self.path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def run_freeze(self, tags, *argv):
+        """(exit code or the refusal's text, what it printed)."""
+        out = io.StringIO()
+        with mock.patch.object(ta, "Git", return_value=FakeGit(chain=[COMMIT], tags=tags)), \
+                mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+            try:
+                code = ta.main(["freeze", "--repo-dir", "/fake/marketplace", "--out", self.path, *argv])
+            except SystemExit as stop:
+                code = stop.code
+        return code, out.getvalue()
+
+    def test_a_first_freeze_writes_every_tag_and_prints_each_as_added(self):
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.on_disk()), [self.row(1), self.row(2)])
+        self.assertEqual(printed.splitlines(), [
+            f"fleet-v1 added: tag object {self.row(1)['object']}, commit {COMMIT}",
+            f"fleet-v2 added: tag object {self.row(2)['object']}, commit {COMMIT}",
+            "froze 2 fleet-v tags into " + self.path])
+
+    def test_a_new_tag_is_added_and_printed_without_an_accept(self):
+        self.write([self.row(1)])
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.on_disk()), [self.row(1), self.row(2)])
+        self.assertEqual(printed.splitlines(), [
+            f"fleet-v2 added: tag object {self.row(2)['object']}, commit {COMMIT}",
+            "froze 2 fleet-v tags into " + self.path])
+
+    def test_a_freeze_that_changes_nothing_says_so(self):
+        self.write([self.row(1), self.row(2)])
+        before = self.on_disk()
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.on_disk(), before)
+        self.assertEqual(printed.splitlines(), ["no row changes", "froze 2 fleet-v tags into " + self.path])
+
+    def test_a_row_that_would_change_is_refused_shown_and_not_written(self):
+        self.write([self.row(1), self.row(2)])
+        before = self.on_disk()
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT), self.moved(2)])
+        self.assertEqual(printed, "", "a refusal prints nothing to stdout; the lines are in the refusal")
+        self.assertIsInstance(code, str)
+        self.assertIn(f"fleet-v2 changed: tag object {self.row(2)['object']} -> {'d' * 40}, commit {COMMIT} -> {'2' * 40}", code)
+        self.assertIn("refusing to freeze: it would change or drop the row of fleet-v2; once each is explained, "
+                      "name it (--accept fleet-v2). Nothing was written.", code)
+        self.assertEqual(self.on_disk(), before)
+
+    def test_accept_names_the_tag_and_the_change_is_written_and_printed(self):
+        self.write([self.row(1), self.row(2)])
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT), self.moved(2)], "--accept", "fleet-v2")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.on_disk()), [self.row(1), {"tag": "fleet-v2", "object": "d" * 40, "commit": "2" * 40}])
+        self.assertEqual(printed.splitlines()[0],
+                         f"fleet-v2 changed: tag object {self.row(2)['object']} -> {'d' * 40}, commit {COMMIT} -> {'2' * 40}")
+
+    def test_every_changed_row_needs_its_own_accept(self):
+        self.write([self.row(1), self.row(2), self.row(3)])
+        before = self.on_disk()
+        tags = [self.moved(1), self.moved(2), fleet_tag(3, COMMIT)]
+        code, _ = self.run_freeze(tags, "--accept", "fleet-v1")
+        self.assertIn("(--accept fleet-v2)", code)
+        self.assertNotIn("--accept fleet-v1)", code)
+        self.assertEqual(self.on_disk(), before)
+        code, _ = self.run_freeze(tags, "--accept", "fleet-v1", "--accept", "fleet-v2")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["object"] for row in json.loads(self.on_disk())], ["d" * 40, "d" * 40, self.row(3)["object"]])
+
+    def test_an_accept_for_a_row_that_does_not_change_is_refused(self):
+        # A flag left over from an earlier freeze, or aimed at a tag the list does not hold yet, approves nothing.
+        self.write([self.row(1)])
+        before = self.on_disk()
+        for flags in (["--accept", "fleet-v1"], ["--accept", "fleet-v2"], ["--accept", "fleet-v9"]):
+            with self.subTest(flags):
+                code, _ = self.run_freeze([fleet_tag(1, COMMIT), fleet_tag(2, COMMIT)], *flags)
+                self.assertIn(f"--accept names {flags[1]}, whose row does not change. Nothing was written.", code)
+                self.assertEqual(self.on_disk(), before)
+
+    def test_dropping_the_row_of_a_tag_that_is_gone_needs_an_accept_too(self):
+        self.write([self.row(1), self.row(2)])
+        before = self.on_disk()
+        code, _ = self.run_freeze([fleet_tag(1, COMMIT)])
+        self.assertIn(f"fleet-v2 removed: the list holds it (tag object {self.row(2)['object']}, commit {COMMIT}) "
+                      "and the tag no longer exists", code)
+        self.assertIn("(--accept fleet-v2)", code)
+        self.assertEqual(self.on_disk(), before)
+        code, printed = self.run_freeze([fleet_tag(1, COMMIT)], "--accept", "fleet-v2")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.on_disk()), [self.row(1)])
+        self.assertIn("fleet-v2 removed", printed)
+
+    def test_a_list_it_cannot_read_or_that_repeats_a_tag_is_refused_and_left_alone(self):
+        for contents, reason in (("{", "is unreadable"), ('[{"tag": "fleet-v1"}]', "must be a list of"),
+                                 (release_checks.dump_json([self.row(1), self.row(1)]), "names fleet-v1 more than once")):
+            with self.subTest(contents):
+                with open(self.path, "w", encoding="utf-8") as handle:
+                    handle.write(contents)
+                code, _ = self.run_freeze([fleet_tag(1, COMMIT)])
+                self.assertIn("refusing to freeze over " + self.path, code)
+                self.assertIn(reason, code)
+                self.assertEqual(self.on_disk(), contents)
+
+    def test_a_lightweight_tag_is_still_refused_before_anything_is_written(self):
+        self.write([self.row(1)])
+        before = self.on_disk()
+        code, _ = self.run_freeze([{"tag": "fleet-v1", "n": 1, "object": COMMIT, "commit": COMMIT}])
+        self.assertIn("refusing to freeze lightweight fleet tags: fleet-v1", code)
+        self.assertEqual(self.on_disk(), before)
+
+    def test_accept_must_name_a_fleet_tag(self):
+        for value in ("v2", "fleet-v0", "fleet-v2 ", "--all", ""):
+            with self.subTest(value):
+                code, _ = self.run_freeze([fleet_tag(1, COMMIT)], "--accept", value)
+                self.assertEqual(code, 2)
+                self.assertFalse(os.path.exists(self.path))
+
+
 class TestCommittedFrozenList(unittest.TestCase):
     """The list this repository commits, read the way the audit reads it."""
 
