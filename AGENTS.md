@@ -103,6 +103,15 @@ shows are the certificate's too. The statement the publisher wrote must agree wi
 and the commit must be on ai-tc's `main`; a statement that contradicts its own signer is refused as
 forged.
 
+**A certificate the reader cannot read is a refusal.** `release_checks.py` reads the certificate's
+structure and refuses anything it does not expect, so it fails closed: a release whose signing
+certificate cannot be read is refused under `provenance` ("the SLSA bundle's signing certificate is
+unreadable", with the reader's reason), never let through. If every new release starts to be refused
+for that reason, suspect a change in Fulcio's certificate format first, before a run of bad
+releases. The reason names the first thing the reader did not expect, and the certificate of an
+earlier release still reads. Mend the reader and the tests that pin it in a reviewed change; do not
+relax the reader to pass a release.
+
 **`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
 annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
 and store-migration class, and for a rollback the version it rolled back from. The approver is the
