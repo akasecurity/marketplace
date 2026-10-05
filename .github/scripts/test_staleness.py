@@ -382,6 +382,23 @@ class TestOnePackumentRead(RunMain):
                 self.assertFalse(rules[rule].red)
         self.assertNotIn("0.9.16", "".join(item.detail for item in rules.values() if item.red))
 
+    def test_the_publish_times_come_from_the_one_read(self):
+        # The one read lists 0.9.16, published two minutes ago, and its checks pass. Its age is what keeps rule (i)
+        # clear: had the times been dropped or read from anywhere else, 0.9.16 would read as published at an unknown
+        # time, which counts as older than a day, and the rule would go red on a release minutes old.
+        self.stubs["npm_candidates"].side_effect = REAL_NPM_CANDIDATES
+        published = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        document = {"versions": {"0.9.15": {}, "0.9.16": {}},
+                    "time": {"0.9.15": "2026-10-01T00:00:00.000Z", "0.9.16": published}}
+        with mock.patch.object(release_checks._OPENER, "open", side_effect=[Reply(document)]) as opened:
+            code, rules = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0].full_url for call in opened.call_args_list], [st.REGISTRY_URL])
+        self.stubs["verify_release"].assert_called_once_with("0.9.16")
+        for rule in ("staleness-i", "staleness-i-refused", "staleness-i-no-verdict"):
+            with self.subTest(rule):
+                self.assertFalse(rules[rule].red)
+
     def test_the_one_read_is_served_for_the_package_document_only(self):
         with mock.patch.object(release_checks, "http_fetch", return_value=(200, b"{}")) as fetched:
             reader = st.read_packument()
