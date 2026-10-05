@@ -26,9 +26,10 @@ then re-read them side by side before committing. This repo is the source of tru
 copy from (the org profile at `akasecurity/.github`, the Homebrew tap README, `ai-tc-docs`), so an
 error here propagates outward.
 
-The two aggregators deliberately differ: Claude Code serves all three plugins, Codex currently
-serves only `preflight`. That asymmetry is real, not drift — the README's closing note states it.
-Don't "fix" it by copying entries across.
+The two aggregators deliberately differ: Claude Code serves all four entries (the three plugins,
+and `claude-tools`, the old name of `aka-claude-tools`, which stays listed for one release), Codex
+currently serves only `preflight`. That asymmetry is real, not drift — the README's closing note
+states it. Don't "fix" it by copying entries across.
 
 ## Adding or renaming a plugin
 
@@ -113,7 +114,7 @@ or had not finished) also gets an `approver-note` saying so; a commit no pull re
 head to look at, so it gets `pr: none` and no such note. Each value is written on one line, with a
 character that is not printable written as an escape, so text from a manifest cannot add a line of
 its own to the message. Rulesets let only the release bot create a `fleet-v` tag and nobody at all
-move or delete one, and refuse every other tag name:
+move or delete one, and refuse every other tag name.
 
 - **Only a tag cut by hand is signed.** `fleet-v1` through `fleet-v9`, cut before `tag-release`
   existed, are SSH-signed by a person; the tags `tag-release` cuts are annotated but **not
@@ -239,22 +240,23 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   free-text value taken from the PR appears in it inside a code span. `validate` does not run again
   when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
   approver re-runs the check before approving (the PR's checklist says so).
-- **`tag-release`** (every push to `main`) runs `tag-audit`'s ledger, ruleset and environment
-  checks (not its comparison with the last green run's snapshot of the tags) and stops, red and
-  creating nothing, while any of them fails. That refusal is a signal, not a control: the workflow
-  runs from the pushed commit. It tags every first-parent commit whose ai-tc version changed and
-  has no `fleet-v` tag yet, and then deletes the bot's branches that still point at the head of a
-  closed PR (a branch re-created after its PR closed is kept). Only a PR merged into `main` counts
-  as a commit's merge. A commit that GitHub links to no merged PR is
-  left untagged, and so is everything after it, until it is an hour old, so that a slow link never
-  becomes a permanent `pr: none` tag; from then on it is tagged as a push without a PR, which
-  `tag-audit` reports, and `tag-release` then cuts nothing more until a reviewed pull request
-  re-freezes the list. A commit dated more than five minutes ahead of the runner's clock (only a
-  direct push can carry one, for example from a machine with the wrong time) is not waited for: it
-  is tagged at once, so its date never holds the tags after it. A restore after the entry was
-  removed is compared with the last version pinned before the removal, so a lower one records
-  `rollback-from`. A tag or a branch deletion that GitHub refuses ends the run with one error naming
-  the ruleset, not a traceback, and a failed sweep runs no clean-up.
+- **`tag-release`** (every push to `main`, and by manual dispatch to re-run a sweep) runs
+  `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the last green
+  run's snapshot of the tags) and stops, red and creating nothing, while any of them fails. That
+  refusal is a signal, not a control: the workflow runs from the pushed commit. It tags every
+  first-parent commit whose ai-tc version changed and has no `fleet-v` tag yet, and then deletes
+  the bot's branches that still point at the head of a closed PR (a branch re-created after its PR
+  closed is kept). Only a PR merged into `main` counts as a commit's merge. A commit that GitHub
+  links to no merged PR is left untagged, and so is everything after it, until it is an hour old,
+  so that a slow link never becomes a permanent `pr: none` tag; from then on it is tagged as a push
+  without a PR, which `tag-audit` reports, and `tag-release` then cuts nothing more until a
+  reviewed pull request re-freezes the list. A commit dated more than five minutes ahead of the
+  runner's clock (only a direct push can carry one, for example from a machine with the wrong time)
+  is not waited for: it is tagged at once, so its date never holds the tags after it. A restore
+  after the entry was removed is compared with the last version pinned before the removal, so a
+  lower one records `rollback-from`.
+  A tag or a branch deletion that GitHub refuses ends the run with one error naming the ruleset,
+  not a traceback, and a failed sweep runs no clean-up.
 - **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
   included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
   only the check that refused it, and the run log holds the reason), the release checks reached no
