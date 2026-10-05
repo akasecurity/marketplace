@@ -12,8 +12,8 @@ from unittest import mock
 
 import release_checks
 import tag_release as tr
-from fakes import (CODEOWNERS, INTEGRITY, REPO, FakeGit, FakeGitHub, fleet_tag, manifest, not_found, pull,
-                   pulls_route, safety, safety_entry)
+from fakes import (CODEOWNERS, INTEGRITY, REPO, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
+                   not_found, pull, pulls_route, safety, safety_entry)
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused
@@ -268,24 +268,6 @@ class TestSweep(unittest.TestCase):
     def test_a_forward_version_without_a_safety_entry_records_unknown(self):
         git = FakeGit(chain=["t8", "b"], files={("b", SAFETY_FILE): safety({})})
         self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
-
-
-def manifest_naming_ai_tc_twice() -> str:
-    """A manifest whose ai-tc entry is ambiguous, which validate refuses."""
-    doc = json.loads(manifest("0.9.14", INTEGRITY["0.9.14"]))
-    doc["plugins"].append(dict(next(plugin for plugin in doc["plugins"] if plugin["name"] == "ai-tc")))
-    return release_checks.dump_json(doc)
-
-
-UNREADABLE_MANIFESTS = {
-    "text that is not JSON": "{",
-    "an empty file": "",
-    "JSON nested far deeper than the parser reads": "[" * 100_000,
-    "a repeated key": '{"plugins": [], "plugins": []}',
-    "a document with no plugins list": "{}",
-    "a document that is not an object": "[]",
-    "an ai-tc entry named twice": manifest_naming_ai_tc_twice(),
-}
 
 
 class TestUnreadableManifests(unittest.TestCase):
