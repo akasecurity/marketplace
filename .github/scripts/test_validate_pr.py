@@ -181,6 +181,20 @@ class TestHumanRules(unittest.TestCase):
                 self.assertEqual(report.exit_code, 1)
                 self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
 
+    def test_the_description_failure_gives_the_reason_that_is_true(self):
+        # Claude Code refuses a null or non-string description but accepts an empty, a blank or a
+        # missing one, so the rule is the marketplace's own and the message must not say otherwise.
+        for bad in (None, 123, ""):
+            with self.subTest(description=bad):
+                head = ts.manifest()
+                ts.ai_tc(head)["description"] = bad
+                report = human_report(head)
+                messages = [f for f in report.failures if "description must be a non-empty string" in f]
+                self.assertEqual(len(messages), 1, report.failures)
+                self.assertIn("this marketplace requires one", messages[0])
+                self.assertIn("Claude Code itself refuses a null or non-string description", messages[0])
+                self.assertNotIn("anything else", messages[0])
+
     def test_a_description_that_is_a_string_with_words_in_it_passes(self):
         for good in ("Clearer words.", "  padded  ", "x", "Ünïcode ✓"):
             with self.subTest(description=good):

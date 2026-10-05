@@ -1617,10 +1617,11 @@ def _integrity_only(metadata) -> bool:
 
 
 def description_ok(entry) -> bool:
-    """An entry's description is a non-empty string. Claude Code refuses a manifest whose
-    plugin description is anything else, and a malformed manifest breaks `/plugin
-    marketplace add` for every user. One test, shared by the restore shape below and by
-    validate's check of a person's description edit, so the two cannot drift."""
+    """An entry's description is a non-empty string. The marketplace requires that. Claude
+    Code itself refuses only a null or non-string description and accepts an empty or blank
+    one or none, so this rule is stricter than Claude Code's own. One test, shared by the
+    restore shape below and by validate's check of a person's description edit, so the two
+    cannot drift."""
     description = entry.get("description") if isinstance(entry, dict) else None
     return isinstance(description, str) and description.strip() != ""
 
