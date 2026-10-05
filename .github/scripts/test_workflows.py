@@ -534,6 +534,37 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertTrue(self.audit_step().startswith("name: tag-audit's ledger, ruleset and environment checks (stop,"),
                         self.audit_step())
 
+    def step(self, needle: str) -> str:
+        """The one step of the job that contains `needle`."""
+        steps = [block for block in re.split(r"(?m)^      - ", self.jobs["tag"]) if needle in block]
+        self.assertEqual(len(steps), 1, f"exactly one step contains {needle!r}")
+        return steps[0]
+
+    def test_the_workflow_token_can_read_checks_and_can_write_nothing(self):
+        # The sweep reads the `validate` runs of each merged PR with the workflow's own token, so the job needs
+        # `checks: read`. `actions: read` is what tag-audit's own job holds for the environment check that this job
+        # runs too. Every permission here is a read; the tags are written with the App's token.
+        block = re.search(r"(?m)^    permissions:\n((?:      [a-z-]+: \w+\n)+)", self.jobs["tag"])
+        self.assertIsNotNone(block, "the job lists its permissions")
+        granted = dict(line.strip().split(": ") for line in block.group(1).splitlines())
+        self.assertEqual(granted, {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read"})
+        self.assertIn("\npermissions: {}\n", self.head)
+
+    def test_the_sweep_reads_checks_with_the_workflow_token_and_writes_with_the_apps(self):
+        sweep = self.step("tag_release.py sweep")
+        self.assertIn("          GH_TOKEN: ${{ steps.app.outputs.token }}\n", sweep)
+        self.assertIn("          GITHUB_TOKEN: ${{ github.token }}\n", sweep)
+        # The clean-up only deletes the bot's branches, as the App; it has no use for the workflow's token.
+        cleanup = self.step("tag_release.py cleanup-branches")
+        self.assertIn("          GH_TOKEN: ${{ steps.app.outputs.token }}\n", cleanup)
+        self.assertNotIn("github.token", cleanup)
+        self.assertNotIn("GITHUB_TOKEN", cleanup)
+
+    def test_the_app_token_asks_for_no_more_than_it_needs_to_write_tags_and_read_pull_requests(self):
+        # Checks are read with the workflow's token, so the App gets no checks or actions permission.
+        asked = re.findall(r"(?m)^          (permission-[a-z-]+): (\w+)$", self.jobs["tag"])
+        self.assertEqual(asked, [("permission-contents", "write"), ("permission-pull-requests", "read")])
+
     def test_the_job_enters_the_environment_the_audit_checks(self):
         self.assertEqual(re.findall(r"(?m)^    environment: (\S+)$", self.text), [tag_audit.ENVIRONMENT])
 

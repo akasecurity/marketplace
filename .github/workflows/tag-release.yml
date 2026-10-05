@@ -7,7 +7,9 @@ name: tag-release
 # snapshot) and stops, red and creating nothing, if any fails; that refusal is a
 # signal, not a control, since this file runs from the pushed commit. Tags are created as the
 # bot App, the only identity ruleset fleet-tags-create lets create one; no Mac
-# follows a tag. It then deletes the bot's own branches that still point at the head
+# follows a tag. A tag also notes a merged PR whose final head had no passing
+# validate run; the sweep reads those check runs with the workflow's own read-only
+# token, so the App's permissions stay as they are. It then deletes the bot's own branches that still point at the head
 # a closed PR closed on, but only after a sweep that finished: a refused or failed
 # sweep ends the run first, and the branches wait for the next one.
 
@@ -28,7 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: marketplace-bot
+    # All read-only. This is the workflow's own token: it runs tag-audit's checks and reads a merged PR's
+    # validate runs for the sweep (`checks`). `actions` is what tag-audit's own job holds for the same
+    # environment check. The tags are written with the App's token, made below.
     permissions:
+      actions: read
+      checks: read
       contents: read
       pull-requests: read
     steps:
@@ -55,6 +62,7 @@ jobs:
       - name: sweep main and cut the missing fleet-v tags
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/tag_release.py sweep --repo-dir .
       # No `if:` on this step (or any other): it runs only while every step before it has passed.
       - name: delete the bot's branches left at the head of a closed PR
