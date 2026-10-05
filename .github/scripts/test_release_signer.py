@@ -5,6 +5,8 @@ refuses a release unless it is ai-tc's release workflow at the version's own tag
 from __future__ import annotations
 
 import base64
+import pathlib
+import re
 import unittest
 
 import _testsupport as ts
@@ -390,7 +392,7 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
         error = self.refused("provenance", audits=audits)
         self.assertIn(ref, error.detail)
         self.assertIn(f"refs/tags/plugin-claude-v{VERSION}", error.detail)
-        self.assertIn("not a stolen npm credential", error.detail)
+        ts.assert_off_tag_text_is_truthful(self, error.detail)
         self.assertIn("only from a tag push", error.detail)
         self.assertIn("maintainers", error.detail)
         self.assertNotIn("anyone can publish", error.detail)
@@ -408,7 +410,7 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
                 error = self.refused("provenance", audits=[ts.audit_output(VERSION, ts.statement(VERSION, ref=ref), cert=cert)])
                 self.assertIn(ref, error.detail)
                 self.assertIn("only from a tag push", error.detail)
-                self.assertIn("not a stolen npm credential", error.detail)
+                ts.assert_off_tag_text_is_truthful(self, error.detail)
                 self.assertIn("maintainers", error.detail)
                 self.assertIn(said, error.detail)
                 self.assertNotIn(unsaid, error.detail)
@@ -503,6 +505,22 @@ class TestSignerBinding(ts.VerifyMixin, unittest.TestCase):
         stranger = ts.signing_cert(VERSION, repository=OTHER)
         chain = {"certificates": [{"rawBytes": base64.b64encode(stranger).decode()}, {"rawBytes": ts.REAL_LEAF_0_9_14}]}
         self.refused("provenance", audits=[ts.audit_output(VERSION, material={"x509CertificateChain": chain})])
+
+
+class TestRetiredWording(unittest.TestCase):
+    def test_nothing_that_runs_says_a_branch_publish_is_not_a_stolen_credential(self):
+        # A certificate naming ai-tc's workflow rules out an npm token alone, not a stolen
+        # GitHub credential with write access to ai-tc. Neither the script nor a workflow may
+        # say otherwise, in any of the places the text has been written.
+        root = pathlib.Path(__file__).resolve().parents[2]
+        runs = [root / ".github/scripts/release_checks.py", *sorted((root / ".github/workflows").glob("*.yml"))]
+        self.assertGreater(len(runs), 1)
+        for path in runs:
+            # Strings broken over lines are joined first, so a claim split across them is found.
+            text = re.sub(r'["\s]+', " ", path.read_text(encoding="utf-8")).lower()
+            for retired in ("not a stolen npm credential", "not a stolen-token signal", "not a stolen token"):
+                with self.subTest(f"{path.name}: {retired}"):
+                    self.assertNotIn(retired, text)
 
 
 if __name__ == "__main__":
