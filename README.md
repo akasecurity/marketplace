@@ -13,7 +13,7 @@ From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its 
 | Tool | What it does | Install handle | Status |
 |---|---|---|---|
 | **preflight** | An independent multi-model review crew for coding agents — two blind cross-family reads plus an independent judge that filters false positives, report-only. Plus `secure-research`: cited web research spread across several search engines. | `preflight@akasecurity` | ✅ available |
-| **claude-tools** | The security defaults Claude Code doesn't ship with — guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. | `claude-tools@akasecurity` | ✅ available |
+| **aka-claude-tools** | The security defaults Claude Code doesn't ship with — guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. | `aka-claude-tools@akasecurity` (was `claude-tools@akasecurity`, renamed in 0.5.2) | ✅ available |
 | **ai-tc** — AI Traffic Control | An open-source control plane for coding agents — intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then monitors, warns, redacts, or blocks before anything reaches the model. Runs entirely locally. | `ai-tc@akasecurity` | ✅ available |
 
 ## Install
@@ -25,7 +25,7 @@ Claude Code:
 ```
 /plugin marketplace add akasecurity/marketplace
 /plugin install preflight@akasecurity
-/plugin install claude-tools@akasecurity
+/plugin install aka-claude-tools@akasecurity
 /plugin install ai-tc@akasecurity
 ```
 
@@ -55,8 +55,8 @@ CLI-first alternative to the marketplace plugin above (which stays the default):
 `curl -fsSL https://raw.githubusercontent.com/akasecurity/ai-tc/cli-latest/tools/installer/install.sh | sh`
 then run `aka init` — it detects whether the Claude Code plugin is installed and offers to add it.
 
-> Codex and Antigravity currently install **preflight** (multi-harness). `claude-tools` and `ai-tc`
-> are Claude Code tools; on other harnesses install `claude-tools` via its shell kit / Homebrew.
+> Codex and Antigravity currently install **preflight** (multi-harness). `aka-claude-tools` and `ai-tc`
+> are Claude Code tools; on other harnesses install `aka-claude-tools` via its shell kit / Homebrew.
 
 ## Version pinning
 
@@ -84,7 +84,7 @@ moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and 
 note that `validate` had not passed on the final head (`approver: unknown` when CODEOWNERS could not
 be read at the parent).
 
-`preflight` and `claude-tools` still float on their default branches.
+`preflight` and `aka-claude-tools` still float on their default branches.
 
 ## About
 

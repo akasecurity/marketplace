@@ -146,7 +146,7 @@ move or delete one, and refuse every other tag name:
   passes, 1 when a check refuses it, and 2 when no verdict could be reached or the arguments are
   wrong (a version that is not an exact `x.y.z` is a usage error, not a refusal).
 
-`preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
+`preflight` and `aka-claude-tools` still float on their default branches (not fleet-deployed).
 
 ## Workflow
 
