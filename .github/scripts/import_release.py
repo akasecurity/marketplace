@@ -291,9 +291,9 @@ def pr_body(plan: dict, run_url: str) -> str:
         lines.append(f"This PR also adds that entry to `{SAFETY_FILE}`." if plan.get("safety_entry")
                      else f"`{SAFETY_FILE}` already has an entry for `{version}`; this PR leaves it unchanged.")
         if plan.get("reimport"):
-            lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main` or a "
-                      "`fleet-v` tag has pinned, or a code owner closed an earlier PR for it. Approve only once "
-                      "the reason it was rolled back or rejected is resolved."]
+            lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
+                      "`fleet-v` tag or a merged release-bot pull request has pinned, or a code owner closed an "
+                      "earlier PR for it. Approve only once the reason it was rolled back or rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
