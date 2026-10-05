@@ -30,13 +30,16 @@ tagging for good: a commit a pull request merged is tagged with
 `approver: unknown` and an approver-note saying why, rather than a guess at who
 counts. A commit no pull request merged records `approver: none`
 whatever the file holds, as there is no approval to match.
+Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
+a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
+the sweep: every run reports it as a warning and goes on, comparing each later
+commit with the nearest earlier one that reads.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -48,9 +51,11 @@ from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
 from issue_router import CODEOWNERS_FILE
-from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
+from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, parse_json, vkey
 
 ABSENT = "entry removed"
+# Not a version: what the manifest at a commit says when it cannot be read at all (see Unreadable).
+UNREADABLE = "manifest unreadable"
 # The modes git gives a regular file; any other mode at the CODEOWNERS path (120000 a symbolic link, 160000 a
 # submodule, 040000 a directory) holds nothing a reader can take rules from.
 FILE_MODES = ("100644", "100755")
@@ -77,26 +82,63 @@ CLOCK_SKEW = 300
 USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
-def version_at(git: Git, sha: str | None) -> str:
-    """The ai-tc version main pinned at `sha`, or ABSENT when the entry (or the commit) is missing."""
+class Unreadable(Refused):
+    """The manifest at a commit cannot be read: it is not JSON, is nested too deeply to read, repeats a key, has
+    no plugins list, or has an ai-tc entry that is ambiguous or malformed. Main's history is fixed, so a commit
+    like that never gets better, and a sweep that stopped at one would stop for good: pin_changes treats it as no
+    pin change and goes on. It is a Refused only so that, if one ever escapes, the run ends as one error line."""
+
+
+def entry_at(git: Git, sha: str) -> dict | None:
+    """The ai-tc entry of the manifest at `sha`, or None when the commit has no manifest or its manifest has no
+    entry. The manifest is read the way validate reads it (parse_json, entry_of), so what is unreadable here is
+    unreadable there: Unreadable says so. A checkout that cannot be read at all (a missing object) raises GitError."""
+    try:
+        raw = git.show(sha, MANIFEST)
+        return None if raw is None else entry_of(parse_json(raw))
+    except (ValueError, Refused) as error:
+        raise Unreadable(f"{MANIFEST} at {sha[:12]} cannot be read: {' '.join(str(error).split())[:200]}") from error
+
+
+def read_version(git: Git, sha: str | None) -> tuple[str, str]:
+    """(the ai-tc version main pinned at `sha`, "") with ABSENT as the version when the entry (or the commit) is
+    missing, or (UNREADABLE, why) when the manifest there cannot be read."""
     if sha is None:
-        return ABSENT
-    raw = git.show(sha, MANIFEST)
-    if raw is None:
-        return ABSENT
-    entry = entry_of(json.loads(raw))
+        return ABSENT, ""
+    try:
+        entry = entry_at(git, sha)
+    except Unreadable as problem:
+        return UNREADABLE, str(problem)
     if entry is None:
-        return ABSENT
+        return ABSENT, ""
     version = entry["source"].get("version")
-    return version if isinstance(version, str) and version else "unpinned"
+    return (version if isinstance(version, str) and version else "unpinned"), ""
+
+
+def version_at(git: Git, sha: str | None) -> str:
+    """The ai-tc version main pinned at `sha`: ABSENT when the entry (or the commit) is missing, UNREADABLE when
+    the manifest there cannot be read."""
+    return read_version(git, sha)[0]
+
+
+def version_up_to(git: Git, sha: str | None) -> str:
+    """The version main pinned at `sha`, or at the nearest first-parent ancestor whose manifest can be read:
+    what a commit's parent stood for. ABSENT when the entry is missing there, or nothing back to the root reads."""
+    while sha is not None:
+        version = version_at(git, sha)
+        if version != UNREADABLE:
+            return version
+        sha = git.first_parent(sha)
+    return ABSENT
 
 
 def last_pinned(git: Git, sha: str | None) -> str:
     """The version main last pinned at or before `sha`: its own, or the nearest first-parent ancestor's
-    when the entry is removed there. ABSENT only when nothing back to the root pins one."""
+    when the entry is removed there or its manifest cannot be read. ABSENT only when nothing back to the root
+    pins one."""
     while sha is not None:
         version = version_at(git, sha)
-        if version != ABSENT:
+        if version not in (ABSENT, UNREADABLE):
             return version
         sha = git.first_parent(sha)
     return ABSENT
@@ -141,27 +183,58 @@ def code_owners(git: Git, sha: str) -> list[str]:
 
 
 def integrity_at(git: Git, sha: str) -> str:
-    raw = git.show(sha, MANIFEST)
-    entry = entry_of(json.loads(raw)) if raw else None
+    entry = entry_at(git, sha)
     metadata = entry.get("metadata") if entry is not None else None
     return metadata.get("integrity", "none") if isinstance(metadata, dict) else "none"
 
 
-def pending(git: Git) -> list[str]:
+def pin_changes(git: Git, base: str) -> tuple[list[str], dict[str, str]]:
+    """The first-parent commits on main after `base` that changed the ai-tc version and carry no fleet-v tag,
+    oldest first, and the commits whose manifest cannot be read, each with why.
+
+    A commit whose manifest cannot be read is never a pin change, and is not compared with: a commit is compared
+    with the version at the nearest earlier commit that reads (version_up_to), so a manifest that was broken for
+    a commit and mended to the same version is no change either way, and a pin change behind a broken commit is
+    found at the first commit that reads again. Main's history is fixed, so a run that stopped at a commit like
+    that would stop on every later run; the caller reports it and carries on."""
+    tagged = {tag["commit"] for tag in git.fleet_tags()}
+    changes, unreadable = [], {}
+    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
+    for sha in git.first_parent_after(base, git.main()):
+        if sha in tagged:
+            continue
+        version, why = read_version(git, sha)
+        if version == UNREADABLE:
+            unreadable[sha] = why
+        elif version != version_up_to(git, git.first_parent(sha)):
+            changes.append(sha)
+    return changes, unreadable
+
+
+def last_tag_commit(git: Git) -> str:
     tags = git.fleet_tags()
     if not tags:
         raise Refused("no fleet-v tag exists to sweep from")
-    tagged = {tag["commit"] for tag in tags}
-    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
-    return [sha for sha in git.first_parent_after(tags[-1]["commit"], git.main())
-            if sha not in tagged and version_at(git, sha) != version_at(git, git.first_parent(sha))]
+    return tags[-1]["commit"]
+
+
+def pending(git: Git) -> list[str]:
+    return pin_changes(git, last_tag_commit(git))[0]
 
 
 def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
+    """The store-migration class the tag records. `unknown` also when the safety table at `sha` cannot be read:
+    a rollback would otherwise read an empty table and record `additive` across a release that was not safe."""
     if not SEMVER.fullmatch(version):
         return "none"
     raw = git.show(sha, SAFETY_FILE)
-    known = json.loads(raw).get("versions", {}) if raw else {}
+    try:
+        table = parse_json(raw) if raw else {}
+    except ValueError:
+        return "unknown"
+    known = table.get("versions", {}) if isinstance(table, dict) else None
+    if not isinstance(known, dict):
+        return "unknown"
     if SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
         crossed = [entry for v, entry in known.items()
                    if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(previous)]
@@ -352,7 +425,10 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
           now: Callable[[], float] = time.time, reader: GitHub | None = None) -> list[str]:
     """Tag every untagged pin change on main, oldest first. `gh` writes (the App's token); `reader` reads the
     checks of a merged PR's head (the workflow token) and defaults to `gh`."""
-    todo = pending(git)
+    todo, unreadable = pin_changes(git, last_tag_commit(git))
+    for why in unreadable.values():
+        # One line each, and the sweep goes on: no later pull request can mend a commit already on main.
+        print(f"::warning::{why}. It is not counted as a pin change, and the sweep goes on with the commits after it.")
     number = git.fleet_tags()[-1]["n"]
     created = []
     for sha in todo:
@@ -361,7 +437,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if tag_exists(gh, name):
             raise Refused(f"{name} already exists on GitHub but not in this checkout; re-run the sweep")
         parent = git.first_parent(sha)
-        version, previous = version_at(git, sha), version_at(git, parent)
+        version, previous = version_at(git, sha), version_up_to(git, parent)
         if previous == ABSENT:
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
