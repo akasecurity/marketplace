@@ -126,8 +126,12 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
                 unverified.append(f"- `{version}` (published {published}): the `{error.check}` check did not finish")
             continue
         except release_checks.ReleaseCheckError as error:
+            # Same rule as above: the full reason goes to the run log and the issue names only the check. A
+            # reason can carry a value that moves without the release changing (a commit-on-main refusal names
+            # ai-tc's current main head), and the router comments on the issue whenever its text changes.
+            print(f"::warning::refused {version}: {describe(error)}")
             if on_npm is None or on_npm > HOUR:
-                refused.append(f"- `{version}` (published {published}): {describe(error)}")
+                refused.append(f"- `{version}` (published {published}): the `{error.check}` check refused it")
             continue
         if on_npm is None or on_npm > DAY:
             stale.append(f"- `{version}`, published {published}")
@@ -144,9 +148,9 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
                    "import-plugin-release run."),
             result("staleness-i-refused", True if refused else (None if undecided else False),
                    f"npm has versions above `{highest}` that the importer refuses:\n" + "\n".join(refused)
-                   + "\n\nA version published from a branch can never pass (its signing certificate names a "
-                   "branch, not the version's tag). If npm `latest` names one, the runbook's dist-tag step moves "
-                   "it back."),
+                   + "\n\nThis workflow's run log holds the full reason for each. A version published from a "
+                   "branch can never pass (its signing certificate names a branch, not the version's tag). If npm "
+                   "`latest` names one, the runbook's dist-tag step moves it back."),
             result("staleness-i-no-verdict", bool(unverified),
                    f"The release checks could not finish on npm versions above `{highest}`: a registry, network, "
                    "npm or GitHub API failure, which is no verdict on the release:\n" + "\n".join(unverified)
