@@ -207,6 +207,23 @@ class TestRuleINoVerdict(StalenessCase):
                 self.assertEqual(rules["staleness-i"].red, None if reported else False)
                 self.assertEqual(rules["staleness-i-refused"].red, None if reported else False)
 
+    def test_a_version_the_run_ran_out_of_time_for_is_no_verdict_and_clears_nothing(self):
+        # Once the run's time budget is spent, release_checks raises InfraError("deadline") for every version still
+        # to check. That is an outage like any other: it must neither pass as a clear result nor as a refusal.
+        self.candidates = ["0.9.16", "0.9.17"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=30)), "0.9.17": stamp(dt.timedelta(hours=5))}
+        self.down = {"0.9.17": ("deadline", "this run's 2400 s time budget ran out before GET could start")}
+        rules = self.rules()
+        self.assertTrue(rules["staleness-i"].red)
+        self.assertIn("`0.9.16`", rules["staleness-i"].detail)
+        self.assertIsNone(rules["staleness-i-refused"].red)
+        self.assertTrue(rules["staleness-i-no-verdict"].red)
+        self.assertIn("- `0.9.17` (published", rules["staleness-i-no-verdict"].detail)
+        self.assertIn("the `deadline` check did not finish", rules["staleness-i-no-verdict"].detail)
+        self.assertNotIn("2400", rules["staleness-i-no-verdict"].detail)
+        self.assertIn("::warning::no verdict on 0.9.17: deadline: this run's 2400 s time budget ran out",
+                      self.log.getvalue())
+
     def test_the_detail_says_which_versions_hold_the_other_rules(self):
         # Only a version on npm for over an hour, or with no known publish time, is reported
         # and holds the other two rules (test_an_outage_in_the_first_hour_is_not_reported).
@@ -322,6 +339,14 @@ class RunMain(StalenessCase):
     """staleness.main() over fakes: the git checkout and the GitHub API are fakes, the registry is whatever the
     test routes the opener to, and the results are the ones it hands the issue router."""
 
+    def setUp(self):
+        super().setUp()
+        # No test here may reach the registry: each routes it somewhere of its own.
+        opener = mock.patch.object(release_checks._OPENER, "open", side_effect=AssertionError("reached the network"))
+        opener.start()
+        self.addCleanup(opener.stop)
+        self.addCleanup(release_checks.clear_budget)
+
     def run_main(self, git=None):
         written = {}
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,6 +388,53 @@ class TestOnePackumentRead(RunMain):
         self.assertEqual(reader(st.REGISTRY_URL, {}), (200, b"{}"))
         with self.assertRaises(ValueError):
             reader("https://registry.npmjs.org/some-other-package", {})
+
+
+class TestRunBudget(RunMain):
+    """main() gives the run one time budget, so that a run which cannot finish says "no verdict" itself before
+    GitHub cancels the job (the job is allowed 45 minutes, and the budget is shorter)."""
+
+    def setUp(self):
+        super().setUp()
+        self.reads = []
+        registry = mock.patch.object(release_checks, "http_fetch", side_effect=self.registry)
+        registry.start()
+        self.addCleanup(registry.stop)
+
+    def registry(self, url, headers):
+        self.reads.append(release_checks.time_left())
+        return 200, json.dumps({"versions": {}, "time": {}}).encode()
+
+    def test_the_run_starts_one_budget_of_about_forty_minutes(self):
+        seen = []
+        evaluate = st.evaluate
+
+        def watching(*args, **kwargs):
+            seen.append(release_checks.time_left())
+            return evaluate(*args, **kwargs)
+
+        with mock.patch.object(st, "evaluate", side_effect=watching), mock.patch.object(
+            release_checks, "start_budget", wraps=release_checks.start_budget
+        ) as started:
+            code, _ = self.run_main()
+        self.assertEqual(code, 0)
+        started.assert_called_once_with(release_checks.BUDGET_STALENESS)
+        self.assertEqual(release_checks.BUDGET_STALENESS, 40 * 60)
+        # the registry read comes first and the rules after it: the budget is running for both
+        self.assertEqual(len(self.reads) + len(seen), 2)
+        for left in self.reads + seen:
+            self.assertIsNotNone(left, "no budget was running while staleness worked")
+            self.assertTrue(release_checks.BUDGET_STALENESS - 60 < left <= release_checks.BUDGET_STALENESS)
+
+    def test_the_budget_ends_with_the_run_however_it_ends(self):
+        for error in (release_checks.InfraError("network", "down"), release_checks.ReleaseCheckError("version", "no"),
+                      KeyError("status"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(st, "evaluate", side_effect=error), self.assertRaises(type(error)):
+                    self.run_main()
+                self.assertIsNone(release_checks.time_left())
+        self.run_main()
+        self.assertIsNone(release_checks.time_left())
 
 
 class TestOtherRules(StalenessCase):

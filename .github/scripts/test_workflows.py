@@ -647,6 +647,12 @@ class StalenessWorkflow(WorkflowCase):
     def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
         self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
 
+    def test_the_run_budget_ends_before_the_job_is_cancelled(self):
+        # staleness reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"(?m)^    timeout-minutes: (\d+)\s*$", self.jobs["evaluate"])
+        self.assertEqual(len(limits), 1, "the evaluate job must set one timeout")
+        self.assertLess(release_checks.BUDGET_STALENESS, int(limits[0]) * 60)
+
     def test_the_workflow_names_the_npm_it_needs_rather_than_just_a_major(self):
         self.assertIn("npm 11.12", self.text)
         self.assertNotIn("npm 11 (node 24)", self.text.lower())

@@ -228,15 +228,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frozen", required=True)
     args = parser.parse_args(argv)
     env = os.environ
-    git = Git(args.repo_dir)
-    with open(args.frozen, encoding="utf-8") as handle:
-        frozen = json.load(handle)
-    packument = read_packument()
-    results = evaluate(git=git, gh=GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]), repo_dir=args.repo_dir,
-                       frozen=frozen, now=dt.datetime.now(dt.timezone.utc),
-                       times=publish_times(lambda url: fetch_json(url, packument)), packument=packument,
-                       remote_refs=git.ls_remote("origin"), drill=env.get("DRILL") == "true",
-                       actor=env.get("ACTOR", "unknown"))
+    # One budget for the whole run, cleared below however it ends. Every release-check request and npm call is
+    # cut to what remains of it, so a run that cannot finish says "no verdict" itself before GitHub cancels the
+    # job. The GitHub API reads each have their own 60 s timeout (ghapi) and are not cut to it.
+    release_checks.start_budget(release_checks.BUDGET_STALENESS)
+    try:
+        git = Git(args.repo_dir)
+        with open(args.frozen, encoding="utf-8") as handle:
+            frozen = json.load(handle)
+        packument = read_packument()
+        results = evaluate(git=git, gh=GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]),
+                           repo_dir=args.repo_dir, frozen=frozen, now=dt.datetime.now(dt.timezone.utc),
+                           times=publish_times(lambda url: fetch_json(url, packument)), packument=packument,
+                           remote_refs=git.ls_remote("origin"), drill=env.get("DRILL") == "true",
+                           actor=env.get("ACTOR", "unknown"))
+    finally:
+        release_checks.clear_budget()
     for item in results:
         print(f"{item.rule}: " + ("not evaluated" if item.red is None else "red" if item.red else "clear"))
     write_output("results", results_to_json(results))
