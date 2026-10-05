@@ -16,10 +16,13 @@ it records for a push made by the App or by auto-merge has not been verified.
 The stand-in can still name the wrong person (a force-push by someone who did
 not write the commit); the main ruleset's "most recent push approved by someone
 else" is what enforces the rule, and this records when it was bypassed.
-Detective only: it runs from the pushed commit's own file, so a bypass push can
-change it in the same push. Every red result is keyed to its push and closed
-only by a person; a push the audit could not finish, or one that moved main
-without extending it, gets its own such result.
+Detective only, and it cannot vouch for itself: main-audit runs from the pushed
+commit, so a push that bypasses the `main` ruleset can also change, disable or
+remove main-audit. That push is then audited by the changed copy, or not at all,
+and no later run looks at it again.
+Every red result is keyed to its push and closed only by a person; a push the
+audit could not finish, or one that moved main without extending it, gets its
+own such result.
 """
 from __future__ import annotations
 
