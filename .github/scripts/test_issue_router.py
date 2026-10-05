@@ -242,6 +242,73 @@ class TestRouter(RouterCase):
         self.assertEqual(self.gh.calls, [])
 
 
+class TestQuoted(RouterCase):
+    """The detail goes into the issue as a code block: it holds text a person chose, and it can be long."""
+
+    HOSTILE = ("- fleet-v10's subject 'ping @someone and @org/team, see org/repo#1 and [x](https://e.example)' "
+               "then a run of seven: " + "`" * 7)
+
+    def assert_inside_a_fence(self, text, detail, width):
+        fence = "`" * width
+        self.assertIn(fence + "\n" + detail + "\n" + fence, text)
+        self.assertEqual(text.count(detail), 1, "the detail appears once, inside the fence")
+
+    def test_the_fence_is_longer_than_any_run_of_backticks_in_the_detail_and_at_least_three(self):
+        for detail, width in (("none", 3), ("one ` here", 3), ("two `` here", 3), ("three ``` here", 4),
+                              (self.HOSTILE, 8), ("a ` and a `````` run", 7)):
+            with self.subTest(detail):
+                self.assertEqual(rt.quoted(detail, RUN), "`" * width + "\n" + detail + "\n" + "`" * width)
+
+    def test_a_new_issue_holds_the_detail_only_inside_a_fence(self):
+        self.router().apply(red(detail=self.HOSTILE))
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_comment_on_a_changed_detail_holds_it_only_inside_a_fence(self):
+        self.issues.append(existing(detail="npm has 0.9.15"))
+        self.router().apply(red(detail=self.HOSTILE))
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues/40/comments"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_comment_on_a_reopened_issue_holds_the_detail_only_inside_a_fence(self):
+        self.issues.append(cleared_issue())
+        self.assertEqual(self.router().apply(red(detail=self.HOSTILE)), "staleness-i: red again; reopened #40")
+        self.assert_inside_a_fence(self.gh.called("POST", R("issues/40/comments"))[0][2]["body"], self.HOSTILE, 8)
+
+    def test_a_detail_past_the_limit_is_cut_and_points_at_the_run_log(self):
+        detail = "- " + "x" * 70_000
+        self.router().apply(red(detail=detail))
+        body = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.assertLessEqual(len(body), 65_536)
+        self.assertIn("\n```\n… truncated; the full detail is in the run log (" + RUN + ")", body)
+        self.assertNotIn(detail, body)
+        self.assertIn("x" * (rt.DETAIL_LIMIT - 2), body)
+
+    def test_the_limit_counts_the_larger_way_github_could_count_a_character(self):
+        # 40,000 characters outside the basic plane are 80,000 UTF-16 code units.
+        detail = "\U0001F600" * 40_000
+        self.router().apply(red(detail=detail))
+        body = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.assertLessEqual(len(body.encode("utf-16-le")) // 2, 65_536)
+        self.assertIn("… truncated", body)
+
+    def test_a_detail_just_inside_the_limit_is_not_cut(self):
+        detail = "y" * rt.DETAIL_LIMIT
+        self.assertEqual(rt.quoted(detail, RUN), "```\n" + detail + "\n```")
+        self.assertIn("… truncated", rt.quoted(detail + "y", RUN))
+
+    def test_the_same_long_detail_does_not_comment_again_on_another_run(self):
+        # The note names the run, so a digest taken from the quoted text would differ on every run.
+        detail = "- " + "x" * 70_000
+        self.router().apply(red(detail=detail))
+        opened = self.gh.called("POST", R("issues"))[0][2]
+        self.issues.append({"number": 40, "body": opened["body"], "created_at": "2026-10-01T10:00:00Z",
+                            "labels": [{"name": "staleness"}], "assignees": []})
+        del self.gh.calls[:]
+        later = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None, owners=["Vaishnav-OM"],
+                          now=NOW + dt.timedelta(hours=1), run_url=RUN + "0")
+        self.assertEqual(later.apply(red(detail=detail)), "staleness-i: #40 unchanged")
+        self.assertEqual(self.gh.writes(), [])
+
+
 class TestRoute(RouterCase):
     def test_only_red_alerts_fail_the_run(self):
         notice = rt.Result(rule="staleness-rollback-hold", label="staleness", title="rolled back, awaiting fix-forward",

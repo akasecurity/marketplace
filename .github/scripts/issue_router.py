@@ -33,6 +33,9 @@ APPROVERS_FILE = ".github/release-approvers.json"
 CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
 ESCALATE_AFTER = dt.timedelta(hours=48)
+# GitHub refuses an issue body or a comment longer than 65,536 characters, and a refused post loses the alert.
+# The detail is cut well below that, which leaves room for everything else the post holds.
+DETAIL_LIMIT = 60_000
 
 
 @dataclass
@@ -102,6 +105,29 @@ def drop_marker(body: str, name: str) -> str:
 
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def quoted(detail: str, run_url: str) -> str:
+    """The detail as a code block, with a note when it had to be cut.
+
+    Part of a detail is text a person chose, a tag's name or the subject of its message. In a code block
+    it cannot mention anyone, link back from another repository's issue or render as a link in an alert
+    that reads as the project's own. The fence is one backtick longer than the longest run of backticks in
+    the text, and at least three, so the text cannot end the block. The cut counts UTF-16 code units, which
+    is the larger of the two ways GitHub could count a character. The digest is taken from the whole detail
+    (see _refresh), so a cut never makes a comment of its own."""
+    units, end = 0, len(detail)
+    for index, character in enumerate(detail):
+        units += 2 if ord(character) > 0xFFFF else 1
+        if units > DETAIL_LIMIT:
+            end = index
+            break
+    text = detail[:end]
+    fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    block = f"{fence}\n{text}\n{fence}"
+    if end == len(detail):
+        return block
+    return f"{block}\n… truncated; the full detail is in the run log ({run_url})"
 
 
 def when(text: str) -> dt.datetime:
@@ -186,7 +212,7 @@ class Router:
         closing = ("It closes by itself when the rule clears." if result.auto_close
                    else "A person closes it once it is explained.")
         body = "\n".join([marker("rule", result.rule), marker("state", digest(result.detail)),
-                          marker("last-comment", stamp(self.now)), "", result.detail, "", "---",
+                          marker("last-comment", stamp(self.now)), "", quoted(result.detail, self.run_url), "", "---",
                           f"Filed by {self.run_url}." + (f" cc {cc}" if cc else ""),
                           "Assigned to the release approvers; after 48 hours the escalation owner is assigned too. "
                           + closing])
@@ -198,7 +224,7 @@ class Router:
     def _reopen(self, result: Result, issue: dict) -> str:
         number, body = issue["number"], issue.get("body") or ""
         self._comment(number, f"Red again at {stamp(self.now)} (cleared at {read_marker(body, 'cleared')}).\n\n"
-                              f"{result.detail}\n\n({self.run_url})")
+                              f"{quoted(result.detail, self.run_url)}\n\n({self.run_url})")
         # The `cleared` marker goes, so a person who closes the reopened issue is not overruled by it.
         body = set_marker(set_marker(drop_marker(body, "cleared"), "state", digest(result.detail)),
                           "last-comment", stamp(self.now))
@@ -216,7 +242,7 @@ class Router:
         new_body, actions = body, []
         state, last = digest(result.detail), read_marker(body, "last-comment")
         if state != read_marker(body, "state") or last is None or self.now - when(last) >= COMMENT_EVERY:
-            self._comment(number, f"{result.detail}\n\n({self.run_url})")
+            self._comment(number, f"{quoted(result.detail, self.run_url)}\n\n({self.run_url})")
             new_body = set_marker(set_marker(new_body, "state", state), "last-comment", stamp(self.now))
             actions.append("commented")
         present = {label.get("name") for label in issue.get("labels", [])}
