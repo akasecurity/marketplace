@@ -160,6 +160,21 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(len(ta.compare_previous(previous, current, None)), 1)
 
 
+class TestCommittedFrozenList(unittest.TestCase):
+    """The list this repository commits, read the way the audit reads it."""
+
+    def test_it_records_every_tag_cut_by_hand(self):
+        # fleet-v1 to fleet-v9 were cut by hand, so they carry no `version:` or `pr:` line, and the audit
+        # judges a tag outside this list by those lines: a hand-cut tag missing here is three problems.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fleet-tags.frozen.json")
+        problems = []
+        rows = release_checks._tag_rows(path, "frozen tag list", problems)
+        self.assertEqual(problems, [])
+        names = [row["tag"] for row in rows]
+        self.assertEqual(names, [f"fleet-v{n}" for n in range(1, len(names) + 1)])
+        self.assertGreaterEqual(len(names), 9)
+
+
 class TestRunCheck(unittest.TestCase):
     def test_every_source_of_problems_is_reported(self):
         git = FakeGit(chain=["c1"], tags=[fleet_tag(1, "c1")])
