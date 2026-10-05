@@ -12,6 +12,7 @@ import tempfile
 import textwrap
 import unittest
 
+import _testsupport as ts
 import release_checks
 
 WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows")
@@ -67,6 +68,9 @@ class ImporterWorkflow(WorkflowCase):
         self.assertRegex(self.head, r"(?s)\n      below_floor:\n.*?type: boolean\n")
 
     def test_each_mode_queues_in_its_own_concurrency_group(self):
+        # The schedule and forward dispatches share the first group on purpose: open-pr replaces a branch
+        # no PR ever used, which is safe only while no other forward run is live. A scheduled tick can
+        # therefore cancel a pending forward dispatch, and the workflow's header says so.
         self.assertIn("  group: ${{ github.event_name == 'schedule' && 'import-forward' || "
                       "format('import-{0}', inputs.mode) }}\n", self.head)
         self.assertIn("  cancel-in-progress: false\n", self.head)
@@ -81,19 +85,68 @@ class ImporterWorkflow(WorkflowCase):
     def test_the_workflow_token_never_writes(self):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    def test_the_app_token_is_made_from_the_clients_id_not_the_deprecated_app_id(self):
+        # create-github-app-token marks app-id deprecated ("Use 'client-id' instead"): every run would
+        # warn, and a later major version may drop it. The secrets are the App's client id and key.
+        self.assertIn("          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}\n", self.jobs["open-pr"])
+        self.assertIn("          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}\n", self.jobs["open-pr"])
+        self.assertNotRegex(self.text, r"(?m)^\s+app-id:")
+        self.assertNotIn("MARKETPLACE_BOT_APP_ID", self.text)
+
     # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
     # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
     FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
 
+    @staticmethod
+    def lowest_admitted(spec):
+        """The lowest release setup-node's version spec can resolve to, or None when it can
+        resolve to a Node that does not ship the npm the gate needs: a bare major, an x-range,
+        an alias, another major (Node 25.0.0 through 25.8.2 bundle npm 11.6 to 11.11), or a range
+        with no upper bound, which setup-node resolves to the highest cached copy of any major.
+        Only an exact 24.x.y, or a range from one up to but not including 25, is accepted."""
+        match = re.fullmatch(r"24\.(\d+)\.(\d+)", spec) or re.fullmatch(r">=24\.(\d+)\.(\d+) <25", spec)
+        return (24, int(match.group(1)), int(match.group(2))) if match else None
+
+    def test_the_lowest_release_a_spec_admits(self):
+        for spec, lowest in (
+            ("24.15.0", (24, 15, 0)),
+            ("24.16.1", (24, 16, 1)),
+            (">=24.15.0 <25", (24, 15, 0)),
+            (">=24.16.1 <25", (24, 16, 1)),
+            # Another major bundles another npm: Node 25.0.0 through 25.8.2 ship npm 11.6 to 11.11.
+            ("25.0.0", None),
+            (">=25.9.0 <26", None),
+            # No upper bound, or one past 25: the highest cached copy of any major can be chosen.
+            (">=24.15.0", None),
+            (">=24.16.1", None),
+            (">=24.15.0 <26", None),
+            (">=24.15.0 <24.99.0", None),
+            ("<25", None),
+            ("24", None),
+            ("24.x", None),
+            ("^24.15.0", None),
+            (">=24", None),
+            ("lts/*", None),
+            ("latest", None),
+        ):
+            with self.subTest(spec):
+                self.assertEqual(self.lowest_admitted(spec), lowest)
+
     def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
         # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
         # can resolve to an older cached 24.x whose npm the release checks refuse, red, on every run.
-        # Only an exact version, or a range that starts at one, cannot.
+        # Only an exact 24.x.y, or a range from one up to but not including 25, cannot.
         specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
         self.assertEqual(len(specs), 1, "the importer installs Node exactly once, with a quoted node-version")
-        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
-        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
-        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+        lowest = self.lowest_admitted(specs[0])
+        self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_verify_budget_ends_before_the_job_is_cancelled(self):
+        # The plan reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"(?m)^    timeout-minutes: (\d+)\s*$", self.jobs["verify"])
+        self.assertEqual(len(limits), 1, "the verify job must set one timeout")
+        self.assertLess(release_checks.BUDGET_JOB, int(limits[0]) * 60)
 
     def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
         self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
@@ -103,7 +156,9 @@ class ImporterWorkflow(WorkflowCase):
         self.assertNotIn("npm 11 (node 24)", self.text.lower())
 
 
-RUN_77 = '[{"databaseId": 77, "event": "schedule"}]'
+# @ON_MAIN@, @TIP@ and @OFF_MAIN@ stand for commits in the throwaway repository run_fetch builds: an earlier commit of
+# main, main's tip, and one that is not on main's history.
+RUN_77 = '[{"databaseId": 77, "event": "schedule", "headSha": "@ON_MAIN@"}]'
 READY = '{"artifacts": [{"name": "fleet-tags-snapshot", "expired": false}]}'
 
 
@@ -148,7 +203,7 @@ class TagAuditWorkflow(WorkflowCase):
         fetch = self.step("name: fetch the snapshot the last green run kept")
         listing = re.search(r"(?s)gh run list.*?--jq", fetch).group(0)
         for flag in ("--workflow tag-audit.yml", "--branch main", "--status success", "--limit 100",
-                     "--json databaseId,event"):
+                     "--json databaseId,event,headSha"):
             self.assertIn(flag, listing)
         # A fork's pull request from its own main also reports the branch main, so the event decides.
         self.assertIn('.event == "schedule" or .event == "workflow_dispatch" or .event == "delete"', fetch)
@@ -177,7 +232,7 @@ class TagAuditWorkflow(WorkflowCase):
             with open(stub, "w", encoding="utf-8") as handle:
                 handle.write(textwrap.dedent("""\
                     #!/usr/bin/env python3
-                    import os, subprocess, sys
+                    import json, os, subprocess, sys
                     args = sys.argv[1:]
                     with open(os.environ["GH_LOG"], "a") as log:
                         log.write(" ".join(args) + "\\n")
@@ -188,7 +243,10 @@ class TagAuditWorkflow(WorkflowCase):
                         sys.stdout.write(out.stdout)
                         sys.exit(out.returncode)
                     if args[:2] == ["run", "list"]:
-                        sys.exit(1) if os.environ.get("LIST_FAILS") else filtered(os.environ["RUNS"])
+                        # Like gh, answer only the fields --json names: a field it was not asked for is absent.
+                        asked = args[args.index("--json") + 1].split(",")
+                        runs = [{key: run.get(key) for key in asked} for run in json.loads(os.environ["RUNS"])]
+                        sys.exit(1) if os.environ.get("LIST_FAILS") else filtered(json.dumps(runs))
                     if args[0] == "api":
                         sys.exit(1) if os.environ.get("API_FAILS") else filtered(os.environ["ARTIFACTS"])
                     if args[:2] == ["run", "download"]:
@@ -197,18 +255,37 @@ class TagAuditWorkflow(WorkflowCase):
                     """))
             os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
             log = os.path.join(root, "gh.log")
+            output = os.path.join(root, "github-output")
             env = {"PATH": os.path.dirname(stub) + os.pathsep + os.environ["PATH"], "GH_LOG": log,
                    "GITHUB_REPOSITORY": "akasecurity/marketplace", "RUNS": runs, "ARTIFACTS": artifacts,
+                   "GITHUB_OUTPUT": output,
                    **({"LIST_FAILS": "1"} if list_fails else {}), **({"API_FAILS": "1"} if api_fails else {}),
                    **({"DOWNLOAD_FAILS": "1"} if download_fails else {})}
             work = os.path.join(root, "work")
             os.makedirs(work)
+            # What the checkout leaves: full history of main (and origin/main), plus a commit that is not on it.
+            ts.git(work, "init", "-q", "-b", "main")
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "first")
+            on_main = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "second")
+            ts.git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
+            tip = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "checkout", "-q", "-b", "elsewhere", on_main)
+            ts.git(work, "commit", "-q", "--allow-empty", "-m", "not on main")
+            off_main = ts.git(work, "rev-parse", "HEAD").strip()
+            ts.git(work, "checkout", "-q", "main")
+            env["RUNS"] = runs.replace("@ON_MAIN@", on_main).replace("@OFF_MAIN@", off_main).replace("@TIP@", tip)
             done = subprocess.run(["bash", "-c", self.fetch_script()], cwd=work, env=env, text=True,
                                   capture_output=True)
             calls = []
             if os.path.exists(log):
                 with open(log, encoding="utf-8") as handle:
                     calls = handle.read().splitlines()
+            # What the step handed on to the next one: "baseline=ready" or "baseline=none" (empty if it said nothing).
+            self.fetch_outputs = {}
+            if os.path.exists(output):
+                with open(output, encoding="utf-8") as handle:
+                    self.fetch_outputs = dict(line.split("=", 1) for line in handle.read().splitlines())
             return done, calls
 
     def test_the_fetch_step_downloads_the_last_green_runs_snapshot(self):
@@ -220,15 +297,17 @@ class TagAuditWorkflow(WorkflowCase):
     def test_the_fetch_step_never_takes_a_pull_request_run_as_the_baseline(self):
         # A fork's pull request from its own main lists as a green run on the branch main; only the
         # older scheduled run may supply the baseline.
-        runs = ('[{"databaseId": 99, "event": "pull_request"}, {"databaseId": 88, "event": "pull_request_target"},'
-                ' {"databaseId": 77, "event": "schedule"}]')
+        runs = ('[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"},'
+                ' {"databaseId": 88, "event": "pull_request_target", "headSha": "@OFF_MAIN@"},'
+                ' {"databaseId": 77, "event": "schedule", "headSha": "@ON_MAIN@"}]')
         done, calls = self.run_fetch(runs=runs, artifacts=READY)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(calls[-1], "run download 77 --repo akasecurity/marketplace --name fleet-tags-snapshot --dir previous")
         self.assertFalse([call for call in calls if " 99 " in f" {call} " or " 88 " in f" {call} "])
 
     def test_the_fetch_step_with_only_pull_request_runs_has_no_baseline(self):
-        done, calls = self.run_fetch(runs='[{"databaseId": 99, "event": "pull_request"}]', artifacts=READY)
+        done, calls = self.run_fetch(runs='[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"}]',
+                                     artifacts=READY)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("::notice::no earlier green tag-audit run", done.stdout)
         # The listing's jq filter spans two lines, so the log holds it as two; nothing else was called.
@@ -238,7 +317,8 @@ class TagAuditWorkflow(WorkflowCase):
     def test_the_fetch_step_takes_a_manual_or_deletion_run_as_the_baseline(self):
         for event in ("workflow_dispatch", "delete"):
             with self.subTest(event):
-                done, calls = self.run_fetch(runs='[{"databaseId": 55, "event": "%s"}]' % event, artifacts=READY)
+                runs = '[{"databaseId": 55, "event": "%s", "headSha": "@ON_MAIN@"}]' % event
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertTrue(calls[-1].startswith("run download 55 "))
 
@@ -275,6 +355,116 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertNotIn("expired", done.stdout)
                 self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
                 self.assertFalse([call for call in calls if call.startswith("run download")])
+
+    def test_the_fetch_step_says_whether_there_is_a_baseline(self):
+        cases = {
+            "a downloaded snapshot": (dict(runs=RUN_77, artifacts=READY), "ready"),
+            "no earlier green run": (dict(), "none"),
+            "only pull request runs": (dict(runs='[{"databaseId": 99, "event": "pull_request", "headSha": "@OFF_MAIN@"}]',
+                                            artifacts=READY), "none"),
+            "an expired snapshot": (dict(runs=RUN_77, artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}'), "none"),
+            "no snapshot listed": (dict(runs=RUN_77, artifacts='{"artifacts": []}'), "none"),
+        }
+        for label, (kwargs, baseline) in cases.items():
+            with self.subTest(label):
+                done, _ = self.run_fetch(**kwargs)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.fetch_outputs, {"baseline": baseline})
+
+    def test_the_fetch_step_says_nothing_when_it_fails(self):
+        listed = dict(runs=RUN_77, artifacts=READY)
+        for label, kwargs in {"the run listing fails": dict(runs=RUN_77, list_fails=True),
+                              "the artifact listing fails": dict(listed, api_fails=True),
+                              "the download fails": dict(listed, download_fails=True)}.items():
+            with self.subTest(label):
+                done, _ = self.run_fetch(**kwargs)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(self.fetch_outputs, {}, "a failed download must not read as 'ready'")
+
+    def audit_script(self) -> str:
+        audit = self.step("tag_audit.py check")
+        return textwrap.dedent(audit.split("run: |\n", 1)[1].split("\n      - ", 1)[0])
+
+    def run_audit(self, baseline: str):
+        """Run the audit step's script with BASELINE as the fetch step would have set it, and a stand-in for
+        python3 that records how tag_audit.py was called. Returns (exit code, the arguments, or None)."""
+        with tempfile.TemporaryDirectory() as root:
+            stub = os.path.join(root, "bin", "python3")
+            os.makedirs(os.path.dirname(stub))
+            log = os.path.join(root, "args")
+            with open(stub, "w", encoding="utf-8") as handle:
+                handle.write('#!/bin/sh\necho "$@" >> "$ARGS_LOG"\n')
+            os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+            env = {"PATH": os.path.dirname(stub) + os.pathsep + os.environ["PATH"], "ARGS_LOG": log, "BASELINE": baseline}
+            done = subprocess.run(["bash", "-c", self.audit_script()], cwd=root, env=env, text=True, capture_output=True)
+            called = None
+            if os.path.exists(log):
+                with open(log, encoding="utf-8") as handle:
+                    called = handle.read().strip()
+            return done.returncode, called
+
+    def test_the_audit_asks_for_a_comparison_only_when_a_snapshot_was_downloaded(self):
+        code, called = self.run_audit("ready")
+        self.assertEqual(code, 0)
+        self.assertIn(" --previous previous/fleet-tags.snapshot.json ", called)
+        self.assertNotIn("--no-baseline", called)
+
+    def test_the_audit_says_there_is_no_baseline_when_the_fetch_step_found_none(self):
+        code, called = self.run_audit("none")
+        self.assertEqual(code, 0)
+        self.assertIn(" --no-baseline ", called)
+        self.assertNotIn("--previous", called)
+
+    def test_the_audit_never_guesses_the_baseline(self):
+        for baseline in ("", "Ready", "true", "ready none"):
+            with self.subTest(baseline):
+                code, called = self.run_audit(baseline)
+                self.assertNotEqual(code, 0)
+                self.assertIsNone(called, "tag_audit.py must not run without a stated baseline")
+
+    def test_the_snapshot_path_is_one_file(self):
+        # The upload, the audit's --snapshot, the download's --dir and the audit's --previous name one file:
+        # an artifact keeps its file's name, so the download puts it back at <dir>/<that name>.
+        uploaded = re.search(r"(?m)^          path: (\S+)$", self.step("uses: actions/upload-artifact@")).group(1)
+        audit = self.step("tag_audit.py check")
+        written = re.search(r"--snapshot (\S+)", audit).group(1)
+        read = re.search(r"--previous ([^\s)]+)", audit).group(1)
+        directory = re.search(r"gh run download .*--dir (\S+)", self.step("name: fetch the snapshot")).group(1)
+        self.assertEqual(written, uploaded)
+        self.assertEqual(read, directory + "/" + os.path.basename(uploaded))
+        self.assertIn(f"mkdir -p {directory}\n", self.step("name: fetch the snapshot"))
+
+    def test_the_fetch_step_takes_a_run_only_if_its_commit_is_on_main(self):
+        # A run on a tag reports the bare tag name as its branch, so a tag named main passes `--branch main`;
+        # the branch name does not make a run main's, its commit does. Only the newest run is judged: an
+        # older one on main is not a way round it.
+        def run(number, sha, event="schedule"):
+            return '{"databaseId": %d, "event": "%s", "headSha": %s}' % (number, event, sha)
+
+        accepted = {
+            "an earlier commit of main": "[" + run(77, '"@ON_MAIN@"') + "]",
+            "main's tip": "[" + run(77, '"@TIP@"', "workflow_dispatch") + "]",
+        }
+        for label, runs in accepted.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertTrue(calls[-1].startswith("run download 77 "))
+        refused = {
+            "a commit off main": "[" + run(77, '"@OFF_MAIN@"') + "]",
+            "a commit the checkout does not have": "[" + run(77, '"' + "f" * 40 + '"') + "]",
+            "no commit reported": '[{"databaseId": 77, "event": "schedule"}]',
+            "a null commit": "[" + run(77, "null") + "]",
+            "the newest run off main, an older one on it": "[" + run(88, '"@OFF_MAIN@"') + ", " + run(77, '"@ON_MAIN@"') + "]",
+            "a deletion run off main": "[" + run(55, '"@OFF_MAIN@"', "delete") + "]",
+        }
+        for label, runs in refused.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertRegex(done.stdout, r"::error::run \d+ reports branch main, but its commit \S+ is not on main")
+                self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
+                self.assertEqual(self.fetch_outputs, {})
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,
@@ -323,19 +513,18 @@ class TagReleaseWorkflow(WorkflowCase):
 class ScriptTestsWorkflow(WorkflowCase):
     name = "script-tests.yml"
 
-    def pull_request_paths(self) -> list[str]:
-        found = re.search(r"(?m)^  pull_request:\n    paths:\n((?:      - .*\n)+)", self.head)
-        self.assertIsNotNone(found, "the pull_request trigger has a paths filter")
-        return [line.strip()[2:].strip('"') for line in found.group(1).splitlines()]
-
     def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
         # tag-release reads that file strictly, and a tag cut for a commit whose parent holds a shape it cannot read
         # records an unknown approver. validate, the required check, does not read it, so the unit test that reads
         # the repository's own copy is the only check on the PR: once a commit is merged, the file at its parent can
-        # no longer change.
-        self.assertIn(".github/CODEOWNERS", self.pull_request_paths())
+        # no longer change. The workflow therefore runs on every pull request. A path filter would have to name this
+        # file, and a branch or type filter could leave the PR out altogether, so none may be nested under the trigger
+        # (only whole-line comments are left out; the workflow's `on:` block is plain).
+        trigger = re.sub(r"(?m)^[ \t]*#.*\n", "", self.head)
+        self.assertRegex(trigger, r"(?m)^  pull_request:[ \t]*\n(?=  \S|\S)",
+                         "the pull_request trigger has a filter under it, so some pull requests run no unit tests")
 
-    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_that_path_to_run(self):
+    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_a_pull_request_to_run(self):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_tag_release.py"), encoding="utf-8") as handle:
             self.assertIn("def test_the_repositorys_own_codeowners_file_can_be_read(", handle.read())
 
