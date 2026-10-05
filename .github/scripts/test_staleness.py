@@ -100,7 +100,7 @@ class TestRuleI(StalenessCase):
         refused = self.rules()["staleness-i-refused"]
         self.assertTrue(refused.red)
         self.assertIn("`0.9.16` (published", refused.detail)
-        self.assertIn("provenance: ref refs/heads/release", refused.detail)
+        self.assertIn("the `provenance` check refused it", refused.detail)
         self.assertNotIn("0.9.17", refused.detail)
 
     def test_the_refused_detail_says_the_signing_certificate_names_the_branch(self):
@@ -113,6 +113,28 @@ class TestRuleI(StalenessCase):
         self.assertTrue(refused.red)
         self.assertIn("its signing certificate names a branch, not the version's tag", refused.detail)
         self.assertNotIn("its attestation binds", refused.detail)
+
+    def test_the_detail_names_only_the_check_so_a_moving_ai_tc_main_does_not_comment_again(self):
+        # A commit-on-main refusal names ai-tc's current main head, which changes on every push there. The router
+        # comments on an open issue whenever its text changes, so the head must stay out of the detail.
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(hours=3))}
+        details = []
+        for head in ("a" * 40, "b" * 40):
+            self.bad = {"0.9.16": ("commit-on-main", f"compare {'c' * 40}...{head} is 'diverged'")}
+            details.append(self.rules()["staleness-i-refused"].detail)
+        self.assertEqual(details[0], details[1])
+        self.assertIn("the `commit-on-main` check refused it", details[0])
+        self.assertNotIn("compare", details[0])
+        self.assertNotIn("a" * 40, details[0])
+
+    def test_the_full_refusal_goes_to_the_run_log(self):
+        self.candidates = ["0.9.16"]
+        self.times = {"0.9.16": stamp(dt.timedelta(minutes=10))}
+        self.bad = {"0.9.16": ("commit-on-main", f"compare {'c' * 40}...{'a' * 40} is 'diverged'")}
+        self.rules()
+        self.assertIn(f"::warning::refused 0.9.16: commit-on-main: compare {'c' * 40}...{'a' * 40} is 'diverged'",
+                      self.log.getvalue())
 
     def test_nothing_new_on_npm_is_green(self):
         rules = self.rules()
