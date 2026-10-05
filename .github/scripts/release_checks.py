@@ -2031,12 +2031,16 @@ def main(argv=None) -> int:
     except ReleaseCheckError as exc:
         print(f"::error::{exc.check}: {exc.detail}", file=sys.stderr)
         return _emit({"error": {"check": exc.check, "detail": exc.detail}}, 1)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        # A file the command line named could not be opened: the caller's mistake. Network and
+        # git failures are InfraError by now, so this is not one of those.
         print(f"::error::{exc}", file=sys.stderr)
         return _emit({"error": {"check": "usage", "detail": str(exc)}}, 2)
     except Exception as exc:
         # Neither a verdict nor a known failure: a defect in this tool, or a document shaped in
         # a way it did not expect. It reached no verdict, so it must not exit 1 (a verdict).
+        # A ValueError lands here too: one that no check turned into a verdict or an outage is
+        # not a mistake in what the caller typed, so it is not labelled `usage`.
         # KeyboardInterrupt and SystemExit are not Exceptions and pass through.
         detail = f"{type(exc).__name__}: {exc}"
         print(f"::error::internal: {detail}", file=sys.stderr)

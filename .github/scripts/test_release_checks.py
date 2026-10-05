@@ -2790,6 +2790,32 @@ class TestCli(unittest.TestCase):
                 self.assertIn(type(error).__name__, document["detail"])
                 self.assertIn("::error::internal: " + type(error).__name__, err)
 
+    def test_a_stray_value_error_is_an_internal_error_not_a_usage_error(self):
+        # `usage` names a mistake in what the caller typed. A ValueError that no check turned
+        # into a verdict or an outage is none of that: it is this tool meeting something it did
+        # not expect, so it reaches no verdict (exit 2) and says so.
+        stray = (
+            ValueError("not a number"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        )
+        for error in stray:
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    code, out, err = cli("classify", "a" * 40, "b" * 40)
+                self.assertEqual(code, 2)
+                document = json.loads(out)["error"]
+                self.assertEqual(document["check"], "internal")
+                self.assertIn(type(error).__name__, document["detail"])
+                self.assertIn("::error::internal: " + type(error).__name__, err)
+
+    def test_a_file_the_command_line_names_but_cannot_be_read_is_a_usage_error(self):
+        # The one failure `usage` still names: a path the caller gave that does not open.
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        code, out, _ = cli("diff-mode", os.path.join(holder.name, "base.json"), os.path.join(holder.name, "head.json"))
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)["error"]["check"], "usage")
+
     def test_an_interrupt_is_not_reported_as_an_internal_error(self):
         for error in (KeyboardInterrupt(), SystemExit(3)):
             with self.subTest(error=type(error).__name__):
