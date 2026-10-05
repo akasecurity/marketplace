@@ -87,13 +87,12 @@ def _depth(value) -> int:
 
 
 def parse_pr_json(text: str):
-    """rc.parse_json for a file the pull request supplies. JSON that nests too deeply to read
-    safely is a ValueError, like any other text that does not parse: the file is at fault, so
-    it is a failed check and not a missing verdict."""
-    try:
-        doc = rc.parse_json(text)
-    except RecursionError as exc:
-        raise ValueError("it nests deeper than the JSON parser can read") from exc
+    """rc.parse_json for a file the pull request supplies, with a depth limit of its own. JSON
+    that nests too deeply to read safely is a ValueError, like any other text that does not
+    parse: the file is at fault, so it is a failed check and not a missing verdict. Text nested
+    past what the JSON parser itself can read is already a ValueError from rc.parse_json; this
+    refuses what parses but would still end the code below in the interpreter's recursion limit."""
+    doc = rc.parse_json(text)
     if _depth(doc) > MAX_JSON_DEPTH:
         raise ValueError(f"it nests deeper than {MAX_JSON_DEPTH} levels")
     return doc

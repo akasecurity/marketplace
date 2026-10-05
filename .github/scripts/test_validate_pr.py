@@ -712,9 +712,11 @@ class TestDeepJson(unittest.TestCase):
         self.assertLess(vp._depth(ts.manifest()), vp.MAX_JSON_DEPTH // 4)
 
     def test_nesting_past_the_parser_and_nesting_inside_it_both_fail_to_parse(self):
-        # 100,000 levels end the JSON parser itself in RecursionError. 2,000 parse, and would
-        # end the code that reads the parsed value (comparisons, the rename search) instead.
+        # 100,000 levels end the JSON parser itself in RecursionError, which rc.parse_json reports
+        # as a ValueError of its own. 2,000 parse, and would end the code that reads the parsed
+        # value (comparisons, the rename search) instead, so validate's depth limit refuses them.
         for levels in (vp.MAX_JSON_DEPTH + 1, 2000, 100_000):
+            reason = "too deeply nested" if levels == 100_000 else "nests deeper"
             with self.subTest(levels=levels):
                 deep = '{"renames": %s, "plugins": []}' % nested(levels)
                 for path in (rc.MANIFEST, ".agents/plugins/marketplace.json", "plugins.json"):
@@ -722,7 +724,7 @@ class TestDeepJson(unittest.TestCase):
                     head[path] = deep
                     report = run(pull(**HUMAN), files(ts.manifest()), head, [path])
                     failed_with(self, report, f"{path} does not parse at the PR head")
-                    failed_with(self, report, "nests deeper")
+                    failed_with(self, report, reason)
                     self.assertEqual((report.exit_code, report.infra), (1, ""))
                 head = files(ts.manifest())
                 head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(levels)
