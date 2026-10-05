@@ -53,6 +53,7 @@ jobs:
       # rather than by the passage of time. Every other failure fails the step, so a hiccup cannot
       # read as "nothing moved".
       - name: fetch the snapshot the last green run kept
+        id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -64,25 +65,45 @@ jobs:
              | .[0].databaseId // empty')
           if [ -z "$run_id" ]; then
             echo "::notice::no earlier green tag-audit run on main; the frozen list has to record every fleet-v tag"
+            echo "baseline=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           kept=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" --jq \
             '[.artifacts[] | select(.name == "fleet-tags-snapshot")]
              | if length == 0 then "missing" elif (map(.expired) | all) then "expired" else "ready" end')
           case "$kept" in
-            ready) gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous ;;
-            expired) echo "::notice::run $run_id kept a snapshot that has expired; the frozen list has to record every fleet-v tag" ;;
-            missing) echo "::notice::run $run_id is the last green run but lists no fleet-tags-snapshot artifact; the frozen list has to record every fleet-v tag" ;;
+            ready)
+              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous
+              echo "baseline=ready" >> "$GITHUB_OUTPUT"
+              ;;
+            expired)
+              echo "::notice::run $run_id kept a snapshot that has expired; the frozen list has to record every fleet-v tag"
+              echo "baseline=none" >> "$GITHUB_OUTPUT"
+              ;;
+            missing)
+              echo "::notice::run $run_id is the last green run but lists no fleet-tags-snapshot artifact; the frozen list has to record every fleet-v tag"
+              echo "baseline=none" >> "$GITHUB_OUTPUT"
+              ;;
             *) echo "::error::run $run_id: unexpected snapshot state '$kept'"; exit 1 ;;
           esac
+      # The fetch step says which: a snapshot it downloaded is passed as --previous, and tag_audit.py is red
+      # if that file is not there; no snapshot is passed as --no-baseline, which applies the coverage rule.
+      # Neither is ever guessed from a file's absence.
       - name: audit
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json
-          --previous previous/fleet-tags.snapshot.json --snapshot snapshot/fleet-tags.snapshot.json --results
+          BASELINE: ${{ steps.fetch.outputs.baseline }}
+        run: |
+          set -eu
+          case "$BASELINE" in
+            ready) baseline=(--previous previous/fleet-tags.snapshot.json) ;;
+            none) baseline=(--no-baseline) ;;
+            *) echo "::error::the fetch step reported the baseline as '$BASELINE', not ready or none"; exit 1 ;;
+          esac
+          python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json \
+            "${baseline[@]}" --snapshot snapshot/fleet-tags.snapshot.json --results
       # Kept only from a green audit, so a moved tag stays red until a person explains it: a reviewed
       # pull request that re-freezes the tag list (tag_audit.py freeze) is that explanation, and the next
       # green run keeps the new state. It lasts 90 days: after that long without a green run of the file

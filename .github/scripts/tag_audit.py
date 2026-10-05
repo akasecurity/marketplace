@@ -189,12 +189,12 @@ def uncovered(current: list[dict], frozen: list[dict] | None) -> list[str]:
 
 
 def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
-              baseline_expected: bool = False) -> list[str]:
+              no_baseline: bool = False) -> list[str]:
     """Every problem: the ledger's, the rulesets', the bot environment's, and then the snapshot comparison's.
-    `baseline_expected` says the caller asked for the comparison (a snapshot path was given): if the snapshot
-    is then absent (previous None), the frozen list has to cover every tag. A caller that never asks, as
-    tag-release does not, gets neither the comparison nor the coverage rule, and still gets the rest: it
-    runs in the same environment, so it refuses on drift in it too."""
+    `previous` is the snapshot an earlier green run kept. `no_baseline` says the caller has none to give
+    (the workflow found none was kept, it expired or it was deleted): the frozen list then has to cover every
+    tag. A caller that gives neither, as tag-release does not, gets neither the comparison nor the coverage
+    rule, and still gets the rest: it runs in the same environment, so it refuses on drift in it too."""
     # The rulesets are checked once, by check_rulesets below (it adds exactly-one-per-name and
     # the fetch-and-merge rule); release_checks.audit_tags would otherwise check them a second
     # time and file every ruleset problem twice. test_the_configured_rulesets_pass pins RULESETS
@@ -203,7 +203,7 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
                 for problem in release_checks.audit_tags(git.repo_dir, frozen, check_rulesets=False)]
     problems += check_rulesets(gh)
     problems += check_environment(gh)
-    if previous is not None or baseline_expected:
+    if previous is not None or no_baseline:
         # An unreadable list is already a ledger problem above, and accepts nothing here.
         rows = release_checks._tag_rows(frozen, "frozen tag list", [])
         if previous is not None:
@@ -225,8 +225,12 @@ def main(argv: list[str] | None = None) -> int:
     check = sub.add_parser("check")
     check.add_argument("--repo-dir", default=".")
     check.add_argument("--frozen", required=True)
-    check.add_argument("--previous", help="the snapshot an earlier green run kept; given but absent, the frozen "
-                                           "list has to record every fleet-v tag")
+    baseline = check.add_mutually_exclusive_group()
+    baseline.add_argument("--previous", help="the snapshot an earlier green run kept; the run is red if the file "
+                                              "is not there")
+    baseline.add_argument("--no-baseline", action="store_true",
+                          help="there is no earlier snapshot (none was kept, it expired or it was deleted): the "
+                               "frozen list has to record every fleet-v tag")
     check.add_argument("--snapshot")
     check.add_argument("--results", action="store_true", help="write the outputs results and red, and exit 0")
     freeze = sub.add_parser("freeze")
@@ -239,16 +243,18 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(freeze_text(git))
         print(f"froze {len(git.fleet_tags())} fleet-v tags into {args.out}")
         return 0
-    previous = None
+    previous, absent = None, []
     if args.previous is not None:
         if os.path.exists(args.previous):
             with open(args.previous, encoding="utf-8") as handle:
                 previous = json.load(handle)
         else:
-            print("::notice::no snapshot from an earlier green tag-audit run to compare against; "
-                  "the frozen list has to record every fleet-v tag")
+            # The workflow says it downloaded a snapshot, so a file that is not there is a break in the wiring
+            # between its steps, and reading it as "no baseline" would leave the comparison off for good.
+            absent = [f"the snapshot the workflow downloaded ({args.previous}) is missing, so this run could not "
+                      "compare the tags with the last green run's"]
     gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
-    problems = run_check(git, gh, args.frozen, previous, baseline_expected=args.previous is not None)
+    problems = absent + run_check(git, gh, args.frozen, previous, no_baseline=args.no_baseline)
     if args.snapshot:
         os.makedirs(os.path.dirname(args.snapshot) or ".", exist_ok=True)
         with open(args.snapshot, "w", encoding="utf-8") as handle:

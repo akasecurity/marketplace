@@ -249,8 +249,10 @@ class TagAuditWorkflow(WorkflowCase):
                     """))
             os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
             log = os.path.join(root, "gh.log")
+            output = os.path.join(root, "github-output")
             env = {"PATH": os.path.dirname(stub) + os.pathsep + os.environ["PATH"], "GH_LOG": log,
                    "GITHUB_REPOSITORY": "akasecurity/marketplace", "RUNS": runs, "ARTIFACTS": artifacts,
+                   "GITHUB_OUTPUT": output,
                    **({"LIST_FAILS": "1"} if list_fails else {}), **({"API_FAILS": "1"} if api_fails else {}),
                    **({"DOWNLOAD_FAILS": "1"} if download_fails else {})}
             work = os.path.join(root, "work")
@@ -261,6 +263,11 @@ class TagAuditWorkflow(WorkflowCase):
             if os.path.exists(log):
                 with open(log, encoding="utf-8") as handle:
                     calls = handle.read().splitlines()
+            # What the step handed on to the next one: "baseline=ready" or "baseline=none" (empty if it said nothing).
+            self.fetch_outputs = {}
+            if os.path.exists(output):
+                with open(output, encoding="utf-8") as handle:
+                    self.fetch_outputs = dict(line.split("=", 1) for line in handle.read().splitlines())
             return done, calls
 
     def test_the_fetch_step_downloads_the_last_green_runs_snapshot(self):
@@ -327,6 +334,83 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertNotIn("expired", done.stdout)
                 self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
                 self.assertFalse([call for call in calls if call.startswith("run download")])
+
+    def test_the_fetch_step_says_whether_there_is_a_baseline(self):
+        cases = {
+            "a downloaded snapshot": (dict(runs=RUN_77, artifacts=READY), "ready"),
+            "no earlier green run": (dict(), "none"),
+            "only pull request runs": (dict(runs='[{"databaseId": 99, "event": "pull_request"}]', artifacts=READY), "none"),
+            "an expired snapshot": (dict(runs=RUN_77, artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}'), "none"),
+            "no snapshot listed": (dict(runs=RUN_77, artifacts='{"artifacts": []}'), "none"),
+        }
+        for label, (kwargs, baseline) in cases.items():
+            with self.subTest(label):
+                done, _ = self.run_fetch(**kwargs)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.fetch_outputs, {"baseline": baseline})
+
+    def test_the_fetch_step_says_nothing_when_it_fails(self):
+        listed = dict(runs=RUN_77, artifacts=READY)
+        for label, kwargs in {"the run listing fails": dict(runs=RUN_77, list_fails=True),
+                              "the artifact listing fails": dict(listed, api_fails=True),
+                              "the download fails": dict(listed, download_fails=True)}.items():
+            with self.subTest(label):
+                done, _ = self.run_fetch(**kwargs)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertEqual(self.fetch_outputs, {}, "a failed download must not read as 'ready'")
+
+    def audit_script(self) -> str:
+        audit = self.step("tag_audit.py check")
+        return textwrap.dedent(audit.split("run: |\n", 1)[1].split("\n      - ", 1)[0])
+
+    def run_audit(self, baseline: str):
+        """Run the audit step's script with BASELINE as the fetch step would have set it, and a stand-in for
+        python3 that records how tag_audit.py was called. Returns (exit code, the arguments, or None)."""
+        with tempfile.TemporaryDirectory() as root:
+            stub = os.path.join(root, "bin", "python3")
+            os.makedirs(os.path.dirname(stub))
+            log = os.path.join(root, "args")
+            with open(stub, "w", encoding="utf-8") as handle:
+                handle.write('#!/bin/sh\necho "$@" >> "$ARGS_LOG"\n')
+            os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+            env = {"PATH": os.path.dirname(stub) + os.pathsep + os.environ["PATH"], "ARGS_LOG": log, "BASELINE": baseline}
+            done = subprocess.run(["bash", "-c", self.audit_script()], cwd=root, env=env, text=True, capture_output=True)
+            called = None
+            if os.path.exists(log):
+                with open(log, encoding="utf-8") as handle:
+                    called = handle.read().strip()
+            return done.returncode, called
+
+    def test_the_audit_asks_for_a_comparison_only_when_a_snapshot_was_downloaded(self):
+        code, called = self.run_audit("ready")
+        self.assertEqual(code, 0)
+        self.assertIn(" --previous previous/fleet-tags.snapshot.json ", called)
+        self.assertNotIn("--no-baseline", called)
+
+    def test_the_audit_says_there_is_no_baseline_when_the_fetch_step_found_none(self):
+        code, called = self.run_audit("none")
+        self.assertEqual(code, 0)
+        self.assertIn(" --no-baseline ", called)
+        self.assertNotIn("--previous", called)
+
+    def test_the_audit_never_guesses_the_baseline(self):
+        for baseline in ("", "Ready", "true", "ready none"):
+            with self.subTest(baseline):
+                code, called = self.run_audit(baseline)
+                self.assertNotEqual(code, 0)
+                self.assertIsNone(called, "tag_audit.py must not run without a stated baseline")
+
+    def test_the_snapshot_path_is_one_file(self):
+        # The upload, the audit's --snapshot, the download's --dir and the audit's --previous name one file:
+        # an artifact keeps its file's name, so the download puts it back at <dir>/<that name>.
+        uploaded = re.search(r"(?m)^          path: (\S+)$", self.step("uses: actions/upload-artifact@")).group(1)
+        audit = self.step("tag_audit.py check")
+        written = re.search(r"--snapshot (\S+)", audit).group(1)
+        read = re.search(r"--previous ([^\s)]+)", audit).group(1)
+        directory = re.search(r"gh run download .*--dir (\S+)", self.step("name: fetch the snapshot")).group(1)
+        self.assertEqual(written, uploaded)
+        self.assertEqual(read, directory + "/" + os.path.basename(uploaded))
+        self.assertIn(f"mkdir -p {directory}\n", self.step("name: fetch the snapshot"))
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,
