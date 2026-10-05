@@ -110,11 +110,14 @@ code owner whose latest review approves the PR's final head; with none, the mess
 `approver: none` and who merged it, and when CODEOWNERS at the commit's parent could not be read
 (or is not a file) the PR is still named but the approver is `unknown`, with the reason. Whoever
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
-or had not finished) also gets an `approver-note` saying so; a commit no pull request merged has no
-head to look at, so it gets `pr: none` and no such note. Each value is written on one line, with a
-character that is not printable written as an escape, so text from a manifest cannot add a line of
-its own to the message. Rulesets let only the release bot create a `fleet-v` tag and nobody at all
-move or delete one, and refuse every other tag name.
+or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
+`pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
+in another workflow passes nothing, and a run made after the merge (an edit of the closed PR, a
+manual re-run) decides nothing. A commit no pull request merged has no head to look at, so it gets
+`pr: none` and no such note. Each value is written on one line, with a character that is not
+printable written as an escape, so text from a manifest cannot add a line of its own to the message.
+Rulesets let only the release bot create a `fleet-v` tag and nobody at all move or delete one, and
+refuse every other tag name.
 
 - **Only a tag cut by hand is signed.** `fleet-v1` through `fleet-v9`, cut before `tag-release`
   existed, are SSH-signed by a person; the tags `tag-release` cuts are annotated but **not
@@ -266,21 +269,28 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
   runner's clock (only a direct push can carry one, for example from a machine with the wrong time)
   is not waited for: it is tagged at once, so its date never holds the tags after it. A restore
   after the entry was removed is compared with the last version pinned before the removal, so a
-  lower one records `rollback-from`.
-  A tag or a branch deletion that GitHub refuses ends the run with one error naming the ruleset,
-  not a traceback, and a failed sweep runs no clean-up.
+  lower one records `rollback-from`. A commit whose manifest cannot be read (not JSON, nested too
+  deeply, a repeated key, an ambiguous ai-tc entry) is no pin change and never stops the sweep: a
+  commit already on `main` cannot be mended, so a stop would last for good. The run logs a warning
+  for it and goes on, comparing each later commit with the nearest earlier one that reads. A
+  `rollback-safety.json` that cannot be read gives `store-migration: unknown`. A tag or a branch
+  deletion that GitHub refuses ends the run with one error naming the ruleset, not a traceback, and
+  a failed sweep runs no clean-up.
 - **`staleness`** (hourly) files an issue when a passing release above every pin (`main`'s
   included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
   only the check that refused it, and the run log holds the reason), the release checks reached no
-  verdict on a version that has been on npm for over an hour, or whose publish
-  time is unknown (its own issue, naming the version and the check that did not finish), a bot PR
-  is open for 24 hours, a pin change is untagged for an hour, a stray tag or a second ref named
-  `main` exists, or the ai-tc entry is gone; it posts a "rolled back, awaiting fix-forward" notice
-  while the latest tag is a rollback. While such a version has no verdict, the unpinned-release and
-  refused-version rules can still go red from the versions that did finish, but they are not
-  cleared. A younger version is left out, because neither rule can name it yet, so an outage never
-  closes the issue of a version they could name. Every script that reads `main` uses its full ref,
-  so a tag named `main` cannot stand in for the branch before the stray-ref rule reports it.
+  verdict on a version that has been on npm for over an hour, or whose publish time is unknown (its
+  own issue, naming the version and the check that did not finish), a bot PR is open for 24 hours,
+  a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
+  ai-tc entry is gone from `main` or `main`'s manifest cannot be read (the reason is in the issue;
+  nothing is imported until a PR mends it); it posts a "rolled back, awaiting fix-forward" notice
+  while the latest tag is a rollback. A commit whose manifest cannot be read is no pin change, as
+  for `tag-release`: the run logs a warning for it and the untagged-pin-change rule goes on past
+  it. While such a version has no verdict, the unpinned-release and refused-version rules can still
+  go red from the versions that did finish, but they are not cleared. A younger version is left
+  out, because neither rule can name it yet, so an outage never closes the issue of a version they
+  could name. Every script that reads `main` uses its full ref, so a tag named `main` cannot stand
+  in for the branch before the stray-ref rule reports it.
 - **`tag-audit`** (daily, on every tag push, on the deletion of a tag or a branch, and by hand)
   checks the `fleet-v` ledger against the frozen list, the last green run and `main`'s history,
   that the rulesets are active as configured, and that the `marketplace-bot` environment admits
@@ -306,10 +316,12 @@ activity. A disabled workflow makes no failed run and files no issue, so `import
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
   added that is not the merge of a PR with a code owner's approval of its final head, from someone
   other than the head's last pusher and not since withdrawn, and a passing `validate` check from
-  GitHub Actions on that head (its latest run decides). The branch commits a merge-commit merge
-  brings in are not on that line and are not checked, and a rebase merge puts every rebased commit
-  on it, so each but the last is reported, worded as probably part of a rebase merge of the pull
-  request GitHub links it to, which is why merges are squash-only. The last pusher is the author
+  GitHub Actions on that head (its latest run decides, and only a run of `validate.yml` that
+  `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
+  applies, so a green re-run after the merge clears nothing). The branch commits a merge-commit
+  merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
+  commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
+  pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
   or committer of the head commit (`web-flow` aside): the audit does not use GitHub's activity API,
   which does record pushers, because what it records for a push made by the App or by auto-merge is
   unverified, and a head that names neither is reported, since an approval could then be the
