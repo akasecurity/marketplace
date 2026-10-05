@@ -168,7 +168,9 @@ class Router:
 
     def find_cleared(self, result: Result) -> dict | None:
         """The rule's issue this router closed within REOPEN_WITHIN, the latest if several. The router leaves
-        a `cleared` marker when it closes an issue (apply), so an issue a person closed never matches."""
+        a `cleared` marker when it closes an issue (apply), so an issue only a person ever closed has no marker
+        and never matches. One the router cleared, a person reopened and closed again keeps its marker, and
+        matches while it is inside the window."""
         found: tuple[dt.datetime, dict] | None = None
         for issue in self._issues("closed", self.now - REOPEN_WITHIN):
             if read_marker(issue.get("body"), "rule") != result.rule:
@@ -188,7 +190,7 @@ class Router:
         Red with no open issue opens one, unless the router closed this rule's issue less than REOPEN_WITHIN
         ago: that issue is reopened instead, so a rule that flaps keeps one issue, and keeps the creation time
         the 48-hour escalation counts from. Only a result that closes by itself (auto_close) is looked up that
-        way; an issue a person closed, or one the router never closes, is not reopened. Clear closes the
+        way; an issue only a person ever closed, or one the router never closes, is not reopened. Clear closes the
         issue and records when, in the same edit."""
         if result.red is None:
             return f"{result.rule}: not evaluated this run; its issue is left as it is"

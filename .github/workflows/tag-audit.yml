@@ -1,14 +1,18 @@
 name: tag-audit
 
-# Daily, on every tag push or deletion, and on demand: detect a fleet-v tag that
-# moved or vanished, a tag that should not exist, a break in the tag ledger, or a
-# ruleset that was edited or disabled (AGENTS.md, "The workflows"). Detection, not
-# prevention: the rulesets prevent. tag-release runs this workflow's ledger and
-# ruleset checks before it creates a tag (not its comparison with the last green
-# run's snapshot of the tag objects); only this workflow makes that comparison. A
-# tag pushed at an old commit that has no copy of this file starts no run; the
-# daily run and staleness's hourly ref check still see it. Red goes to one issue,
-# filed by the only job here that may write issues.
+# Daily, on a tag push or deletion, and on demand: detect a fleet-v tag that
+# moved or vanished, a tag that should not exist, a break in the tag ledger, a
+# ruleset that was edited or disabled, or a change to the deployment branches of
+# the marketplace-bot environment (AGENTS.md, "The workflows"). Detection, not
+# prevention: the rulesets prevent. GitHub starts no run for a push or a deletion
+# that touches more than three tags at once, so the tag trigger is not a guaranteed
+# immediate check: the daily run sees such a change within a day. A tag pushed at
+# an old commit that has no copy of this file starts no run either; the daily run
+# and staleness's hourly ref check still see it. tag-release runs this workflow's
+# ledger, ruleset and environment checks before it creates a tag (not its comparison
+# with the last green run's snapshot of the tag objects); only this workflow makes
+# that comparison. Red goes to one issue, filed by the only job here that may write
+# issues.
 
 on:
   schedule:
@@ -52,7 +56,10 @@ jobs:
       # A snapshot that is expired (they last 90 days), or that the green run no longer lists
       # (for instance, deleted), gives no baseline: a notice names which, and tag_audit.py then requires the
       # frozen list to record every fleet-v tag, so the baseline is re-set by a reviewed re-freeze
-      # rather than by the passage of time. Every other failure fails the step, so a hiccup cannot
+      # rather than by the passage of time. That rule sees only the tags that exist: a tag cut after the
+      # frozen list and deleted since the lost snapshot is not noticed here (staleness reports its pin
+      # change as untagged once it has stood for an hour, and tag-release cuts the tag again; neither
+      # says that a tag was deleted). Every other failure fails the step, so a hiccup cannot
       # read as "nothing moved".
       - name: fetch the snapshot the last green run kept
         id: fetch
