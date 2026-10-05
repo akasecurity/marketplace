@@ -9,6 +9,7 @@ from unittest import mock
 
 import issue_router as rt
 import main_audit as ma
+import tag_release as tr
 from fakes import BOT, CODEOWNERS, REPO, FakeGit, FakeGitHub
 from ghapi import GitHubError
 from gitrepo import Git
@@ -213,6 +214,9 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
                          [(f"main-audit-{rebased_first[:12]}", True, False), ("main-audit", False, False)])
         self.assertIn("is not the merge commit of any pull request", results[0].detail)
+        self.assertIn(f"links it to PR #40, which merged into main at `{rebased_last}`", results[0].detail)
+        self.assertIn("one of the commits of a rebase merge", results[0].detail)
+        self.assertNotIn("pushed to main directly", results[0].detail)
         self.assertEqual(results[-1].detail, "2 commit(s) audited in this push, 1 flagged.")
 
     def test_a_rewrite_audits_every_first_parent_commit_after_the_merge_base(self):
@@ -266,6 +270,40 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual((results[0].rule, results[0].label, results[0].red, results[0].auto_close),
                          ("main-audit-s1", "main-audit", True, False))
         self.assertIn("pushed to main directly", results[0].detail)
+
+    def test_a_commit_linked_to_a_pull_request_merged_at_another_commit_is_called_part_of_a_rebase_merge(self):
+        other_merge = [{"number": 40, "merge_commit_sha": "s2", "merged_at": "2026-10-05T10:00:00Z",
+                        "base": {"ref": "main"}}]
+        gh = github(pulls=other_merge)
+        results = self.audit(gh)
+        self.assertEqual([(item.rule, item.red, item.auto_close) for item in results],
+                         [("main-audit-s1", True, False)])
+        self.assertIn("`s1` is not the merge commit of any pull request. GitHub links it to PR #40, which merged "
+                      "into main at `s2`", results[0].detail)
+        self.assertIn("a rebase merge", results[0].detail)
+        self.assertIn("allows squash merges only", results[0].detail)
+        self.assertNotIn("pushed to main directly", results[0].detail)
+        # The wording comes from the answer the lookup already read: no ask beyond the lookup's own.
+        self.assertEqual(len(gh.called("GET", R("commits/s1/pulls"))), tr.ASSOCIATION_ATTEMPTS)
+
+    def test_a_commit_linked_only_to_a_pull_request_that_did_not_merge_into_main_is_a_direct_push(self):
+        stamp = "2026-10-05T10:00:00Z"
+        for label, pull in (
+                ("an open pull request", {"number": 41, "merge_commit_sha": None, "merged_at": None,
+                                          "base": {"ref": "main"}}),
+                ("a closed one that never merged", {"number": 42, "merge_commit_sha": "s2", "merged_at": None,
+                                                    "base": {"ref": "main"}}),
+                ("one merged into another branch", {"number": 43, "merge_commit_sha": "s2", "merged_at": stamp,
+                                                    "base": {"ref": "release"}}),
+                ("one with no base", {"number": 44, "merge_commit_sha": "s2", "merged_at": stamp}),
+                ("a merged one with no merge commit", {"number": 45, "merge_commit_sha": None, "merged_at": stamp,
+                                                       "base": {"ref": "main"}})):
+            with self.subTest(label):
+                results = self.audit(github(pulls=[pull]))
+                self.assertEqual(len(results), 1)
+                self.assertIn("is not the merge commit of any pull request: it was pushed to main directly.",
+                              results[0].detail)
+                self.assertNotIn("rebase", results[0].detail)
 
     def test_an_approval_on_a_stale_head_does_not_count(self):
         results = self.audit(github(reviews=[{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]))
