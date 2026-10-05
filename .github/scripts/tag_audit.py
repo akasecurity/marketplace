@@ -1,5 +1,6 @@
-"""tag-audit's checks. tag-release runs tag-audit's ledger and ruleset checks before it creates anything (not its
-comparison with the last green run's snapshot of the tag objects); only tag-audit's own run makes that comparison.
+"""tag-audit's checks. tag-release runs tag-audit's ledger, ruleset and environment checks before it creates
+anything (not its comparison with the last green run's snapshot of the tag objects); only tag-audit's own run
+makes that comparison.
 
 Detection, not prevention: the rulesets prevent, and this notices an edit to
 one of them, a change to the deployment branches of the `marketplace-bot`
@@ -17,12 +18,16 @@ admin's read-back cover those.
 
 A change to a tag since the last green run stays red until a reviewed pull
 request re-freezes the tag list (`freeze`), which is how a person records
-that it is explained. When the run was asked to compare (`--previous`) but
-no snapshot exists, because none was ever kept, it expired or it was deleted,
-the comparison is replaced by a stricter rule: the frozen list must record
-every fleet-v tag, so the baseline is re-set in a reviewed pull request
-rather than by the passage of time. A run that is not asked to compare
-(tag-release's) applies neither.
+that it is explained. When the run is told there is no snapshot to compare
+with (`--no-baseline`: none was ever kept, it expired or it was deleted), the
+comparison is replaced by a stricter rule: the frozen list must record every
+fleet-v tag that exists, so the baseline is re-set in a reviewed pull request
+rather than by the passage of time. That rule sees only tags that exist. A tag
+cut after the frozen list and deleted since the lost snapshot is not seen by
+this audit: staleness reports its pin change as untagged once it has stood for
+an hour, and tag-release cuts the tag again on its next run, but neither says
+that a tag was deleted. A `--previous` file that is not there is red, and a
+run given neither flag (tag-release's) applies neither rule.
 """
 from __future__ import annotations
 
