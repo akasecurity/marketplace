@@ -6,15 +6,18 @@ release_checks, and prints one JSON plan. `open-pr` runs in the
 marketplace-bot environment with the bot App's installation credential: it
 re-reads main through the API, writes the bot commit through the Git Data API
 (no local push and no persisted credential), creates the branch with a create-only
-ref, never a force-push (an existing branch with an open PR is skipped; one the bot's
-closed PR used is skipped on a plain forward run, and deleted and created again only by a
-reimport or rollback dispatch; one no PR ever used was left by a run that died before
+ref, never a force-push (an existing branch with an open bot PR is skipped, and one with an
+open PR of anyone else's is a red refusal, since deleting the branch would close that PR; one
+the bot's closed PR used is skipped on a plain forward run, and deleted and created again only
+by a reimport or rollback dispatch; one no PR ever used was left by a run that died before
 opening it, and any run deletes it and creates it again), opens the PR and enables
 auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
 version while a higher one has no verdict. Every decision about an open or closed PR looks at
 the pull requests the release bot opened and no others (release_checks.BOT_LOGIN), so a person's
-PR from a `bot/` branch name neither stops the schedule nor is closed; while no bot login is
+PR from a `bot/` branch name neither stops the schedule nor is closed, with one exception:
+open-pr refuses, red, to delete a branch that a person's open PR is from, and stays red for
+that version until the person closes the PR or renames its branch. While no bot login is
 configured the importer refuses, red. AGENTS.md ("ai-tc is pinned", "The workflows") describes
 the flow.
 """
@@ -32,7 +35,8 @@ from typing import Any, Callable
 import release_checks
 from ghapi import GitHub, GitHubError
 from gitrepo import Git
-from release_checks import FLEET_TAG, INTEGRITY, MANIFEST, PACKAGE, SAFETY_FILE, SEMVER, SHA40, dump_json, vkey
+from release_checks import (FLEET_TAG, INTEGRITY, MANIFEST, MIGRATION_TAG, PACKAGE, RUN_URL, SAFETY_FILE, SEMVER,
+                            SHA40, SHASUM, dump_json, vkey)
 
 # The paths, patterns, version order and JSON writer above are release_checks.py's, the
 # module validate runs, so the importer and validate cannot disagree about them. These
@@ -126,13 +130,30 @@ def bot_login() -> str:
 
 def bot_pulls(pulls: list[dict]) -> list[dict]:
     """The pull requests the release bot opened. Every importer decision about an open or closed PR reads
-    through this, as validate does when it asks whose PR it is judging."""
+    through this, as validate does when it asks whose PR it is judging, except one refusal: open_pr lists
+    every author's open PRs from its branch, and refuses red to delete the branch of a person's."""
     login = bot_login()
     return [p for p in pulls if p["author"] == login]
 
 
 def pulls_by(pulls: list[dict], pattern: re.Pattern) -> list[dict]:
     return [p for p in pulls if pattern.fullmatch(p["head"])]
+
+
+def merged_bot_versions(bot_closed: list[dict]) -> set[str]:
+    """Versions the release bot's merged pull requests put on main or took it back from: the version
+    of each merged bot/pin-ai-tc-<v> and the `from` of each merged bot/rollback-ai-tc-<from>-to-<to>.
+    A fleet-v tag records a pin too, but tags are cut after the merge and only while tag-release is
+    green, so a version can sit on main untagged; a version a rollback moved away from is exactly the
+    one no tag may name. `bot_closed` is already the bot's own pull requests (bot_pulls)."""
+    versions = set()
+    for pr in bot_closed:
+        if not pr["merged"]:
+            continue
+        match = PIN_BRANCH.fullmatch(pr["head"]) or ROLLBACK_BRANCH.fullmatch(pr["head"])
+        if match:
+            versions.add(match.group(1))
+    return versions
 
 
 def edit_pin(raw: str, plan: dict) -> str:
@@ -170,34 +191,77 @@ def add_safety_entry(raw: str, version: str, entry: dict) -> str | None:
     return dump_json(doc)
 
 
+# The title is built here, from the mode and the versions, by the planner and again by open-pr: a plan's own
+# "title" field is never read back, so nothing in it can reach the commit message or the PR.
 MODE_RULES: dict[str, dict] = {
     "forward": {"branch": lambda plan: f"bot/pin-ai-tc-{plan['version']}",
-                "required": ("version", "from_version", "integrity", "git_commit")},
+                "title": lambda plan: f"feat: advance the ai-tc pin to {plan['version']}",
+                "required": ("version", "from_version", "integrity", "git_commit", "shasum", "run_url",
+                             "highest_pinned")},
     "rollback": {"branch": lambda plan: f"bot/rollback-ai-tc-{plan['from_version']}-to-{plan['version']}",
-                 "required": ("version", "from_version", "integrity", "git_commit")},
+                 "title": lambda plan: f"fix: roll the ai-tc pin back from {plan['from_version']} to {plan['version']}",
+                 "required": ("version", "from_version", "integrity", "git_commit", "shasum", "run_url",
+                              "highest_pinned")},
 }
+CLASSIFICATIONS = ("additive", "not-rollback-safe")
 
 
 def check_plan(plan: dict) -> None:
-    """The verify job's output crosses a job boundary: re-check its shape before acting on it."""
+    """The verify job's output crosses a job boundary: re-check it before acting on it. Every field that
+    reaches the commit, the branch, the labels or the PR text is checked here or built by open-pr itself."""
     rules = MODE_RULES.get(plan.get("mode"))
     if rules is None:
         raise Refused(f"the plan names mode {plan.get('mode')!r}, which open-pr does not handle")
     for key in rules["required"]:
         if not plan.get(key):
             raise Refused(f"the plan has no {key}")
-    for key, pattern in (("version", SEMVER), ("from_version", SEMVER), ("integrity", INTEGRITY), ("git_commit", SHA40)):
+    # A value of None is allowed where the key is not required: floor and target_tag are None unless a
+    # rollback names them.
+    for key, pattern in (("version", SEMVER), ("from_version", SEMVER), ("integrity", INTEGRITY), ("git_commit", SHA40),
+                         ("shasum", SHASUM), ("run_url", RUN_URL), ("highest_pinned", SEMVER), ("floor", SEMVER),
+                         ("target_tag", FLEET_TAG)):
         value = plan.get(key)
         if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
             raise Refused(f"the plan's {key} {value!r} is malformed")
+    for key, pattern in (("migrations", MIGRATION_TAG), ("crossed", SEMVER)):
+        value = plan.get(key)
+        if not (isinstance(value, list) and all(isinstance(item, str) and pattern.fullmatch(item) for item in value)):
+            raise Refused(f"the plan's {key} {value!r} is malformed")
+    if plan.get("classification") not in CLASSIFICATIONS:
+        raise Refused(f"the plan's classification {plan.get('classification')!r} is malformed")
+    for key in ("reimport", "below_floor"):
+        if not isinstance(plan.get(key), bool):
+            raise Refused(f"the plan's {key} {plan.get(key)!r} is malformed")
     if plan.get("branch") != rules["branch"](plan):
         raise Refused(f"the plan's branch {plan.get('branch')!r} does not match its mode and versions")
     if not set(plan.get("labels", [])) <= LABELS:
         raise Refused(f"the plan's labels {plan.get('labels')!r} are not the importer's")
+    check_plan_safety_entry(plan)
+
+
+def check_plan_safety_entry(plan: dict) -> None:
+    """The entry the plan asks open-pr to write into rollback-safety.json: none for a rollback, and for a
+    forward import a well-formed entry for the plan's version that agrees with the plan's own
+    classification, migrations and attested commit."""
+    entry = plan.get("safety_entry")
+    if entry is None:
+        return
+    if plan["mode"] != "forward":
+        raise Refused(f"the plan's safety_entry {entry!r} is malformed: only a forward import writes one")
+    if release_checks.safety_problems({"versions": {plan["version"]: entry}}):
+        raise Refused(f"the plan's safety_entry {entry!r} is malformed")
+    if (entry["classification"], entry["migrations"], entry["to"]) != (
+            plan["classification"], plan["migrations"], plan["git_commit"]):
+        raise Refused(f"the plan's safety_entry {entry!r} does not agree with the plan's classification, "
+                      "migrations and commit")
 
 
 def pr_body(plan: dict, run_url: str) -> str:
     version, current, branch = plan["version"], plan["from_version"], plan["branch"]
+    # What the provenance check requires of a release, read from the one table it reads, so the body
+    # cannot say a different workflow or tag than the check enforces.
+    pipeline = release_checks.RELEASE_PIPELINE[PACKAGE]
+    provenance_repo = release_checks.PROV_REPO.removeprefix("https://github.com/")
     lines: list[str] = []
     if plan["mode"] == "forward":
         lines.append(f"Advances the `ai-tc` pin in `{MANIFEST}`: `{current}` → `{version}`.")
@@ -214,8 +278,8 @@ def pr_body(plan: dict, run_url: str) -> str:
         f"- package: `{PACKAGE}@{version}`",
         f"- integrity: `{plan['integrity']}` (also written to the entry's `metadata.integrity`)",
         f"- shasum: `{plan['shasum']}`",
-        f"- provenance: SLSA, built by `.github/workflows/release-plugin-claude.yml` in akasecurity/ai-tc "
-        f"at `refs/tags/plugin-claude-v{version}` on a GitHub-hosted runner",
+        f"- provenance: SLSA, built by `{pipeline['workflow']}` in {provenance_repo} "
+        f"at `refs/tags/{pipeline['tag_prefix']}{version}` on a GitHub-hosted runner",
         f"- attested commit: `{plan['git_commit']}`, on ai-tc main: yes",
         f"- ai-tc release run (its hook fail-open smoke tests run there): {plan['run_url']}",
         "",
@@ -227,9 +291,9 @@ def pr_body(plan: dict, run_url: str) -> str:
         lines.append(f"This PR also adds that entry to `{SAFETY_FILE}`." if plan.get("safety_entry")
                      else f"`{SAFETY_FILE}` already has an entry for `{version}`; this PR leaves it unchanged.")
         if plan.get("reimport"):
-            lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main` or a "
-                      "`fleet-v` tag has pinned, or a code owner closed an earlier PR for it. Approve only once "
-                      "the reason it was rolled back or rejected is resolved."]
+            lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
+                      "`fleet-v` tag or a merged release-bot pull request has pinned, or a code owner closed an "
+                      "earlier PR for it. Approve only once the reason it was rolled back or rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
@@ -237,8 +301,9 @@ def pr_body(plan: dict, run_url: str) -> str:
                         if floor else f"no release between `{version}` and `{plan['highest_pinned']}` is flagged."))
         if plan.get("below_floor"):
             lines.append("**Dispatched with `below_floor: true`.** `validate` fails this PR; only an org owner's "
-                         "break-glass merge can land it, and `main-audit` opens an issue for that merge. Its tag "
-                         "records a bypass only if no code owner had approved the PR.")
+                         "break-glass merge can land it. The merge is recorded twice: its `fleet-v<N>` tag notes "
+                         "that `validate` had not passed on the PR's final head, and `main-audit` opens an issue "
+                         "for the merge.")
         if plan.get("crossed"):
             lines.append("Flagged not-rollback-safe releases this rollback moves back across: "
                          + ", ".join(f"`{v}`" for v in plan["crossed"])
@@ -335,7 +400,12 @@ def plan_forward(ctx: Context) -> dict:
         raise Refused(f"rollback PR #{rollbacks[0]['number']} is open: the scheduled import opens nothing "
                       "until it merges or closes", red=False)
     pinned = set(release_checks.pinned_versions(ctx.repo_dir))
-    highest = max(pinned, key=vkey)
+    # What "above every version ever pinned" means: main and the fleet-v tags (`pinned`, which is also what
+    # validate computes a rollback-safety entry from), and the versions the bot's merged pull requests put
+    # on main or took it back from, which no tag need name.
+    bot_closed = bot_pulls(list_pulls(ctx.gh, "closed"))
+    ever = pinned | merged_bot_versions(bot_closed)
+    highest = max(ever, key=vkey)
     refused: list[dict] = []
     if ctx.target:
         if not SEMVER.fullmatch(ctx.target):
@@ -344,14 +414,17 @@ def plan_forward(ctx: Context) -> dict:
             raise Refused(f"{ctx.target} is not above main's pin {ctx.current}; moving the pin down is a "
                           "rollback-mode dispatch")
         if not ctx.reimport and not vkey(ctx.target) > vkey(highest):
-            raise Refused(f"{ctx.target} is not above {highest}, the highest version main or a fleet-v tag has "
-                          "pinned; re-promoting a version a rollback moved away from takes reimport: true")
+            raise Refused(f"{ctx.target} is not above {highest}, the highest version main, a fleet-v tag or a "
+                          "merged release-bot pull request has pinned; re-promoting a version a rollback moved "
+                          "away from takes reimport: true")
         release = verify(ctx.target)
     else:
         if ctx.reimport:
             raise Refused("reimport: true needs an explicit target version")
         release = None
-        for candidate in reversed(release_checks.npm_candidates(pinned)):
+        # npm_candidates takes the floor from `ever`; the filter is the same rule stated again, so a
+        # version at or below it is never walked, whatever the list holds.
+        for candidate in reversed([v for v in release_checks.npm_candidates(ever) if vkey(v) > vkey(highest)]):
             try:
                 release = release_checks.verify_release(candidate)
                 break
@@ -379,7 +452,7 @@ def plan_forward(ctx: Context) -> dict:
     if same:
         raise Refused(f"PR #{same[0]['number']} for {version} is already open", red=False)
     if not ctx.reimport:
-        closed = [p for p in bot_pulls(list_pulls(ctx.gh, "closed")) if p["head"] == branch and not p["merged"]]
+        closed = [p for p in bot_closed if p["head"] == branch and not p["merged"]]
         if closed:
             raise Refused(f"a bot PR for {version} (#{closed[0]['number']}) was closed unmerged; that rejection "
                           "stands until a dispatch with reimport: true", red=not scheduled)
@@ -405,7 +478,7 @@ def plan_forward(ctx: Context) -> dict:
     else:
         safety_entry = computed
         classification, migrations = safety_entry["classification"], list(safety_entry["migrations"])
-    return {**facts(release), "branch": branch, "title": f"feat: advance the ai-tc pin to {version}",
+    return {**facts(release), "branch": branch, "title": MODE_RULES["forward"]["title"]({"version": version}),
             "labels": [], "classification": classification, "migrations": migrations,
             "safety_entry": safety_entry, "refused": refused, "highest_pinned": highest}
 
@@ -450,7 +523,8 @@ def plan_rollback(ctx: Context) -> dict:
                       if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(ctx.current)
                       and entry.get("classification") == "not-rollback-safe"), key=vkey)
     return {**facts(release), "branch": branch,
-            "title": f"fix: roll the ai-tc pin back from {ctx.current} to {version}", "labels": ["rollback"],
+            "title": MODE_RULES["rollback"]["title"]({"version": version, "from_version": ctx.current}),
+            "labels": ["rollback"],
             "classification": "not-rollback-safe" if crossed else "additive", "migrations": [],
             "highest_pinned": highest, "floor": floor, "crossed": crossed, "target_tag": target_tag}
 
@@ -651,6 +725,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
     check_plan(plan)
     bot_login()
     actions = ACTIONS[plan["mode"]]
+    title = MODE_RULES[plan["mode"]]["title"](plan)
     main_sha = gh.get(gh.repo_path("git/ref/heads/main"))["object"]["sha"]
     raw = read_file(gh, MANIFEST, main_sha)
     if raw is None:
@@ -674,12 +749,15 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
                               "deleted its branch); that rejection stands, and a dispatch with reimport: true "
                               "replaces it", red=False)
             # No PR ever used it, so an earlier run died between creating the branch and opening the PR.
-            # Forward runs share one concurrency group, so no live run owns it. Delete and create, as a
-            # reimport does; the ref is still never force-pushed.
+            # Scheduled runs and forward dispatches share one concurrency group (the workflow's header says
+            # why they must), so no live run owns it. Delete and create, as a reimport does; the ref is still
+            # never force-pushed.
             leftover = True
         gh.delete(gh.repo_path(f"git/refs/heads/{branch}"))
-        print(f"::notice::deleted {branch}, left with no pull request by an earlier run, and created it again"
-              if leftover else f"deleted {branch}, which had no open PR, before creating it again")
+        # Said as what happens next, not as done: the commit and the ref are still to be made, and a failure
+        # there ends the run red before anything has been created.
+        print(f"::notice::deleted {branch}, left with no pull request by an earlier run; creating it again"
+              if leftover else f"deleted {branch}, which had no open PR; creating it again")
     files = {MANIFEST: actions["edit"](raw, plan)}
     if plan.get("safety_entry"):
         safety_raw = read_file(gh, SAFETY_FILE, main_sha)
@@ -688,7 +766,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
         added = add_safety_entry(safety_raw, plan["version"], plan["safety_entry"])
         if added is not None:
             files[SAFETY_FILE] = added
-    commit = create_commit(gh, main_sha, files, plan["title"])
+    commit = create_commit(gh, main_sha, files, title)
     try:
         gh.post(gh.repo_path("git/refs"), {"ref": f"refs/heads/{branch}", "sha": commit})
     except GitHubError as error:
@@ -698,7 +776,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
         if branch_exists(gh, branch):
             raise Refused(f"{branch} was created by another run first", red=False) from error
         raise Refused(f"GitHub refused to create {branch}, and it does not exist: {error.body[:500]}") from error
-    pr = gh.post(gh.repo_path("pulls"), {"title": plan["title"], "head": branch, "base": "main",
+    pr = gh.post(gh.repo_path("pulls"), {"title": title, "head": branch, "base": "main",
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
         gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})
@@ -723,6 +801,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     env = os.environ
     gh = GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"])
+    if args.command == "plan":
+        # The verify job runs the release checks; open-pr runs none (its calls are GitHub's, each
+        # with its own timeout), so it starts no budget. One budget for the whole plan, cleared
+        # below however the run ends: every release-check request and npm call is cut to what
+        # remains of it, so the run ends with a no-verdict of its own before GitHub cancels the
+        # job. The plan's own GitHub reads are not budgeted; each has its own 60 s timeout.
+        release_checks.start_budget(release_checks.BUDGET_JOB)
     try:
         if args.command == "plan":
             plan = make_plan(Git(args.repo_dir), gh, repo_dir=args.repo_dir, mode=env.get("MODE") or "forward",
@@ -748,6 +833,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             write_output("proceed", "false")
         return 1
+    finally:
+        release_checks.clear_budget()
     return 0
 
 

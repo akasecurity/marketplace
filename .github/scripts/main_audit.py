@@ -16,10 +16,13 @@ it records for a push made by the App or by auto-merge has not been verified.
 The stand-in can still name the wrong person (a force-push by someone who did
 not write the commit); the main ruleset's "most recent push approved by someone
 else" is what enforces the rule, and this records when it was bypassed.
-Detective only: it runs from the pushed commit's own file, so a bypass push can
-change it in the same push. Every red result is keyed to its push and closed
-only by a person; a push the audit could not finish, or one that moved main
-without extending it, gets its own such result.
+Detective only, and it cannot vouch for itself: main-audit runs from the pushed
+commit, so a push that bypasses the `main` ruleset can also change, disable or
+remove main-audit. That push is then audited by the changed copy, or not at all,
+and no later run looks at it again.
+Every red result is keyed to its push and closed only by a person; a push the
+audit could not finish, or one that moved main without extending it, gets its
+own such result.
 """
 from __future__ import annotations
 
@@ -34,8 +37,8 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import Refused, write_output
 from issue_router import Result, results_to_json
-from release_checks import GITHUB_ACTIONS_APP_ID
-from tag_release import code_owners, merged_pull, owner_approvals
+from tag_release import (VALIDATE_CHECK, code_owners, merged_into_main, owner_approvals, pull_association,
+                         validate_conclusion)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -43,14 +46,14 @@ REWRITE_RULE = "main-audit-rewrite-"
 UNAUDITED_RULE = "main-audit-unaudited-"
 ZERO = re.compile(r"0{40}")
 NOT_A_PUSHER = {"web-flow"}
-# The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
-VALIDATE_CHECK = "validate"
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
     """The commits a push put on main's first-parent line, oldest first: the squash commit of a squash merge,
     the merge commit of a merge commit. The branch commits a merge commit brings in are on no pull request of
-    their own, so counting them would report each as pushed directly."""
+    their own, so counting them would report each as pushed directly. A rebase merge does put every rebased
+    commit on this line, and only the last is the pull request's merge commit: the others are reported, and
+    no_merge_problem says why."""
     if not before or ZERO.fullmatch(before):
         return [after]
     return git.first_parent_after(before, after)
@@ -80,35 +83,43 @@ def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> 
         return None
     return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
             f"({', '.join(owners) or 'none listed'}) on its final head `{head}` by someone other than its last "
-            f"pusher ({', '.join(sorted(pushers)) or 'unknown'}).")
+            f"pusher ({', '.join(sorted(pushers))}).")
 
 
 def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
     """Why `head` has no passing `validate` check from GitHub Actions, or None when its latest run succeeded.
 
-    The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
-    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that
-    failed after an earlier pass leaves the head unvalidated."""
-    runs = [run for run in gh.paginate(gh.repo_path(f"commits/{head}/check-runs"),
-                                       {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID, "filter": "all"})
-            if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    The runs are read by the helper tag-release uses for the same question, so the two cannot disagree about
+    which run counts: the job named `validate` that GitHub Actions reports, the latest of them deciding."""
+    conclusion = validate_conclusion(gh, head)
+    if conclusion == "success":
+        return None
     lead = (f"`{sha}` merged PR #{number} without a passing `{VALIDATE_CHECK}` check from GitHub Actions on its "
             f"final head `{head}`: ")
-    if not runs:
-        return lead + "none ran."
-    latest = max(runs, key=lambda run: run.get("id") or 0)
-    if latest.get("status") != "completed":
-        return lead + f"the latest run is {latest.get('status') or 'unfinished'}."
-    if latest.get("conclusion") != "success":
-        return lead + f"the latest run ended {latest.get('conclusion') or 'without a result'}."
-    return None
+    return lead + ("none ran." if conclusion is None else f"its latest run: {conclusion}.")
+
+
+def no_merge_problem(sha: str, linked: list[dict]) -> str:
+    """Why `sha`, which is no pull request's merge commit, is red. A rebase merge puts each commit of the pull
+    request on main as a new commit and names only the last one as its merge commit, so a commit that GitHub
+    links to a pull request merged into main at some other commit is probably one of those. It is still red:
+    the main ruleset allows squash merges only, so a rebase merge was a bypass of it. Any other commit was
+    pushed directly. `linked` is the answer the lookup already read, so this asks GitHub nothing."""
+    lead = f"`{sha}` is not the merge commit of any pull request"
+    for pull in linked:
+        merge_commit = pull.get("merge_commit_sha")
+        if merge_commit and merged_into_main(pull):
+            return (f"{lead}. GitHub links it to PR #{pull['number']}, which merged into main at `{merge_commit}`, "
+                    "so it is probably one of the commits of a rebase merge of that pull request. The main ruleset "
+                    "allows squash merges only, so a rebase merge means that rule was bypassed or is not in force.")
+    return f"{lead}: it was pushed to main directly."
 
 
 def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
     """What is wrong with how `sha` reached main, or None. A commit with both problems gets one description."""
-    pull = merged_pull(gh, sha, sleep)
+    pull, linked = pull_association(gh, sha, sleep)
     if pull is None:
-        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
+        return no_merge_problem(sha, linked)
     number = pull["number"]
     head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
     problems = [problem for problem in (approval_problem(gh, git, sha, number, head),

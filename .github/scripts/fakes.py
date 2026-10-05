@@ -12,6 +12,7 @@ from typing import Any, Callable
 import _testsupport as ts
 import release_checks
 from ghapi import GitHubError
+from gitrepo import GitError
 
 REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
@@ -50,10 +51,12 @@ class FakeGit:
 
     def __init__(self, *, chain: list[str], files: dict | None = None, tags: list[dict] | None = None,
                  messages: dict | None = None, times: dict | None = None,
-                 remote_refs: list[str] | None = None) -> None:
+                 remote_refs: list[str] | None = None, modes: dict | None = None) -> None:
         self.repo_dir = "/fake/marketplace"
         self.chain = list(chain)
         self.files = dict(files or {})
+        # (commit, path) -> a git mode, for an entry that is not a plain file (160000 is a submodule).
+        self.modes = dict(modes or {})
         self.tags = list(tags or [])
         self.messages = dict(messages or {})
         self.times = dict(times or {})
@@ -66,9 +69,17 @@ class FakeGit:
         return "main"
 
     def show(self, rev: str, path: str) -> str | None:
-        content = self.files.get((self.rev_parse(rev), path))
+        key = (self.rev_parse(rev), path)
+        if self.modes.get(key) == "160000":
+            # What `git show` says of a submodule entry: there is no blob to read.
+            raise GitError(f"git show {key[0]}:{path} failed: fatal: bad object {'0' * 40}")
+        content = self.files.get(key)
         # A file held as bytes is decoded as UTF-8, as gitrepo.Git.show decodes what it reads.
         return content.decode("utf-8") if isinstance(content, bytes) else content
+
+    def entry_mode(self, rev: str, path: str) -> str | None:
+        key = (self.rev_parse(rev), path)
+        return self.modes.get(key) or ("100644" if key in self.files else None)
 
     def fleet_tags(self) -> list[dict]:
         return sorted(self.tags, key=lambda tag: tag["n"])
