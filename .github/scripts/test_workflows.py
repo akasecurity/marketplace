@@ -527,6 +527,14 @@ class TagReleaseWorkflow(WorkflowCase):
     def test_the_job_enters_the_environment_the_audit_checks(self):
         self.assertEqual(re.findall(r"(?m)^    environment: (\S+)$", self.text), [tag_audit.ENVIRONMENT])
 
+    def test_the_app_token_is_made_from_the_clients_id_not_the_deprecated_app_id(self):
+        # create-github-app-token marks app-id deprecated ("Use 'client-id' instead"): every run would warn,
+        # and a later major version may drop it. The secrets are the App's client id and key.
+        self.assertIn("          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}\n", self.jobs["tag"])
+        self.assertIn("          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}\n", self.jobs["tag"])
+        self.assertNotRegex(self.text, r"(?m)^\s+app-id:")
+        self.assertNotIn("MARKETPLACE_BOT_APP_ID", self.text)
+
     def test_branch_clean_up_follows_the_sweep_and_never_runs_after_a_failed_one(self):
         job = self.jobs["tag"]
         self.assertLess(job.index("tag_release.py sweep"), job.index("tag_release.py cleanup-branches"))
