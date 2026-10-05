@@ -87,13 +87,12 @@ def _depth(value) -> int:
 
 
 def parse_pr_json(text: str):
-    """rc.parse_json for a file the pull request supplies. JSON that nests too deeply to read
-    safely is a ValueError, like any other text that does not parse: the file is at fault, so
-    it is a failed check and not a missing verdict."""
-    try:
-        doc = rc.parse_json(text)
-    except RecursionError as exc:
-        raise ValueError("it nests deeper than the JSON parser can read") from exc
+    """rc.parse_json for a file the pull request supplies, with a depth limit of its own. JSON
+    that nests too deeply to read safely is a ValueError, like any other text that does not
+    parse: the file is at fault, so it is a failed check and not a missing verdict. Text nested
+    past what the JSON parser itself can read is already a ValueError from rc.parse_json; this
+    refuses what parses but would still end the code below in the interpreter's recursion limit."""
+    doc = rc.parse_json(text)
     if _depth(doc) > MAX_JSON_DEPTH:
         raise ValueError(f"it nests deeper than {MAX_JSON_DEPTH} levels")
     return doc
@@ -123,6 +122,192 @@ def _names_ai_tc(value) -> bool:
     if isinstance(value, list):
         return any(_names_ai_tc(v) for v in value)
     return False
+
+
+# A workflow file a pull request adds or changes can define a job named validate, and the required
+# check is matched by name, so any such job can stand beside this one. validate reads each such file
+# as text, never runs it, and fails the PR for what it can see plainly:
+#   * a job id, or a job `name:`, written out as validate;
+#   * checks: write, statuses: write or write-all permissions (or the permission-checks and
+#     permission-statuses inputs of the App-token action), which let a job create a check run or
+#     a status named validate through the API;
+#   * a file whose jobs it cannot read with confidence (flow style, anchors and aliases, merge keys,
+#     an escape in a quoted name, a name on the next line), which it refuses rather than guess at.
+# It does not see a job name built from an expression or a matrix value, a workflow that declares
+# no permissions and so takes the repository's default token, a workflow that posts a check run or
+# status with some other token or secret, a push-triggered workflow on another branch posting on the
+# PR's head commit, or a fork PR's own run. Code-owner review of every workflow change is the control
+# for those. validate.yml itself is exempt from the job rule, since it must define the job (a change
+# to it is still called out in the notes, and its permissions are still read).
+WORKFLOW_FILE = re.compile(r"\.github/workflows/[^/]+\.ya?ml", re.IGNORECASE)
+VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
+REQUIRED_CHECK = "validate"
+SAME_NAME = f"any job named {REQUIRED_CHECK} satisfies the required check, so only {VALIDATE_WORKFLOW} may have one"
+_CREATES_CHECKS = re.compile(r"""(?:^|[\s{,])["']?(?:permission-)?(?:checks|statuses)["']?\s*:\s*["']?write\b""", re.MULTILINE)
+_WRITE_ALL = re.compile(r"""(?:^|[\s{,])["']?permissions["']?\s*:\s*["']?write-all\b""", re.MULTILINE)
+_PLAIN_KEY_END = re.compile(r":(?:\s|$)")
+_QUOTED_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s+(.*))?$""")
+
+
+class _Unreadable(Exception):
+    """A workflow file written in a form the scan below will not guess at."""
+
+
+def _uncommented(line: str) -> str:
+    """The line without a trailing YAML comment: a # at the start or after a space, outside quotes."""
+    quote, escaped = "", False
+    for at, char in enumerate(line):
+        if escaped:
+            escaped = False
+        elif quote:
+            if char == "\\" and quote == '"':
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (at == 0 or line[at - 1] in " \t"):
+            return line[:at].rstrip()
+    return line.rstrip()
+
+
+def _without_properties(text: str) -> str:
+    """The text without the anchors and tags (`&name`, `!tag`) written in front of a value."""
+    text = text.strip()
+    while text[:1] in ("&", "!"):
+        text = text.partition(" ")[2].lstrip()
+    return text
+
+
+def _scalar(text: str):
+    """The text of a scalar written on one line, or None for a form that is not read: an alias, a
+    block scalar, a quote left open, an escape (never decoded, since a decoded escape could spell
+    the name) or no value on the line."""
+    text = _without_properties(text)
+    if not text or text[0] in "|>*":
+        return None
+    if text[0] == '"':
+        match = re.fullmatch(r'"([^"\\]*)"', text)
+        return match.group(1) if match else None
+    if text[0] == "'":
+        match = re.fullmatch(r"'((?:[^']|'')*)'", text)
+        return match.group(1).replace("''", "'") if match else None
+    return text
+
+
+def _key_line(content: str):
+    """(key, the text after the colon) of a `key: value` line, with key None for a quoted key that
+    holds an escape; None for any other line (a list item, a complex key, a flow collection)."""
+    if content[:1] in ("'", '"'):
+        match = _QUOTED_KEY.match(content)
+        return (_scalar(match.group(1)), match.group(2) or "") if match else None
+    end = _PLAIN_KEY_END.search(content)
+    if end is None or content[0] in "-?[{&*!|>%@`":
+        return None
+    return content[: end.start()].strip(), content[end.end():].strip()
+
+
+def _read_key(content: str, what: str):
+    line = _key_line(content)
+    if line is None or line[0] is None or line[0] == "<<":
+        raise _Unreadable(f"{what} is a complex key, holds an escape or is a merge key")
+    return line
+
+
+def _is_required_check(name: str) -> bool:
+    return name.strip().casefold() == REQUIRED_CHECK
+
+
+def _rows(clean: list) -> list:
+    """(indent, text) of every line that holds something: no comments, blank lines or document markers."""
+    rows = []
+    for line in clean:
+        content = line.strip()
+        if not content or content in ("---", "..."):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if line[indent] == "\t":
+            raise _Unreadable("it is indented with a tab")
+        rows.append((indent, content))
+    return rows
+
+
+def _jobs_blocks(rows: list) -> list:
+    """The rows under each top-level `jobs:` key."""
+    if not rows:
+        return []
+    top, blocks = rows[0][0], []
+    for start, (indent, content) in enumerate(rows):
+        if indent != top:
+            continue
+        line = _key_line(content)
+        if line is not None and line[0] is None:
+            raise _Unreadable("a top-level key holds an escape")
+        if line is None or line[0] != "jobs":
+            continue
+        if line[1]:
+            raise _Unreadable("its jobs are given in flow style or as an alias")
+        end = next((i for i in range(start + 1, len(rows)) if rows[i][0] <= top), len(rows))
+        blocks.append(rows[start + 1:end])
+    if not blocks and any(re.search(r"\bjobs\b", content) for _, content in rows):
+        raise _Unreadable("it has no top-level jobs key in block style")
+    return blocks
+
+
+def _scan_jobs(block: list, problems: list) -> None:
+    """Add what is wrong with the jobs under one `jobs:` key. Job ids sit at the first row's
+    indent, and each job's own keys at the indent of its first row."""
+    if not block:
+        return
+    first, jobs = block[0][0], []
+    for indent, content in block:
+        if indent == first:
+            jobs.append((content, []))
+        elif indent > first:
+            jobs[-1][1].append((indent, content))
+        else:
+            raise _Unreadable("its jobs are not indented consistently")
+    for content, children in jobs:
+        job_id, rest = _read_key(content, "a job id")
+        if _is_required_check(job_id):
+            problems.append(f"defines a job with the id {REQUIRED_CHECK}: {SAME_NAME}")
+        elif _without_properties(rest):
+            raise _Unreadable(f"job {_code(job_id)} is given in flow style, as an alias or as a scalar")
+        for indent, child in children:
+            if indent != children[0][0]:
+                continue
+            key, value = _read_key(child, f"a key of job {_code(job_id)}")
+            if key != "name":
+                continue
+            name = _scalar(value)
+            if name is None:
+                raise _Unreadable(
+                    f"the name of job {_code(job_id)} is an alias, a block scalar, an escape, an open quote or on the next line"
+                )
+            if _is_required_check(name):
+                problems.append(f"names job {_code(job_id)} {REQUIRED_CHECK}: {SAME_NAME}")
+
+
+def workflow_problems(path: str, text: str) -> list:
+    """Why a workflow file a PR adds or changes may not stand, or []: what the comment above lists."""
+    clean = [_uncommented(line) for line in text.splitlines()]
+    body = "\n".join(clean)
+    problems = []
+    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body):
+        problems.append(
+            "grants checks: write, statuses: write or write-all, which lets a job create a check run or a status "
+            f"named {REQUIRED_CHECK}, and any such check satisfies the required check"
+        )
+    if path != VALIDATE_WORKFLOW:
+        try:
+            for block in _jobs_blocks(_rows(clean)):
+                _scan_jobs(block, problems)
+        except _Unreadable as exc:
+            problems.append(
+                f"is written in a form this check does not read ({exc}), so it cannot tell whether a job in it is "
+                f"named {REQUIRED_CHECK}; write its jobs in plain block style"
+            )
+    return [f"{_code(path)} {problem}" for problem in problems]
 
 
 def parse_manifests(files: dict, report: Report, *, label: str) -> dict:
@@ -263,8 +448,8 @@ def human_rules(entries, base_safety, head_safety, changed, report: Report, *, b
         if not rc.description_ok(head_entry):
             report.fail(
                 "the ai-tc entry's description must be a non-empty string: this marketplace requires one, "
-                "and Claude Code itself refuses a null or non-string description (a manifest it refuses "
-                "breaks `/plugin marketplace add` for every user)"
+                "and Claude Code itself refuses a null or non-string description (it still adds the "
+                "marketplace, but lists ai-tc as unsupported with a schema error)"
             )
         report.note("ai-tc description changed: change all four files (AGENTS.md, 'Four files, one set of facts')")
     else:
@@ -497,6 +682,11 @@ def evaluate(pr: PullRequest, base_files: dict, head_files: dict, changed, pins,
     The base files come from the merge base of main and the PR head. The tip safety text
     is main's rollback-safety.json, which alone decides the floor."""
     report = Report()
+    for path in changed:
+        # A deleted file has no text at the head, and a file read as data is never run.
+        if WORKFLOW_FILE.fullmatch(path) and head_files.get(path) is not None:
+            for problem in workflow_problems(path, head_files[path]):
+                report.fail(problem)
     head_docs = parse_manifests(head_files, report, label="the PR head")
     for path in (rc.MANIFEST, rc.SAFETY_FILE):
         text = head_files.get(path)
@@ -639,8 +829,10 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
         # else, such as the work tree's HEAD, can move where the comparison starts.
         main_sha = _run_git(repo, "rev-parse", "--verify", f"{rc.main_ref(repo)}^{{commit}}").strip()
         start = _run_git(repo, "merge-base", main_sha, head_sha).strip()
+        changed = changed_files(repo, start, head_sha)
         base = {path: read_at(repo, start, path) for path in WATCHED}
-        head = {path: read_at(repo, head_sha, path) for path in WATCHED}
+        workflows = [path for path in changed if WORKFLOW_FILE.fullmatch(path)]
+        head = {path: read_at(repo, head_sha, path) for path in (*WATCHED, *workflows)}
         pr = PullRequest(
             int(number),
             env.get("AUTHOR_LOGIN", ""),
@@ -654,7 +846,7 @@ def main(*, repo: str = ".", env=None, fetch=None, verify=None, classify=None) -
             pr,
             base,
             head,
-            changed_files(repo, start, head_sha),
+            changed,
             rc.pins_by_ref(repo, main_rev=main_sha),
             read_at(repo, main_sha, rc.SAFETY_FILE),
             bot_login=rc.BOT_LOGIN,
