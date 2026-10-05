@@ -313,6 +313,14 @@ class TestUnreadableManifests(unittest.TestCase):
         self.assertNotIn("\n", unreadable["a"])
         self.assertLess(len(unreadable["a"]), 400)
 
+    def test_a_reason_that_spans_lines_cannot_start_a_workflow_command_of_its_own(self):
+        # The reason becomes a warning annotation, and a command is read only at the start of a line.
+        git = history(chain=("t8", "a"))
+        with mock.patch.object(tr, "entry_of", side_effect=Refused("one\n::error::two\r\nthree")):
+            _, unreadable = tr.pin_changes(git, "t8")
+        self.assertNotRegex(unreadable["a"], r"[\r\n]")
+        self.assertIn("one ::error::two three", unreadable["a"])
+
     def test_a_broken_commit_between_two_pin_changes_is_passed_over(self):
         # "c" sits between the release (b, 0.9.15) and the entry's removal (d): d is compared with b.
         changes, unreadable = tr.pin_changes(self.broken("c", "{"), "t8")
