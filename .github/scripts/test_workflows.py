@@ -524,6 +524,16 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertNotIn("--previous", audit)
         self.assertNotIn("--no-baseline", audit)
 
+    def test_the_header_and_the_step_name_say_every_check_the_audit_runs(self):
+        # tag_audit.run_check runs the tag ledger, the rulesets and the bot environment (and, when asked, the
+        # comparison with an earlier run, which this workflow does not ask for). A line that names fewer is a
+        # claim the audit has outgrown.
+        header = re.sub(r"\s*\n#\s*", " ", self.head)
+        self.assertIn("tag-audit's ledger, ruleset and environment checks (not its comparison with the last green "
+                      "run's snapshot)", header)
+        self.assertTrue(self.audit_step().startswith("name: tag-audit's ledger, ruleset and environment checks (stop,"),
+                        self.audit_step())
+
     def test_the_job_enters_the_environment_the_audit_checks(self):
         self.assertEqual(re.findall(r"(?m)^    environment: (\S+)$", self.text), [tag_audit.ENVIRONMENT])
 
