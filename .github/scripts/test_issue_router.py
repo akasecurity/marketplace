@@ -3,6 +3,7 @@ import datetime as dt
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -292,7 +293,8 @@ class TestQuoted(RouterCase):
         self.assertLessEqual(len(body), 65_536)
         self.assertIn("\n```\n… truncated; the full detail is in the run log (" + RUN + ")", body)
         self.assertNotIn(detail, body)
-        self.assertIn("x" * (rt.DETAIL_LIMIT - 2), body)
+        # The fences and the note come out of the same budget, so a little less than the limit is kept.
+        self.assertIn("x" * (rt.DETAIL_LIMIT - 200), body)
 
     def test_the_limit_counts_the_larger_way_github_could_count_a_character(self):
         # 40,000 characters outside the basic plane are 80,000 UTF-16 code units.
@@ -303,9 +305,56 @@ class TestQuoted(RouterCase):
         self.assertIn("… truncated", body)
 
     def test_a_detail_just_inside_the_limit_is_not_cut(self):
-        detail = "y" * rt.DETAIL_LIMIT
+        # The limit is on the whole block, and the two plain fences with their line breaks are eight characters.
+        detail = "y" * (rt.DETAIL_LIMIT - 8)
         self.assertEqual(rt.quoted(detail, RUN), "```\n" + detail + "\n```")
-        self.assertIn("… truncated", rt.quoted(detail + "y", RUN))
+        cut = rt.quoted(detail + "y", RUN)
+        self.assertIn("… truncated", cut)
+        self.assertLessEqual(len(cut), rt.DETAIL_LIMIT)
+
+    @staticmethod
+    def units(text):
+        return len(text.encode("utf-16-le")) // 2
+
+    def longest_run(self, text):
+        return max((len(run) for run in re.findall(r"`+", text)), default=0)
+
+    def test_the_fences_and_the_note_count_toward_the_limit(self):
+        # A run of backticks makes a fence as long as itself, and the fence is printed twice. 22,000 backticks
+        # came to 66,000 characters, 30,000 to 90,000 and 59,000 to 177,000, past the 65,536 GitHub accepts.
+        for run in (22_000, 30_000, 59_000, 100_000):
+            with self.subTest(run=run):
+                detail = "- fleet-v10's subject: " + "`" * run
+                block = rt.quoted(detail, RUN)
+                note = "\n… truncated; the full detail is in the run log (" + RUN + ")"
+                self.assertTrue(block.endswith(note))
+                self.assertLessEqual(self.units(block), rt.DETAIL_LIMIT)
+                # As much of the text is kept as the budget allows: one more backtick would not have fitted.
+                self.assertGreater(self.units(block), rt.DETAIL_LIMIT - 4)
+                fence = block.split("\n", 1)[0]
+                self.assertEqual(fence, "`" * len(fence))
+                inner = block[len(fence) + 1:-len(note) - len(fence) - 1]
+                self.assertTrue(detail.startswith(inner))
+                self.assertGreater(len(fence), self.longest_run(inner))
+                self.assertEqual(block, fence + "\n" + inner + "\n" + fence + note)
+
+    def test_a_long_run_of_backticks_cannot_push_a_post_past_the_limit(self):
+        detail = "- fleet-v10's subject: " + "`" * 30_000
+        self.router().apply(red(detail=detail))
+        opened = self.gh.called("POST", R("issues"))[0][2]["body"]
+        self.issues.append(existing(detail="npm has 0.9.15"))
+        self.router().apply(red(detail=detail))
+        changed = self.gh.called("POST", R("issues/40/comments"))[0][2]["body"]
+        del self.issues[:]
+        self.issues.append(cleared_issue())
+        del self.gh.calls[:]
+        self.router().apply(red(detail=detail))
+        reopened = self.gh.called("POST", R("issues/40/comments"))[0][2]["body"]
+        for name, body in (("a new issue", opened), ("a comment on a changed detail", changed),
+                           ("a comment on a reopened issue", reopened)):
+            with self.subTest(name):
+                self.assertLessEqual(self.units(body), 65_536)
+                self.assertIn("… truncated; the full detail is in the run log", body)
 
     def test_the_same_long_detail_does_not_comment_again_on_another_run(self):
         # The note names the run, so a digest taken from the quoted text would differ on every run.
