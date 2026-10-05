@@ -81,7 +81,7 @@ at that commit → version, registry → integrity), so:
   visible to `main` installers only; a fleet only moves when its own configuration moves to the
   new tag.
 
-`preflight` and `claude-tools` still float on their default branches (not fleet-deployed).
+`preflight` and `aka-claude-tools` still float on their default branches (not fleet-deployed).
 
 ## Workflow
 
