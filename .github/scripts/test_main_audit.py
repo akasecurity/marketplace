@@ -355,17 +355,21 @@ class TestMainAudit(unittest.TestCase):
                          {"check_name": "validate", "app_id": 15368, "filter": "all"})
 
     def test_a_merge_past_a_failed_validate_is_red(self):
-        for label, run in (("failed", validate_run(conclusion="failure")),
-                           ("cancelled", validate_run(conclusion="cancelled")),
-                           ("skipped", validate_run(conclusion="skipped")),
-                           ("neutral", validate_run(conclusion="neutral")),
-                           ("still running", validate_run(status="in_progress", conclusion=None)),
-                           ("queued", validate_run(status="queued", conclusion=None))):
+        for label, run, state in (("failed", validate_run(conclusion="failure"), "failure"),
+                                  ("cancelled", validate_run(conclusion="cancelled"), "cancelled"),
+                                  ("skipped", validate_run(conclusion="skipped"), "skipped"),
+                                  ("neutral", validate_run(conclusion="neutral"), "neutral"),
+                                  ("completed with no conclusion", validate_run(conclusion=None),
+                                   "without a result"),
+                                  ("still running", validate_run(status="in_progress", conclusion=None),
+                                   "in_progress"),
+                                  ("queued", validate_run(status="queued", conclusion=None), "queued")):
             with self.subTest(label):
                 results = self.audit(github(runs=[run]))
                 self.assertEqual(len(results), 1)
                 self.assertIn("without a passing `validate` check from GitHub Actions on its final head `h30`",
                               results[0].detail)
+                self.assertIn(f"its latest run: {state}.", results[0].detail)
 
     def test_a_merge_with_no_validate_run_is_red(self):
         results = self.audit(github(runs=[]))
