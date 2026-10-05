@@ -16,10 +16,12 @@ push can carry one, and waiting for its date would hold every later tag back):
 it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
-no later pull request can change, so a parent whose file is anything else never
-stops the sweep (it would stop tagging for good): a commit a pull request merged
-is tagged with `approver: unknown` and an approver-note saying why, rather than
-a guess at who counts. A commit no pull request merged records `approver: none`
+no later pull request can change, so a parent whose file is anything else (a
+team, a path rule, bytes that are not text, no file, or an entry that is not a
+file at all, such as a submodule) never stops the sweep, which would stop
+tagging for good: a commit a pull request merged is tagged with
+`approver: unknown` and an approver-note saying why, rather than a guess at who
+counts. A commit no pull request merged records `approver: none`
 whatever the file holds, as there is no approval to match.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
@@ -41,6 +43,10 @@ from issue_router import CODEOWNERS_FILE
 from release_checks import MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
 
 ABSENT = "entry removed"
+# The modes git gives a regular file; any other mode at the CODEOWNERS path (120000 a symbolic link, 160000 a
+# submodule, 040000 a directory) holds nothing a reader can take rules from.
+FILE_MODES = ("100644", "100755")
+ENTRY_KINDS = {"120000": "a symbolic link", "160000": "a submodule", "040000": "a directory"}
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
@@ -83,11 +89,19 @@ def last_pinned(git: Git, sha: str | None) -> str:
 def code_owners(git: Git, sha: str) -> list[str]:
     """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
     naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule,
-    a file that is not UTF-8 text or no file at all is a Refused, not a guess: a reviewer's login can be matched
-    only to a user, so any other shape would turn a real approval into a recorded bypass. What a caller does
-    with the Refused is its own call: for a commit a pull request merged, the sweep tags with an unknown
-    approver, because the file it reads is fixed history (a commit no pull request merged records `none`)."""
+    a file that is not UTF-8 text, an entry that is not a file (a submodule, a symbolic link, a directory) or no
+    file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other shape
+    would turn a real approval into a recorded bypass. What a caller does with the Refused is its own call: for
+    a commit a pull request merged, the sweep tags with an unknown approver, because the file it reads is fixed
+    history (a commit no pull request merged records `none`). Only a checkout that cannot be read at all
+    (a missing object) raises GitError, as Git.show says."""
     where = f"{CODEOWNERS_FILE} at {sha[:12]}"
+    mode = git.entry_mode(sha, CODEOWNERS_FILE)
+    if mode is not None and mode not in FILE_MODES:
+        # Git.show cannot read a submodule entry (there is no blob) and would raise GitError, which is not a
+        # statement about the file; the entry's kind is.
+        raise Refused(f"{where} is {ENTRY_KINDS.get(mode, f'a tree entry of mode {mode}')}, not a file; code owners "
+                      "can only be read from a file of one `*` line naming users.")
     try:
         raw = git.show(sha, CODEOWNERS_FILE)
     except UnicodeDecodeError as error:

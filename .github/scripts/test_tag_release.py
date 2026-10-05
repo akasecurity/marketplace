@@ -513,6 +513,73 @@ class TestCodeOwners(unittest.TestCase):
             self.assertIn("not valid UTF-8", str(caught.exception))
 
 
+    def test_an_entry_that_is_not_a_file_is_a_refusal_that_names_the_kind(self):
+        # A submodule entry has no blob: Git.show raises GitError ("bad object") for it, and that must not escape
+        # as a statement about the checkout, because the sweep would stop on it for good.
+        for mode, kind in (("160000", "a submodule"), ("120000", "a symbolic link"), ("040000", "a directory")):
+            with self.subTest(kind):
+                git = FakeGit(chain=["x"], files={("x", ".github/CODEOWNERS"): "* @a\n"},
+                              modes={("x", ".github/CODEOWNERS"): mode})
+                with self.assertRaises(Refused) as caught:
+                    tr.code_owners(git, "x")
+                self.assertIn(f".github/CODEOWNERS at x is {kind}, not a file", str(caught.exception))
+        # An executable file is still a file.
+        git = FakeGit(chain=["x"], files={("x", ".github/CODEOWNERS"): "* @a\n"},
+                      modes={("x", ".github/CODEOWNERS"): "100755"})
+        self.assertEqual(tr.code_owners(git, "x"), ["a"])
+
+    def test_an_entry_that_is_not_a_file_is_a_refusal_in_a_real_repository(self):
+        # Read through the real Git: a gitlink at the path makes `git show` fail with "bad object", a symbolic link
+        # shows its target, and a directory lists its entries. None of them is a file of rules.
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
+                       GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+
+            def sh(*args):
+                return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            sh("init", "-q", "-b", "main")
+            path = os.path.join(directory, ".github", "CODEOWNERS")
+            os.makedirs(os.path.dirname(path))
+            git = Git(directory)
+
+            def commit(label):
+                sh("add", "-A")
+                sh("commit", "-q", "-m", label)
+                return sh("rev-parse", "HEAD")
+
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("* @a @b\n")
+            plain = commit("file")
+            self.assertEqual(tr.code_owners(git, plain), ["a", "b"])
+
+            os.remove(path)
+            sh("update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},.github/CODEOWNERS")
+            sh("commit", "-q", "-m", "submodule")
+            submodule = sh("rev-parse", "HEAD")
+            self.assertEqual(sh("ls-tree", submodule, "--", ".github/CODEOWNERS").split()[:2], ["160000", "commit"])
+            with self.assertRaises(GitError):
+                git.show(submodule, ".github/CODEOWNERS")  # the failure Git.show reports for it
+            sh("rm", "-q", "--cached", ".github/CODEOWNERS")
+
+            os.symlink("elsewhere", path)
+            link = commit("symbolic link")
+            os.remove(path)
+            os.makedirs(path)
+            with open(os.path.join(path, "inner"), "w", encoding="utf-8") as handle:
+                handle.write("* @a\n")
+            directory_entry = commit("directory")
+
+            for label, sha, kind in (("submodule", submodule, "a submodule"), ("symbolic link", link, "a symbolic link"),
+                                     ("directory", directory_entry, "a directory")):
+                with self.subTest(label):
+                    with self.assertRaises(Refused) as caught:
+                        tr.code_owners(git, sha)
+                    self.assertIn(f".github/CODEOWNERS at {sha[:12]} is {kind}, not a file", str(caught.exception))
+
+
 class TestSweepOwners(unittest.TestCase):
     """The owners come from the merged commit's parent, which is fixed history: no later pull request can change
     that file. A file the strict reader cannot read must therefore never stop the sweep, or tagging would stop
@@ -544,6 +611,20 @@ class TestSweepOwners(unittest.TestCase):
                 self.assertEqual(message.count("approver-note:"), 1)
                 self.assertNotIn("bypass", message)
                 self.assertEqual(len(gh.called("POST", R("git/refs"))), 1)
+
+    def test_a_codeowners_entry_that_is_a_submodule_gives_an_unknown_approver_and_the_tag_is_cut(self):
+        # Reading it raises GitError in the checkout, not a Refused; the sweep must not stop on a parent that can
+        # never change. The commit after it is tagged with its own parent's file.
+        git = history(chain=("t8", "b", "c"))
+        git.modes[("t8", ".github/CODEOWNERS")] = "160000"
+        gh = sweep_github()
+        self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
+                         ["fleet-v9 -> b (ai-tc 0.9.15)", "fleet-v10 -> c (ai-tc 0.9.14)"])
+        first, second = (call[2]["message"] for call in gh.called("POST", R("git/tags")))
+        self.assertIn("pr: 13\napprover: unknown\n", first)
+        self.assertRegex(first, r"(?m)^approver-note: code owners could not be read: "
+                                r"\.github/CODEOWNERS at t8 is a submodule, not a file")
+        self.assertIn("approver: none\n", second)  # c's parent (b) holds a readable file; nobody approved PR 14
 
     def test_an_unreadable_file_marks_only_the_commits_whose_parent_holds_it(self):
         # b's parent (t8) and d's parent (c) are readable; c's parent (b) is not. The catch that no longer refuses is
