@@ -5,13 +5,15 @@ name: tag-release
 # fleet-v tag yet (AGENTS.md, "The workflows"). It first runs tag-audit's ledger,
 # ruleset and environment checks (not its comparison with the last green run's
 # snapshot) and stops, red and creating nothing, if any fails; that refusal is a
-# signal, not a control, since this file runs from the pushed commit. Tags are created as the
-# bot App, the only identity ruleset fleet-tags-create lets create one; no Mac
-# follows a tag. A tag also notes a merged PR whose final head had no passing
-# validate run; the sweep reads those check runs with the workflow's own read-only
-# token, so the App's permissions stay as they are. It then deletes the bot's own branches that still point at the head
-# a closed PR closed on, but only after a sweep that finished: a refused or failed
-# sweep ends the run first, and the branches wait for the next one.
+# signal, not a control, since this file runs from the pushed commit. Tags are
+# created as the bot App, the only identity ruleset fleet-tags-create lets create
+# one; no Mac follows a tag. A tag also notes a merged PR whose final head had no
+# passing validate run: only a run of validate.yml started by pull_request_target,
+# at or before the PR merged, counts. The sweep reads those check runs, and the
+# workflow runs behind them, with the workflow's own read-only token, so the App's
+# permissions stay as they are. It then deletes the bot's own branches that still
+# point at the head a closed PR closed on, but only after a sweep that finished: a
+# refused or failed sweep ends the run first, and the branches wait for the next one.
 
 on:
   push:
@@ -30,9 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: marketplace-bot
-    # All read-only. This is the workflow's own token: it runs tag-audit's checks and reads a merged PR's
-    # validate runs for the sweep (`checks`). `actions` is what tag-audit's own job holds for the same
-    # environment check. The tags are written with the App's token, made below.
+    # All read-only. This is the workflow's own token: it runs tag-audit's checks and, for the
+    # sweep, reads a merged PR's validate check runs (`checks`) and the workflow runs behind
+    # them (`actions`). tag-audit's audit job, which runs the same environment check, holds
+    # `actions: read` too. Both are reads, and a private repository would need them for these
+    # calls. The tags are written with the App's token, made below.
     permissions:
       actions: read
       checks: read
