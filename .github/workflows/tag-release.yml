@@ -2,10 +2,10 @@ name: tag-release
 
 # On every push to main (and by hand, to re-run a sweep): cut the next fleet-v<N>
 # tag at each first-parent commit whose ai-tc version changed and that has no
-# fleet-v tag yet (AGENTS.md, "The workflows"). It first runs tag-audit's ledger
-# and ruleset checks (not its comparison with the last green run's snapshot)
-# and stops, red and creating nothing, if any fails; that refusal is a signal, not
-# a control, since this file runs from the pushed commit. Tags are created as the
+# fleet-v tag yet (AGENTS.md, "The workflows"). It first runs tag-audit's ledger,
+# ruleset and environment checks (not its comparison with the last green run's
+# snapshot) and stops, red and creating nothing, if any fails; that refusal is a
+# signal, not a control, since this file runs from the pushed commit. Tags are created as the
 # bot App, the only identity ruleset fleet-tags-create lets create one; no Mac
 # follows a tag. It then deletes the bot's own branches that still point at the head
 # a closed PR closed on, but only after a sweep that finished: a refused or failed
@@ -38,7 +38,7 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: tag-audit's ledger and ruleset checks (stop, creating nothing, if any fails)
+      - name: tag-audit's ledger, ruleset and environment checks (stop, creating nothing, if any fails)
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
