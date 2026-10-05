@@ -203,7 +203,7 @@ class TagAuditWorkflow(WorkflowCase):
         fetch = self.step("name: fetch the snapshot the last green run kept")
         listing = re.search(r"(?s)gh run list.*?--jq", fetch).group(0)
         for flag in ("--workflow tag-audit.yml", "--branch main", "--status success", "--limit 100",
-                     "--json databaseId,event"):
+                     "--json databaseId,event,headSha"):
             self.assertIn(flag, listing)
         # A fork's pull request from its own main also reports the branch main, so the event decides.
         self.assertIn('.event == "schedule" or .event == "workflow_dispatch" or .event == "delete"', fetch)
@@ -232,7 +232,7 @@ class TagAuditWorkflow(WorkflowCase):
             with open(stub, "w", encoding="utf-8") as handle:
                 handle.write(textwrap.dedent("""\
                     #!/usr/bin/env python3
-                    import os, subprocess, sys
+                    import json, os, subprocess, sys
                     args = sys.argv[1:]
                     with open(os.environ["GH_LOG"], "a") as log:
                         log.write(" ".join(args) + "\\n")
@@ -243,7 +243,10 @@ class TagAuditWorkflow(WorkflowCase):
                         sys.stdout.write(out.stdout)
                         sys.exit(out.returncode)
                     if args[:2] == ["run", "list"]:
-                        sys.exit(1) if os.environ.get("LIST_FAILS") else filtered(os.environ["RUNS"])
+                        # Like gh, answer only the fields --json names: a field it was not asked for is absent.
+                        asked = args[args.index("--json") + 1].split(",")
+                        runs = [{key: run.get(key) for key in asked} for run in json.loads(os.environ["RUNS"])]
+                        sys.exit(1) if os.environ.get("LIST_FAILS") else filtered(json.dumps(runs))
                     if args[0] == "api":
                         sys.exit(1) if os.environ.get("API_FAILS") else filtered(os.environ["ARTIFACTS"])
                     if args[:2] == ["run", "download"]:
