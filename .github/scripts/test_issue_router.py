@@ -329,8 +329,12 @@ class TestQuoted(RouterCase):
                 note = "\n… truncated; the full detail is in the run log (" + RUN + ")"
                 self.assertTrue(block.endswith(note))
                 self.assertLessEqual(self.units(block), rt.DETAIL_LIMIT)
-                # As much of the text is kept as the budget allows: one more backtick would not have fitted.
-                self.assertGreater(self.units(block), rt.DETAIL_LIMIT - 4)
+                # As much of the text is kept as the budget allows. Each backtick kept costs three characters (it,
+                # and one more in each fence), so the count that fits is plain arithmetic. 4 is the line breaks.
+                prefix = "- fleet-v10's subject: "
+                kept = (rt.DETAIL_LIMIT - 4 - len(prefix) - len(note)) // 3
+                self.assertEqual(block.split("\n", 1)[1][:len(prefix) + kept], prefix + "`" * kept)
+                self.assertEqual(len(block.split("\n", 1)[0]), kept + 1)
                 fence = block.split("\n", 1)[0]
                 self.assertEqual(fence, "`" * len(fence))
                 inner = block[len(fence) + 1:-len(note) - len(fence) - 1]
