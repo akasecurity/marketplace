@@ -21,6 +21,9 @@ from unittest import mock
 import _testsupport as ts
 import release_checks as rc
 
+# A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
+NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
 
 class TestJsonHelpers(unittest.TestCase):
     def test_duplicate_keys_are_refused(self):
@@ -30,6 +33,19 @@ class TestJsonHelpers(unittest.TestCase):
     def test_nan_is_refused(self):
         with self.assertRaisesRegex(ValueError, "NaN"):
             rc.parse_json('{"n": NaN}')
+
+    def test_nesting_deeper_than_the_parser_reads_is_a_value_error(self):
+        # json.loads raises RecursionError past the interpreter's depth, and RecursionError is
+        # not a ValueError. Every caller of parse_json handles an unreadable document as a
+        # ValueError, so the conversion is made here, once, for all of them.
+        for label, text in (
+            ("arrays inside a manifest", NESTED_TOO_DEEP),
+            ("bare arrays", "[" * 100_000 + "]" * 100_000),
+            ("objects", '{"a":' * 100_000 + "1" + "}" * 100_000),
+        ):
+            with self.subTest(label):
+                with self.assertRaisesRegex(ValueError, "too deeply nested"):
+                    rc.parse_json(text)
 
     def test_the_writer_keeps_non_ascii_and_ends_in_a_newline(self):
         text = rc.dump_json(ts.manifest())
@@ -231,6 +247,35 @@ class TestPinnedVersions(unittest.TestCase):
             ],
         )
         self.assertNotIn("0.9.20", rc.pinned_versions(self.repo.path))
+
+    def test_a_fleet_tag_nested_too_deeply_to_read_pins_nothing(self):
+        # A tag is permanent history, so one tag a parser cannot read must not stop every
+        # caller of pins_by_ref (validate, the importer, the audit): it pins nothing, as a tag
+        # whose manifest does not parse does, and the others read as before.
+        self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        self.repo.tag("fleet-v11")
+        self.repo.commit(ts.manifest("0.9.14"))
+        self.assertIsNone(rc._tag_pin(self.repo.path, "fleet-v11"))
+        self.assertEqual(
+            list(rc.pins_by_ref(self.repo.path).items()),
+            [
+                ("main", "0.9.14"),
+                ("fleet-v1", None),
+                ("fleet-v2", "0.9.6"),
+                ("fleet-v10", "0.9.12"),
+                ("fleet-v11", None),
+            ],
+        )
+        self.assertEqual(rc.pinned_versions(self.repo.path), {"0.9.6", "0.9.12", "0.9.14"})
+
+    def test_a_main_manifest_nested_too_deeply_to_read_is_refused(self):
+        # Main is read strictly, so this is pins_by_ref's usual refusal for a manifest that
+        # does not parse, not an uncaught RecursionError.
+        self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        with self.assertRaises(rc.ReleaseCheckError) as caught:
+            rc.pins_by_ref(self.repo.path)
+        self.assertEqual(caught.exception.check, "manifest")
+        self.assertIn("does not parse", caught.exception.detail)
 
     def test_a_repository_without_main_is_infrastructure(self):
         ts.git(self.repo.path, "branch", "-m", "main", "trunk")
@@ -2353,6 +2398,19 @@ class TestAuditTags(unittest.TestCase):
             ["fleet-v4 records version '0.9.10', but the manifest at its commit pins 'entry removed'"],
         )
 
+    def test_a_new_tag_whose_manifest_is_nested_too_deeply_is_a_problem_not_a_crash(self):
+        # Tags never change, so a tag whose manifest crashed the audit would crash every later
+        # audit. It reads as an unreadable manifest, which cannot match the version the tag records.
+        commit = self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP}, message="a manifest nested too deeply")
+        self.tag_at(commit, "0.9.10", 4)
+        self.assertEqual(
+            self.audit(),
+            [
+                "fleet-v4 records version '0.9.10', but the manifest at its commit pins "
+                "'an unreadable manifest (the document is too deeply nested to read)'"
+            ],
+        )
+
     def test_a_manifest_object_git_cannot_read_is_no_verdict_not_drift(self):
         # The tree lists the file and the blob is gone: git failed, which says nothing about the tag.
         commit = self.cut("0.9.10", 4)
@@ -2774,6 +2832,32 @@ class TestCli(unittest.TestCase):
                 self.assertIn(type(error).__name__, document["detail"])
                 self.assertIn("::error::internal: " + type(error).__name__, err)
 
+    def test_a_stray_value_error_is_an_internal_error_not_a_usage_error(self):
+        # `usage` names a mistake in what the caller typed. A ValueError that no check turned
+        # into a verdict or an outage is none of that: it is this tool meeting something it did
+        # not expect, so it reaches no verdict (exit 2) and says so.
+        stray = (
+            ValueError("not a number"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        )
+        for error in stray:
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(rc, "classify_migrations", side_effect=error):
+                    code, out, err = cli("classify", "a" * 40, "b" * 40)
+                self.assertEqual(code, 2)
+                document = json.loads(out)["error"]
+                self.assertEqual(document["check"], "internal")
+                self.assertIn(type(error).__name__, document["detail"])
+                self.assertIn("::error::internal: " + type(error).__name__, err)
+
+    def test_a_file_the_command_line_names_but_cannot_be_read_is_a_usage_error(self):
+        # The one failure `usage` still names: a path the caller gave that does not open.
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        code, out, _ = cli("diff-mode", os.path.join(holder.name, "base.json"), os.path.join(holder.name, "head.json"))
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)["error"]["check"], "usage")
+
     def test_an_interrupt_is_not_reported_as_an_internal_error(self):
         for error in (KeyboardInterrupt(), SystemExit(3)):
             with self.subTest(error=type(error).__name__):
@@ -2812,6 +2896,18 @@ class TestCli(unittest.TestCase):
 
     def test_candidates(self):
         repo = self.repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        candidates.assert_called_once_with({"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"pinned": ["0.9.13", "0.9.14"], "candidates": ["0.9.15"]}))
+
+    def test_a_fleet_tag_nested_too_deeply_to_read_does_not_stop_candidates(self):
+        # The importer asks for candidates on every run, so one tag the parser cannot read
+        # must leave that tag pinning nothing and everything else as it was, not end the run.
+        repo = self.repo()
+        repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        repo.tag("fleet-v2")
+        repo.commit(ts.manifest("0.9.14"))
         with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
             code, out, _ = cli("candidates", "--repo", repo.path)
         candidates.assert_called_once_with({"0.9.13", "0.9.14"})

@@ -10,14 +10,17 @@ records the version, integrity, PR, approver and store-migration class, plus
 rollback-from, drill and approver-note when they apply. The approver-note also
 says when the PR's final head had no passing `validate` run (none at all, or its
 latest one failed or had not finished), whoever approved it, so a merge past a
-failed check is in the permanent record. That read uses the workflow's own
-token, which can read checks, not the App's. A commit that GitHub links to no
-merged PR is left untagged, and so is everything after it, until it is an hour
-old: a slow link must not become a permanent `pr: none` tag. After that hour
-it is tagged as a push without a PR. A commit dated more than
-five minutes ahead of the runner's clock is not young either (only a direct
-push can carry one, and waiting for its date would hold every later tag back):
-it is tagged at once, as an old one would be. The owners that decide
+failed check is in the permanent record. Only a run of validate.yml that the
+`pull_request_target` event started, at or before the time the PR merged, counts:
+a job of that name in another workflow passes nothing, and a run made after the
+merge (an edit of the closed PR, a manual re-run) decides nothing. That read uses
+the workflow's own token, which can read checks and workflow runs, not the App's.
+A commit that GitHub links to no merged PR is left untagged, and so is everything
+after it, until it is an hour old: a slow link must not become a permanent
+`pr: none` tag. After that hour it is tagged as a push without a PR. A commit
+dated more than five minutes ahead of the runner's clock is not young either
+(only a direct push can carry one, and waiting for its date would hold every
+later tag back): it is tagged at once, as an old one would be. The owners that decide
 whether a PR was approved come from CODEOWNERS at the merged commit's parent,
 read strictly: one `*` line of user owners. That file is fixed history, which
 no later pull request can change, so a parent whose file is anything else (a
@@ -27,32 +30,44 @@ tagging for good: a commit a pull request merged is tagged with
 `approver: unknown` and an approver-note saying why, rather than a guess at who
 counts. A commit no pull request merged records `approver: none`
 whatever the file holds, as there is no approval to match.
+Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
+a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
+the sweep: every run reports it as a warning and goes on, comparing each later
+commit with the nearest earlier one that reads.
 The run also deletes the bot's own branches that still point at the head a
 closed PR closed on, since only the bot may delete bot/** branches.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Callable
 
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
 from issue_router import CODEOWNERS_FILE
-from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, vkey
+from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, parse_json, vkey
 
 ABSENT = "entry removed"
+# Not a version: what the manifest at a commit says when it cannot be read at all (see Unreadable).
+UNREADABLE = "manifest unreadable"
 # The modes git gives a regular file; any other mode at the CODEOWNERS path (120000 a symbolic link, 160000 a
 # submodule, 040000 a directory) holds nothing a reader can take rules from.
 FILE_MODES = ("100644", "100755")
 ENTRY_KINDS = {"120000": "a symbolic link", "160000": "a submodule", "040000": "a directory"}
 # The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
 VALIDATE_CHECK = "validate"
+# Only a check run of that workflow file, run for the event below, is the required check. A job of any other
+# name-alike workflow (another file, a push or pull_request run of validate.yml itself) can report the same
+# check name. validate.yml runs for pull_request_target, so GitHub takes the workflow from main and not from
+# the pull request, which is what makes its answer one a pull request cannot write for itself.
+VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
+VALIDATE_EVENT = "pull_request_target"
 ASSOCIATION_ATTEMPTS = 3
 ASSOCIATION_WAIT = 20.0
 # How long a commit may stay unlinked from a merged PR before it is tagged as a push without one (the
@@ -67,26 +82,63 @@ CLOCK_SKEW = 300
 USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
-def version_at(git: Git, sha: str | None) -> str:
-    """The ai-tc version main pinned at `sha`, or ABSENT when the entry (or the commit) is missing."""
+class Unreadable(Refused):
+    """The manifest at a commit cannot be read: it is not JSON, is nested too deeply to read, repeats a key, has
+    no plugins list, or has an ai-tc entry that is ambiguous or malformed. Main's history is fixed, so a commit
+    like that never gets better, and a sweep that stopped at one would stop for good: pin_changes treats it as no
+    pin change and goes on. It is a Refused only so that, if one ever escapes, the run ends as one error line."""
+
+
+def entry_at(git: Git, sha: str) -> dict | None:
+    """The ai-tc entry of the manifest at `sha`, or None when the commit has no manifest or its manifest has no
+    entry. The manifest is read the way validate reads it (parse_json, entry_of), so what is unreadable here is
+    unreadable there: Unreadable says so. A checkout that cannot be read at all (a missing object) raises GitError."""
+    try:
+        raw = git.show(sha, MANIFEST)
+        return None if raw is None else entry_of(parse_json(raw))
+    except (ValueError, Refused) as error:
+        raise Unreadable(f"{MANIFEST} at {sha[:12]} cannot be read: {' '.join(str(error).split())[:200]}") from error
+
+
+def read_version(git: Git, sha: str | None) -> tuple[str, str]:
+    """(the ai-tc version main pinned at `sha`, "") with ABSENT as the version when the entry (or the commit) is
+    missing, or (UNREADABLE, why) when the manifest there cannot be read."""
     if sha is None:
-        return ABSENT
-    raw = git.show(sha, MANIFEST)
-    if raw is None:
-        return ABSENT
-    entry = entry_of(json.loads(raw))
+        return ABSENT, ""
+    try:
+        entry = entry_at(git, sha)
+    except Unreadable as problem:
+        return UNREADABLE, str(problem)
     if entry is None:
-        return ABSENT
+        return ABSENT, ""
     version = entry["source"].get("version")
-    return version if isinstance(version, str) and version else "unpinned"
+    return (version if isinstance(version, str) and version else "unpinned"), ""
+
+
+def version_at(git: Git, sha: str | None) -> str:
+    """The ai-tc version main pinned at `sha`: ABSENT when the entry (or the commit) is missing, UNREADABLE when
+    the manifest there cannot be read."""
+    return read_version(git, sha)[0]
+
+
+def version_up_to(git: Git, sha: str | None) -> str:
+    """The version main pinned at `sha`, or at the nearest first-parent ancestor whose manifest can be read:
+    what a commit's parent stood for. ABSENT when the entry is missing there, or nothing back to the root reads."""
+    while sha is not None:
+        version = version_at(git, sha)
+        if version != UNREADABLE:
+            return version
+        sha = git.first_parent(sha)
+    return ABSENT
 
 
 def last_pinned(git: Git, sha: str | None) -> str:
     """The version main last pinned at or before `sha`: its own, or the nearest first-parent ancestor's
-    when the entry is removed there. ABSENT only when nothing back to the root pins one."""
+    when the entry is removed there or its manifest cannot be read. ABSENT only when nothing back to the root
+    pins one."""
     while sha is not None:
         version = version_at(git, sha)
-        if version != ABSENT:
+        if version not in (ABSENT, UNREADABLE):
             return version
         sha = git.first_parent(sha)
     return ABSENT
@@ -131,27 +183,58 @@ def code_owners(git: Git, sha: str) -> list[str]:
 
 
 def integrity_at(git: Git, sha: str) -> str:
-    raw = git.show(sha, MANIFEST)
-    entry = entry_of(json.loads(raw)) if raw else None
+    entry = entry_at(git, sha)
     metadata = entry.get("metadata") if entry is not None else None
     return metadata.get("integrity", "none") if isinstance(metadata, dict) else "none"
 
 
-def pending(git: Git) -> list[str]:
+def pin_changes(git: Git, base: str) -> tuple[list[str], dict[str, str]]:
+    """The first-parent commits on main after `base` that changed the ai-tc version and carry no fleet-v tag,
+    oldest first, and the commits whose manifest cannot be read, each with why.
+
+    A commit whose manifest cannot be read is never a pin change, and is not compared with: a commit is compared
+    with the version at the nearest earlier commit that reads (version_up_to), so a manifest that was broken for
+    a commit and mended to the same version is no change either way, and a pin change behind a broken commit is
+    found at the first commit that reads again. Main's history is fixed, so a run that stopped at a commit like
+    that would stop on every later run; the caller reports it and carries on."""
+    tagged = {tag["commit"] for tag in git.fleet_tags()}
+    changes, unreadable = [], {}
+    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
+    for sha in git.first_parent_after(base, git.main()):
+        if sha in tagged:
+            continue
+        version, why = read_version(git, sha)
+        if version == UNREADABLE:
+            unreadable[sha] = why
+        elif version != version_up_to(git, git.first_parent(sha)):
+            changes.append(sha)
+    return changes, unreadable
+
+
+def last_tag_commit(git: Git) -> str:
     tags = git.fleet_tags()
     if not tags:
         raise Refused("no fleet-v tag exists to sweep from")
-    tagged = {tag["commit"] for tag in tags}
-    # git.main() is the full ref: a bare "main" would resolve to a tag of that name before the branch.
-    return [sha for sha in git.first_parent_after(tags[-1]["commit"], git.main())
-            if sha not in tagged and version_at(git, sha) != version_at(git, git.first_parent(sha))]
+    return tags[-1]["commit"]
+
+
+def pending(git: Git) -> list[str]:
+    return pin_changes(git, last_tag_commit(git))[0]
 
 
 def store_migration(git: Git, sha: str, version: str, previous: str) -> str:
+    """The store-migration class the tag records. `unknown` also when the safety table at `sha` cannot be read:
+    a rollback would otherwise read an empty table and record `additive` across a release that was not safe."""
     if not SEMVER.fullmatch(version):
         return "none"
     raw = git.show(sha, SAFETY_FILE)
-    known = json.loads(raw).get("versions", {}) if raw else {}
+    try:
+        table = parse_json(raw) if raw else {}
+    except ValueError:
+        return "unknown"
+    known = table.get("versions", {}) if isinstance(table, dict) else None
+    if not isinstance(known, dict):
+        return "unknown"
     if SEMVER.fullmatch(previous) and vkey(version) < vkey(previous):
         crossed = [entry for v, entry in known.items()
                    if SEMVER.fullmatch(v) and vkey(version) < vkey(v) <= vkey(previous)]
@@ -193,25 +276,70 @@ def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[s
             and login in owners and login not in exclude]
 
 
-def validate_conclusion(reader: GitHub, head: str) -> str | None:
-    """How the latest `validate` run from GitHub Actions on `head` ended, or None when none ran. A run that has
-    not finished has no conclusion, so its status stands in for it (`queued`, `in_progress`); the two sets of
-    words do not overlap, and only `success` is a pass.
+def timestamp(text) -> datetime | None:
+    """A GitHub timestamp ("2026-10-02T00:00:00Z") as a datetime, or None when it is missing or in any other form."""
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ") if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def is_validate_workflow_run(reader: GitHub, run: dict, suites: dict[int, list]) -> bool:
+    """Whether check run `run` was reported by a run of validate.yml that the `pull_request_target` event started.
+
+    A check run names its check suite, and GitHub Actions makes one check suite for each workflow run, so the
+    workflow runs listed for the suite say what the check run belongs to (`check_suite_id` is a documented
+    filter of the repository's workflow-run list, and each run there states its `event` and the `path` of its
+    workflow file). A check run with no suite, or one whose suite lists no workflow run or more than one, is not
+    counted: nothing says what it belongs to. `suites` keeps the answers of one call, so a suite is asked once."""
+    suite = (run.get("check_suite") or {}).get("id")
+    if not isinstance(suite, int) or isinstance(suite, bool):
+        return False
+    if suite not in suites:
+        answer = reader.get(reader.repo_path("actions/runs"), {"check_suite_id": suite})
+        listed = answer.get("workflow_runs") if isinstance(answer, dict) else None
+        suites[suite] = listed if isinstance(listed, list) else []
+    if len(suites[suite]) != 1 or not isinstance(suites[suite][0], dict):
+        return False
+    workflow = suites[suite][0]
+    # The path is the workflow file's; a trailing "@<ref>" is accepted, as GitHub's own examples show one.
+    return (workflow.get("event") == VALIDATE_EVENT
+            and isinstance(workflow.get("path"), str) and workflow["path"].split("@", 1)[0] == VALIDATE_WORKFLOW)
+
+
+def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str | None:
+    """How the latest `validate` run on `head` that counts ended, or None when none counts. A run that has not
+    finished has no conclusion, so its status stands in for it (`queued`, `in_progress`); the two sets of words
+    do not overlap, and only `success` is a pass.
 
     The required check is the job named `validate` that GitHub Actions reports, so the runs are asked for by
-    name and app and checked again here, and the latest of them (the highest id) decides: a re-run that failed
-    after an earlier pass leaves the head unvalidated. `filter=all` asks for every run, not just the latest of
-    each name."""
+    name and app and checked again here. Of those, a run counts only if it
+    (1) started at or before `merged_at`, the time its pull request merged: a run made afterwards (an edit of the
+        closed pull request starts one, and so does a manual re-run) neither fails a head that was validated nor
+        passes one that was not. A run queued before the merge and started after it started after it. A run with
+        no start time, or a merge with no time, cannot be placed before the merge and does not count; and
+    (2) belongs to a run of .github/workflows/validate.yml started by `pull_request_target`
+        (is_validate_workflow_run), so a job of that name in any other workflow, or in a push or pull_request run,
+        passes nothing and fails nothing.
+    Of the runs that count the latest (the highest id) decides: a re-run that failed after an earlier pass leaves
+    the head unvalidated. They are tried newest first, so the workflow run behind a check run is asked about only
+    until one counts. `filter=all` asks for every run, not just the latest of each name.
+
+    The reader needs `checks: read` and `actions: read`. A failed read raises, as any read of GitHub does."""
+    merged = timestamp(merged_at)
     runs = [run for run in reader.paginate(reader.repo_path(f"commits/{head}/check-runs"),
                                            {"check_name": VALIDATE_CHECK, "app_id": GITHUB_ACTIONS_APP_ID,
                                             "filter": "all"})
             if run.get("name") == VALIDATE_CHECK and (run.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
-    if not runs:
-        return None
-    latest = max(runs, key=lambda run: run.get("id") or 0)
-    if latest.get("status") != "completed":
-        return latest.get("status") or "unfinished"
-    return latest.get("conclusion") or "without a result"
+    suites: dict[int, list] = {}
+    for run in sorted(runs, key=lambda run: run.get("id") or 0, reverse=True):
+        started = timestamp(run.get("started_at"))
+        if merged is not None and started is not None and started <= merged \
+                and is_validate_workflow_run(reader, run, suites):
+            if run.get("status") != "completed":
+                return run.get("status") or "unfinished"
+            return run.get("conclusion") or "without a result"
+    return None
 
 
 def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
@@ -241,7 +369,7 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[fl
         approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
         approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
         bypass = not approvers
-    conclusion = validate_conclusion(gh if reader is None else reader, head)
+    conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "
                        f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")
@@ -297,7 +425,10 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
           now: Callable[[], float] = time.time, reader: GitHub | None = None) -> list[str]:
     """Tag every untagged pin change on main, oldest first. `gh` writes (the App's token); `reader` reads the
     checks of a merged PR's head (the workflow token) and defaults to `gh`."""
-    todo = pending(git)
+    todo, unreadable = pin_changes(git, last_tag_commit(git))
+    for why in unreadable.values():
+        # One line each, and the sweep goes on: no later pull request can mend a commit already on main.
+        print(f"::warning::{why}. It is not counted as a pin change, and the sweep goes on with the commits after it.")
     number = git.fleet_tags()[-1]["n"]
     created = []
     for sha in todo:
@@ -306,7 +437,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if tag_exists(gh, name):
             raise Refused(f"{name} already exists on GitHub but not in this checkout; re-run the sweep")
         parent = git.first_parent(sha)
-        version, previous = version_at(git, sha), version_at(git, parent)
+        version, previous = version_at(git, sha), version_up_to(git, parent)
         if previous == ABSENT:
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
