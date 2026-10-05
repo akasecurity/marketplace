@@ -804,8 +804,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plan":
         # The verify job runs the release checks; open-pr runs none (its calls are GitHub's, each
         # with its own timeout), so it starts no budget. One budget for the whole plan, cleared
-        # below however the run ends: every request and npm call is cut to what remains of it, so
-        # the run ends with a no-verdict of its own before GitHub cancels the job.
+        # below however the run ends: every release-check request and npm call is cut to what
+        # remains of it, so the run ends with a no-verdict of its own before GitHub cancels the
+        # job. The plan's own GitHub reads are not budgeted; each has its own 60 s timeout.
         release_checks.start_budget(release_checks.BUDGET_JOB)
     try:
         if args.command == "plan":
