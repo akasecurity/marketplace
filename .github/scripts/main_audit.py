@@ -35,7 +35,7 @@ from gitrepo import Git
 from import_release import Refused, write_output
 from issue_router import Result, results_to_json
 from release_checks import GITHUB_ACTIONS_APP_ID
-from tag_release import code_owners, merged_pull, owner_approvals
+from tag_release import code_owners, merged_into_main, owner_approvals, pull_association
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -104,11 +104,27 @@ def validate_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None
     return None
 
 
+def no_merge_problem(sha: str, linked: list[dict]) -> str:
+    """Why `sha`, which is no pull request's merge commit, is red. A rebase merge puts each commit of the pull
+    request on main as a new commit and names only the last one as its merge commit, so a commit that GitHub
+    links to a pull request merged into main at some other commit is probably one of those. It is still red:
+    the main ruleset allows squash merges only, so a rebase merge was a bypass of it. Any other commit was
+    pushed directly. `linked` is the answer the lookup already read, so this asks GitHub nothing."""
+    lead = f"`{sha}` is not the merge commit of any pull request"
+    for pull in linked:
+        merge_commit = pull.get("merge_commit_sha")
+        if merge_commit and merged_into_main(pull):
+            return (f"{lead}. GitHub links it to PR #{pull['number']}, which merged into main at `{merge_commit}`, "
+                    "so it is probably one of the commits of a rebase merge of that pull request. The main ruleset "
+                    "allows squash merges only, so a rebase merge means that rule was bypassed or is not in force.")
+    return f"{lead}: it was pushed to main directly."
+
+
 def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
     """What is wrong with how `sha` reached main, or None. A commit with both problems gets one description."""
-    pull = merged_pull(gh, sha, sleep)
+    pull, linked = pull_association(gh, sha, sleep)
     if pull is None:
-        return f"`{sha}` is not the merge commit of any pull request: it was pushed to main directly."
+        return no_merge_problem(sha, linked)
     number = pull["number"]
     head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
     problems = [problem for problem in (approval_problem(gh, git, sha, number, head),
