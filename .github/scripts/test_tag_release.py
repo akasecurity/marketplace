@@ -270,6 +270,172 @@ class TestSweep(unittest.TestCase):
         self.assertEqual(tr.store_migration(git, "b", "0.9.15", "0.9.14"), "unknown")
 
 
+def manifest_naming_ai_tc_twice() -> str:
+    """A manifest whose ai-tc entry is ambiguous, which validate refuses."""
+    doc = json.loads(manifest("0.9.14", INTEGRITY["0.9.14"]))
+    doc["plugins"].append(dict(next(plugin for plugin in doc["plugins"] if plugin["name"] == "ai-tc")))
+    return release_checks.dump_json(doc)
+
+
+UNREADABLE_MANIFESTS = {
+    "text that is not JSON": "{",
+    "an empty file": "",
+    "JSON nested far deeper than the parser reads": "[" * 100_000,
+    "a repeated key": '{"plugins": [], "plugins": []}',
+    "a document with no plugins list": "{}",
+    "a document that is not an object": "[]",
+    "an ai-tc entry named twice": manifest_naming_ai_tc_twice(),
+}
+
+
+class TestUnreadableManifests(unittest.TestCase):
+    """A commit already on main never gets better, so a manifest that cannot be read at one must not stop the
+    sweep (and so every tag after it) for good. The commit is no pin change, it is reported, and the sweep goes on."""
+
+    def broken(self, sha: str, text: str, chain=("t8", "a", "b", "c", "d")) -> FakeGit:
+        git = history(chain=chain)
+        git.files[(sha, MANIFEST)] = text
+        return git
+
+    def test_a_commit_whose_manifest_cannot_be_read_is_no_pin_change_and_the_walk_goes_on(self):
+        for label, text in UNREADABLE_MANIFESTS.items():
+            with self.subTest(label):
+                git = self.broken("a", text)
+                changes, unreadable = tr.pin_changes(git, "t8")
+                self.assertEqual(changes, ["b", "c", "d"])
+                self.assertEqual(list(unreadable), ["a"])
+                self.assertIn(f"{MANIFEST} at a cannot be read: ", unreadable["a"])
+                self.assertEqual(tr.pending(git), ["b", "c", "d"])
+
+    def test_the_reason_is_one_line_however_long_the_parser_message_is(self):
+        git = self.broken("a", '{"k": 1, "' + "k" * 5000 + '": 1, "' + "k" * 5000 + '": 2}')
+        _, unreadable = tr.pin_changes(git, "t8")
+        self.assertNotIn("\n", unreadable["a"])
+        self.assertLess(len(unreadable["a"]), 400)
+
+    def test_a_broken_commit_between_two_pin_changes_is_passed_over(self):
+        # "c" sits between the release (b, 0.9.15) and the entry's removal (d): d is compared with b.
+        changes, unreadable = tr.pin_changes(self.broken("c", "{"), "t8")
+        self.assertEqual((changes, list(unreadable)), (["b", "d"], ["c"]))
+
+    def test_the_tip_can_be_the_broken_commit(self):
+        changes, unreadable = tr.pin_changes(self.broken("c", "{", chain=("t8", "a", "b", "c")), "t8")
+        self.assertEqual((changes, list(unreadable)), (["b"], ["c"]))
+
+    def test_a_manifest_broken_for_one_commit_and_mended_to_the_same_version_is_no_change(self):
+        git = history(chain=("t8", "a", "a2"))
+        git.files[("a", MANIFEST)] = "{"
+        git.files[("a2", MANIFEST)] = manifest("0.9.14", INTEGRITY["0.9.14"])
+        self.assertEqual(tr.pin_changes(git, "t8"), ([], {"a": unreadable_reason(git, "a")}))
+
+    def test_a_pin_change_behind_a_broken_commit_is_found_at_the_first_commit_that_reads(self):
+        git = history(chain=("t8", "a", "b"))
+        git.files[("a", MANIFEST)] = "[" * 100_000
+        self.assertEqual(tr.pin_changes(git, "t8")[0], ["b"])
+
+    def test_a_tagged_commit_is_neither_a_pin_change_nor_reported(self):
+        git = self.broken("a", "{")
+        git.tags.append(fleet_tag(9, "a"))
+        self.assertEqual(tr.pin_changes(git, "t8"), (["b", "c", "d"], {}))
+
+    def test_the_sweep_reports_each_broken_commit_once_tags_the_rest_and_ends_green(self):
+        gh = sweep_github()
+        code, out = run_main("sweep", self.broken("a", "{", chain=("t8", "a", "b")), gh)
+        self.assertEqual(code, 0, out)
+        warnings = re.findall(r"(?m)^::warning::.*$", out)
+        self.assertEqual(len(warnings), 1, out)
+        self.assertIn(f"{MANIFEST} at a cannot be read", warnings[0])
+        self.assertIn("not counted as a pin change", warnings[0])
+        self.assertIn("created fleet-v9 -> b (ai-tc 0.9.15)", out)
+        self.assertIn("tagged 1 commit(s)", out)
+
+    def test_nothing_to_tag_after_a_broken_commit_is_still_reported(self):
+        code, out = run_main("sweep", self.broken("a", "{", chain=("t8", "a")), sweep_github())
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"(?m)^::warning::.*at a cannot be read")
+        self.assertIn("nothing to tag", out)
+
+    def test_a_tag_after_a_broken_commit_records_the_version_it_moved_from_not_the_broken_one(self):
+        # c rolls 0.9.15 (b) back to 0.9.14, with the broken commit a in between: the rollback is still recorded.
+        gh = sweep_github()
+        tr.sweep(self.broken("a", "{", chain=("t8", "b", "a", "c")), gh, sleep=lambda seconds: None, now=lambda: NOW)
+        first, second = (call[2]["message"] for call in gh.called("POST", R("git/tags")))
+        self.assertIn("version: 0.9.15\n", first)
+        self.assertIn("version: 0.9.14\n", second)
+        self.assertIn("rollback-from: 0.9.15\n", second)
+
+    def test_a_restore_after_a_removal_is_compared_with_the_last_version_that_could_be_read(self):
+        # b pins 0.9.15, d removes the entry (no PR, old enough to be tagged), a is broken, c restores 0.9.14.
+        git = history(chain=("t8", "b", "d", "a", "c"), times={"d": NOW - 7200})
+        git.files[("a", MANIFEST)] = "{"
+        gh = sweep_github()
+        tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        messages = [call[2]["message"] for call in gh.called("POST", R("git/tags"))]
+        self.assertIn("rollback-from: 0.9.15\n", messages[-1])
+
+    def test_the_last_pin_is_found_back_through_broken_commits(self):
+        git = history(chain=("t8", "b", "a", "c", "d"))
+        git.files[("a", MANIFEST)] = "{"
+        git.files[("c", MANIFEST)] = "{"
+        self.assertEqual(tr.last_pinned(git, "c"), "0.9.15")
+        self.assertEqual(tr.version_up_to(git, "c"), "0.9.15")
+        self.assertEqual(tr.version_up_to(git, "a"), "0.9.15")
+        self.assertEqual(tr.version_at(git, "a"), tr.UNREADABLE)
+        root = history(chain=("a", "b"))
+        root.files[("a", MANIFEST)] = "{"
+        self.assertEqual((tr.version_up_to(root, "a"), tr.last_pinned(root, "a")), (tr.ABSENT, tr.ABSENT))
+
+    def test_a_damaged_checkout_is_still_an_error_not_an_unreadable_manifest(self):
+        class Damaged(FakeGit):
+            def show(self, rev, path):
+                raise GitError("git show failed: bad object")
+
+        git = Damaged(chain=["t8", "a"], tags=[fleet_tag(8, "t8")])
+        with self.assertRaises(GitError):
+            tr.pin_changes(git, "t8")
+
+    def test_a_manifest_that_is_not_text_is_unreadable_too(self):
+        class NotText(FakeGit):
+            def show(self, rev, path):
+                if (rev, path) == ("a", MANIFEST):
+                    raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+                return super().show(rev, path)
+
+        base = history(chain=("t8", "a", "b"))
+        git = NotText(chain=base.chain, files=base.files, tags=base.tags)
+        changes, unreadable = tr.pin_changes(git, "t8")
+        self.assertEqual((changes, list(unreadable)), (["b"], ["a"]))
+
+    def table(self, text, version, previous):
+        git = FakeGit(chain=["x"], files={("x", SAFETY_FILE): text})
+        return tr.store_migration(git, "x", version, previous)
+
+    def test_a_safety_table_that_cannot_be_read_records_unknown_for_a_release_and_for_a_rollback(self):
+        # An empty table would call a rollback across an unsafe release additive.
+        for label, text in {"not JSON": "{", "too deeply nested": "[" * 100_000, "not an object": "[]",
+                            "versions that is not an object": '{"versions": []}', "a repeated key": '{"a": 1, "a": 2}'}.items():
+            with self.subTest(label):
+                self.assertEqual(self.table(text, "0.9.15", "0.9.14"), "unknown")
+                self.assertEqual(self.table(text, "0.9.14", "0.9.15"), "unknown")
+
+    def test_a_missing_safety_table_keeps_the_answers_it_always_gave(self):
+        git = FakeGit(chain=["x"])
+        self.assertEqual(tr.store_migration(git, "x", "0.9.15", "0.9.14"), "unknown")
+        self.assertEqual(tr.store_migration(git, "x", "0.9.14", "0.9.15"), "additive")
+
+    def test_the_tag_for_a_release_whose_safety_table_cannot_be_read_is_still_cut_as_unknown(self):
+        git = history(chain=("t8", "b"))
+        git.files[("b", SAFETY_FILE)] = "[" * 100_000
+        gh = sweep_github()
+        tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
+        self.assertIn("store-migration: unknown\n", gh.called("POST", R("git/tags"))[0][2]["message"])
+
+
+def unreadable_reason(git, sha: str) -> str:
+    """Why tag_release says the manifest at `sha` cannot be read."""
+    return tr.read_version(git, sha)[1]
+
+
 class TestMessage(unittest.TestCase):
     """A tag message is permanent and read line by line (`splitlines`, first line of a key wins), so no value that
     comes from a file may add a line of its own. Every kind of line break str.splitlines honours is tried."""
