@@ -67,6 +67,9 @@ class ImporterWorkflow(WorkflowCase):
         self.assertRegex(self.head, r"(?s)\n      below_floor:\n.*?type: boolean\n")
 
     def test_each_mode_queues_in_its_own_concurrency_group(self):
+        # The schedule and forward dispatches share the first group on purpose: open-pr replaces a branch
+        # no PR ever used, which is safe only while no other forward run is live. A scheduled tick can
+        # therefore cancel a pending forward dispatch, and the workflow's header says so.
         self.assertIn("  group: ${{ github.event_name == 'schedule' && 'import-forward' || "
                       "format('import-{0}', inputs.mode) }}\n", self.head)
         self.assertIn("  cancel-in-progress: false\n", self.head)
@@ -81,19 +84,68 @@ class ImporterWorkflow(WorkflowCase):
     def test_the_workflow_token_never_writes(self):
         self.assertNotRegex(self.text, r"(?m)^\s+(contents|pull-requests|issues): write")
 
+    def test_the_app_token_is_made_from_the_clients_id_not_the_deprecated_app_id(self):
+        # create-github-app-token marks app-id deprecated ("Use 'client-id' instead"): every run would
+        # warn, and a later major version may drop it. The secrets are the App's client id and key.
+        self.assertIn("          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}\n", self.jobs["open-pr"])
+        self.assertIn("          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}\n", self.jobs["open-pr"])
+        self.assertNotRegex(self.text, r"(?m)^\s+app-id:")
+        self.assertNotIn("MARKETPLACE_BOT_APP_ID", self.text)
+
     # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
     # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
     FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
 
+    @staticmethod
+    def lowest_admitted(spec):
+        """The lowest release setup-node's version spec can resolve to, or None when it can
+        resolve to a Node that does not ship the npm the gate needs: a bare major, an x-range,
+        an alias, another major (Node 25.0.0 through 25.8.2 bundle npm 11.6 to 11.11), or a range
+        with no upper bound, which setup-node resolves to the highest cached copy of any major.
+        Only an exact 24.x.y, or a range from one up to but not including 25, is accepted."""
+        match = re.fullmatch(r"24\.(\d+)\.(\d+)", spec) or re.fullmatch(r">=24\.(\d+)\.(\d+) <25", spec)
+        return (24, int(match.group(1)), int(match.group(2))) if match else None
+
+    def test_the_lowest_release_a_spec_admits(self):
+        for spec, lowest in (
+            ("24.15.0", (24, 15, 0)),
+            ("24.16.1", (24, 16, 1)),
+            (">=24.15.0 <25", (24, 15, 0)),
+            (">=24.16.1 <25", (24, 16, 1)),
+            # Another major bundles another npm: Node 25.0.0 through 25.8.2 ship npm 11.6 to 11.11.
+            ("25.0.0", None),
+            (">=25.9.0 <26", None),
+            # No upper bound, or one past 25: the highest cached copy of any major can be chosen.
+            (">=24.15.0", None),
+            (">=24.16.1", None),
+            (">=24.15.0 <26", None),
+            (">=24.15.0 <24.99.0", None),
+            ("<25", None),
+            ("24", None),
+            ("24.x", None),
+            ("^24.15.0", None),
+            (">=24", None),
+            ("lts/*", None),
+            ("latest", None),
+        ):
+            with self.subTest(spec):
+                self.assertEqual(self.lowest_admitted(spec), lowest)
+
     def test_node_is_installed_at_a_release_that_ships_the_npm_the_gate_accepts(self):
         # setup-node uses a cached Node that satisfies the spec before it downloads one, so a bare "24"
         # can resolve to an older cached 24.x whose npm the release checks refuse, red, on every run.
-        # Only an exact version, or a range that starts at one, cannot.
+        # Only an exact 24.x.y, or a range from one up to but not including 25, cannot.
         specs = re.findall(r'uses: actions/setup-node@[0-9a-f]{40}.*\n\s+with:\n\s+node-version: "([^"]+)"', self.text)
         self.assertEqual(len(specs), 1, "the importer installs Node exactly once, with a quoted node-version")
-        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", specs[0])
-        self.assertIsNotNone(match, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
-        self.assertGreaterEqual(tuple(int(part) for part in match.groups()), self.FIRST_NODE_WITH_MIN_NPM)
+        lowest = self.lowest_admitted(specs[0])
+        self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
+        self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
+
+    def test_the_verify_budget_ends_before_the_job_is_cancelled(self):
+        # The plan reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"(?m)^    timeout-minutes: (\d+)\s*$", self.jobs["verify"])
+        self.assertEqual(len(limits), 1, "the verify job must set one timeout")
+        self.assertLess(release_checks.BUDGET_JOB, int(limits[0]) * 60)
 
     def test_the_node_release_was_chosen_for_the_gates_npm_floor(self):
         self.assertEqual(release_checks.MIN_NPM, (11, 12, 0))
