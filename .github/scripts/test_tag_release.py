@@ -25,6 +25,20 @@ def R(suffix):
     return f"repos/{REPO}/{suffix}"
 
 
+def scratch_repository(directory: str):
+    """`git init` in `directory`, and a function that runs git there with a fixed identity and no user config."""
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
+               GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+
+    def sh(*args):
+        return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    sh("init", "-q", "-b", "main")
+    return sh
+
+
 def history(chain=("t8", "a", "b", "c", "d"), times=None) -> FakeGit:
     """main after fleet-v8 ("t8", 0.9.14): a description-only merge ("a"), a release to 0.9.15 ("b"),
     a rollback to 0.9.14 ("c"), and the entry's removal ("d")."""
@@ -532,15 +546,7 @@ class TestCodeOwners(unittest.TestCase):
         # Read through the real Git: a gitlink at the path makes `git show` fail with "bad object", a symbolic link
         # shows its target, and a directory lists its entries. None of them is a file of rules.
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                       GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
-                       GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
-
-            def sh(*args):
-                return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
-                                      capture_output=True, text=True).stdout.strip()
-
-            sh("init", "-q", "-b", "main")
+            sh = scratch_repository(directory)
             path = os.path.join(directory, ".github", "CODEOWNERS")
             os.makedirs(os.path.dirname(path))
             git = Git(directory)
@@ -578,6 +584,25 @@ class TestCodeOwners(unittest.TestCase):
                     with self.assertRaises(Refused) as caught:
                         tr.code_owners(git, sha)
                     self.assertIn(f".github/CODEOWNERS at {sha[:12]} is {kind}, not a file", str(caught.exception))
+
+
+    def test_a_damaged_checkout_still_raises_instead_of_reading_as_unreadable_owners(self):
+        # Git.show raises GitError for a blob the tree lists but the checkout lacks. That says the checkout is
+        # damaged, not that the file is unreadable, so it must stay an error and not become an unknown approver.
+        with tempfile.TemporaryDirectory() as directory:
+            sh = scratch_repository(directory)
+            os.makedirs(os.path.join(directory, ".github"))
+            with open(os.path.join(directory, ".github", "CODEOWNERS"), "w", encoding="utf-8") as handle:
+                handle.write("* @a\n")
+            sh("add", "-A")
+            sh("commit", "-q", "-m", "owners")
+            sha = sh("rev-parse", "HEAD")
+            blob = sh("rev-parse", f"{sha}:.github/CODEOWNERS")
+            loose = os.path.join(directory, ".git", "objects", blob[:2], blob[2:])
+            os.chmod(loose, 0o644)
+            os.remove(loose)
+            with self.assertRaises(GitError):
+                tr.code_owners(Git(directory), sha)
 
 
 class TestSweepOwners(unittest.TestCase):
