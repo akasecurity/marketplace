@@ -2356,6 +2356,19 @@ class TestAuditTags(unittest.TestCase):
             ["fleet-v4 records version '0.9.10', but the manifest at its commit pins 'entry removed'"],
         )
 
+    def test_a_new_tag_whose_manifest_is_nested_too_deeply_is_a_problem_not_a_crash(self):
+        # Tags never change, so a tag whose manifest crashed the audit would crash every later
+        # audit. It reads as an unreadable manifest, which cannot match the version the tag records.
+        commit = self.repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP}, message="a manifest nested too deeply")
+        self.tag_at(commit, "0.9.10", 4)
+        self.assertEqual(
+            self.audit(),
+            [
+                "fleet-v4 records version '0.9.10', but the manifest at its commit pins "
+                "'an unreadable manifest (the document is too deeply nested to read)'"
+            ],
+        )
+
     def test_a_manifest_object_git_cannot_read_is_no_verdict_not_drift(self):
         # The tree lists the file and the blob is gone: git failed, which says nothing about the tag.
         commit = self.cut("0.9.10", 4)
@@ -2815,6 +2828,18 @@ class TestCli(unittest.TestCase):
 
     def test_candidates(self):
         repo = self.repo()
+        with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
+            code, out, _ = cli("candidates", "--repo", repo.path)
+        candidates.assert_called_once_with({"0.9.13", "0.9.14"})
+        self.assertEqual((code, json.loads(out)), (0, {"pinned": ["0.9.13", "0.9.14"], "candidates": ["0.9.15"]}))
+
+    def test_a_fleet_tag_nested_too_deeply_to_read_does_not_stop_candidates(self):
+        # The importer asks for candidates on every run, so one tag the parser cannot read
+        # must leave that tag pinning nothing and everything else as it was, not end the run.
+        repo = self.repo()
+        repo.commit(files={rc.MANIFEST: NESTED_TOO_DEEP})
+        repo.tag("fleet-v2")
+        repo.commit(ts.manifest("0.9.14"))
         with mock.patch.object(rc, "npm_candidates", return_value=["0.9.15"]) as candidates:
             code, out, _ = cli("candidates", "--repo", repo.path)
         candidates.assert_called_once_with({"0.9.13", "0.9.14"})
