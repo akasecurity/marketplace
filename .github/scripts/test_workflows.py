@@ -702,6 +702,16 @@ class MainAuditWorkflow(WorkflowCase):
         self.assertIn("      checks: read\n", self.jobs["audit"])
         self.assertNotIn("checks: write", self.text)
 
+    def test_the_audit_job_reads_the_workflow_runs_behind_those_checks_and_nothing_can_write(self):
+        # A check run counts as validate's only if the workflow run behind it is validate.yml's, so the job reads
+        # workflow runs (`actions`) as well as checks. Every permission in the file is a read, apart from the
+        # issues the second job files.
+        granted = re.search(r"(?m)^    permissions:\n((?:      [a-z-]+: \w+\n)+)", self.jobs["audit"])
+        self.assertIsNotNone(granted, "the audit job lists its permissions")
+        self.assertEqual(dict(line.strip().split(": ") for line in granted.group(1).splitlines()),
+                         {"actions": "read", "checks": "read", "contents": "read", "pull-requests": "read"})
+        self.assertNotRegex(self.text.replace("      issues: write\n", ""), r"(?m)^\s+[a-z-]+: write\b")
+
     def test_no_secret_no_environment_and_only_file_issues_writes_issues(self):
         self.assertNotIn("secrets.", self.text)
         self.assertNotIn("environment:", self.text)
