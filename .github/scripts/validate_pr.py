@@ -128,17 +128,31 @@ def _names_ai_tc(value) -> bool:
 # check is matched by name, so any such job can stand beside this one. validate reads each such file
 # as text, never runs it, and fails the PR for what it can see plainly:
 #   * a job id, or a job `name:`, written out as validate;
-#   * checks: write, statuses: write or write-all permissions (or the permission-checks and
-#     permission-statuses inputs of the App-token action), which let a job create a check run or
-#     a status named validate through the API;
-#   * a file whose jobs it cannot read with confidence (flow style, anchors and aliases, merge keys,
-#     an escape in a quoted name, a name on the next line), which it refuses rather than guess at.
-# It does not see a job name built from an expression or a matrix value, a workflow that declares
-# no permissions and so takes the repository's default token, a workflow that posts a check run or
-# status with some other token or secret, a push-triggered workflow on another branch posting on the
-# PR's head commit, or a fork PR's own run. Code-owner review of every workflow change is the control
-# for those. validate.yml itself is exempt from the job rule, since it must define the job (a change
-# to it is still called out in the notes, and its permissions are still read).
+#   * checks: write, statuses: write or write-all permissions written out plainly (or the
+#     permission-checks and permission-statuses inputs of the App-token action), which let a job
+#     create a check run or a status named validate through the API;
+#   * a file that has the word jobs in it but no top-level `jobs:` key in block style, and a file
+#     with such a key whose jobs it cannot read with confidence (flow style under it, anchors and
+#     aliases, merge keys, an escape in a quoted name, a name on the next line), which it refuses
+#     rather than guess at.
+# This is a best-effort read of the text, not a YAML parser, and it refuses only what it finds.
+# It does not see:
+#   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
+#     refusal above looks for the word jobs, so a file that never spells it out is not refused);
+#   * a change to validate.yml itself, for example another trigger: that file is exempt from the job
+#     rule and a change to it is only called out in the notes;
+#   * a permission grant written with an anchor, an alias or an escape: only plain grants match;
+#   * a job name built from an expression or a matrix value;
+#   * a workflow that declares no permissions and so takes the repository's default token;
+#   * a check run or status posted with some other token or secret;
+#   * a push-triggered workflow on another branch posting on the PR's head commit;
+#   * a fork PR's own run.
+# Code-owner review of every workflow change is the control for all of these. The detection is the
+# check after the merge: tag-release's note and the main audit count a validate check run only
+# when it belongs to a pull_request_target run of validate.yml, so a job that only shares the name
+# does not count there. That tie runs through the check run's check suite, so a check run created
+# through the API with a workflow token and filed by GitHub under that suite could still count (a
+# known limit, not reproduced).
 WORKFLOW_FILE = re.compile(r"\.github/workflows/[^/]+\.ya?ml", re.IGNORECASE)
 VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
 REQUIRED_CHECK = "validate"
