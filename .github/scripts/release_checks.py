@@ -225,8 +225,17 @@ def _reject_constant(name):
 
 
 def parse_json(text: str):
-    """json.loads that refuses duplicate keys and NaN/Infinity, which jq and json.loads accept."""
-    return json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+    """json.loads that refuses duplicate keys and NaN/Infinity, which jq and json.loads accept.
+
+    Every refusal is a ValueError, including text nested deeper than the parser reads:
+    json.loads raises RecursionError for that, which is not a ValueError, so a caller that
+    treats an unreadable document as a ValueError would crash on it. A fleet tag is permanent
+    and each tag's manifest is read on every run, so one such tag would otherwise stop every
+    later run."""
+    try:
+        return json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+    except RecursionError as exc:
+        raise ValueError("the document is too deeply nested to read") from exc
 
 
 def dump_json(doc) -> str:
