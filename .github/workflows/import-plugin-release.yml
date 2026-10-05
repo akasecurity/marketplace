@@ -15,7 +15,8 @@ name: import-plugin-release
 # until a higher release passes.
 #
 # Two jobs. `verify` holds no secret and decides. `open-pr` runs in the
-# marketplace-bot environment, whose deployment policy admits only main, and acts
+# marketplace-bot environment, whose deployment policy admits only main (tag-audit
+# reads it, and reports a change), and acts
 # as the bot App: a bot branch made with a create-only ref, never force-pushed (an
 # existing branch with an open bot PR is skipped, and one with an open PR of anyone
 # else's is a red refusal, since deleting the branch would close that PR; one the
