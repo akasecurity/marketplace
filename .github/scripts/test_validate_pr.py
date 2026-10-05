@@ -167,6 +167,40 @@ class TestHumanRules(unittest.TestCase):
         self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
         self.assertTrue(any("change all four files" in n for n in report.notes))
 
+    def test_a_description_that_is_not_a_non_empty_string_fails(self):
+        removed = object()
+        for bad in (None, 123, "", "   ", ["x"], {"text": "x"}, True, removed):
+            with self.subTest(description=bad if bad is not removed else "key removed"):
+                head = ts.manifest()
+                if bad is removed:
+                    del ts.ai_tc(head)["description"]
+                else:
+                    ts.ai_tc(head)["description"] = bad
+                report = human_report(head)
+                failed_with(self, report, "the ai-tc entry's description must be a non-empty string")
+                self.assertEqual(report.exit_code, 1)
+                self.assertIn(("Mode", "HUMAN PR, ai-tc description edit"), report.rows)
+
+    def test_the_description_failure_gives_the_reason_that_is_true(self):
+        # Claude Code refuses a null or non-string description but accepts an empty, a blank or a
+        # missing one, so the rule is the marketplace's own and the message must not say otherwise.
+        for bad in (None, 123, ""):
+            with self.subTest(description=bad):
+                head = ts.manifest()
+                ts.ai_tc(head)["description"] = bad
+                report = human_report(head)
+                messages = [f for f in report.failures if "description must be a non-empty string" in f]
+                self.assertEqual(len(messages), 1, report.failures)
+                self.assertIn("this marketplace requires one", messages[0])
+                self.assertIn("Claude Code itself refuses a null or non-string description", messages[0])
+                self.assertNotIn("anything else", messages[0])
+
+    def test_a_description_that_is_a_string_with_words_in_it_passes(self):
+        for good in ("Clearer words.", "  padded  ", "x", "Ünïcode ✓"):
+            with self.subTest(description=good):
+                report = human_report(ts.manifest(description=good))
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+
     def test_a_perfect_advance_by_a_human_fails(self):
         report = human_report(ts.manifest("0.9.15", integrity=ts.OTHER_INTEGRITY))
         failed_with(self, report, "a human PR may change only the ai-tc entry's description")
@@ -213,6 +247,51 @@ class TestHumanRules(unittest.TestCase):
             report.notes,
         )
         self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
+
+    def edited_safety_entry(self, version, **changes):
+        head_safety = copy.deepcopy(ts.SEED)
+        head_safety[version].update(changes)
+        return human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+
+    def test_an_edit_that_keeps_the_class_names_the_fields_it_changes(self):
+        other = "c" * 40
+        for changes, fields in (
+            ({"migrations": []}, "migrations"),
+            ({"from": other}, "from"),
+            ({"to": other}, "to"),
+            ({"from": other, "to": other, "migrations": ["0001_other"]}, "from, to, migrations"),
+        ):
+            with self.subTest(fields=fields):
+                report = self.edited_safety_entry("0.9.14", **changes)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+                self.assertIn(
+                    f"HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> not-rollback-safe "
+                    f"(class unchanged; changes {fields}); the approving code owner owns this classification",
+                    report.notes,
+                )
+
+    def test_an_edit_that_changes_the_class_and_more_names_the_rest(self):
+        report = self.edited_safety_entry("0.9.14", classification="additive", migrations=[])
+        self.assertEqual(report.failures, [])
+        self.assertIn(
+            "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive "
+            "(also changes migrations); the approving code owner owns this classification",
+            report.notes,
+        )
+
+    def test_an_edit_that_only_moves_the_class_names_no_other_field(self):
+        report = self.edited_safety_entry("0.9.14", classification="additive")
+        self.assertFalse(any("changes" in n for n in report.notes), report.notes)
+
+    def test_an_entry_added_or_removed_names_no_field(self):
+        head_safety = {"0.9.8": copy.deepcopy(NEXT_ENTRY), **copy.deepcopy(ts.SEED)}
+        added = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=head_safety)
+        removed_safety = copy.deepcopy(ts.SEED)
+        del removed_safety["0.9.9"]
+        removed = human_report(ts.manifest(), changed=(rc.SAFETY_FILE,), head_safety=removed_safety)
+        for report in (added, removed):
+            self.assertTrue(any("HUMAN EDIT" in n for n in report.notes), report.notes)
+            self.assertFalse(any("changes" in n for n in report.notes), report.notes)
 
     def test_a_hand_added_entry_for_a_version_nothing_pins_fails(self):
         head_safety = copy.deepcopy(ts.SEED)
@@ -610,6 +689,58 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual((report.rows, report.exit_code), ([], 1))
 
 
+def nested(levels):
+    """JSON `levels` lists deep, built as text: json.dumps would recurse as deeply as it nests."""
+    return "[" * levels + "]" * levels
+
+
+class TestDeepJson(unittest.TestCase):
+    """A file a pull request supplies that nests too deeply is a file that does not parse: a failed
+    check with a summary, not a stack trace and not a missing verdict."""
+
+    def test_the_depth_limit_is_exact(self):
+        self.assertEqual(vp._depth(rc.parse_json(nested(vp.MAX_JSON_DEPTH))), vp.MAX_JSON_DEPTH)
+        self.assertEqual(vp._depth(rc.parse_json(nested(vp.MAX_JSON_DEPTH + 1))), vp.MAX_JSON_DEPTH + 1)
+        self.assertEqual(vp._depth({"a": [{"b": [1]}], "c": []}), 4)
+        self.assertEqual(vp._depth([]), 1)
+        self.assertEqual(vp._depth(7), 0)
+        vp.parse_pr_json(nested(vp.MAX_JSON_DEPTH))
+        with self.assertRaises(ValueError):
+            vp.parse_pr_json(nested(vp.MAX_JSON_DEPTH + 1))
+
+    def test_a_real_manifest_is_far_below_the_limit(self):
+        self.assertLess(vp._depth(ts.manifest()), vp.MAX_JSON_DEPTH // 4)
+
+    def test_nesting_past_the_parser_and_nesting_inside_it_both_fail_to_parse(self):
+        # 100,000 levels end the JSON parser itself in RecursionError. 2,000 parse, and would
+        # end the code that reads the parsed value (comparisons, the rename search) instead.
+        for levels in (vp.MAX_JSON_DEPTH + 1, 2000, 100_000):
+            with self.subTest(levels=levels):
+                deep = '{"renames": %s, "plugins": []}' % nested(levels)
+                for path in (rc.MANIFEST, ".agents/plugins/marketplace.json", "plugins.json"):
+                    head = files(ts.manifest())
+                    head[path] = deep
+                    report = run(pull(**HUMAN), files(ts.manifest()), head, [path])
+                    failed_with(self, report, f"{path} does not parse at the PR head")
+                    failed_with(self, report, "nests deeper")
+                    self.assertEqual((report.exit_code, report.infra), (1, ""))
+                head = files(ts.manifest())
+                head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(levels)
+                report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.SAFETY_FILE])
+                failed_with(self, report, "rollback-safety.json does not parse at the PR head")
+                self.assertEqual((report.exit_code, report.infra), (1, ""))
+
+    def test_a_deep_file_does_not_hide_a_second_problem(self):
+        head = files(ts.manifest())
+        head[rc.SAFETY_FILE] = '{"versions": %s}' % nested(100_000)
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head[rc.MANIFEST] = rc.dump_json(doc)
+        report = run(pull(**HUMAN), files(ts.manifest()), head, [rc.MANIFEST, rc.SAFETY_FILE])
+        failed_with(self, report, "rollback-safety.json does not parse at the PR head")
+        failed_with(self, report, "a human PR may change only")
+
+
 class TestWorkflow(unittest.TestCase):
     """validate.yml cannot run here, but what it promises the script can be read from it."""
 
@@ -620,17 +751,29 @@ class TestWorkflow(unittest.TestCase):
 
     @staticmethod
     def lowest_admitted(spec):
-        """The lowest release setup-node's version spec can resolve to, or None when it admits
-        older ones (a bare major, an x-range, an alias). Only an exact version or a range that
-        starts at one is accepted."""
-        match = re.fullmatch(r"(?:>=)?(\d+)\.(\d+)\.(\d+)(?: <\d+)?", spec)
-        return tuple(int(part) for part in match.groups()) if match else None
+        """The lowest release setup-node's version spec can resolve to, or None when it can
+        resolve to a Node that does not ship the npm the gate needs: a bare major, an x-range,
+        an alias, another major (Node 25.0.0 through 25.8.2 bundle npm 11.6 to 11.11), or a range
+        with no upper bound, which setup-node resolves to the highest cached copy of any major.
+        Only an exact 24.x.y, or a range from one up to but not including 25, is accepted."""
+        match = re.fullmatch(r"24\.(\d+)\.(\d+)", spec) or re.fullmatch(r">=24\.(\d+)\.(\d+) <25", spec)
+        return (24, int(match.group(1)), int(match.group(2))) if match else None
 
     def test_the_lowest_release_a_spec_admits(self):
         for spec, lowest in (
             ("24.15.0", (24, 15, 0)),
+            ("24.16.1", (24, 16, 1)),
             (">=24.15.0 <25", (24, 15, 0)),
-            (">=24.16.1", (24, 16, 1)),
+            (">=24.16.1 <25", (24, 16, 1)),
+            # Another major bundles another npm: Node 25.0.0 through 25.8.2 ship npm 11.6 to 11.11.
+            ("25.0.0", None),
+            (">=25.9.0 <26", None),
+            # No upper bound, or one past 25: the highest cached copy of any major can be chosen.
+            (">=24.15.0", None),
+            (">=24.16.1", None),
+            (">=24.15.0 <26", None),
+            (">=24.15.0 <24.99.0", None),
+            ("<25", None),
             ("24", None),
             ("24.x", None),
             ("^24.15.0", None),
@@ -649,6 +792,12 @@ class TestWorkflow(unittest.TestCase):
         self.assertIsNotNone(lowest, f"node-version {specs[0]!r} can resolve to a cached Node with an older npm")
         self.assertGreaterEqual(lowest, self.FIRST_NODE_WITH_MIN_NPM)
 
+    def test_the_run_budget_ends_before_the_job_is_cancelled(self):
+        # validate reaches its own "no verdict" first; GitHub's cancellation of the job is not one.
+        limits = re.findall(r"^\s+timeout-minutes: (\d+)\s*$", self.WORKFLOW.read_text(encoding="utf-8"), re.M)
+        self.assertEqual(len(limits), 1, "validate.yml must set one job timeout")
+        self.assertLess(rc.BUDGET_JOB, int(limits[0]) * 60)
+
     def test_the_npm_floor_the_node_version_was_chosen_for_is_the_gates(self):
         # If the gate's floor moves, the Node release above has to move with it.
         self.assertEqual(rc.MIN_NPM, (11, 12, 0))
@@ -657,6 +806,49 @@ class TestWorkflow(unittest.TestCase):
         text = self.WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("npm 11 (Node 24)", text)
         self.assertIn("npm 11.12", text)
+
+
+class TestScriptTestsWorkflow(unittest.TestCase):
+    """The unit tests read workflow files, so a change to one must run them."""
+
+    WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / "workflows" / "script-tests.yml"
+
+    @staticmethod
+    def under_pull_request(text):
+        """What script-tests.yml nests under `on: pull_request:` (comments left out); the
+        standard library has no YAML reader, and this file's `on:` block is plain."""
+        lines = text.splitlines()
+        block = []
+        for line in lines[lines.index("on:") + 1:]:
+            if line.strip() and not line.startswith(" "):
+                break
+            block.append(line)
+        keys = [i for i, line in enumerate(block) if re.fullmatch(r"  pull_request:\s*(#.*)?", line)]
+        if len(keys) != 1:
+            return None
+        nested = []
+        for line in block[keys[0] + 1:]:
+            if line.strip() and not line.startswith("    "):
+                break
+            if line.strip() and not line.strip().startswith("#"):
+                nested.append(line.strip())
+        return nested
+
+    def test_the_unit_tests_run_on_every_pull_request(self):
+        nested = self.under_pull_request(self.WORKFLOW.read_text(encoding="utf-8"))
+        self.assertIsNotNone(nested, "script-tests.yml must declare pull_request exactly once, under on:")
+        self.assertEqual(nested, [], "a path, branch or type filter on pull_request leaves some changes untested")
+
+    def test_the_reader_sees_a_filter_wherever_it_is_written(self):
+        for text, expected in (
+            ("on:\n  pull_request:\n  push:\n    branches: [main]\n", []),
+            ("on:\n  pull_request:   # every PR\n  push:\n", []),
+            ("on:\n  pull_request:\n    paths:\n      - 'a'\n  push:\n", ["paths:", "- 'a'"]),
+            ("on:\n  pull_request:\n    branches: [main]\n", ["branches: [main]"]),
+            ("on:\n  push:\n    branches: [main]\n", None),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.under_pull_request(text), expected)
 
 
 class TestSummary(unittest.TestCase):
@@ -706,6 +898,9 @@ class TestSummary(unittest.TestCase):
         text = vp.render_summary(report, 7)
         self.assertTrue(text.startswith("## validate: PR #7: PASS\n"))
         self.assertIn("confirm it is that workflow", text)
+        # pull_request_target runs the default branch's copy, whatever branch the PR targets.
+        self.assertIn("validate.yml from main (the default branch)", text)
+        self.assertNotIn("base branch", text)
         self.assertIn("| Mode | ADVANCE (bot PR) |", text)
         self.assertTrue(text.endswith("\n"))
 
@@ -843,12 +1038,51 @@ class TestMain(unittest.TestCase):
         start = ts.git(self.repo.path, "merge-base", "HEAD", head).strip()
         self.assertEqual(vp.changed_files(self.repo.path, start, head), ["README.md"])
 
+    def test_the_diff_starts_at_the_merge_base_not_at_main(self):
+        # Main moves on after the PR branched. What main gained is not the PR's change, so the
+        # run must not report it as a touched workflow or ownership file.
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        self.repo.commit(files={".github/other.txt": "moved on main\n"})
+        self.assertEqual(self.main(head, self.commits(head)), 0)
+        text = self.summary_text()
+        self.assertNotIn("other.txt", text)
+        self.assertNotIn("touches automation", text)
+
+    def test_the_diff_starts_from_the_main_the_run_resolved_whatever_is_checked_out(self):
+        # The base is the merge base of the main commit the run resolved and the PR head. It is
+        # not whatever the work tree holds: with the PR head checked out, a base taken from the
+        # work tree would be the PR itself, and a pin edit would compare equal to itself.
+        doc = ts.manifest()
+        ts.ai_tc(doc)["source"]["version"] = "0.9.13"
+        head = self.pr_commit(doc)
+        ts.git(self.repo.path, "checkout", "-q", "--detach", head)
+        self.assertEqual(self.main(head, self.commits(head)), 1)
+        self.assertIn("a human PR may change only", self.summary_text())
+
     def test_the_summary_names_the_main_commit_it_read(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
         self.repo.commit(files={"llms.txt": "moved on main\n"})
         tip = ts.git(self.repo.path, "rev-parse", "main").strip()
         self.assertEqual(self.main(head, self.commits(head)), 0)
         self.assertIn(f"| Main read at | `{tip[:12]}` |", self.summary_text())
+
+    def test_the_pins_are_read_at_the_main_commit_the_run_resolved(self):
+        # Main gains a commit that pins 0.9.15 after the run resolved it. The summary names the
+        # commit the run read, so the pins must come from that one too: an entry for 0.9.15 is
+        # still one nothing pins.
+        head = self.pr_commit(ts.manifest(), {rc.SAFETY_FILE: rc.dump_json({"versions": {**ts.SEED, "0.9.15": NEXT_ENTRY}})})
+        resolved = ts.git(self.repo.path, "rev-parse", "main").strip()
+        read_pins = rc.pins_by_ref
+
+        def pins_after_main_moves(*args, **kwargs):
+            self.repo.commit(ts.manifest(NEXT))
+            return read_pins(*args, **kwargs)
+
+        with mock.patch.object(rc, "pins_by_ref", side_effect=pins_after_main_moves):
+            self.assertEqual(self.main(head, self.commits(head)), 1)
+        text = self.summary_text()
+        self.assertIn("rollback-safety.json gains 0.9.15, which nothing pins", text)
+        self.assertIn(f"| Main read at | `{resolved[:12]}` |", text)
 
     def test_a_failing_pr_names_the_main_commit_it_read_too(self):
         doc = ts.manifest()
@@ -870,6 +1104,19 @@ class TestMain(unittest.TestCase):
                 self.assertIn("NO VERDICT", text)
                 self.assertIn("api: GET ", text)
 
+    def test_a_manifest_that_nests_too_deeply_fails_with_a_summary(self):
+        for levels in (2000, 100_000):
+            with self.subTest(levels=levels):
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)
+                ts.git(self.repo.path, "checkout", "-q", "-b", f"deep-{levels}")
+                head = self.repo.commit(files={rc.MANIFEST: '{"renames": %s}' % nested(levels)})
+                ts.git(self.repo.path, "checkout", "-q", "main")
+                self.assertEqual(self.main(head, self.commits(head)), 1)
+                text = self.summary_text()
+                self.assertIn("## validate: PR #7: FAIL", text)
+                self.assertIn("claude-plugin/marketplace.json does not parse at the PR head", text)
+
     def test_an_unexpected_error_is_no_verdict_with_a_summary(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
         with mock.patch.object(vp, "evaluate", side_effect=KeyError("surprise")):
@@ -877,6 +1124,36 @@ class TestMain(unittest.TestCase):
         text = self.summary_text()
         self.assertIn("NO VERDICT", text)
         self.assertIn("internal: KeyError", text)
+
+    def test_the_run_starts_one_budget_of_about_twenty_five_minutes(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        seen = []
+        evaluate = vp.evaluate
+
+        def watching(*args, **kwargs):
+            seen.append(rc.time_left())
+            return evaluate(*args, **kwargs)
+
+        with mock.patch.object(vp, "evaluate", side_effect=watching), mock.patch.object(
+            rc, "start_budget", wraps=rc.start_budget
+        ) as started:
+            self.assertEqual(self.main(head, self.commits(head)), 0)
+        started.assert_called_once_with(rc.BUDGET_JOB)
+        self.assertEqual(rc.BUDGET_JOB, 25 * 60)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0], "no budget was running while validate worked")
+        self.assertTrue(rc.BUDGET_JOB - 60 < seen[0] <= rc.BUDGET_JOB)
+
+    def test_the_budget_ends_with_the_run_however_it_ends(self):
+        head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})
+        for error in (rc.InfraError("network", "down"), rc.ReleaseCheckError("version", "no"), KeyError("status")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(vp, "evaluate", side_effect=error):
+                    self.main(head, self.commits(head))
+                self.assertIsNone(rc.time_left())
+        with mock.patch.object(vp, "evaluate", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.main(head, self.commits(head))
+        self.assertIsNone(rc.time_left())
 
     def test_an_interrupt_is_not_swallowed_by_the_net(self):
         head = self.pr_commit(ts.manifest(), {"README.md": "hello\n"})

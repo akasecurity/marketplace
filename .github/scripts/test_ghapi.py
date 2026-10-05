@@ -1,8 +1,14 @@
-"""Tests for ghapi.py: headers, bodies, statuses, pagination and GraphQL errors."""
+"""Tests for ghapi.py: headers, bodies, statuses, pagination, GraphQL errors, and (against loopback
+servers only) the real transport's refusal to follow a redirect."""
+import http.server
 import json
+import os
 import secrets
+import threading
 import unittest
+from unittest import mock
 
+import ghapi
 from ghapi import GitHub, GitHubError
 
 
@@ -72,6 +78,63 @@ class TestGitHub(unittest.TestCase):
         failing = GitHub("", "o/r", Transport((200, {"errors": [{"message": "nope"}]})))
         with self.assertRaisesRegex(GitHubError, "nope"):
             failing.graphql("mutation { y }", {})
+
+
+class _Origin(http.server.BaseHTTPRequestHandler):
+    """A loopback server: records each request's headers on its server, and answers 302 to the
+    server's redirect_to, or 200 with a small JSON body when it has none."""
+
+    def do_GET(self):
+        self.server.requests.append(dict(self.headers))
+        body = b"" if self.server.redirect_to else b'{"ok": true}'
+        self.send_response(302 if self.server.redirect_to else 200)
+        if self.server.redirect_to:
+            self.send_header("Location", self.server.redirect_to)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class TestUrllibTransport(unittest.TestCase):
+    """The real transport, against loopback servers, never the network."""
+
+    def serve(self, redirect_to=None):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
+        server.requests = []
+        server.redirect_to = redirect_to
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def setUp(self):
+        # Reach the loopback servers directly, whatever proxy the machine's environment names.
+        environ = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        environ.start()
+        self.addCleanup(environ.stop)
+
+    def test_an_answer_comes_back_with_its_status_and_body(self):
+        origin = self.serve()
+        status, body = ghapi.urllib_transport("GET", f"http://127.0.0.1:{origin.server_port}/x", {}, None)
+        self.assertEqual((status, json.loads(body)), (200, {"ok": True}))
+
+    def test_a_redirect_comes_back_as_its_status_and_the_token_goes_no_further(self):
+        # urllib's default handler copies every header onto the follow-up request, the credential
+        # included, whatever host the redirect names.
+        second = self.serve()
+        first = self.serve(redirect_to=f"http://localhost:{second.server_port}/")
+        value = secrets.token_hex(8)  # generated per run, so the source holds no credential-shaped literal
+        with mock.patch.object(ghapi, "API", f"http://127.0.0.1:{first.server_port}"):
+            with self.assertRaises(GitHubError) as caught:
+                GitHub(value, "o/r").get("repos/o/r/pulls")
+        self.assertEqual(caught.exception.status, 302)
+        self.assertEqual([seen.get("Authorization") for seen in first.requests], ["Bearer " + value])
+        self.assertEqual(second.requests, [])
 
 
 if __name__ == "__main__":

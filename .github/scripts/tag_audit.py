@@ -1,24 +1,33 @@
-"""tag-audit's checks. tag-release runs tag-audit's ledger and ruleset checks before it creates anything (not its
-comparison with the last green run's snapshot of the tag objects); only tag-audit's own run makes that comparison.
+"""tag-audit's checks. tag-release runs tag-audit's ledger, ruleset and environment checks before it creates
+anything (not its comparison with the last green run's snapshot of the tag objects); only tag-audit's own run
+makes that comparison.
 
 Detection, not prevention: the rulesets prevent, and this notices an edit to
-one of them, a moved or deleted fleet-v tag, or a tag that should not exist.
+one of them, a change to the deployment branches of the `marketplace-bot`
+environment, a moved or deleted fleet-v tag, or a tag that should not exist.
 release_checks.audit_tags holds the tag-ledger rules: the frozen list, the
 fleet-v<N> name rule, and, for every tag after the frozen list, contiguous
 numbering, its place on main's first-parent history, its message's version
 and the merged bot PR it names. This script adds what audit_tags's inputs
-cannot carry: the tag objects the last green run saw, and the rulesets'
-presence, enforcement, targets, rules and conditions. Bypass lists are
-visible only to admins; the probe and an admin's read-back cover those.
+cannot carry: the tag objects the last green run saw, the rulesets'
+presence, enforcement, targets, rules and conditions, and that environment's
+existence and deployment branches (the one place the release bot's key is
+released, and only to a job running from main). Bypass lists, and where the
+bot's secrets are stored, are visible only to admins; the probe and an
+admin's read-back cover those.
 
 A change to a tag since the last green run stays red until a reviewed pull
 request re-freezes the tag list (`freeze`), which is how a person records
-that it is explained. When the run was asked to compare (`--previous`) but
-no snapshot exists, because none was ever kept, it expired or it was deleted,
-the comparison is replaced by a stricter rule: the frozen list must record
-every fleet-v tag, so the baseline is re-set in a reviewed pull request
-rather than by the passage of time. A run that is not asked to compare
-(tag-release's) applies neither.
+that it is explained. When the run is told there is no snapshot to compare
+with (`--no-baseline`: none was ever kept, it expired or it was deleted), the
+comparison is replaced by a stricter rule: the frozen list must record every
+fleet-v tag that exists, so the baseline is re-set in a reviewed pull request
+rather than by the passage of time. That rule sees only tags that exist. A tag
+cut after the frozen list and deleted since the lost snapshot is not seen by
+this audit: staleness reports its pin change as untagged once it has stood for
+an hour, and tag-release cuts the tag again on its next run, but neither says
+that a tag was deleted. A `--previous` file that is not there is red, and a
+run given neither flag (tag-release's) applies neither rule.
 """
 from __future__ import annotations
 
@@ -28,7 +37,7 @@ import os
 import sys
 
 import release_checks
-from ghapi import GitHub
+from ghapi import GitHub, GitHubError
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
@@ -40,6 +49,12 @@ RULESETS: dict[str, dict] = {
            "exclude": [release_checks.EXPECTED_REF_PATTERNS[name][1]]}
     for name, (target, rules) in release_checks.EXPECTED_RULESETS.items()
 }
+# The environment the release bot's key is stored in; import-plugin-release.yml's open-pr job enters it by
+# this name (a test reads the workflow). It must admit deployments from main alone: a custom list of
+# branch rules, none for protected branches, holding the branch main and nothing else, no tag rule.
+ENVIRONMENT = "marketplace-bot"
+ENVIRONMENT_POLICY = {"protected_branches": False, "custom_branch_policies": True}
+ENVIRONMENT_RULES = [{"name": "main", "type": "branch"}]
 MAIN_REVIEW = {"required_approving_review_count": 1, "require_code_owner_review": True,
                "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
                "allowed_merge_methods": ["squash"]}
@@ -100,6 +115,32 @@ def check_rulesets(gh: GitHub) -> list[str]:
     return problems
 
 
+def check_environment(gh: GitHub) -> list[str]:
+    """What is wrong with the `marketplace-bot` environment's deployment branches, from GitHub's own answer.
+    An environment that does not exist (404) is a problem; any other failure to read it is an error, never
+    a problem, so a token that cannot read it fails the run instead of reporting drift that did not happen.
+    The rule list is read only when the environment says it has custom rules: GitHub answers 404 for the
+    list of an environment that has none. Not checked here: where the secrets are stored."""
+    path = gh.repo_path(f"environments/{ENVIRONMENT}")
+    try:
+        environment = gh.get(path)
+    except GitHubError as error:
+        if error.status == 404:
+            return [f"the {ENVIRONMENT} environment does not exist"]
+        raise
+    policy = environment.get("deployment_branch_policy")
+    if policy != ENVIRONMENT_POLICY:
+        return [f"the {ENVIRONMENT} environment's deployment_branch_policy is {policy!r}, "
+                f"not {ENVIRONMENT_POLICY!r}"]
+    listed = gh.get(f"{path}/deployment-branch-policies", params={"per_page": 100})
+    rules = sorted(({"name": rule.get("name"), "type": rule.get("type")} for rule in listed.get("branch_policies") or []),
+                   key=lambda rule: (str(rule["name"]), str(rule["type"])))
+    if rules != ENVIRONMENT_RULES or listed.get("total_count") != len(ENVIRONMENT_RULES):
+        return [f"the {ENVIRONMENT} environment's deployment branch rules are {rules!r} "
+                f"(total_count {listed.get('total_count')!r}), not {ENVIRONMENT_RULES!r}"]
+    return []
+
+
 def snapshot(git: Git) -> list[dict]:
     return [{"tag": tag["tag"], "object": tag["object"], "commit": tag["commit"]} for tag in git.fleet_tags()]
 
@@ -153,10 +194,12 @@ def uncovered(current: list[dict], frozen: list[dict] | None) -> list[str]:
 
 
 def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
-              baseline_expected: bool = False) -> list[str]:
-    """Every problem. `baseline_expected` says the caller asked for the comparison (a snapshot path was
-    given): if the snapshot is then absent (previous None), the frozen list has to cover every tag. A caller
-    that never asks, as tag-release does not, gets neither the comparison nor the coverage rule."""
+              no_baseline: bool = False) -> list[str]:
+    """Every problem: the ledger's, the rulesets', the bot environment's, and then the snapshot comparison's.
+    `previous` is the snapshot an earlier green run kept. `no_baseline` says the caller has none to give
+    (the workflow found none was kept, it expired or it was deleted): the frozen list then has to cover every
+    tag. A caller that gives neither, as tag-release does not, gets neither the comparison nor the coverage
+    rule, and still gets the rest: it runs in the same environment, so it refuses on drift in it too."""
     # The rulesets are checked once, by check_rulesets below (it adds exactly-one-per-name and
     # the fetch-and-merge rule); release_checks.audit_tags would otherwise check them a second
     # time and file every ruleset problem twice. test_the_configured_rulesets_pass pins RULESETS
@@ -164,7 +207,8 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
     problems = [f"tag ledger: {problem}"
                 for problem in release_checks.audit_tags(git.repo_dir, frozen, check_rulesets=False)]
     problems += check_rulesets(gh)
-    if previous is not None or baseline_expected:
+    problems += check_environment(gh)
+    if previous is not None or no_baseline:
         # An unreadable list is already a ledger problem above, and accepts nothing here.
         rows = release_checks._tag_rows(frozen, "frozen tag list", [])
         if previous is not None:
@@ -176,7 +220,7 @@ def run_check(git: Git, gh: GitHub, frozen: str, previous: list[dict] | None, *,
 
 def as_result(problems: list[str]) -> Result:
     return Result(rule="tag-audit", label="tag-audit",
-                  title="tag-audit: the fleet-v tag ledger or the marketplace rulesets changed", red=bool(problems),
+                  title="tag-audit: the fleet-v tag ledger, the marketplace rulesets or the release bot's environment changed", red=bool(problems),
                   detail="\n".join(f"- {problem}" for problem in problems) if problems else "Every tag-audit check passes.")
 
 
@@ -186,8 +230,12 @@ def main(argv: list[str] | None = None) -> int:
     check = sub.add_parser("check")
     check.add_argument("--repo-dir", default=".")
     check.add_argument("--frozen", required=True)
-    check.add_argument("--previous", help="the snapshot an earlier green run kept; given but absent, the frozen "
-                                           "list has to record every fleet-v tag")
+    baseline = check.add_mutually_exclusive_group()
+    baseline.add_argument("--previous", help="the snapshot an earlier green run kept; the run is red if the file "
+                                              "is not there")
+    baseline.add_argument("--no-baseline", action="store_true",
+                          help="there is no earlier snapshot (none was kept, it expired or it was deleted): the "
+                               "frozen list has to record every fleet-v tag")
     check.add_argument("--snapshot")
     check.add_argument("--results", action="store_true", help="write the outputs results and red, and exit 0")
     freeze = sub.add_parser("freeze")
@@ -200,16 +248,18 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(freeze_text(git))
         print(f"froze {len(git.fleet_tags())} fleet-v tags into {args.out}")
         return 0
-    previous = None
+    previous, absent = None, []
     if args.previous is not None:
         if os.path.exists(args.previous):
             with open(args.previous, encoding="utf-8") as handle:
                 previous = json.load(handle)
         else:
-            print("::notice::no snapshot from an earlier green tag-audit run to compare against; "
-                  "the frozen list has to record every fleet-v tag")
+            # The workflow says it downloaded a snapshot, so a file that is not there is a break in the wiring
+            # between its steps, and reading it as "no baseline" would leave the comparison off for good.
+            absent = [f"the snapshot the workflow downloaded ({args.previous}) is missing, so this run could not "
+                      "compare the tags with the last green run's"]
     gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
-    problems = run_check(git, gh, args.frozen, previous, baseline_expected=args.previous is not None)
+    problems = absent + run_check(git, gh, args.frozen, previous, no_baseline=args.no_baseline)
     if args.snapshot:
         os.makedirs(os.path.dirname(args.snapshot) or ".", exist_ok=True)
         with open(args.snapshot, "w", encoding="utf-8") as handle:
