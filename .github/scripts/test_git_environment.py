@@ -77,7 +77,9 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
                 continue
             with self.subTest(os.path.basename(path)):
                 with open(path, encoding="utf-8") as handle:
-                    self.assertNotIn(setting, handle.read(), "build the environment with ts.git_env instead")
+                    builds_its_own = setting in handle.read()
+                # Not assertNotIn: its failure would print the whole module.
+                self.assertFalse(builds_its_own, f"{os.path.basename(path)} names {setting}: use ts.git_env instead")
 
 
 if __name__ == "__main__":
