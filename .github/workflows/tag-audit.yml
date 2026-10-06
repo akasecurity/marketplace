@@ -1,0 +1,156 @@
+name: tag-audit
+
+# Daily, on a tag push or deletion, and on demand: detect a fleet-v tag that
+# moved or vanished, a tag that should not exist, a break in the tag ledger, a
+# ruleset that was edited or disabled, or a change to the deployment branches of
+# the marketplace-bot environment (AGENTS.md, "The workflows"). Detection, not
+# prevention: the rulesets prevent. GitHub starts no run for a push or a deletion
+# that touches more than three tags at once, so the tag trigger is not a guaranteed
+# immediate check: the daily run sees such a change within a day. A tag pushed at
+# an old commit that has no copy of this file starts no run either; the daily run
+# and staleness's hourly ref check still see it. tag-release runs this workflow's
+# ledger, ruleset and environment checks before it creates a tag (not its comparison
+# with the last green run's snapshot of the tag objects); only this workflow makes
+# that comparison. Red goes to one issue, filed by the only job here that may write
+# issues.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  push:
+    tags: ["**"]
+  delete:
+  workflow_dispatch:
+
+concurrency:
+  group: tag-audit
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      results: ${{ steps.check.outputs.results }}
+      red: ${{ steps.check.outputs.red }}
+    steps:
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      # The baseline is the snapshot the last green run of this file on main kept. A run on any other
+      # branch never supplies it, because a branch can carry its own edited copy of this file. The
+      # branch name alone is not enough: a pull request from a fork's own main also reports main, so
+      # only a run started by the schedule, by hand or by a deletion counts; a pull request never
+      # does. A run on a tag reports the bare tag name as its branch too, so a tag named main would pass
+      # for the branch: the run's commit has to be on main's own history, and if it is not the step fails.
+      # A snapshot that is expired (they last 90 days), or that the green run no longer lists
+      # (for instance, deleted), gives no baseline: a notice names which, and tag_audit.py then requires the
+      # frozen list to record every fleet-v tag, so the baseline is re-set by a reviewed re-freeze
+      # rather than by the passage of time. That rule sees only the tags that exist: a tag cut after the
+      # frozen list and deleted since the lost snapshot is not noticed here (staleness reports its pin
+      # change as untagged once it has stood for an hour, and tag-release cuts the tag again; neither
+      # says that a tag was deleted). Every other failure fails the step, so a hiccup cannot
+      # read as "nothing moved".
+      - name: fetch the snapshot the last green run kept
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p previous
+          picked=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tag-audit.yml --branch main --status success \
+            --limit 100 --json databaseId,event,headSha --jq \
+            'first(.[] | select(.event == "schedule" or .event == "workflow_dispatch" or .event == "delete"))
+             | "\(.databaseId) \(.headSha)"')
+          if [ -z "$picked" ]; then
+            echo "::notice::no earlier green tag-audit run on main; the frozen list has to record every fleet-v tag"
+            echo "baseline=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run_id=${picked%% *}
+          head_sha=${picked#* }
+          # The checkout is full history of main (fetch-depth 0), so a commit that is not an ancestor of it, or
+          # that is not here at all, is a run from somewhere else.
+          if ! git merge-base --is-ancestor "$head_sha" origin/main; then
+            echo "::error::run $run_id reports branch main, but its commit $head_sha is not on main"
+            exit 1
+          fi
+          kept=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" --jq \
+            '[.artifacts[] | select(.name == "fleet-tags-snapshot")]
+             | if length == 0 then "missing" elif (map(.expired) | all) then "expired" else "ready" end')
+          case "$kept" in
+            ready)
+              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name fleet-tags-snapshot --dir previous
+              echo "baseline=ready" >> "$GITHUB_OUTPUT"
+              ;;
+            expired)
+              echo "::notice::run $run_id kept a snapshot that has expired; the frozen list has to record every fleet-v tag"
+              echo "baseline=none" >> "$GITHUB_OUTPUT"
+              ;;
+            missing)
+              echo "::notice::run $run_id is the last green run but lists no fleet-tags-snapshot artifact; the frozen list has to record every fleet-v tag"
+              echo "baseline=none" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "::error::run $run_id: unexpected snapshot state '$kept'"; exit 1 ;;
+          esac
+      # The fetch step says which: a snapshot it downloaded is passed as --previous, and tag_audit.py is red
+      # if that file is not there; no snapshot is passed as --no-baseline, which applies the coverage rule.
+      # Neither is ever guessed from a file's absence.
+      - name: audit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BASELINE: ${{ steps.fetch.outputs.baseline }}
+        run: |
+          set -eu
+          case "$BASELINE" in
+            ready) baseline=(--previous previous/fleet-tags.snapshot.json) ;;
+            none) baseline=(--no-baseline) ;;
+            *) echo "::error::the fetch step reported the baseline as '$BASELINE', not ready or none"; exit 1 ;;
+          esac
+          python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json \
+            "${baseline[@]}" --snapshot snapshot/fleet-tags.snapshot.json --results
+      # Kept only from a green audit, so a moved tag stays red until a person explains it: a reviewed
+      # pull request that re-freezes the tag list (tag_audit.py freeze) is that explanation, and the next
+      # green run keeps the new state. It lasts 90 days: after that long without a green run of the file
+      # on main, the next run has no baseline and the frozen list has to record every fleet-v tag.
+      # 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a == v7.0.1 (verified with git ls-remote).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.check.outputs.red == 'false'
+        with:
+          name: fleet-tags-snapshot
+          path: snapshot/fleet-tags.snapshot.json
+          retention-days: 90
+          if-no-files-found: error
+
+  file-issues:
+    name: file-issues
+    needs: audit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: open, update or close the tag-audit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS_JSON: ${{ needs.audit.outputs.results }}
+          JOB_RESULT: ${{ needs.audit.result }}
+        run: python3 .github/scripts/issue_router.py apply --label tag-audit
