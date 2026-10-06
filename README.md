@@ -3,8 +3,8 @@
 **One place to install AKA Security's tools for coding agents.** Add the marketplace once and
 install any tool your harness supports. First-party today; the manifests reference each tool's own
 repository (nothing is vendored here), so a tool's own releases flow through automatically —
-except **ai-tc**, whose npm source is pinned to an exact version and moves only when a commit here
-moves it (see [Version pinning](#version-pinning)).
+except **ai-tc**, whose npm source is pinned to an exact version and moves only when a
+code-owner-approved pull request here moves it (see [Version pinning](#version-pinning)).
 
 From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its own repository.
 
@@ -61,16 +61,30 @@ then run `aka init` — it detects whether the Claude Code plugin is installed a
 ## Version pinning
 
 The `ai-tc` entry in `.claude-plugin/marketplace.json` names an **exact** npm version
-(`source.version`), so `/plugin install ai-tc@akasecurity` — and the plugin auto-update pass on
-machines that have it on — resolves to that version rather than to whatever npm's `latest` tag
-points at. A new ai-tc release reaches marketplace users only when a commit here advances the
-pin; that commit is the audit trail. (The pin exists from `fleet-v2` / today's `main` onward —
-`fleet-v1` predates it and its ai-tc entry is unpinned.)
+(`source.version`) on the public npm registry (`source.registry`), so `/plugin install ai-tc@akasecurity`
+— and the plugin auto-update pass on machines that have it on — resolves to that version rather
+than to whatever npm's `latest` tag points at. A new ai-tc release reaches marketplace users only
+when a code-owner-approved pull request here advances the pin; the release bot opens that pull request after
+verifying the release's provenance, and the pull request is the audit trail. (The pin exists from
+`fleet-v2` / today's `main` onward — `fleet-v1` predates it and its ai-tc entry is unpinned.)
 
-Managed fleets go one step further and register this marketplace at a signed `fleet-v<N>` tag
-instead of `main`, so they move versions only when their own configuration moves the tag they
-pin. Those tags are treated as immutable once pushed: a release cuts the **next** tag, never
-re-points an existing one. `preflight` and `aka-claude-tools` still float on their default branches.
+Each merged pin change also gets the next `fleet-v<N>` tag, cut automatically at its commit. Tags
+are immutable once pushed: a release cuts the **next** tag and never re-points an existing one.
+Managed fleets either follow `main`, which moves only through a code-owner-approved pull request, or
+register this marketplace at a `fleet-v<N>` tag and move only when their own configuration names a
+later one.
+
+The one exception is break-glass: a few organisation owners can merge past the `main` ruleset's
+approval and `validate` requirements when no code owner is reachable, for example to roll a bad
+release back. An automated audit of `main` opens an issue for each commit that reached it without a
+code-owner-approved pull request whose final head passed `validate`. The audit runs from the pushed
+commit, so a push that bypasses the `main` ruleset can also change, disable or remove it; that push
+is then audited by the changed copy, or not at all, and no later run looks at it again. If the merge
+moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and who merged it, or a
+note that `validate` had not passed on the final head (`approver: unknown` when CODEOWNERS could not
+be read at the parent).
+
+`preflight` and `aka-claude-tools` still float on their default branches.
 
 ## About
 

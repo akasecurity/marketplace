@@ -1,0 +1,75 @@
+name: main-audit
+
+# On every push to main: red unless every commit the push added to main's
+# first-parent line is the merge commit of a PR whose final head has an
+# approving review from a code owner other than its last pusher, and a passing
+# validate check from GitHub Actions (AGENTS.md, "The workflows"): only a run of
+# validate.yml that pull_request_target started, at or before the PR merged, counts.
+# The branch commits a merge-commit merge brings in are not on that line and are not
+# checked.
+# Detective only: the main ruleset prevents, and this records a bypass. It cannot
+# vouch for itself: main-audit runs from the pushed commit, so a push that bypasses
+# the `main` ruleset can also change, disable or remove main-audit. That push is then
+# audited by the changed copy, or not at all, and no later run looks at it again.
+# Each offending commit, each push that rewrote main and each push
+# the audit could not finish gets its own issue, which only a person closes; if
+# the job itself dies (a timeout), that push gets a workflow issue of its own too.
+# No concurrency group: a group drops pending runs, and a dropped run would be
+# an unaudited push.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # All read-only: `checks` for the validate check runs of a merged PR's head, and `actions` for the
+    # workflow runs behind them, which say whether a check run is validate.yml's own.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      results: ${{ steps.audit.outputs.results }}
+    steps:
+      # The pushed commit, with full history so the push's first commit has its parent.
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: audit the commits this push added
+        id: audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: python3 .github/scripts/main_audit.py --repo-dir .
+
+  file-issues:
+    name: file-issues
+    needs: audit
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: open an issue for each commit that reached main unapproved or unvalidated
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULTS_JSON: ${{ needs.audit.outputs.results }}
+          JOB_RESULT: ${{ needs.audit.result }}
+          AFTER: ${{ github.event.after }}
+        run: python3 .github/scripts/issue_router.py apply --label main-audit

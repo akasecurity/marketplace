@@ -1,0 +1,75 @@
+name: tag-release
+
+# On every push to main (and by hand, to re-run a sweep): cut the next fleet-v<N>
+# tag at each first-parent commit whose ai-tc version changed and that has no
+# fleet-v tag yet (AGENTS.md, "The workflows"). It first runs tag-audit's ledger,
+# ruleset and environment checks (not its comparison with the last green run's
+# snapshot) and stops, red and creating nothing, if any fails; that refusal is a
+# signal, not a control, since this file runs from the pushed commit. Tags are
+# created as the bot App, the only identity ruleset fleet-tags-create lets create
+# one; no Mac follows a tag. A tag also notes a merged PR whose final head had no
+# passing validate run: only a run of validate.yml started by pull_request_target,
+# at or before the PR merged, counts. The sweep reads those check runs, and the
+# workflow runs behind them, with the workflow's own read-only token, so the App's
+# permissions stay as they are. It then deletes the bot's own branches that still
+# point at the head a closed PR closed on, but only after a sweep that finished: a
+# refused or failed sweep ends the run first, and the branches wait for the next one.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tag:
+    name: tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: marketplace-bot
+    # All read-only. This is the workflow's own token: it runs tag-audit's checks and, for the
+    # sweep, reads a merged PR's validate check runs (`checks`) and the workflow runs behind
+    # them (`actions`). tag-audit's audit job, which runs the same environment check, holds
+    # `actions: read` too. Both are reads, and a private repository would need them for these
+    # calls. The tags are written with the App's token, made below.
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      # 11d5960a326750d5838078e36cf38b85af677262 == v4.4.0 (verified with git ls-remote).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: tag-audit's ledger, ruleset and environment checks (stop, creating nothing, if any fails)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/tag_audit.py check --repo-dir . --frozen .github/fleet-tags.frozen.json
+      # bcd2ba49218906704ab6c1aa796996da409d3eb1 == v3.2.0 (verified with git ls-remote). The App is named by
+      # its client id: this release marks the app-id input deprecated.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: read
+      - name: sweep main and cut the missing fleet-v tags
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/tag_release.py sweep --repo-dir .
+      # No `if:` on this step (or any other): it runs only while every step before it has passed.
+      - name: delete the bot's branches left at the head of a closed PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .github/scripts/tag_release.py cleanup-branches
