@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import _testsupport as ts
 import issue_router as rt
 import main_audit as ma
 import tag_release as tr
@@ -29,9 +30,7 @@ def scratch_repo():
     """An empty repository on main in a temporary directory: yields (path, sh, commit), where `commit(name, text)`
     writes a file, commits it and returns its sha."""
     with tempfile.TemporaryDirectory() as root:
-        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        env = ts.git_env("t", "t@example.invalid")
 
         def sh(*args):
             return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
@@ -175,9 +174,7 @@ class TestMainAudit(unittest.TestCase):
 
     def test_a_reset_in_a_real_repository_is_red_and_does_not_raise(self):
         with tempfile.TemporaryDirectory() as root:
-            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                       GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
-                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+            env = ts.git_env("t", "t@example.invalid")
 
             def sh(*args):
                 return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
