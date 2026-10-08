@@ -2,7 +2,6 @@
 import contextlib
 import io
 import os
-import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -33,8 +32,7 @@ def scratch_repo():
         env = ts.git_env("t", "t@example.invalid")
 
         def sh(*args):
-            return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
-                                  text=True).stdout.strip()
+            return ts.git(root, *args, env=env).strip()
 
         def commit(name, text=None):
             path = os.path.join(root, name)
@@ -177,8 +175,7 @@ class TestMainAudit(unittest.TestCase):
             env = ts.git_env("t", "t@example.invalid")
 
             def sh(*args):
-                return subprocess.run(["git", "-C", root, *args], env=env, check=True, capture_output=True,
-                                      text=True).stdout.strip()
+                return ts.git(root, *args, env=env).strip()
 
             sh("init", "-q", "-b", "main")
             for name in ("a", "b", "c"):

@@ -4,7 +4,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import tempfile
 import unittest
 import urllib.parse
@@ -73,8 +72,7 @@ def scratch_repository(directory: str):
     env = ts.git_env("test", "test@example.invalid")
 
     def sh(*args):
-        return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
-                              capture_output=True, text=True).stdout.strip()
+        return ts.git(directory, *args, env=env).strip()
 
     sh("init", "-q", "-b", "main")
     return sh
@@ -1224,8 +1222,7 @@ class TestCodeOwners(unittest.TestCase):
             env = ts.git_env("test", "test@example.invalid")
 
             def sh(*args):
-                return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
-                                      capture_output=True, text=True).stdout.strip()
+                return ts.git(directory, *args, env=env).strip()
 
             def commit_owners(content: bytes) -> str:
                 with open(os.path.join(directory, ".github", "CODEOWNERS"), "wb") as handle:

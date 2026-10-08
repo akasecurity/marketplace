@@ -1,6 +1,5 @@
 """Tests for gitrepo.py against a scratch repository (no network)."""
 import os
-import subprocess
 import tempfile
 import unittest
 
@@ -19,8 +18,7 @@ class Scratch(unittest.TestCase):
 
     def sh(self, *args, when="2026-09-01T00:00:00+00:00"):
         env = dict(self.env, GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
-        return subprocess.run(["git", "-C", self.dir, *args], env=env, check=True,
-                              capture_output=True, text=True).stdout.strip()
+        return ts.git(self.dir, *args, env=env).strip()
 
     def commit(self, path, text, when="2026-09-01T00:00:00+00:00"):
         full = os.path.join(self.dir, path)
