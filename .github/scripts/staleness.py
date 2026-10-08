@@ -195,8 +195,8 @@ def rule_iii(git: Git, frozen: list[dict], now: dt.datetime) -> Result:
             missing.append(f"- `{sha}` (ai-tc {version_at(git, sha)}, committed {committed:%Y-%m-%dT%H:%M:%SZ})")
     return result("staleness-iii", bool(missing),
                   f"Pin changes on main after {last['tag']} with no fleet-v tag for more than an hour:\n"
-                  + "\n".join(missing) + "\n\ntag-release tags them on its next run: dispatch it, and read why "
-                  "its last run failed.")
+                  + "\n".join(missing) + "\n\ntag-release tags them on its next run (it runs hourly too): dispatch it for "
+                  "an immediate run, and read why its last run failed.")
 
 
 def rule_iv(refs: list[str]) -> Result:

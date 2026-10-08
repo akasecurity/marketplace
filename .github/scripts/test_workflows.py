@@ -490,6 +490,7 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assert_common_shape()
 
     def test_triggers_and_serialization(self):
+        self.assertIn('    - cron: "37 * * * *"', self.head)
         self.assertIn("  push:\n    branches: [main]\n", self.head)
         self.assertIn("\n  workflow_dispatch:\n", self.head)
         self.assertIn("  group: tag-release\n", self.head)
