@@ -102,10 +102,15 @@ def bot_app_problem(slug: str | None) -> str | None:
     naming another App ends the run here, naming the cause, instead of later as a PR judged by the wrong author."""
     if app_slug_is_bot(slug):
         return None
-    return (f"the App this job signed in as is {f'{slug}[bot]' if slug else '(not reported)'}, but BOT_LOGIN "
-            f"(release_checks.BOT_LOGIN) names {BOT_LOGIN if BOT_LOGIN is not None else '(nothing)'}; the "
-            "MARKETPLACE_BOT_CLIENT_ID secret probably names a different App, or BOT_LOGIN is out of date. "
-            "Nothing was written.")
+    if BOT_LOGIN is None:
+        return ("no bot login is configured (release_checks.BOT_LOGIN is None), so the App this job signed in as "
+                "cannot be confirmed; set BOT_LOGIN to the release bot's login. Nothing was written.")
+    if not slug:
+        return ("the token step reported no app-slug: this step was not given BOT_APP_SLUG from the token step's "
+                "app-slug output, or that step did not report one. Nothing was written.")
+    return (f"the App this job signed in as is {slug}[bot], but BOT_LOGIN (release_checks.BOT_LOGIN) names "
+            f"{BOT_LOGIN}; the MARKETPLACE_BOT_CLIENT_ID secret probably names a different App, or BOT_LOGIN is "
+            "out of date. Nothing was written.")
 
 # Until a measured downgrade shows that an older build keeps working on a store an
 # additive migration touched, EVERY migration marks its release not rollback-safe.

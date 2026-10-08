@@ -20,7 +20,7 @@ from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
-from fakes import BOT
+from fakes import BOT, SLUG
 
 # A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
 NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
@@ -2305,14 +2305,27 @@ class TestBotAppSlug(unittest.TestCase):
     """The token step's app-slug is checked against BOT_LOGIN before a script writes as the App."""
 
     def test_the_slug_of_the_configured_app_matches(self):
-        self.assertTrue(rc.app_slug_is_bot("aka-marketplace-bot"))
-        self.assertIsNone(rc.bot_app_problem("aka-marketplace-bot"))
+        self.assertTrue(rc.app_slug_is_bot(SLUG))
+        self.assertIsNone(rc.bot_app_problem(SLUG))
 
     def test_another_missing_or_empty_slug_does_not_match(self):
         for slug in ("some-other-app", "aka-marketplace-bot[bot]", "", None):
             with self.subTest(slug=slug):
                 self.assertFalse(rc.app_slug_is_bot(slug))
+                self.assertIsNotNone(rc.bot_app_problem(slug))
+
+    def test_a_mismatch_names_the_secret_as_the_likely_cause(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]"):
+            with self.subTest(slug=slug):
                 self.assertIn("MARKETPLACE_BOT_CLIENT_ID", rc.bot_app_problem(slug))
+
+    def test_a_missing_slug_names_the_unreported_slug_not_the_secret(self):
+        for slug in ("", None):
+            with self.subTest(slug=slug):
+                problem = rc.bot_app_problem(slug)
+                self.assertIn("BOT_APP_SLUG", problem)
+                self.assertIn("reported no app-slug", problem)
+                self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
 
     def test_the_problem_names_both_logins(self):
         problem = rc.bot_app_problem("some-other-app")
@@ -2321,8 +2334,10 @@ class TestBotAppSlug(unittest.TestCase):
 
     def test_no_configured_login_matches_no_slug(self):
         with mock.patch.object(rc, "BOT_LOGIN", None):
-            self.assertFalse(rc.app_slug_is_bot("aka-marketplace-bot"))
-            self.assertIn("(nothing)", rc.bot_app_problem("aka-marketplace-bot"))
+            self.assertFalse(rc.app_slug_is_bot(SLUG))
+            problem = rc.bot_app_problem(SLUG)
+            self.assertIn("no bot login is configured", problem)
+            self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
 
 
 class TestParseTagMessage(unittest.TestCase):
