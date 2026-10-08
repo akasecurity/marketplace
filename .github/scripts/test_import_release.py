@@ -13,7 +13,7 @@ from unittest import mock
 import _testsupport as ts
 import import_release as ir
 import release_checks
-from fakes import (ATTESTED, BOT, INTEGRITY, REPO, FakeGit, FakeGitHub, contents, fleet_tag, manifest,
+from fakes import (ATTESTED, BOT, INTEGRITY, REPO, SLUG, FakeGit, FakeGitHub, contents, fleet_tag, manifest,
                    not_found, pull, pulls_route, safety, safety_entry)
 from ghapi import GitHubError
 from release_checks import MANIFEST, SAFETY_FILE
@@ -1079,7 +1079,7 @@ class TestMain(unittest.TestCase):
 
     def test_a_red_refusal_exits_one(self):
         env = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan(integrity="bad")),
-               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+               "BOT_APP_SLUG": SLUG, "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
         with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(ir.main(["open-pr"]), 1)
         self.assertIn("::error::", out.getvalue())
@@ -1099,7 +1099,7 @@ class TestMain(unittest.TestCase):
 
     def test_the_open_pr_command_reports_a_check_error_the_same_way_without_a_proceed_output(self):
         env = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
-               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+               "BOT_APP_SLUG": SLUG, "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
         with mock.patch.dict(ir.os.environ, env, clear=True), \
                 mock.patch.object(ir, "open_pr", side_effect=release_checks.InfraError("network", "down")), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
@@ -1108,12 +1108,58 @@ class TestMain(unittest.TestCase):
         self.assertNotIn("proceed=", out.getvalue())
 
 
+class TestOpenPrNamesTheBotApp(unittest.TestCase):
+    """open-pr signs in as whatever App the client-id secret names; it writes only when that is the App BOT_LOGIN names."""
+
+    def run_open_pr(self, **env_slug):
+        env = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
+               "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7", **env_slug}
+        gh = FakeGitHub()
+        with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch.object(ir, "GitHub", lambda token, repo: gh), \
+                mock.patch.object(ir, "open_pr", return_value="opened") as opened, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = ir.main(["open-pr"])
+        return code, out.getvalue(), gh, opened
+
+    def test_another_apps_slug_refuses_red_naming_both_logins_and_makes_no_call(self):
+        code, out, gh, opened = self.run_open_pr(BOT_APP_SLUG="some-other-app")
+        self.assertEqual(code, 1)
+        self.assertIn("::error::", out)
+        self.assertIn("some-other-app[bot]", out)
+        self.assertIn(release_checks.BOT_LOGIN, out)
+        self.assertIn("MARKETPLACE_BOT_CLIENT_ID", out)
+        opened.assert_not_called()
+        self.assertEqual(gh.calls, [])
+
+    def test_a_missing_or_empty_slug_refuses_naming_the_unreported_slug(self):
+        for env in ({}, {"BOT_APP_SLUG": ""}):
+            with self.subTest(env=env):
+                code, out, gh, opened = self.run_open_pr(**env)
+                self.assertEqual(code, 1)
+                self.assertIn("::error::", out)
+                self.assertIn("BOT_APP_SLUG", out)
+                self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", out)
+                opened.assert_not_called()
+                self.assertEqual(gh.calls, [])
+
+    def test_no_configured_login_refuses_even_with_a_slug(self):
+        with mock.patch.object(release_checks, "BOT_LOGIN", None):
+            code, out, gh, opened = self.run_open_pr(BOT_APP_SLUG=SLUG)
+        self.assertEqual(code, 1)
+        opened.assert_not_called()
+
+    def test_the_slug_of_the_configured_app_proceeds(self):
+        code, out, gh, opened = self.run_open_pr(BOT_APP_SLUG=SLUG)
+        self.assertEqual(code, 0, out)
+        opened.assert_called_once()
+
+
 class TestMainBudget(unittest.TestCase):
     """The verify job's checks run inside one time budget, started once and ended with the run."""
 
     PLAN_ENV = {"GITHUB_REPOSITORY": REPO, "MODE": "forward", "EVENT_NAME": "schedule"}
     OPEN_PR_ENV = {"GITHUB_REPOSITORY": REPO, "PLAN_JSON": json.dumps(forward_plan()),
-                   "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
+                   "BOT_APP_SLUG": SLUG, "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "7"}
 
     def run_main(self, command: str, env: dict, **patched):
         with mock.patch.dict(ir.os.environ, env, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO):

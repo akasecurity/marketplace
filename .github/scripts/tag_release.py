@@ -50,6 +50,7 @@ import time
 from datetime import datetime
 from typing import Callable
 
+import release_checks
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
@@ -556,6 +557,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     gh = GitHub(os.environ.get("GH_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])
     try:
+        problem = release_checks.bot_app_problem(os.environ.get("BOT_APP_SLUG"))
+        if problem:
+            raise Refused(problem)
         if args.command == "sweep":
             # The App's token writes the tags; the workflow's own token (GITHUB_TOKEN, `checks: read`) reads checks.
             reader = GitHub(os.environ.get("GITHUB_TOKEN", ""), os.environ["GITHUB_REPOSITORY"])

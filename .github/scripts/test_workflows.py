@@ -95,6 +95,14 @@ class ImporterWorkflow(WorkflowCase):
         self.assertNotRegex(self.text, r"(?m)^\s+app-id:")
         self.assertNotIn("MARKETPLACE_BOT_APP_ID", self.text)
 
+    def test_the_step_that_writes_reads_the_token_steps_app_slug(self):
+        # The script refuses before any write unless the App the token was made for is the one BOT_LOGIN names.
+        steps = [b for b in re.split(r"(?m)^      - ", self.jobs["open-pr"]) if "import_release.py open-pr" in b]
+        self.assertEqual(len(steps), 1)
+        step = steps[0]
+        self.assertIn("          BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}\n", step)
+        self.assertEqual(self.text.count("BOT_APP_SLUG"), 1)
+
     # The first Node 24 release that bundles an npm of release_checks.MIN_NPM or later: v24.15.0 ships
     # npm 11.12.1 (nodejs.org/dist/index.json), and every later 24.x ships a newer one.
     FIRST_NODE_WITH_MIN_NPM = (24, 15, 0)
@@ -577,6 +585,12 @@ class TagReleaseWorkflow(WorkflowCase):
         self.assertIn("          GH_TOKEN: ${{ steps.app.outputs.token }}\n", cleanup)
         self.assertNotIn("github.token", cleanup)
         self.assertNotIn("GITHUB_TOKEN", cleanup)
+
+    def test_each_step_that_writes_as_the_app_reads_the_token_steps_app_slug(self):
+        slug = "          BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}\n"
+        self.assertIn(slug, self.step("tag_release.py sweep"))
+        self.assertIn(slug, self.step("tag_release.py cleanup-branches"))
+        self.assertEqual(self.text.count("BOT_APP_SLUG"), 2)
 
     def test_the_app_token_asks_for_no_more_than_it_needs_to_write_tags_and_read_pull_requests(self):
         # Checks are read with the workflow's token, so the App gets no checks or actions permission.

@@ -169,7 +169,18 @@ last pusher) and the `validate` check to pass, so a code owner's own PR needs th
 owner. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
 audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
-missing or differs, and `tag-release` creates no tag meanwhile.
+missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
+settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
+
+The audit cannot see who may bypass a ruleset: GitHub returns a ruleset's bypass list only to a
+caller who can edit it, and the workflows' read-only tokens get nothing. So an organisation owner
+reads the bypass lists back in the repository settings after creating or changing any ruleset.
+Expected:
+
+- `main`: organisation admins, for pull requests only;
+- `fleet-tags-create` and `bot-branches`: the release bot App;
+- `x4-branches` and `x4-tags`: the x4 experimenters team;
+- `tags-locked` and `fleet-tags-immutable`: nobody.
 
 Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
@@ -196,7 +207,9 @@ path; `staleness`, `tag-audit` and `main-audit` watch it; `script-tests` runs th
 tests. Their logic lives in `.github/scripts/` (stdlib Python, with tests beside it), so the
 workflow files stay thin. Only `import-plugin-release`'s `open-pr` job and `tag-release` act as the
 release bot, through the `marketplace-bot` environment, which only `main` may use (`tag-audit`
-checks the environment's deployment branches every day).
+checks the environment's deployment branches every day). Both refuse, before any write, unless the
+App their token was made for (the token step's `app-slug`) is the App `release_checks.BOT_LOGIN`
+names, so a `MARKETPLACE_BOT_CLIENT_ID` secret naming another App ends the run with that cause.
 
 GitHub disables a public repository's scheduled workflows after 60 days with no repository
 activity. A disabled workflow makes no failed run and files no issue, so `import-plugin-release`,
@@ -309,8 +322,9 @@ true only once it is.
   included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
   only the check that refused it, and the run log holds the reason), the release checks reached no
   verdict on a version that has been on npm for over an hour, or whose publish time is unknown (its
-  own issue, naming the version and the check that did not finish), a bot PR is open for 24 hours,
-  a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
+  own issue, naming the version and the check that did not finish), a PR the release bot opened (by its
+  author, not a `bot/` branch name alone; none counts while no bot login is configured) is open for 24
+  hours, a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
   ai-tc entry is gone from `main` or `main`'s manifest cannot be read (one issue for both, titled
   for both, with the reason in its detail; nothing is imported until a PR mends it); it posts a
   "rolled back, awaiting fix-forward" notice while the latest tag is a rollback. A commit whose
@@ -323,7 +337,8 @@ true only once it is.
   reports it.
 - **`tag-audit`** (daily, on every tag push, on the deletion of a tag or a branch, and by hand)
   checks the `fleet-v` ledger against the frozen list, the last green run and `main`'s history,
-  that the rulesets are active as configured, and that the `marketplace-bot` environment admits
+  that the rulesets are active with the expected rules, target and ref patterns (not their bypass
+  lists, which the audit cannot read), and that the `marketplace-bot` environment admits
   deployments from `main` alone. GitHub starts no run for a push or a deletion that touches more
   than three tags at once, nor for a tag pushed at an old commit that has no copy of the workflow,
   so the daily run is what sees those. A tag that changed since the last green run stays red until
