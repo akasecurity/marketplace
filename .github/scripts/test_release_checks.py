@@ -20,6 +20,7 @@ from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
+from fakes import BOT, SLUG
 
 # A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
 NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
@@ -2285,7 +2286,58 @@ class TestDiffMode(unittest.TestCase):
             rc.diff_mode(ts.manifest(), head)
 
 
-BOT = "aka-marketplace-bot[bot]"
+
+
+class TestBotLoginShape(unittest.TestCase):
+    def test_configured_login_is_the_one_the_bot_path_fixtures_use(self):
+        # A wrong but well-formed login passes the shape test below; the fixtures every bot-path test builds its
+        # PRs from (fakes.BOT) would then match nothing in production. Change both together.
+        self.assertEqual(rc.BOT_LOGIN, BOT)
+
+    def test_configured_login_is_an_app_slug_with_the_bot_suffix(self):
+        login = rc.BOT_LOGIN
+        self.assertIsInstance(login, str)
+        self.assertTrue(login.endswith("[bot]"), login)
+        self.assertRegex(login[: -len("[bot]")], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+class TestBotAppSlug(unittest.TestCase):
+    """The token step's app-slug is checked against BOT_LOGIN before a script writes as the App."""
+
+    def test_the_slug_of_the_configured_app_matches(self):
+        self.assertTrue(rc.app_slug_is_bot(SLUG))
+        self.assertIsNone(rc.bot_app_problem(SLUG))
+
+    def test_another_missing_or_empty_slug_does_not_match(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]", "", None):
+            with self.subTest(slug=slug):
+                self.assertFalse(rc.app_slug_is_bot(slug))
+                self.assertIsNotNone(rc.bot_app_problem(slug))
+
+    def test_a_mismatch_names_the_secret_as_the_likely_cause(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]"):
+            with self.subTest(slug=slug):
+                self.assertIn("MARKETPLACE_BOT_CLIENT_ID", rc.bot_app_problem(slug))
+
+    def test_a_missing_slug_names_the_unreported_slug_not_the_secret(self):
+        for slug in ("", None):
+            with self.subTest(slug=slug):
+                problem = rc.bot_app_problem(slug)
+                self.assertIn("BOT_APP_SLUG", problem)
+                self.assertIn("reported no app-slug", problem)
+                self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
+
+    def test_the_problem_names_both_logins(self):
+        problem = rc.bot_app_problem("some-other-app")
+        self.assertIn("some-other-app[bot]", problem)
+        self.assertIn(rc.BOT_LOGIN, problem)
+
+    def test_no_configured_login_matches_no_slug(self):
+        with mock.patch.object(rc, "BOT_LOGIN", None):
+            self.assertFalse(rc.app_slug_is_bot(SLUG))
+            problem = rc.bot_app_problem(SLUG)
+            self.assertIn("no bot login is configured", problem)
+            self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
 
 
 class TestParseTagMessage(unittest.TestCase):
@@ -2580,6 +2632,39 @@ class TestAuditRulesets(unittest.TestCase):
         routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
 
+    def test_a_rule_with_unreadable_parameters_is_named_and_does_not_crash(self):
+        def with_rule(kind, parameters):
+            routes = ruleset_routes()
+            body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+            next(r for r in body["rules"] if r["type"] == kind)["parameters"] = parameters
+            return routes
+        for parameters in (["x"], "x", [], ""):
+            for kind in ("pull_request", "required_status_checks"):
+                with self.subTest(parameters=parameters, rule=kind):
+                    problems = rc.audit_rulesets(fetch=ts.FakeFetch(with_rule(kind, parameters)))
+                    self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object", problems)
+
+    def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
+        for rules in (5, "update"):
+            with self.subTest(rules=rules):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"] = rules
+                problems = rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+                self.assertIn(f"ruleset 'main': its rules are {rules!r}, not a list", problems)
+        routes = ruleset_routes()
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"].append("update")
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': a rule is 'update', not an object"])
+
+    def test_required_checks_that_are_not_a_list_read_as_missing_the_validate_check(self):
+        for checks in (1, "validate"):
+            with self.subTest(checks=checks):
+                routes = ruleset_routes()
+                body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+                next(r for r in body["rules"] if r["type"] == "required_status_checks")["parameters"]["required_status_checks"] = checks
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 ["ruleset 'main' does not require the validate check from the GitHub Actions app"])
+
     def test_tags_locked_on_all_is_caught(self):
         # ~ALL would cover every tag on a tag ruleset too (GitHub's own tag recipes use it), but
         # tags-locked must list the two explicit globs, so what it covers is spelled out and
@@ -2650,6 +2735,29 @@ class TestAuditRulesets(unittest.TestCase):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"conditions": {"ref_name": probe}}})))
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
+
+    def test_main_review_settings_must_be_the_right_type(self):
+        # True is an int, so an isinstance check alone lets it through as a count.
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        review = main["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': required_approving_review_count is True, not at least 1"])
+        routes = ruleset_routes()
+        next(r for r in routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"]
+             if r["type"] == "pull_request")["parameters"]["allowed_merge_methods"] = 1
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': allowed_merge_methods is 1, not ['squash']"])
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            with self.subTest(key=key):
+                routes = ruleset_routes()
+                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+                main["rules"][2]["parameters"][key] = 1
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 [f"ruleset 'main': {key} is 1, not True"])
 
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()

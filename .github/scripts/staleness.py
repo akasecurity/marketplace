@@ -12,7 +12,10 @@ Each rule is its own result, filed as its own issue by issue_router.py:
         versions that did finish, but neither is cleared. A younger version is
         left out: neither rule can name it yet. So an outage never closes the
         issue of a version either rule could name;
-  (ii)  a bot PR has been open for more than 24 hours;
+  (ii)  a PR the release bot opened (by author, release_checks.BOT_LOGIN, not by
+        a bot/ branch name alone, though every importer branch is bot/-prefixed)
+        has been open for more than 24 hours; with no
+        BOT_LOGIN there is no bot PR to count, so the rule is green;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
         than an hour old, changed the ai-tc version and carries no fleet-v tag
         (a commit whose manifest cannot be read is no pin change: the run logs
@@ -39,7 +42,7 @@ from typing import Callable
 import release_checks
 from ghapi import GitHub
 from gitrepo import Git
-from import_release import describe, list_pulls, write_output
+from import_release import bot_pulls, describe, list_pulls, write_output
 from issue_router import Result, results_to_json
 from release_checks import MANIFEST, vkey
 from tag_release import Unreadable, entry_at, pin_changes, version_at
@@ -173,8 +176,12 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
 
 
 def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
-    old = [p for p in list_pulls(gh, "open")
-           if p["head"].startswith("bot/") and (age(now, p["created_at"]) or dt.timedelta(0)) > DAY]
+    # Only the release bot's PRs, by author, through the importer's own test (import_release.bot_pulls): a person's
+    # PR from a bot/ branch is not stale importer work. The bot/ prefix test below stays too (every importer branch
+    # is bot/-prefixed); the author is what makes a PR the bot's. With no BOT_LOGIN there is none to count
+    # (bot_pulls would refuse, and the importer itself is red on that), so the rule is green, not a crash.
+    opened = bot_pulls(list_pulls(gh, "open")) if release_checks.BOT_LOGIN is not None else []
+    old = [p for p in opened if p["head"].startswith("bot/") and (age(now, p["created_at"]) or dt.timedelta(0)) > DAY]
     return result("staleness-ii", bool(old),
                   "Open for more than 24 hours:\n"
                   + "\n".join(f"- #{p['number']} `{p['head']}`, opened {p['created_at']}" for p in old)
