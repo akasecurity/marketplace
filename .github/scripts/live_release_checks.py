@@ -92,13 +92,12 @@ class TestLiveRelease(unittest.TestCase):
 
 
 class TestLiveBotApp(unittest.TestCase):
-    """BOT_LOGIN names a real Bot account of the release bot App, which akasecurity owns. The requests carry no
-    token: the user endpoint is public; the App endpoint answers only while the App is public."""
+    """BOT_LOGIN names a real Bot account, and its App slug is the login's. The user endpoint is public. The App
+    endpoint answers 404 to a caller without a token while the App is private, so the owner is checked only when
+    GITHUB_TOKEN is set (http_fetch sends it to api.github.com alone); without one that test skips."""
 
     def get(self, path):
-        with mock.patch.dict(os.environ):
-            os.environ.pop("GITHUB_TOKEN", None)
-            return rc.http_fetch(f"https://api.github.com/{path}", {})
+        return rc.http_fetch(f"https://api.github.com/{path}", {})
 
     def test_the_configured_login_is_a_bot_account(self):
         status, body = self.get(f"users/{urllib.parse.quote(rc.BOT_LOGIN, safe='')}")
@@ -109,9 +108,9 @@ class TestLiveBotApp(unittest.TestCase):
     def test_the_apps_slug_is_the_logins_and_akasecurity_owns_it(self):
         slug = rc.BOT_LOGIN[: -len("[bot]")]
         status, body = self.get(f"apps/{urllib.parse.quote(slug, safe='')}")
-        if status == 404:
-            self.skipTest("GitHub answers an unauthenticated read of /apps/<slug> only for a public App; this one "
-                          "is not public, so its owner cannot be read without a token")
+        if status == 404 and not os.environ.get("GITHUB_TOKEN"):
+            self.skipTest("GitHub answers an unauthenticated read of /apps/<slug> only for a public App; set "
+                          "GITHUB_TOKEN to check the owner of this one")
         self.assertEqual(status, 200, body[:200])
         app = json.loads(body)
         self.assertEqual((app["slug"], app["owner"]["login"]), (slug, "akasecurity"))
