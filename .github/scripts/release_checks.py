@@ -1818,7 +1818,7 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
 
 def _main_ruleset_problems(rules: dict) -> list:
     problems = []
-    review = rules.get("pull_request") or {}
+    review = rules.get("pull_request", {})
     count = review.get("required_approving_review_count")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
@@ -1827,7 +1827,9 @@ def _main_ruleset_problems(rules: dict) -> list:
             problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
     if review.get("allowed_merge_methods") != ["squash"]:
         problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
-    checks = (rules.get("required_status_checks") or {}).get("required_status_checks") or []
+    checks = rules.get("required_status_checks", {}).get("required_status_checks")
+    if not isinstance(checks, list):
+        checks = []
     if not any(
         isinstance(c, dict) and c.get("context") == "validate" and c.get("integration_id") == GITHUB_ACTIONS_APP_ID
         for c in checks
@@ -1878,7 +1880,17 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
                 f"ruleset {name!r} covers include {got_include} exclude {got_exclude}, "
                 f"not include {wanted} exclude {sorted(exclude)}"
             )
-        rules = {r.get("type"): r.get("parameters") or {} for r in ruleset.get("rules") or [] if isinstance(r, dict)}
+        rules = {}
+        for r in ruleset.get("rules") or []:
+            if not isinstance(r, dict):
+                continue
+            parameters = r.get("parameters")
+            if parameters is None:
+                parameters = {}
+            elif not isinstance(parameters, dict):
+                problems.append(f"ruleset {name!r}: its {r.get('type')} rule's parameters are {parameters!r}, not an object")
+                parameters = {}
+            rules[r.get("type")] = parameters
         missing = sorted(rule_types - set(rules))
         if missing:
             problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")

@@ -136,7 +136,7 @@ class TestRulesets(unittest.TestCase):
                          ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
 
     def test_an_update_rule_in_each_default_shape_passes(self):
-        # GitHub nulls or omits what is unset, so each of these means fetch-and-merge is off.
+        # Live update rules omit the parameters; a missing or null parameters object or flag is read as the default, off.
         shapes = {"flag false": {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}},
                   "no flag": {"type": "update", "parameters": {}},
                   "null parameters": {"type": "update", "parameters": None},
@@ -177,6 +177,38 @@ class TestRulesets(unittest.TestCase):
             "ruleset 'main': pull_request require_code_owner_review is 1, expected True",
             "ruleset 'main': pull_request dismiss_stale_reviews_on_push is 1, expected True",
             "ruleset 'main': pull_request require_last_push_approval is 1, expected True"])
+
+    def test_a_rule_whose_parameters_are_not_an_object_is_named_and_does_not_crash(self):
+        for parameters in (["x"], "x"):
+            for index, kind in ((2, "pull_request"), (3, "required_status_checks")):
+                with self.subTest(parameters=parameters, rule=kind):
+                    sets = good_rulesets()
+                    sets[1]["rules"][index]["parameters"] = parameters
+                    self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object",
+                                  ta.check_rulesets(github(sets)))
+
+    def test_merge_methods_that_are_not_a_list_are_named(self):
+        for methods in (1, "squash", {"squash": True}):
+            with self.subTest(methods=methods):
+                sets = good_rulesets()
+                sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = methods
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'main': pull_request allowed_merge_methods is {methods!r}, expected ['squash']"])
+
+    def test_entries_that_are_not_objects_are_named_and_do_not_crash(self):
+        sets = good_rulesets()
+        sets[4]["rules"].append("update")
+        self.assertEqual(ta.check_rulesets(github(sets)),
+                         ["ruleset 'fleet-tags-immutable': a rule is 'update', not an object"])
+        sets = good_rulesets()
+        sets[4]["rules"] = "update"
+        self.assertIn("ruleset 'fleet-tags-immutable': its rules are 'update', not a list", ta.check_rulesets(github(sets)))
+        for checks in (1, "validate", ["validate", 3]):
+            with self.subTest(checks=checks):
+                sets = good_rulesets()
+                sets[1]["rules"][3]["parameters"]["required_status_checks"] = checks
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 ["ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing"])
 
     def test_unreadable_conditions_are_named(self):
         sets = good_rulesets()
