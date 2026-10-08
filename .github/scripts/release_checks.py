@@ -77,10 +77,11 @@ PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
 # The release bot App's login, "<app-slug>[bot]". It decides which pull requests are the bot's:
-# validate judges a bot-authored pin PR as the bot's, the importer acts only on PRs this login
-# opened, and tag-audit accepts a tag's PR only when this login opened it. The annotation keeps
-# None as a possible value because tests patch it to None to exercise the unset path, where no
-# PR is judged as the bot's and the importer and tag-audit refuse.
+# validate judges a pin PR this login opened as the bot's, the importer's PR decisions read only
+# PRs this login opened, and tag-audit confirms a tag cut after the frozen list only when this
+# login opened its PR. None stays a possible value: each of the three keeps an unset path (no PR
+# is the bot's, the importer refuses, tag-audit reports every later tag as unconfirmed), which
+# the tests exercise by patching it to None.
 BOT_LOGIN: str | None = "aka-marketplace-bot[bot]"
 
 # Until a measured downgrade shows that an older build keeps working on a store an
