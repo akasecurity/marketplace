@@ -485,8 +485,12 @@ def git_env(name="test", email="test"):
         env[f"GIT_{role}_NAME"] = name
         env[f"GIT_{role}_EMAIL"] = email
     # Added after any config the caller's shell already passed this way, never over it.
-    taken = env.get("GIT_CONFIG_COUNT", "")
-    first = int(taken) if taken.isdigit() else 0
+    # Git reads the count with strtoul, which takes a sign and leading white space ("+1", " 1"), so read it
+    # the way int() does; anything int() refuses (words, "²") counts as none, and so does a negative.
+    try:
+        first = max(int(env.get("GIT_CONFIG_COUNT", "")), 0)
+    except ValueError:
+        first = 0
     for offset, (key, value) in enumerate(NO_BACKGROUND_UPKEEP):
         env[f"GIT_CONFIG_KEY_{first + offset}"] = key
         env[f"GIT_CONFIG_VALUE_{first + offset}"] = value

@@ -67,6 +67,26 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
         self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]), ("maintenance.auto", "gc.auto"))
 
+    def test_a_count_git_accepts_with_a_sign_or_white_space_keeps_the_callers_settings(self):
+        # git reads the count with strtoul, so "+1" and " 1" both mean one setting: ours go after it.
+        for count in ("+1", " 1"):
+            with self.subTest(count):
+                inherited = {"GIT_CONFIG_COUNT": count, "GIT_CONFIG_KEY_0": "test.inherited", "GIT_CONFIG_VALUE_0": "kept"}
+                with mock.patch.dict(os.environ, inherited):
+                    env = ts.git_env()
+                self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+                self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]), ("test.inherited", "kept"))
+                self.assertEqual((env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_KEY_2"]), ("maintenance.auto", "gc.auto"))
+
+    def test_a_count_no_one_can_read_is_none_and_never_raises(self):
+        # "\u00b2" is a digit to str.isdigit() but not to int(); "-1" and "" are no count at all.
+        for count in ("\u00b2", "abc", "-1", ""):
+            with self.subTest(count):
+                with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": count}):
+                    env = ts.git_env()
+                self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
+                self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]), ("maintenance.auto", "gc.auto"))
+
     def test_no_other_test_module_builds_its_own_git_environment(self):
         # The hand-built environments this replaced each carried the no-system-config setting, so a module that
         # still has it is building git an environment of its own, one that would start the upkeep again.
