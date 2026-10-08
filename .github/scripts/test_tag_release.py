@@ -12,7 +12,7 @@ from unittest import mock
 
 import release_checks
 import tag_release as tr
-from fakes import (CODEOWNERS, INTEGRITY, REPO, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
+from fakes import (CODEOWNERS, INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
                    not_found, pull, pulls_route, safety, safety_entry)
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
@@ -1144,7 +1144,7 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         reader = FakeGitHub(checks("h13", [validate_run(conclusion="failure")]))
         clients = {"app-token": writer, "workflow-token": reader}
         env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "app-token", "GITHUB_TOKEN": "workflow-token",
-               "BOT_APP_SLUG": "aka-marketplace-bot"}
+               "BOT_APP_SLUG": SLUG}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(tr, "Git", lambda path: history(chain=("t8", "b"))), \
                 mock.patch.object(tr, "GitHub", lambda token, repo: clients[token]), contextlib.redirect_stdout(out):
@@ -1422,13 +1422,13 @@ def branch_ref(name: str, tip: str) -> dict:
 
 def run_main(command: str, git, gh, slug: dict | None = None) -> tuple[int, str]:
     """tag_release.main with the checkout and the GitHub client replaced: its exit code and its output."""
-    slug = {"BOT_APP_SLUG": "aka-marketplace-bot"} if slug is None else slug
+    slug = {"BOT_APP_SLUG": SLUG} if slug is None else slug
     out = io.StringIO()
-    if "BOT_APP_SLUG" not in slug:
-        os.environ.pop("BOT_APP_SLUG", None)  # an exported one must not turn a missing-slug case into a match
     with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t", **slug}), \
             mock.patch.object(tr, "Git", lambda path: git), mock.patch.object(tr, "GitHub", lambda token, repo: gh), \
             contextlib.redirect_stdout(out):
+        if "BOT_APP_SLUG" not in slug:
+            os.environ.pop("BOT_APP_SLUG", None)  # an exported one must not turn a missing-slug case into a match
         code = tr.main([command])
     return code, out.getvalue()
 
@@ -1458,11 +1458,13 @@ class TestMainNamesTheBotApp(unittest.TestCase):
                 with self.subTest(command=command, slug=slug):
                     self.assertEqual(code, 1)
                     self.assertTrue(out.startswith("::error::"), out)
+                    self.assertIn("BOT_APP_SLUG", out)
+                    self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", out)
                     self.assertEqual(gh.calls, [])
 
     def test_the_configured_apps_slug_proceeds(self):
         gh = sweep_github()
-        code, out = run_main("sweep", history(chain=("t8", "b")), gh, {"BOT_APP_SLUG": "aka-marketplace-bot"})
+        code, out = run_main("sweep", history(chain=("t8", "b")), gh, {"BOT_APP_SLUG": SLUG})
         self.assertEqual(code, 0, out)
         self.assertTrue(gh.calls)
 

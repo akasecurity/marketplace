@@ -17,6 +17,7 @@ from gitrepo import GitError
 
 REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
+SLUG = BOT.removesuffix("[bot]")
 VERSIONS = ("0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17")
 INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64)).decode() for v in VERSIONS}
 # The real attested commits through 0.9.14, then invented stand-ins for every later version.
