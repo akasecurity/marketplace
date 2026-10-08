@@ -13,7 +13,8 @@ Each rule is its own result, filed as its own issue by issue_router.py:
         left out: neither rule can name it yet. So an outage never closes the
         issue of a version either rule could name;
   (ii)  a PR the release bot opened (by author, release_checks.BOT_LOGIN, not by
-        a bot/ branch name) has been open for more than 24 hours; with no
+        a bot/ branch name alone, though every importer branch is bot/-prefixed)
+        has been open for more than 24 hours; with no
         BOT_LOGIN there is no bot PR to count, so the rule is green;
   (iii) a first-parent commit on main after the last frozen tag's commit, more
         than an hour old, changed the ai-tc version and carries no fleet-v tag
@@ -176,8 +177,9 @@ def entry_and_rule_i(git: Git, repo_dir: str, now: dt.datetime, times: dict[str,
 
 def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
     # Only the release bot's PRs, by author, through the importer's own test (import_release.bot_pulls): a person's
-    # PR from a bot/ branch is not stale importer work. With no BOT_LOGIN there is none to count (bot_pulls would
-    # refuse, and the importer itself is red on that), so the rule is green rather than crashing the run.
+    # PR from a bot/ branch is not stale importer work. The bot/ prefix test below stays too (every importer branch
+    # is bot/-prefixed); the author is what makes a PR the bot's. With no BOT_LOGIN there is none to count
+    # (bot_pulls would refuse, and the importer itself is red on that), so the rule is green, not a crash.
     opened = bot_pulls(list_pulls(gh, "open")) if release_checks.BOT_LOGIN is not None else []
     old = [p for p in opened if p["head"].startswith("bot/") and (age(now, p["created_at"]) or dt.timedelta(0)) > DAY]
     return result("staleness-ii", bool(old),
