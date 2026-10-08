@@ -501,8 +501,8 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if facts["pr"] == "none" and -CLOCK_SKEW <= now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "
-                          "so that a slow link never becomes a permanent `pr: none` tag: the next push to main or a "
-                          "dispatch of tag-release asks again, and from an hour after the commit an unlinked commit "
+                          "so that a slow link never becomes a permanent `pr: none` tag: the next push to main, the hourly "
+                          "run or a dispatch of tag-release asks again, and from an hour after the commit an unlinked commit "
                           "is tagged as a push without a pull request.")
         integrity, integrity_why = integrity_at(git, sha)
         migration, migration_why = store_migration(git, sha, version, previous)

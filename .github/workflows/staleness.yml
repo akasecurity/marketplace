@@ -16,8 +16,8 @@ name: staleness
 # repository activity. A disabled workflow makes no failed run and files no issue,
 # so this check cannot report its own silence. `gh workflow list --all` shows each
 # workflow's state, and `gh workflow enable staleness.yml` turns this one back on.
-# The same goes for the other two scheduled workflows, import-plugin-release.yml
-# and tag-audit.yml.
+# The same goes for the other three scheduled workflows, import-plugin-release.yml,
+# tag-audit.yml and tag-release.yml.
 
 on:
   schedule:

@@ -200,10 +200,11 @@ checks the environment's deployment branches every day).
 
 GitHub disables a public repository's scheduled workflows after 60 days with no repository
 activity. A disabled workflow makes no failed run and files no issue, so `import-plugin-release`,
-`staleness` and `tag-audit`, the three that run on a schedule, cannot report their own silence.
+`staleness`, `tag-audit` and `tag-release`, the four that run on a schedule, cannot report their own
+silence (a disabled `tag-release` still runs on a push to `main`, but its hourly retries stop).
 `gh workflow list --all` shows each workflow's state, and
-`gh workflow enable import-plugin-release.yml` turns one back on (likewise `staleness.yml` and
-`tag-audit.yml`). `import-plugin-release` is the last to go back on: once the version of the
+`gh workflow enable import-plugin-release.yml` turns one back on (likewise `staleness.yml`,
+`tag-audit.yml` and `tag-release.yml`). `import-plugin-release` is the last to go back on: once the version of the
 workflow that opens its pull requests as the release bot is on `main`, and `BOT_LOGIN`, the
 release-bot App and the `marketplace-bot` environment are live (before then it cannot open a pull
 request as the bot). `gh workflow list --all` confirms it is on, and "every 15 minutes" below is
@@ -279,7 +280,8 @@ true only once it is.
   free-text value taken from the PR appears in it inside a code span. `validate` does not run again
   when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
   approver re-runs the check before approving (the PR's checklist says so).
-- **`tag-release`** (every push to `main`, and by manual dispatch to re-run a sweep) runs
+- **`tag-release`** (every push to `main`, hourly at minute 37, and by manual dispatch to re-run a
+  sweep) runs
   `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the last green
   run's snapshot of the tags) and stops, red and creating nothing, while any of them fails. That
   refusal is a signal, not a control: the workflow runs from the pushed commit. It tags every
