@@ -169,7 +169,18 @@ last pusher) and the `validate` check to pass, so a code owner's own PR needs th
 owner. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
 audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
-missing or differs, and `tag-release` creates no tag meanwhile.
+missing, not active, or differs in its rules, target or ref patterns (and, for `main`, its review
+settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
+
+The audit cannot see who may bypass a ruleset: GitHub returns a ruleset's bypass list only to a
+caller who can edit it, and the workflows' read-only tokens get nothing. So an organisation owner
+reads the bypass lists back in the repository settings after creating or changing any ruleset.
+Expected:
+
+- `main`: organisation admins, for pull requests only;
+- `fleet-tags-create` and `bot-branches`: the release bot App;
+- `x4-branches` and `x4-tags`: the x4 experimenters team;
+- `tags-locked` and `fleet-tags-immutable`: nobody.
 
 Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
@@ -324,7 +335,8 @@ true only once it is.
   reports it.
 - **`tag-audit`** (daily, on every tag push, on the deletion of a tag or a branch, and by hand)
   checks the `fleet-v` ledger against the frozen list, the last green run and `main`'s history,
-  that the rulesets are active as configured, and that the `marketplace-bot` environment admits
+  that the rulesets are active with the expected rules, target and ref patterns (not their bypass
+  lists, which the audit cannot read), and that the `marketplace-bot` environment admits
   deployments from `main` alone. GitHub starts no run for a push or a deletion that touches more
   than three tags at once, nor for a tag pushed at an old commit that has no copy of the workflow,
   so the daily run is what sees those. A tag that changed since the last green run stays red until
