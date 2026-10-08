@@ -145,6 +145,13 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
                 self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
                 self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]), ("maintenance.auto", "gc.auto"))
 
+    def test_the_shared_git_helper_runs_under_the_environment_it_is_given_and_defaults_to_the_shared_one(self):
+        with tempfile.TemporaryDirectory() as root:
+            ts.git(root, "init", "-q", "-b", "main")
+            own = ts.git_env("Zed", "zed@example.invalid")
+            self.assertIn("Zed <zed@example.invalid>", ts.git(root, "var", "GIT_AUTHOR_IDENT", env=own))
+            self.assertIn("test <test> ", ts.git(root, "var", "GIT_AUTHOR_IDENT"))
+
     def test_the_guard_catches_a_hand_built_environment(self):
         # Each of these is how a test could give git an environment of its own, and so a shell that starts upkeep.
         for name in sorted(OWN_ENVIRONMENT_KEYS):

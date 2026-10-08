@@ -501,10 +501,10 @@ def git_env(name="test", email="test"):
 GIT_ENV = git_env()
 
 
-def git(repo, *args):
-    return subprocess.run(
-        ["git", "-C", repo, *args], check=True, capture_output=True, text=True, env=GIT_ENV
-    ).stdout
+def git(repo, *args, env=GIT_ENV):
+    """Run git in `repo` under `env` (the shared environment unless a test builds one with git_env, for its own
+    identity or dates) and return its stdout. A failing command raises CalledProcessError."""
+    return subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True, text=True, env=env).stdout
 
 
 class Repo:
