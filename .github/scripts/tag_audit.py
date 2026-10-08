@@ -3,7 +3,8 @@ anything (not its comparison with the last green run's snapshot of the tag objec
 makes that comparison.
 
 Detection, not prevention: the rulesets prevent, and this notices an edit to
-one of them, a change to the deployment branches of the `marketplace-bot`
+one of them that changes its enforcement, target, rules or ref patterns (not its
+bypass list), a change to the deployment branches of the `marketplace-bot`
 environment, a moved or deleted fleet-v tag, or a tag that should not exist.
 release_checks.audit_tags holds the tag-ledger rules: the frozen list, the
 fleet-v<N> name rule, and, for every tag after the frozen list, contiguous

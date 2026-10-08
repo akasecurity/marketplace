@@ -1713,7 +1713,9 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
 
 
 # The rulesets this repository must carry: name -> (target, rule types). Bypass lists are
-# visible only to admins, so they are proven by probe when the rulesets are created.
+# visible only to admins, so this audit cannot check them: they are proven by probe when the
+# rulesets are created, and an organisation owner reads them back after any change (AGENTS.md,
+# "Workflow", lists what each should hold).
 EXPECTED_RULESETS = {
     "main": ("branch", {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}),
     "tags-locked": ("tag", {"creation", "update", "deletion"}),

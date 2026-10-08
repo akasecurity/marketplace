@@ -2,7 +2,8 @@ name: tag-audit
 
 # Daily, on a tag push or deletion, and on demand: detect a fleet-v tag that
 # moved or vanished, a tag that should not exist, a break in the tag ledger, a
-# ruleset that was edited or disabled, or a change to the deployment branches of
+# ruleset that was disabled or whose rules, target or ref patterns changed (its
+# bypass list is not readable here), or a change to the deployment branches of
 # the marketplace-bot environment (AGENTS.md, "The workflows"). Detection, not
 # prevention: the rulesets prevent. GitHub starts no run for a push or a deletion
 # that touches more than three tags at once, so the tag trigger is not a guaranteed
