@@ -80,7 +80,8 @@ def environment_problems(source, name="module"):
     Known blind spots (it checks the shapes the tests use, not every way to write them): a key added by
     subscript or `.update(...)`, an f-string key, `subprocess` imported under another name or its functions
     imported bare (other than Popen/check_*), a command list held in a variable or passed as `args=`,
-    `subprocess.call`, `env=os.environ` or `env=None`, and git run inside a shell string."""
+    `subprocess.call`, `env=os.environ` or `env=None`, git run inside a shell string, and an environment
+    that starts from ts.GIT_ENV but overrides GIT_CONFIG_COUNT or a GIT_CONFIG_KEY_n."""
     problems = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Dict):
@@ -121,7 +122,7 @@ def commit_trace(env):
 
 class TestNoBackgroundUpkeep(unittest.TestCase):
     @needs_environment_config
-    def test_a_commit_made_the_way_the_helper_makes_it_starts_no_maintenance_or_gc(self):
+    def test_a_commit_made_the_way_the_helper_makes_it_starts_no_maintenance(self):
         trace = commit_trace(ts.GIT_ENV)
         # The commit itself shows in the trace, so an empty or unwritten trace cannot pass for a quiet one.
         self.assertIn("git commit", trace)
