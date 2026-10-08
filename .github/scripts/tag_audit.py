@@ -101,8 +101,11 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
         parameters = rule_parameters(name, rule, problems)
         if rule.get("type") != "update" or parameters is None:
             continue
-        # A live update rule has no parameters when the flag is false (its default). A missing or null
-        # parameters object and a missing or null flag are read as that default.
+        # GitHub's REST answer leaves out an update rule's parameters when the flag is false, its default,
+        # and this repository keeps the flag false even when a ruleset asks for true (checked 2026-10-08:
+        # GraphQL read the stored flag back as false, and REST showed no parameters to an admin or to an
+        # unauthenticated caller). So a missing or null parameters object, or a missing or null flag, is
+        # read as that default.
         flag = parameters.get("update_allows_fetch_and_merge")
         if flag is None:
             flag = False
