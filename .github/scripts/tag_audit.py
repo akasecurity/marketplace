@@ -75,7 +75,8 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
     if missing:
         problems.append(f"ruleset {name!r} lacks the rules {sorted(missing)}")
     for rule in rules:
-        if rule.get("type") == "update" and (rule.get("parameters") or {}).get("update_allows_fetch_and_merge") is not False:
+        # GitHub omits the parameters when the flag is false (its default); only a flag that is not false is a problem.
+        if rule.get("type") == "update" and (rule.get("parameters") or {}).get("update_allows_fetch_and_merge", False) is not False:
             problems.append(f"ruleset {name!r}: its update rule allows fetch-and-merge")
     ref_name = (ruleset.get("conditions") or {}).get("ref_name")
     if not isinstance(ref_name, dict):
