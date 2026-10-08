@@ -13,7 +13,8 @@ import tag_audit as ta
 from fakes import REPO, FakeGit, FakeGitHub, fleet_tag, not_found
 from ghapi import GitHubError
 
-UPDATE = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
+# GitHub stores an update rule without parameters when fetch-and-merge is off, its default.
+UPDATE = {"type": "update"}
 LOCKED = [{"type": "creation"}, UPDATE, {"type": "deletion"}]
 
 
@@ -128,6 +129,22 @@ class TestRulesets(unittest.TestCase):
     def test_an_update_rule_that_allows_fetch_and_merge_is_named(self):
         sets = good_rulesets()
         sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": True}}
+        self.assertEqual(ta.check_rulesets(github(sets)),
+                         ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
+
+    def test_an_update_rule_without_parameters_is_the_default_and_passes(self):
+        sets = good_rulesets()
+        self.assertEqual(sets[4]["rules"][0], {"type": "update"})
+        self.assertEqual(ta.check_rulesets(github(sets)), [])
+
+    def test_an_update_rule_with_the_flag_explicitly_false_passes(self):
+        sets = good_rulesets()
+        sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
+        self.assertEqual(ta.check_rulesets(github(sets)), [])
+
+    def test_an_update_rule_with_a_non_boolean_flag_is_named(self):
+        sets = good_rulesets()
+        sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": "false"}}
         self.assertEqual(ta.check_rulesets(github(sets)),
                          ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
 
