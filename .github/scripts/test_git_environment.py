@@ -18,9 +18,11 @@ from unittest import mock
 import _testsupport as ts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# What a commit's trace shows when git goes on to do upkeep: `maintenance run --auto` since git 2.29, and the
-# `gc --auto` it replaced before that.
-UPKEEP = re.compile(r"maintenance run|gc --auto")
+# What a commit's trace shows when git goes on to start upkeep: `maintenance run --auto` (git 2.29 and later).
+# `gc --auto` is not matched, on purpose: before 2.29 every commit spawns it, it reads gc.auto=0 and exits at
+# once, so it is in every trace and says nothing about whether upkeep ran. That setting is pinned by the config
+# read-back test below instead.
+UPKEEP = re.compile(r"maintenance run")
 
 
 def commit_trace(env):
@@ -43,6 +45,10 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
         # The commit itself shows in the trace, so an empty or unwritten trace cannot pass for a quiet one.
         self.assertIn("git commit", trace)
         self.assertIsNone(UPKEEP.search(trace), trace)
+
+    def test_the_trace_pattern_matches_maintenance_and_ignores_an_instant_gc_auto(self):
+        self.assertIsNotNone(UPKEEP.search("trace: built-in: git maintenance run --auto --no-quiet"))
+        self.assertIsNone(UPKEEP.search("trace: run_command: git gc --auto"))
 
     def test_so_does_the_environment_a_test_builds_with_its_own_identity(self):
         trace = commit_trace(ts.git_env("t", "t@example.invalid"))
