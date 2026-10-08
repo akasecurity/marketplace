@@ -4,13 +4,18 @@ Not collected by the unit-test pattern (test_*.py), so CI never needs the networ
 them by hand before merging any change to the release checks, with npm 11.12 or later on PATH:
 
     python3 -m unittest discover -s .github/scripts -p 'live_*.py' -v
+
+Set GITHUB_TOKEN so the check of the bot App's owner runs; without it that check is skipped.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import unittest
+import urllib.parse
+from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
@@ -86,6 +91,31 @@ class TestLiveRelease(unittest.TestCase):
         )
         unchanged = classify_pair("0.9.12", "0.9.13")
         self.assertEqual((unchanged.classification, unchanged.migrations, unchanged.kinds), ("additive", [], {}))
+
+
+class TestLiveBotApp(unittest.TestCase):
+    """BOT_LOGIN names a real Bot account, and its App slug is the login's. The user endpoint is public. The App
+    endpoint answers 404 to a caller without a token while the App is private, so the owner is checked only when
+    GITHUB_TOKEN is set (http_fetch sends it to api.github.com alone); without one that test skips."""
+
+    def get(self, path):
+        return rc.http_fetch(f"https://api.github.com/{path}", {})
+
+    def test_the_configured_login_is_a_bot_account(self):
+        status, body = self.get(f"users/{urllib.parse.quote(rc.BOT_LOGIN, safe='')}")
+        self.assertEqual(status, 200, body[:200])
+        user = json.loads(body)
+        self.assertEqual((user["login"], user["type"]), (rc.BOT_LOGIN, "Bot"))
+
+    def test_the_apps_slug_is_the_logins_and_akasecurity_owns_it(self):
+        slug = rc.BOT_LOGIN[: -len("[bot]")]
+        status, body = self.get(f"apps/{urllib.parse.quote(slug, safe='')}")
+        if status == 404 and not os.environ.get("GITHUB_TOKEN"):
+            self.skipTest("GitHub answers an unauthenticated read of /apps/<slug> only for a public App; set "
+                          "GITHUB_TOKEN to check the owner of this one")
+        self.assertEqual(status, 200, body[:200])
+        app = json.loads(body)
+        self.assertEqual((app["slug"], app["owner"]["login"]), (slug, "akasecurity"))
 
 
 def classify_pair(earlier, later):

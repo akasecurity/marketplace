@@ -66,10 +66,12 @@ jobs:
       - name: sweep main and cut the missing fleet-v tags
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/tag_release.py sweep --repo-dir .
       # No `if:` on this step (or any other): it runs only while every step before it has passed.
       - name: delete the bot's branches left at the head of a closed PR
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
         run: python3 .github/scripts/tag_release.py cleanup-branches

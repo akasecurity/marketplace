@@ -20,6 +20,7 @@ from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
+from fakes import BOT, SLUG
 
 # A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
 NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
@@ -2285,7 +2286,58 @@ class TestDiffMode(unittest.TestCase):
             rc.diff_mode(ts.manifest(), head)
 
 
-BOT = "aka-marketplace-bot[bot]"
+
+
+class TestBotLoginShape(unittest.TestCase):
+    def test_configured_login_is_the_one_the_bot_path_fixtures_use(self):
+        # A wrong but well-formed login passes the shape test below; the fixtures every bot-path test builds its
+        # PRs from (fakes.BOT) would then match nothing in production. Change both together.
+        self.assertEqual(rc.BOT_LOGIN, BOT)
+
+    def test_configured_login_is_an_app_slug_with_the_bot_suffix(self):
+        login = rc.BOT_LOGIN
+        self.assertIsInstance(login, str)
+        self.assertTrue(login.endswith("[bot]"), login)
+        self.assertRegex(login[: -len("[bot]")], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+class TestBotAppSlug(unittest.TestCase):
+    """The token step's app-slug is checked against BOT_LOGIN before a script writes as the App."""
+
+    def test_the_slug_of_the_configured_app_matches(self):
+        self.assertTrue(rc.app_slug_is_bot(SLUG))
+        self.assertIsNone(rc.bot_app_problem(SLUG))
+
+    def test_another_missing_or_empty_slug_does_not_match(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]", "", None):
+            with self.subTest(slug=slug):
+                self.assertFalse(rc.app_slug_is_bot(slug))
+                self.assertIsNotNone(rc.bot_app_problem(slug))
+
+    def test_a_mismatch_names_the_secret_as_the_likely_cause(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]"):
+            with self.subTest(slug=slug):
+                self.assertIn("MARKETPLACE_BOT_CLIENT_ID", rc.bot_app_problem(slug))
+
+    def test_a_missing_slug_names_the_unreported_slug_not_the_secret(self):
+        for slug in ("", None):
+            with self.subTest(slug=slug):
+                problem = rc.bot_app_problem(slug)
+                self.assertIn("BOT_APP_SLUG", problem)
+                self.assertIn("reported no app-slug", problem)
+                self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
+
+    def test_the_problem_names_both_logins(self):
+        problem = rc.bot_app_problem("some-other-app")
+        self.assertIn("some-other-app[bot]", problem)
+        self.assertIn(rc.BOT_LOGIN, problem)
+
+    def test_no_configured_login_matches_no_slug(self):
+        with mock.patch.object(rc, "BOT_LOGIN", None):
+            self.assertFalse(rc.app_slug_is_bot(SLUG))
+            problem = rc.bot_app_problem(SLUG)
+            self.assertIn("no bot login is configured", problem)
+            self.assertNotIn("MARKETPLACE_BOT_CLIENT_ID", problem)
 
 
 class TestParseTagMessage(unittest.TestCase):
