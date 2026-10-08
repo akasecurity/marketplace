@@ -2586,7 +2586,7 @@ class TestAuditRulesets(unittest.TestCase):
             body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
             next(r for r in body["rules"] if r["type"] == kind)["parameters"] = parameters
             return routes
-        for parameters in (["x"], "x"):
+        for parameters in (["x"], "x", [], ""):
             for kind in ("pull_request", "required_status_checks"):
                 with self.subTest(parameters=parameters, rule=kind):
                     problems = rc.audit_rulesets(fetch=ts.FakeFetch(with_rule(kind, parameters)))
