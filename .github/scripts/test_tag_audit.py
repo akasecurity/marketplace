@@ -13,7 +13,8 @@ import tag_audit as ta
 from fakes import REPO, FakeGit, FakeGitHub, fleet_tag, not_found
 from ghapi import GitHubError
 
-UPDATE = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
+# GitHub stores an update rule without parameters when fetch-and-merge is off, its default.
+UPDATE = {"type": "update"}
 LOCKED = [{"type": "creation"}, UPDATE, {"type": "deletion"}]
 
 
@@ -84,7 +85,10 @@ def github(rulesets, *, environment=None, rules=None):
 
 class TestRulesets(unittest.TestCase):
     def test_the_configured_rulesets_pass(self):
-        self.assertEqual(ta.check_rulesets(github(good_rulesets())), [])
+        sets = good_rulesets()
+        # GitHub returns an update rule with no parameters when fetch-and-merge is off.
+        self.assertEqual(sets[4]["rules"][0], {"type": "update"})
+        self.assertEqual(ta.check_rulesets(github(sets)), [])
         # RULESETS is built from release_checks' tables, the ones an external vendored copy
         # of release_checks.audit_rulesets runs, so the two cannot drift.
         self.assertEqual({name: (want["target"], want["rules"]) for name, want in ta.RULESETS.items()},
@@ -130,6 +134,86 @@ class TestRulesets(unittest.TestCase):
         sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": True}}
         self.assertEqual(ta.check_rulesets(github(sets)),
                          ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
+
+    def test_an_update_rule_in_each_default_shape_passes(self):
+        # Live update rules omit the parameters; a missing or null parameters object or flag is read as the default, off.
+        shapes = {"flag false": {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}},
+                  "no flag": {"type": "update", "parameters": {}},
+                  "null parameters": {"type": "update", "parameters": None},
+                  "null flag": {"type": "update", "parameters": {"update_allows_fetch_and_merge": None}}}
+        for label, rule in shapes.items():
+            with self.subTest(label):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = rule
+                self.assertEqual(ta.check_rulesets(github(sets)), [])
+
+    def test_an_update_rule_with_a_non_boolean_flag_is_named(self):
+        # 0 and 1 compare equal to False and True, so only an identity check refuses them.
+        for flag in ("false", 0, 1):
+            with self.subTest(flag=flag):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": flag}}
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'fleet-tags-immutable': its update rule's update_allows_fetch_and_merge is {flag!r}, "
+                                  "not a boolean"])
+
+    def test_an_update_rule_whose_parameters_are_not_an_object_is_named(self):
+        for parameters in (["x"], "false", [], ""):
+            with self.subTest(parameters=parameters):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = {"type": "update", "parameters": parameters}
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'fleet-tags-immutable': its update rule's parameters are {parameters!r}, "
+                                  "not an object"])
+
+    def test_main_review_settings_are_compared_with_their_type(self):
+        sets = good_rulesets()
+        review = sets[1]["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            review[key] = 1
+        self.assertEqual(ta.check_rulesets(github(sets)), [
+            "ruleset 'main': pull_request required_approving_review_count is True, expected 1",
+            "ruleset 'main': pull_request require_code_owner_review is 1, expected True",
+            "ruleset 'main': pull_request dismiss_stale_reviews_on_push is 1, expected True",
+            "ruleset 'main': pull_request require_last_push_approval is 1, expected True"])
+
+    def test_a_rule_whose_parameters_are_not_an_object_is_named_and_does_not_crash(self):
+        for parameters in (["x"], "x"):
+            for index, kind in ((2, "pull_request"), (3, "required_status_checks")):
+                with self.subTest(parameters=parameters, rule=kind):
+                    sets = good_rulesets()
+                    sets[1]["rules"][index]["parameters"] = parameters
+                    self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object",
+                                  ta.check_rulesets(github(sets)))
+
+    def test_merge_methods_that_are_not_a_list_are_named(self):
+        for methods in (1, "squash", {"squash": True}):
+            with self.subTest(methods=methods):
+                sets = good_rulesets()
+                sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = methods
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'main': pull_request allowed_merge_methods is {methods!r}, expected ['squash']"])
+
+    def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
+        sets = good_rulesets()
+        sets[4]["rules"].append("update")
+        self.assertEqual(ta.check_rulesets(github(sets)),
+                         ["ruleset 'fleet-tags-immutable': a rule is 'update', not an object"])
+        for rules in ("update", 5):
+            with self.subTest(rules=rules):
+                sets = good_rulesets()
+                sets[4]["rules"] = rules
+                self.assertIn(f"ruleset 'fleet-tags-immutable': its rules are {rules!r}, not a list",
+                              ta.check_rulesets(github(sets)))
+
+    def test_main_required_checks_that_are_not_a_list_read_as_missing_the_validate_check(self):
+        for checks in (1, "validate", ["validate", 3]):
+            with self.subTest(checks=checks):
+                sets = good_rulesets()
+                sets[1]["rules"][3]["parameters"]["required_status_checks"] = checks
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 ["ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing"])
 
     def test_unreadable_conditions_are_named(self):
         sets = good_rulesets()
