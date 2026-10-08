@@ -2592,19 +2592,19 @@ class TestAuditRulesets(unittest.TestCase):
                     problems = rc.audit_rulesets(fetch=ts.FakeFetch(with_rule(kind, parameters)))
                     self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object", problems)
 
-    def test_main_review_settings_that_are_not_what_they_seem_are_named(self):
+    def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
+        for rules in (5, "update"):
+            with self.subTest(rules=rules):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"] = rules
+                problems = rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+                self.assertIn(f"ruleset 'main': its rules are {rules!r}, not a list", problems)
         routes = ruleset_routes()
-        body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
-        review = next(r for r in body["rules"] if r["type"] == "pull_request")["parameters"]
-        review["required_approving_review_count"] = True
-        review["allowed_merge_methods"] = 1
-        review["require_code_owner_review"] = 1
-        problems = rc.audit_rulesets(fetch=ts.FakeFetch(routes))
-        self.assertIn("ruleset 'main': required_approving_review_count is True, not at least 1", problems)
-        self.assertIn("ruleset 'main': allowed_merge_methods is 1, not ['squash']", problems)
-        self.assertIn("ruleset 'main': require_code_owner_review is 1, not True", problems)
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"].append("update")
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': a rule is 'update', not an object"])
 
-    def test_required_checks_that_are_not_a_list_are_named(self):
+    def test_required_checks_that_are_not_a_list_read_as_missing_the_validate_check(self):
         for checks in (1, "validate"):
             with self.subTest(checks=checks):
                 routes = ruleset_routes()
@@ -2693,6 +2693,11 @@ class TestAuditRulesets(unittest.TestCase):
         routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
                          ["ruleset 'main': required_approving_review_count is True, not at least 1"])
+        routes = ruleset_routes()
+        next(r for r in routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"]
+             if r["type"] == "pull_request")["parameters"]["allowed_merge_methods"] = 1
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': allowed_merge_methods is 1, not ['squash']"])
         for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
             with self.subTest(key=key):
                 routes = ruleset_routes()
