@@ -146,7 +146,8 @@ class TestRulesets(unittest.TestCase):
         sets = good_rulesets()
         sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": "false"}}
         self.assertEqual(ta.check_rulesets(github(sets)),
-                         ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
+                         ["ruleset 'fleet-tags-immutable': its update rule's update_allows_fetch_and_merge is 'false', "
+                          "not a boolean"])
 
     def test_unreadable_conditions_are_named(self):
         sets = good_rulesets()
