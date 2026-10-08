@@ -1424,6 +1424,8 @@ def run_main(command: str, git, gh, slug: dict | None = None) -> tuple[int, str]
     """tag_release.main with the checkout and the GitHub client replaced: its exit code and its output."""
     slug = {"BOT_APP_SLUG": "aka-marketplace-bot"} if slug is None else slug
     out = io.StringIO()
+    if "BOT_APP_SLUG" not in slug:
+        os.environ.pop("BOT_APP_SLUG", None)  # an exported one must not turn a missing-slug case into a match
     with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t", **slug}), \
             mock.patch.object(tr, "Git", lambda path: git), mock.patch.object(tr, "GitHub", lambda token, repo: gh), \
             contextlib.redirect_stdout(out):
