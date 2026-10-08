@@ -1881,8 +1881,15 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
                 f"not include {wanted} exclude {sorted(exclude)}"
             )
         rules = {}
-        for r in ruleset.get("rules") or []:
+        listed = ruleset.get("rules")
+        if listed is None:
+            listed = []
+        elif not isinstance(listed, list):
+            problems.append(f"ruleset {name!r}: its rules are {listed!r}, not a list")
+            listed = []
+        for r in listed:
             if not isinstance(r, dict):
+                problems.append(f"ruleset {name!r}: a rule is {r!r}, not an object")
                 continue
             parameters = r.get("parameters")
             if parameters is None:

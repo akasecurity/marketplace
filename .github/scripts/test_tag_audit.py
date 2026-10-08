@@ -195,14 +195,19 @@ class TestRulesets(unittest.TestCase):
                 self.assertEqual(ta.check_rulesets(github(sets)),
                                  [f"ruleset 'main': pull_request allowed_merge_methods is {methods!r}, expected ['squash']"])
 
-    def test_entries_that_are_not_objects_are_named_and_do_not_crash(self):
+    def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
         sets = good_rulesets()
         sets[4]["rules"].append("update")
         self.assertEqual(ta.check_rulesets(github(sets)),
                          ["ruleset 'fleet-tags-immutable': a rule is 'update', not an object"])
-        sets = good_rulesets()
-        sets[4]["rules"] = "update"
-        self.assertIn("ruleset 'fleet-tags-immutable': its rules are 'update', not a list", ta.check_rulesets(github(sets)))
+        for rules in ("update", 5):
+            with self.subTest(rules=rules):
+                sets = good_rulesets()
+                sets[4]["rules"] = rules
+                self.assertIn(f"ruleset 'fleet-tags-immutable': its rules are {rules!r}, not a list",
+                              ta.check_rulesets(github(sets)))
+
+    def test_main_required_checks_that_are_not_a_list_read_as_missing_the_validate_check(self):
         for checks in (1, "validate", ["validate", 3]):
             with self.subTest(checks=checks):
                 sets = good_rulesets()
