@@ -2580,6 +2580,39 @@ class TestAuditRulesets(unittest.TestCase):
         routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
 
+    def test_a_rule_with_unreadable_parameters_is_named_and_does_not_crash(self):
+        def with_rule(kind, parameters):
+            routes = ruleset_routes()
+            body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+            next(r for r in body["rules"] if r["type"] == kind)["parameters"] = parameters
+            return routes
+        for parameters in (["x"], "x"):
+            for kind in ("pull_request", "required_status_checks"):
+                with self.subTest(parameters=parameters, rule=kind):
+                    problems = rc.audit_rulesets(fetch=ts.FakeFetch(with_rule(kind, parameters)))
+                    self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object", problems)
+
+    def test_main_review_settings_that_are_not_what_they_seem_are_named(self):
+        routes = ruleset_routes()
+        body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+        review = next(r for r in body["rules"] if r["type"] == "pull_request")["parameters"]
+        review["required_approving_review_count"] = True
+        review["allowed_merge_methods"] = 1
+        review["require_code_owner_review"] = 1
+        problems = rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+        self.assertIn("ruleset 'main': required_approving_review_count is True, not at least 1", problems)
+        self.assertIn("ruleset 'main': allowed_merge_methods is 1, not ['squash']", problems)
+        self.assertIn("ruleset 'main': require_code_owner_review is 1, not True", problems)
+
+    def test_required_checks_that_are_not_a_list_are_named(self):
+        for checks in (1, "validate"):
+            with self.subTest(checks=checks):
+                routes = ruleset_routes()
+                body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+                next(r for r in body["rules"] if r["type"] == "required_status_checks")["parameters"]["required_status_checks"] = checks
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 ["ruleset 'main' does not require the validate check from the GitHub Actions app"])
+
     def test_tags_locked_on_all_is_caught(self):
         # ~ALL would cover every tag on a tag ruleset too (GitHub's own tag recipes use it), but
         # tags-locked must list the two explicit globs, so what it covers is spelled out and
