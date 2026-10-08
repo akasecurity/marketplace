@@ -2296,6 +2296,30 @@ class TestBotLoginShape(unittest.TestCase):
         self.assertRegex(login[: -len("[bot]")], r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
+class TestBotAppSlug(unittest.TestCase):
+    """The token step's app-slug is checked against BOT_LOGIN before a script writes as the App."""
+
+    def test_the_slug_of_the_configured_app_matches(self):
+        self.assertTrue(rc.app_slug_is_bot("aka-marketplace-bot"))
+        self.assertIsNone(rc.bot_app_problem("aka-marketplace-bot"))
+
+    def test_another_missing_or_empty_slug_does_not_match(self):
+        for slug in ("some-other-app", "aka-marketplace-bot[bot]", "", None):
+            with self.subTest(slug=slug):
+                self.assertFalse(rc.app_slug_is_bot(slug))
+                self.assertIn("MARKETPLACE_BOT_CLIENT_ID", rc.bot_app_problem(slug))
+
+    def test_the_problem_names_both_logins(self):
+        problem = rc.bot_app_problem("some-other-app")
+        self.assertIn("some-other-app[bot]", problem)
+        self.assertIn(rc.BOT_LOGIN, problem)
+
+    def test_no_configured_login_matches_no_slug(self):
+        with mock.patch.object(rc, "BOT_LOGIN", None):
+            self.assertFalse(rc.app_slug_is_bot("aka-marketplace-bot"))
+            self.assertIn("(nothing)", rc.bot_app_problem("aka-marketplace-bot"))
+
+
 class TestParseTagMessage(unittest.TestCase):
     def test_subject_and_fields(self):
         fields = rc.parse_tag_message("fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\npr: #14\ndrill: true\n")

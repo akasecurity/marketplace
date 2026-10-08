@@ -84,6 +84,24 @@ GITHUB_ACTIONS_APP_ID = 15368
 # the tests exercise by patching it to None.
 BOT_LOGIN: str | None = "aka-marketplace-bot[bot]"
 
+
+def app_slug_is_bot(slug: str | None) -> bool:
+    """Whether `slug`, the app-slug the token step reports for the App it signed in as, is the App BOT_LOGIN
+    names. An empty or missing slug, or no BOT_LOGIN, is no match."""
+    return bool(slug) and BOT_LOGIN is not None and f"{slug}[bot]" == BOT_LOGIN
+
+
+def bot_app_problem(slug: str | None) -> str | None:
+    """None when the App a workflow signed in as is the one BOT_LOGIN names, else one line saying what differs
+    and the likely cause. A script that writes as the App calls this first and refuses on a problem, so a secret
+    naming another App ends the run here, naming the cause, instead of later as a PR judged by the wrong author."""
+    if app_slug_is_bot(slug):
+        return None
+    return (f"the App this job signed in as is {f'{slug}[bot]' if slug else '(not reported)'}, but BOT_LOGIN "
+            f"(release_checks.BOT_LOGIN) names {BOT_LOGIN if BOT_LOGIN is not None else '(nothing)'}; the "
+            "MARKETPLACE_BOT_CLIENT_ID secret probably names a different App, or BOT_LOGIN is out of date. "
+            "Nothing was written.")
+
 # Until a measured downgrade shows that an older build keeps working on a store an
 # additive migration touched, EVERY migration marks its release not rollback-safe.
 # Flip this only in a reviewed change that cites that measurement. The per-statement
