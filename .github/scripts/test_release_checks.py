@@ -2288,6 +2288,14 @@ class TestDiffMode(unittest.TestCase):
 BOT = "aka-marketplace-bot[bot]"
 
 
+class TestBotLoginShape(unittest.TestCase):
+    def test_configured_login_is_an_app_slug_with_the_bot_suffix(self):
+        login = rc.BOT_LOGIN
+        self.assertIsInstance(login, str)
+        self.assertTrue(login.endswith("[bot]"), login)
+        self.assertRegex(login[: -len("[bot]")], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
 class TestParseTagMessage(unittest.TestCase):
     def test_subject_and_fields(self):
         fields = rc.parse_tag_message("fleet-v9: ai-tc 0.9.15\n\nversion: 0.9.15\npr: #14\ndrill: true\n")
