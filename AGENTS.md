@@ -169,7 +169,7 @@ last pusher) and the `validate` check to pass, so a code owner's own PR needs th
 owner. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
 audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
-missing, not active, or differs in its rules, target or ref patterns (and, for `main`, its review
+missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
 settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
 
 The audit cannot see who may bypass a ruleset: GitHub returns a ruleset's bypass list only to a

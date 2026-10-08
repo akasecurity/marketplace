@@ -1918,7 +1918,8 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
 
 def audit_tags(repo_dir: str, frozen_path: str, *, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
     """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
-    detection, not prevention: the rulesets prevent, and this notices when one was edited.
+    detection, not prevention: the rulesets prevent, and this notices when one is disabled or lacks an expected rule, or its target or ref
+    patterns change (not its bypass list, which it cannot read).
     A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
     verdict, and a problem would file a drift that did not happen."""
     problems = []
