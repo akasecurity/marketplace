@@ -1143,7 +1143,8 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         del writer.routes[("GET", R("actions/runs"))]
         reader = FakeGitHub(checks("h13", [validate_run(conclusion="failure")]))
         clients = {"app-token": writer, "workflow-token": reader}
-        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "app-token", "GITHUB_TOKEN": "workflow-token"}
+        env = {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "app-token", "GITHUB_TOKEN": "workflow-token",
+               "BOT_APP_SLUG": "aka-marketplace-bot"}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(tr, "Git", lambda path: history(chain=("t8", "b"))), \
                 mock.patch.object(tr, "GitHub", lambda token, repo: clients[token]), contextlib.redirect_stdout(out):
@@ -1419,14 +1420,49 @@ def branch_ref(name: str, tip: str) -> dict:
     return {"ref": f"refs/heads/{name}", "object": {"sha": tip, "type": "commit"}}
 
 
-def run_main(command: str, git, gh) -> tuple[int, str]:
+def run_main(command: str, git, gh, slug: dict | None = None) -> tuple[int, str]:
     """tag_release.main with the checkout and the GitHub client replaced: its exit code and its output."""
+    slug = {"BOT_APP_SLUG": "aka-marketplace-bot"} if slug is None else slug
     out = io.StringIO()
-    with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}), \
+    with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t", **slug}), \
             mock.patch.object(tr, "Git", lambda path: git), mock.patch.object(tr, "GitHub", lambda token, repo: gh), \
             contextlib.redirect_stdout(out):
         code = tr.main([command])
     return code, out.getvalue()
+
+
+class TestMainNamesTheBotApp(unittest.TestCase):
+    """Both commands write as the App their token was made for; each writes only when that is the App BOT_LOGIN names."""
+
+    def run_each(self, slug: dict | None):
+        for command in ("sweep", "cleanup-branches"):
+            gh = sweep_github() if command == "sweep" else FakeGitHub()
+            code, out = run_main(command, history(chain=("t8", "b")), gh, slug)
+            yield command, code, out, gh
+
+    def test_another_apps_slug_refuses_red_naming_both_logins_with_no_write(self):
+        for command, code, out, gh in self.run_each({"BOT_APP_SLUG": "some-other-app"}):
+            with self.subTest(command=command):
+                self.assertEqual(code, 1)
+                self.assertTrue(out.startswith("::error::"), out)
+                self.assertIn("some-other-app[bot]", out)
+                self.assertIn(release_checks.BOT_LOGIN, out)
+                self.assertIn("MARKETPLACE_BOT_CLIENT_ID", out)
+                self.assertEqual(gh.calls, [])
+
+    def test_a_missing_or_empty_slug_refuses_with_no_write(self):
+        for slug in ({}, {"BOT_APP_SLUG": ""}):
+            for command, code, out, gh in self.run_each(slug):
+                with self.subTest(command=command, slug=slug):
+                    self.assertEqual(code, 1)
+                    self.assertTrue(out.startswith("::error::"), out)
+                    self.assertEqual(gh.calls, [])
+
+    def test_the_configured_apps_slug_proceeds(self):
+        gh = sweep_github()
+        code, out = run_main("sweep", history(chain=("t8", "b")), gh, {"BOT_APP_SLUG": "aka-marketplace-bot"})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(gh.calls)
 
 
 def refused(path: str, status: int = 422, body: str = '{"message": "Repository rule violations found"}'):

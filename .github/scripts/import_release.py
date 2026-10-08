@@ -825,6 +825,9 @@ def main(argv: list[str] | None = None) -> int:
             write_output("plan", json.dumps(plan, separators=(",", ":")))
             print(f"plan: {plan['mode']} {plan['from_version']} -> {plan['version']} on {plan['branch']}")
         else:
+            problem = release_checks.bot_app_problem(env.get("BOT_APP_SLUG"))
+            if problem:
+                raise Refused(problem)
             run_url = f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}"
             print(open_pr(gh, json.loads(env["PLAN_JSON"]), run_url))
     except Refused as refusal:
