@@ -207,7 +207,9 @@ path; `staleness`, `tag-audit` and `main-audit` watch it; `script-tests` runs th
 tests. Their logic lives in `.github/scripts/` (stdlib Python, with tests beside it), so the
 workflow files stay thin. Only `import-plugin-release`'s `open-pr` job and `tag-release` act as the
 release bot, through the `marketplace-bot` environment, which only `main` may use (`tag-audit`
-checks the environment's deployment branches every day).
+checks the environment's deployment branches every day). Both refuse, before any write, unless the
+App their token was made for (the token step's `app-slug`) is the App `release_checks.BOT_LOGIN`
+names, so a `MARKETPLACE_BOT_CLIENT_ID` secret naming another App ends the run with that cause.
 
 GitHub disables a public repository's scheduled workflows after 60 days with no repository
 activity. A disabled workflow makes no failed run and files no issue, so `import-plugin-release`,

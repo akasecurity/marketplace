@@ -76,12 +76,17 @@ GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
 PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
-# The release bot App's login, "<app-slug>[bot]". It decides which pull requests are the bot's:
-# validate judges a pin PR this login opened as the bot's, the importer's PR decisions read only
-# PRs this login opened, and tag-audit confirms a tag cut after the frozen list only when this
-# login opened its PR. None stays a possible value: each of the three keeps an unset path (no PR
-# is the bot's, the importer refuses, tag-audit reports every later tag as unconfirmed), which
-# the tests exercise by patching it to None.
+# The release bot App's login, "<app-slug>[bot]". It decides which pull requests are the bot's, and
+# what each user of it does while it is None (the tests patch it to None to exercise those paths):
+#   validate        judges a pin PR this login opened as the bot's; unset, every PR is judged as a person's.
+#   the importer    decides about open and closed PRs from those this login opened, except that open-pr,
+#                   before it deletes a branch, lists every author's open PRs from it and refuses red if
+#                   a person's uses it; unset, it refuses red.
+#   tag-audit       confirms a tag cut after the frozen list only when this login opened its PR; unset,
+#                   every such tag is unconfirmed.
+#   staleness (ii)  counts open PRs this login opened; unset, it counts none and stays green.
+#   the App check   the importer's open-pr and tag-release refuse before any write unless the App their
+#                   token was made for is this login's App; unset, they refuse.
 BOT_LOGIN: str | None = "aka-marketplace-bot[bot]"
 
 
