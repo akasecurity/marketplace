@@ -77,8 +77,17 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
     for rule in rules:
         if rule.get("type") != "update":
             continue
-        # GitHub omits the parameters when the flag is false (its default), so an absent flag is false.
-        flag = (rule.get("parameters") or {}).get("update_allows_fetch_and_merge", False)
+        # GitHub omits the parameters, or nulls them, when the flag is false (its default), so a missing
+        # or null parameters object and a missing or null flag all mean false. Anything else must be an object.
+        parameters = rule.get("parameters")
+        if parameters is None:
+            parameters = {}
+        if not isinstance(parameters, dict):
+            problems.append(f"ruleset {name!r}: its update rule's parameters are {parameters!r}, not an object")
+            continue
+        flag = parameters.get("update_allows_fetch_and_merge")
+        if flag is None:
+            flag = False
         if flag is True:
             problems.append(f"ruleset {name!r}: its update rule allows fetch-and-merge")
         elif flag is not False:
@@ -103,7 +112,8 @@ def main_problems(rules: list[dict]) -> list[str]:
         got = review.get(key)
         if key == "allowed_merge_methods":
             got = sorted(got or [])
-        if got != want:
+        # Compared with the type too: True is not a count of 1, and 1 is not True.
+        if type(got) is not type(want) or got != want:
             problems.append(f"ruleset 'main': pull_request {key} is {got!r}, expected {want!r}")
     checks = next(((rule.get("parameters") or {}).get("required_status_checks", [])
                    for rule in rules if rule.get("type") == "required_status_checks"), [])

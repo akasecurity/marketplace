@@ -85,7 +85,10 @@ def github(rulesets, *, environment=None, rules=None):
 
 class TestRulesets(unittest.TestCase):
     def test_the_configured_rulesets_pass(self):
-        self.assertEqual(ta.check_rulesets(github(good_rulesets())), [])
+        sets = good_rulesets()
+        # GitHub returns an update rule with no parameters when fetch-and-merge is off.
+        self.assertEqual(sets[4]["rules"][0], {"type": "update"})
+        self.assertEqual(ta.check_rulesets(github(sets)), [])
         # RULESETS is built from release_checks' tables, the ones an external vendored copy
         # of release_checks.audit_rulesets runs, so the two cannot drift.
         self.assertEqual({name: (want["target"], want["rules"]) for name, want in ta.RULESETS.items()},
@@ -132,22 +135,48 @@ class TestRulesets(unittest.TestCase):
         self.assertEqual(ta.check_rulesets(github(sets)),
                          ["ruleset 'fleet-tags-immutable': its update rule allows fetch-and-merge"])
 
-    def test_an_update_rule_without_parameters_is_the_default_and_passes(self):
-        sets = good_rulesets()
-        self.assertEqual(sets[4]["rules"][0], {"type": "update"})
-        self.assertEqual(ta.check_rulesets(github(sets)), [])
-
-    def test_an_update_rule_with_the_flag_explicitly_false_passes(self):
-        sets = good_rulesets()
-        sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}}
-        self.assertEqual(ta.check_rulesets(github(sets)), [])
+    def test_an_update_rule_in_each_default_shape_passes(self):
+        # GitHub nulls or omits what is unset, so each of these means fetch-and-merge is off.
+        shapes = {"flag false": {"type": "update", "parameters": {"update_allows_fetch_and_merge": False}},
+                  "no flag": {"type": "update", "parameters": {}},
+                  "null parameters": {"type": "update", "parameters": None},
+                  "null flag": {"type": "update", "parameters": {"update_allows_fetch_and_merge": None}}}
+        for label, rule in shapes.items():
+            with self.subTest(label):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = rule
+                self.assertEqual(ta.check_rulesets(github(sets)), [])
 
     def test_an_update_rule_with_a_non_boolean_flag_is_named(self):
+        # 0 and 1 compare equal to False and True, so only an identity check refuses them.
+        for flag in ("false", 0, 1):
+            with self.subTest(flag=flag):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": flag}}
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'fleet-tags-immutable': its update rule's update_allows_fetch_and_merge is {flag!r}, "
+                                  "not a boolean"])
+
+    def test_an_update_rule_whose_parameters_are_not_an_object_is_named(self):
+        for parameters in (["x"], "false", [], ""):
+            with self.subTest(parameters=parameters):
+                sets = good_rulesets()
+                sets[4]["rules"][0] = {"type": "update", "parameters": parameters}
+                self.assertEqual(ta.check_rulesets(github(sets)),
+                                 [f"ruleset 'fleet-tags-immutable': its update rule's parameters are {parameters!r}, "
+                                  "not an object"])
+
+    def test_main_review_settings_are_compared_with_their_type(self):
         sets = good_rulesets()
-        sets[4]["rules"][0] = {"type": "update", "parameters": {"update_allows_fetch_and_merge": "false"}}
-        self.assertEqual(ta.check_rulesets(github(sets)),
-                         ["ruleset 'fleet-tags-immutable': its update rule's update_allows_fetch_and_merge is 'false', "
-                          "not a boolean"])
+        review = sets[1]["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            review[key] = 1
+        self.assertEqual(ta.check_rulesets(github(sets)), [
+            "ruleset 'main': pull_request required_approving_review_count is True, expected 1",
+            "ruleset 'main': pull_request require_code_owner_review is 1, expected True",
+            "ruleset 'main': pull_request dismiss_stale_reviews_on_push is 1, expected True",
+            "ruleset 'main': pull_request require_last_push_approval is 1, expected True"])
 
     def test_unreadable_conditions_are_named(self):
         sets = good_rulesets()

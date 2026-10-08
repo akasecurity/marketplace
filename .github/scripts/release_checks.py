@@ -1820,7 +1820,7 @@ def _main_ruleset_problems(rules: dict) -> list:
     problems = []
     review = rules.get("pull_request") or {}
     count = review.get("required_approving_review_count")
-    if not isinstance(count, int) or count < 1:
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
     for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
         if review.get(key) is not True:
