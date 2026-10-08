@@ -2651,6 +2651,24 @@ class TestAuditRulesets(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
 
+    def test_main_review_settings_must_be_the_right_type(self):
+        # True is an int, so an isinstance check alone lets it through as a count.
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        review = main["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': required_approving_review_count is True, not at least 1"])
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            with self.subTest(key=key):
+                routes = ruleset_routes()
+                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+                main["rules"][2]["parameters"][key] = 1
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 [f"ruleset 'main': {key} is 1, not True"])
+
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()
         main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
