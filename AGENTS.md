@@ -288,7 +288,8 @@ minutes" below is true only once it is.
   file. Every run enters the `marketplace-bot` environment, so the schedule adds a deployment
   record each hour. Until the rulesets and that environment's deployment branches are live, every
   run, hourly ones included, is red, and GitHub mails each failed scheduled run to whoever last
-  edited the cron line, so bring them up before relying on the schedule. It tags every
+  edited the cron line or last re-enabled the workflow, so bring them up before relying on the
+  schedule. It tags every
   first-parent commit whose ai-tc version changed and has no `fleet-v` tag yet, and then deletes
   the bot's branches that still point at the head of a closed PR (a branch re-created after its PR
   closed is kept). Only a PR merged into `main` counts as a commit's merge. A commit that GitHub
