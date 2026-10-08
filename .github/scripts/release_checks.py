@@ -76,9 +76,41 @@ GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
 PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
-# The bot App's login, "<app-slug>[bot]". None until the App exists. While it is None, no
-# PR is judged as the bot's, so every change to the ai-tc pin fails validate.
-BOT_LOGIN: str | None = None
+# The release bot App's login, "<app-slug>[bot]". It decides which pull requests are the bot's, and
+# what each user of it does while it is None (the tests patch it to None to exercise those paths):
+#   validate        judges a pin PR this login opened as the bot's; unset, every PR is judged as a person's.
+#   the importer    decides about open and closed PRs from those this login opened, except that open-pr,
+#                   before it deletes a branch, lists every author's open PRs from it and refuses red if
+#                   a person's uses it; unset, it refuses red.
+#   tag-audit       confirms a tag cut after the frozen list only when this login opened its PR; unset,
+#                   every such tag is unconfirmed.
+#   staleness (ii)  counts open PRs this login opened; unset, it counts none and stays green.
+#   the App check   the importer's open-pr and tag-release refuse before any write unless the App their
+#                   token was made for is this login's App; unset, they refuse.
+BOT_LOGIN: str | None = "aka-marketplace-bot[bot]"
+
+
+def app_slug_is_bot(slug: str | None) -> bool:
+    """Whether `slug`, the app-slug the token step reports for the App it signed in as, is the App BOT_LOGIN
+    names. An empty or missing slug, or no BOT_LOGIN, is no match."""
+    return bool(slug) and BOT_LOGIN is not None and f"{slug}[bot]" == BOT_LOGIN
+
+
+def bot_app_problem(slug: str | None) -> str | None:
+    """None when the App a workflow signed in as is the one BOT_LOGIN names, else one line saying what differs
+    and the likely cause. A script that writes as the App calls this first and refuses on a problem, so a secret
+    naming another App ends the run here, naming the cause, instead of later as a PR judged by the wrong author."""
+    if app_slug_is_bot(slug):
+        return None
+    if BOT_LOGIN is None:
+        return ("no bot login is configured (release_checks.BOT_LOGIN is None), so the App this job signed in as "
+                "cannot be confirmed; set BOT_LOGIN to the release bot's login. Nothing was written.")
+    if not slug:
+        return ("the token step reported no app-slug: this step was not given BOT_APP_SLUG from the token step's "
+                "app-slug output, or that step did not report one. Nothing was written.")
+    return (f"the App this job signed in as is {slug}[bot], but BOT_LOGIN (release_checks.BOT_LOGIN) names "
+            f"{BOT_LOGIN}; the MARKETPLACE_BOT_CLIENT_ID secret probably names a different App, or BOT_LOGIN is "
+            "out of date. Nothing was written.")
 
 # Until a measured downgrade shows that an older build keeps working on a store an
 # additive migration touched, EVERY migration marks its release not rollback-safe.
@@ -1691,7 +1723,9 @@ def diff_mode(base_manifest: dict, head_manifest: dict) -> str:
 
 
 # The rulesets this repository must carry: name -> (target, rule types). Bypass lists are
-# visible only to admins, so they are proven by probe when the rulesets are created.
+# visible only to admins, so this audit cannot check them: they are proven by probe when the
+# rulesets are created, and an organisation owner reads them back after any change (AGENTS.md,
+# "Workflow", lists what each should hold).
 EXPECTED_RULESETS = {
     "main": ("branch", {"deletion", "non_fast_forward", "pull_request", "required_status_checks"}),
     "tags-locked": ("tag", {"creation", "update", "deletion"}),
@@ -1818,16 +1852,18 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
 
 def _main_ruleset_problems(rules: dict) -> list:
     problems = []
-    review = rules.get("pull_request") or {}
+    review = rules.get("pull_request", {})
     count = review.get("required_approving_review_count")
-    if not isinstance(count, int) or count < 1:
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
     for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
         if review.get(key) is not True:
             problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
     if review.get("allowed_merge_methods") != ["squash"]:
         problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
-    checks = (rules.get("required_status_checks") or {}).get("required_status_checks") or []
+    checks = rules.get("required_status_checks", {}).get("required_status_checks")
+    if not isinstance(checks, list):
+        checks = []
     if not any(
         isinstance(c, dict) and c.get("context") == "validate" and c.get("integration_id") == GITHUB_ACTIONS_APP_ID
         for c in checks
@@ -1878,7 +1914,24 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
                 f"ruleset {name!r} covers include {got_include} exclude {got_exclude}, "
                 f"not include {wanted} exclude {sorted(exclude)}"
             )
-        rules = {r.get("type"): r.get("parameters") or {} for r in ruleset.get("rules") or [] if isinstance(r, dict)}
+        rules = {}
+        listed = ruleset.get("rules")
+        if listed is None:
+            listed = []
+        elif not isinstance(listed, list):
+            problems.append(f"ruleset {name!r}: its rules are {listed!r}, not a list")
+            listed = []
+        for r in listed:
+            if not isinstance(r, dict):
+                problems.append(f"ruleset {name!r}: a rule is {r!r}, not an object")
+                continue
+            parameters = r.get("parameters")
+            if parameters is None:
+                parameters = {}
+            elif not isinstance(parameters, dict):
+                problems.append(f"ruleset {name!r}: its {r.get('type')} rule's parameters are {parameters!r}, not an object")
+                parameters = {}
+            rules[r.get("type")] = parameters
         missing = sorted(rule_types - set(rules))
         if missing:
             problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")
@@ -1889,7 +1942,9 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
 
 def audit_tags(repo_dir: str, frozen_path: str, *, fetch: Fetch = http_fetch, check_rulesets=True) -> list:
     """Every problem with the fleet-v ledger (and the rulesets); empty means pass. This is
-    detection, not prevention: the rulesets prevent, and this notices when one was edited.
+    detection, not prevention: the rulesets prevent, and this notices when one is missing,
+    duplicated, disabled, lacks an expected rule or covers other refs (not its bypass list,
+    which it cannot read).
     A read that fails (git, or GitHub) is InfraError, never a problem: the audit then has no
     verdict, and a problem would file a drift that did not happen."""
     problems = []

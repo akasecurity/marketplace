@@ -4,7 +4,7 @@ name: staleness
 # workflows"): a passing release left unpinned for a day, a version the importer
 # refuses, a version the release checks could not finish on (a registry, network,
 # npm or GitHub API failure: no verdict, reported on its own and never as a
-# refusal), a bot PR open for a day, a pin change left untagged for an hour, a
+# refusal), a release-bot PR open for a day, a pin change left untagged for an hour, a
 # stray tag or a second ref named main, the ai-tc entry gone from main, and the
 # "rolled back, awaiting fix-forward" notice. Each rule is its own issue, filed
 # by the only job here that may write issues: GitHub mails a failed scheduled run

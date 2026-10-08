@@ -12,8 +12,8 @@ from unittest import mock
 import _testsupport as ts
 import release_checks as rc
 import validate_pr as vp
+from fakes import BOT
 
-BOT = "aka-marketplace-bot[bot]"
 NEXT = "0.9.15"
 ATTESTED = {**ts.ATTESTED, NEXT: "f" * 40}
 NEXT_ENTRY = {
