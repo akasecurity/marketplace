@@ -7,6 +7,7 @@ in forty. The cure is for no test git command to start the run at all; these tes
 
 from __future__ import annotations
 
+import ast
 import glob
 import os
 import re
@@ -23,6 +24,57 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # once, so it is in every trace and says nothing about whether upkeep ran. That setting is pinned by the config
 # read-back test below instead.
 UPKEEP = re.compile(r"maintenance run")
+
+
+# Variables a test must take from ts.git_env, which sets them with the upkeep settings, and never build itself.
+OWN_ENVIRONMENT_KEYS = frozenset(
+    {
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    }
+)
+SUBPROCESS_CALLS = frozenset({"run", "check_output", "check_call", "Popen"})
+
+
+def _is_subprocess_call(func):
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in SUBPROCESS_CALLS
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "subprocess"
+    ) or (isinstance(func, ast.Name) and func.id in SUBPROCESS_CALLS - {"run"})
+
+
+def environment_problems(source, name="module"):
+    """What in this Python source gives git an environment of its own: a dict built with one of
+    OWN_ENVIRONMENT_KEYS as a key or keyword, or a subprocess call whose command list starts with "git" and
+    passes no env=. One line of text per finding, naming the module and the line."""
+    problems = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value in OWN_ENVIRONMENT_KEYS:
+                    problems.append(f"{name}:{node.lineno} builds a dict with {key.value}: use ts.git_env")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "dict":
+                for keyword in node.keywords:
+                    if keyword.arg in OWN_ENVIRONMENT_KEYS:
+                        problems.append(f"{name}:{node.lineno} builds a dict with {keyword.arg}: use ts.git_env")
+            if _is_subprocess_call(node.func) and node.args:
+                command = node.args[0]
+                runs_git = (
+                    isinstance(command, (ast.List, ast.Tuple))
+                    and command.elts
+                    and isinstance(command.elts[0], ast.Constant)
+                    and command.elts[0].value == "git"
+                )
+                if runs_git and not any(keyword.arg == "env" for keyword in node.keywords):
+                    problems.append(f"{name}:{node.lineno} runs git without env=: pass ts.GIT_ENV or ts.git_env()")
+    return problems
 
 
 def commit_trace(env):
@@ -93,19 +145,51 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
                 self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
                 self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]), ("maintenance.auto", "gc.auto"))
 
-    def test_no_other_test_module_builds_its_own_git_environment(self):
-        # The hand-built environments this replaced each carried the no-system-config setting, so a module that
-        # still has it is building git an environment of its own, one that would start the upkeep again.
-        own = {os.path.abspath(__file__), os.path.join(HERE, "_testsupport.py")}
-        setting = "GIT_CONFIG_" + "NOSYSTEM"
-        for path in sorted(glob.glob(os.path.join(HERE, "*.py"))):
-            if os.path.abspath(path) in own:
-                continue
+    def test_the_guard_catches_a_hand_built_environment(self):
+        # Each of these is how a test could give git an environment of its own, and so a shell that starts upkeep.
+        for name in sorted(OWN_ENVIRONMENT_KEYS):
+            for shape, source in (
+                ("a dict display", f"env = {{'{name}': 'x'}}\n"),
+                ("dict() keywords", f"env = dict(os.environ, {name}='x')\n"),
+            ):
+                with self.subTest(f"{shape} with {name}"):
+                    self.assertEqual(len(environment_problems(source)), 1, source)
+
+    def test_the_guard_catches_a_git_command_run_without_an_environment(self):
+        for call in ("run", "check_output", "check_call", "Popen"):
+            for source in (
+                f"subprocess.{call}(['git', '-C', root, 'status'])\n",
+                f"subprocess.{call}(('git', 'status'), check=True)\n",
+                f"subprocess.{call}(['git', 'status'], **options)\n",
+            ):
+                with self.subTest(source):
+                    self.assertEqual(len(environment_problems(source)), 1, source)
+
+    def test_the_guard_passes_what_it_should(self):
+        for source in (
+            "subprocess.run(['git', 'status'], env=env)\n",
+            "subprocess.check_output(['git', 'log'], env=ts.GIT_ENV, text=True)\n",
+            "subprocess.run([sys.executable, 'tool.py'], capture_output=True)\n",
+            "subprocess.run(['jq', '-r', expression])\n",
+            "subprocess.run(command)\n",
+            "env = dict(os.environ, GIT_AUTHOR_DATE='d', GIT_COMMITTER_DATE='d')\n",
+            "env = ts.git_env('t', 't@example.invalid')\n",
+        ):
+            with self.subTest(source):
+                self.assertEqual(environment_problems(source), [])
+
+    def test_no_test_module_builds_its_own_git_environment_or_runs_git_without_one(self):
+        # What a module DOES is checked, not what it names: a dict built with an identity or config variable, or a
+        # git command started without env=. Only test_*.py is read: _testsupport.py (which builds the
+        # environment) and fakes.py are helpers, and the production modules run git in their caller's environment.
+        modules = sorted(glob.glob(os.path.join(HERE, "test_*.py")))
+        self.assertIn(os.path.abspath(__file__), [os.path.abspath(path) for path in modules])
+        for path in modules:
             with self.subTest(os.path.basename(path)):
                 with open(path, encoding="utf-8") as handle:
-                    builds_its_own = setting in handle.read()
-                # Not assertNotIn: its failure would print the whole module.
-                self.assertFalse(builds_its_own, f"{os.path.basename(path)} names {setting}: use ts.git_env instead")
+                    problems = environment_problems(handle.read(), os.path.basename(path))
+                # Not assertEqual: its failure would print the whole module.
+                self.assertFalse(problems, "; ".join(problems))
 
 
 if __name__ == "__main__":
