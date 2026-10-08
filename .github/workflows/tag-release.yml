@@ -2,11 +2,12 @@ name: tag-release
 
 # On every push to main, hourly at minute 37 (so a commit held back for want of
 # a PR link is retried without anyone stepping in), and by hand to re-run a
-# sweep: cut the next fleet-v<N> tag at each first-parent commit whose ai-tc version changed and that has no
-# fleet-v tag yet (AGENTS.md, "The workflows"). It first runs tag-audit's ledger,
-# ruleset and environment checks (not its comparison with the last green run's
-# snapshot) and stops, red and creating nothing, if any fails; that refusal is a
-# signal, not a control, since this file runs from the pushed commit. Tags are
+# sweep: cut the next fleet-v<N> tag at each first-parent commit whose ai-tc
+# version changed and that has no fleet-v tag yet (AGENTS.md, "The workflows").
+# It first runs tag-audit's ledger, ruleset and environment checks (not its
+# comparison with the last green run's snapshot) and stops, red and creating
+# nothing, if any fails; that refusal is a signal, not a control, since this
+# file runs from main's own copy. Tags are
 # created as the bot App, the only identity ruleset fleet-tags-create lets create
 # one; no Mac follows a tag. A tag also notes a merged PR whose final head had no
 # passing validate run: only a run of validate.yml started by pull_request_target,

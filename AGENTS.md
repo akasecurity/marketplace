@@ -208,8 +208,8 @@ one of the four whose disabling also stops tagging until it is turned back on.
 `tag-audit.yml` and `tag-release.yml`). `import-plugin-release` is the last to go back on: once the
 version of the workflow that opens its pull requests as the release bot is on `main`, and
 `BOT_LOGIN`, the release-bot App and the `marketplace-bot` environment are live (before then it
-cannot open a pull request as the bot). `gh workflow list --all` confirms it is on, and "every 15 minutes" below is
-true only once it is.
+cannot open a pull request as the bot). `gh workflow list --all` confirms it is on, and "every 15
+minutes" below is true only once it is.
 
 - **`import-plugin-release`** runs every 15 minutes and by manual dispatch. Its `verify` job holds
   no secret: it takes the highest exact npm version above every version `main`, a `fleet-v` tag or
@@ -284,9 +284,11 @@ true only once it is.
 - **`tag-release`** (every push to `main`, hourly at minute 37, and by manual dispatch to re-run a
   sweep) runs `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the
   last green run's snapshot of the tags) and stops, red and creating nothing, while any of them
-  fails. Until the rulesets and the `marketplace-bot` environment's deployment branches are live,
-  every hourly run is therefore red and enters that environment, so bring them up before relying
-  on the schedule. That refusal is a signal, not a control: the workflow runs from the pushed commit. It tags every
+  fails. That refusal is a signal, not a control: the workflow runs from main's own copy of the
+  file. Every run enters the `marketplace-bot` environment, so the schedule adds a deployment
+  record each hour. Until the rulesets and that environment's deployment branches are live, every
+  run, hourly ones included, is red, and GitHub mails each failed scheduled run to whoever last
+  edited the cron line, so bring them up before relying on the schedule. It tags every
   first-parent commit whose ai-tc version changed and has no `fleet-v` tag yet, and then deletes
   the bot's branches that still point at the head of a closed PR (a branch re-created after its PR
   closed is kept). Only a PR merged into `main` counts as a commit's merge. A commit that GitHub
