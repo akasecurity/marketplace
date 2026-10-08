@@ -466,6 +466,25 @@ class TestOtherRules(StalenessCase):
         self.assertNotIn("#31", rule.detail)
         self.assertNotIn("#32", rule.detail)
 
+    def test_rule_ii_counts_only_prs_the_release_bot_opened(self):
+        old = stamp(dt.timedelta(hours=30))
+        self.pulls += [pull(40, "bot/pin-ai-tc-0.9.16", created_at=old, author="a-person"),
+                       pull(41, "bot/pin-ai-tc-0.9.17", created_at=old)]
+        rule = self.rules()["staleness-ii"]
+        self.assertTrue(rule.red)
+        self.assertIn("#41", rule.detail)
+        self.assertNotIn("#40", rule.detail)
+
+    def test_rule_ii_is_green_for_a_persons_old_pr_from_a_bot_branch(self):
+        self.pulls.append(pull(40, "bot/pin-ai-tc-0.9.16", created_at=stamp(dt.timedelta(hours=30)), author="a-person"))
+        self.assertFalse(self.rules()["staleness-ii"].red)
+
+    def test_rule_ii_counts_nothing_while_no_bot_login_is_configured(self):
+        self.pulls.append(pull(41, "bot/pin-ai-tc-0.9.17", created_at=stamp(dt.timedelta(hours=30))))
+        with mock.patch.object(release_checks, "BOT_LOGIN", None):
+            rule = self.rules()["staleness-ii"]
+        self.assertFalse(rule.red)
+
     def test_rule_iii_names_a_pin_change_left_untagged_for_an_hour(self):
         rule = self.rules()["staleness-iii"]
         self.assertTrue(rule.red)

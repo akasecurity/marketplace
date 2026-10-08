@@ -309,8 +309,9 @@ true only once it is.
   included) has been on npm for 24 hours, npm has a version the importer refuses (its issue names
   only the check that refused it, and the run log holds the reason), the release checks reached no
   verdict on a version that has been on npm for over an hour, or whose publish time is unknown (its
-  own issue, naming the version and the check that did not finish), a bot PR is open for 24 hours,
-  a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
+  own issue, naming the version and the check that did not finish), a PR the release bot opened (by its
+  author, not a `bot/` branch name; none counts while no bot login is configured) is open for 24
+  hours, a pin change is untagged for an hour, a stray tag or a second ref named `main` exists, or the
   ai-tc entry is gone from `main` or `main`'s manifest cannot be read (one issue for both, titled
   for both, with the reason in its detail; nothing is imported until a PR mends it); it posts a
   "rolled back, awaiting fix-forward" notice while the latest tag is a rollback. A commit whose
