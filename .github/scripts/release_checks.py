@@ -76,9 +76,12 @@ GITHUB_HOSTED_BUILDER = "https://github.com/actions/runner/github-hosted"
 PUBLISH = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1"
 GITHUB_ACTIONS_APP_ID = 15368
 
-# The bot App's login, "<app-slug>[bot]". None until the App exists. While it is None, no
-# PR is judged as the bot's, so every change to the ai-tc pin fails validate.
-BOT_LOGIN: str | None = None
+# The release bot App's login, "<app-slug>[bot]". It decides which pull requests are the bot's:
+# validate judges a bot-authored pin PR as the bot's, the importer acts only on PRs this login
+# opened, and tag-audit accepts a tag's PR only when this login opened it. The annotation keeps
+# None as a possible value because tests patch it to None to exercise the unset path, where no
+# PR is judged as the bot's and the importer and tag-audit refuse.
+BOT_LOGIN: str | None = "aka-marketplace-bot[bot]"
 
 # Until a measured downgrade shows that an older build keeps working on a store an
 # additive migration touched, EVERY migration marks its release not rollback-safe.
