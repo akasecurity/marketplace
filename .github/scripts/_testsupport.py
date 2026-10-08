@@ -485,8 +485,10 @@ def git_env(name="test", email="test"):
         env[f"GIT_{role}_NAME"] = name
         env[f"GIT_{role}_EMAIL"] = email
     # Added after any config the caller's shell already passed this way, never over it.
-    # Git reads the count with strtoul, which takes a sign and leading white space ("+1", " 1"), so read it
-    # the way int() does; anything int() refuses (words, "²") counts as none, and so does a negative.
+    # Git reads the count with strtoul, which takes a sign and leading white space ("+1", " 1"), and int() gives
+    # the same count for every string git accepts; anything int() refuses (words, "²") counts as none, and so
+    # does a negative. (Git itself rejects some strings int() takes, e.g. "1_0"; it would refuse the caller's own
+    # count then, so nothing is lost.)
     try:
         first = max(int(env.get("GIT_CONFIG_COUNT", "")), 0)
     except ValueError:

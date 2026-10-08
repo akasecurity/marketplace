@@ -1219,10 +1219,7 @@ class TestCodeOwners(unittest.TestCase):
         # Read through the real Git, which decodes what it shows as UTF-8 and raises on a byte that is not: the
         # strict reader must turn that into its refusal, and only for bytes that are not text (a UTF-8 comment is fine).
         with tempfile.TemporaryDirectory() as directory:
-            env = ts.git_env("test", "test@example.invalid")
-
-            def sh(*args):
-                return ts.git(directory, *args, env=env).strip()
+            sh = scratch_repository(directory)
 
             def commit_owners(content: bytes) -> str:
                 with open(os.path.join(directory, ".github", "CODEOWNERS"), "wb") as handle:
@@ -1231,7 +1228,6 @@ class TestCodeOwners(unittest.TestCase):
                 sh("commit", "-q", "-m", "owners")
                 return sh("rev-parse", "HEAD")
 
-            sh("init", "-q", "-b", "main")
             os.makedirs(os.path.join(directory, ".github"))
             git = Git(directory)
             readable = commit_owners("# caf\u00e9 team\n* @a @b\n".encode("utf-8"))

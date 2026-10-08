@@ -20,10 +20,33 @@ import _testsupport as ts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # What a commit's trace shows when git goes on to start upkeep: `maintenance run --auto` (git 2.29 and later).
-# `gc --auto` is not matched, on purpose: before 2.29 every commit spawns it, it reads gc.auto=0 and exits at
-# once, so it is in every trace and says nothing about whether upkeep ran. That setting is pinned by the config
-# read-back test below instead.
+# `gc --auto` is not matched, on purpose. Before 2.29 every commit spawns it, and in a scratch repository it has
+# nothing to collect and exits at once, so it is in every trace and says nothing about whether upkeep ran.
+# gc.auto=0 is pinned by the config read-back test below instead.
 UPKEEP = re.compile(r"maintenance run")
+# The settings reach git through GIT_CONFIG_COUNT and its numbered variables, which git reads from 2.31. Before
+# that neither maintenance.auto nor gc.auto arrives, so the tests that ask git what it was given need 2.31 or later.
+NEEDS_ENVIRONMENT_CONFIG = (2, 31)
+
+
+def parse_git_version(text):
+    """(major, minor) from `git --version` output, e.g. "git version 2.39.3 (Apple Git-146)"; None if unreadable."""
+    found = re.search(r"(\d+)\.(\d+)", text)
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def installed_git_version():
+    try:
+        return parse_git_version(subprocess.run(["git", "--version"], capture_output=True, text=True, env=ts.GIT_ENV).stdout)
+    except OSError:
+        return None
+
+
+_INSTALLED = installed_git_version()
+needs_environment_config = unittest.skipIf(
+    _INSTALLED is not None and _INSTALLED < NEEDS_ENVIRONMENT_CONFIG,
+    "git before 2.31 does not read GIT_CONFIG_COUNT, so the upkeep settings never reach it",
+)
 
 
 # Variables a test must take from ts.git_env, which sets them with the upkeep settings, and never build itself.
@@ -52,7 +75,12 @@ def _is_subprocess_call(func):
 def environment_problems(source, name="module"):
     """What in this Python source gives git an environment of its own: a dict built with one of
     OWN_ENVIRONMENT_KEYS as a key or keyword, or a subprocess call whose command list starts with "git" and
-    passes no env=. One line of text per finding, naming the module and the line."""
+    passes no env=. One line of text per finding, naming the module and the line.
+
+    Known blind spots (it checks the shapes the tests use, not every way to write them): a key added by
+    subscript or `.update(...)`, an f-string key, `subprocess` imported under another name or its functions
+    imported bare (other than Popen/check_*), a command list held in a variable or passed as `args=`,
+    `subprocess.call`, `env=os.environ` or `env=None`, and git run inside a shell string."""
     problems = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Dict):
@@ -92,21 +120,36 @@ def commit_trace(env):
 
 
 class TestNoBackgroundUpkeep(unittest.TestCase):
+    @needs_environment_config
     def test_a_commit_made_the_way_the_helper_makes_it_starts_no_maintenance_or_gc(self):
         trace = commit_trace(ts.GIT_ENV)
         # The commit itself shows in the trace, so an empty or unwritten trace cannot pass for a quiet one.
         self.assertIn("git commit", trace)
         self.assertIsNone(UPKEEP.search(trace), trace)
 
+    def test_the_git_version_is_read_from_its_own_output(self):
+        for text, expected in (
+            ("git version 2.25.1\n", (2, 25)),
+            ("git version 2.39.3 (Apple Git-146)\n", (2, 39)),
+            ("git version 2.31.0.windows.1", (2, 31)),
+            ("", None),
+        ):
+            with self.subTest(text):
+                self.assertEqual(parse_git_version(text), expected)
+        self.assertLess((2, 30), NEEDS_ENVIRONMENT_CONFIG)
+        self.assertGreaterEqual((2, 31), NEEDS_ENVIRONMENT_CONFIG)
+
     def test_the_trace_pattern_matches_maintenance_and_ignores_an_instant_gc_auto(self):
         self.assertIsNotNone(UPKEEP.search("trace: built-in: git maintenance run --auto --no-quiet"))
         self.assertIsNone(UPKEEP.search("trace: run_command: git gc --auto"))
 
+    @needs_environment_config
     def test_so_does_the_environment_a_test_builds_with_its_own_identity(self):
         trace = commit_trace(ts.git_env("t", "t@example.invalid"))
         self.assertIn("git commit", trace)
         self.assertIsNone(UPKEEP.search(trace), trace)
 
+    @needs_environment_config
     def test_the_settings_are_ones_git_reads_and_come_after_any_the_shell_passed(self):
         inherited = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "test.inherited", "GIT_CONFIG_VALUE_0": "kept"}
         with mock.patch.dict(os.environ, inherited):
@@ -118,12 +161,6 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
                     ["git", "config", "--get", name], capture_output=True, text=True, env=env, check=True
                 )
                 self.assertEqual(done.stdout.strip(), expected)
-
-    def test_a_count_the_shell_left_unreadable_does_not_stop_the_settings(self):
-        with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "many"}):
-            env = ts.git_env()
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
-        self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"]), ("maintenance.auto", "gc.auto"))
 
     def test_a_count_git_accepts_with_a_sign_or_white_space_keeps_the_callers_settings(self):
         # git reads the count with strtoul, so "+1" and " 1" both mean one setting: ours go after it.
@@ -138,7 +175,7 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
 
     def test_a_count_no_one_can_read_is_none_and_never_raises(self):
         # "\u00b2" is a digit to str.isdigit() but not to int(); "-1" and "" are no count at all.
-        for count in ("\u00b2", "abc", "-1", ""):
+        for count in ("\u00b2", "abc", "many", "-1", ""):
             with self.subTest(count):
                 with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": count}):
                     env = ts.git_env()
@@ -179,7 +216,7 @@ class TestNoBackgroundUpkeep(unittest.TestCase):
             "subprocess.run([sys.executable, 'tool.py'], capture_output=True)\n",
             "subprocess.run(['jq', '-r', expression])\n",
             "subprocess.run(command)\n",
-            "env = dict(os.environ, GIT_AUTHOR_DATE='d', GIT_COMMITTER_DATE='d')\n",
+            "env = dict(ts.GIT_ENV, GIT_AUTHOR_DATE='d', GIT_COMMITTER_DATE='d')\n",
             "env = ts.git_env('t', 't@example.invalid')\n",
         ):
             with self.subTest(source):

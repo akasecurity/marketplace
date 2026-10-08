@@ -171,18 +171,9 @@ class TestMainAudit(unittest.TestCase):
         self.assertEqual(len(gh.called("GET", R("commits/s1/pulls"))), 3)
 
     def test_a_reset_in_a_real_repository_is_red_and_does_not_raise(self):
-        with tempfile.TemporaryDirectory() as root:
-            env = ts.git_env("t", "t@example.invalid")
-
-            def sh(*args):
-                return ts.git(root, *args, env=env).strip()
-
-            sh("init", "-q", "-b", "main")
+        with scratch_repo() as (root, sh, commit):
             for name in ("a", "b", "c"):
-                with open(os.path.join(root, name), "w", encoding="utf-8") as handle:
-                    handle.write(name)
-                sh("add", name)
-                sh("commit", "-q", "-m", name)
+                commit(name)
             old_tip, first = sh("rev-parse", "HEAD"), sh("rev-parse", "HEAD~2")
             sh("reset", "-q", "--hard", first)
             sh("reflog", "expire", "--expire=now", "--all")
