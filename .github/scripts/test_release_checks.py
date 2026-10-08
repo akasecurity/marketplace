@@ -20,6 +20,7 @@ from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
+from fakes import BOT
 
 # A manifest nested far past the depth json.loads reads: it raises RecursionError, not ValueError.
 NESTED_TOO_DEEP = '{"plugins": ' + "[" * 100_000 + "]" * 100_000 + "}"
@@ -2285,10 +2286,14 @@ class TestDiffMode(unittest.TestCase):
             rc.diff_mode(ts.manifest(), head)
 
 
-BOT = "aka-marketplace-bot[bot]"
 
 
 class TestBotLoginShape(unittest.TestCase):
+    def test_configured_login_is_the_one_the_bot_path_fixtures_use(self):
+        # A wrong but well-formed login passes the shape test below; the fixtures every bot-path test builds its
+        # PRs from (fakes.BOT) would then match nothing in production. Change both together.
+        self.assertEqual(rc.BOT_LOGIN, BOT)
+
     def test_configured_login_is_an_app_slug_with_the_bot_suffix(self):
         login = rc.BOT_LOGIN
         self.assertIsInstance(login, str)

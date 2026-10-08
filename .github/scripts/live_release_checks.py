@@ -9,8 +9,11 @@ them by hand before merging any change to the release checks, with npm 11.12 or 
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import unittest
+import urllib.parse
+from unittest import mock
 
 import _testsupport as ts
 import release_checks as rc
@@ -86,6 +89,32 @@ class TestLiveRelease(unittest.TestCase):
         )
         unchanged = classify_pair("0.9.12", "0.9.13")
         self.assertEqual((unchanged.classification, unchanged.migrations, unchanged.kinds), ("additive", [], {}))
+
+
+class TestLiveBotApp(unittest.TestCase):
+    """BOT_LOGIN names a real Bot account of the release bot App, which akasecurity owns. The requests carry no
+    token: the user endpoint is public; the App endpoint answers only while the App is public."""
+
+    def get(self, path):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("GITHUB_TOKEN", None)
+            return rc.http_fetch(f"https://api.github.com/{path}", {})
+
+    def test_the_configured_login_is_a_bot_account(self):
+        status, body = self.get(f"users/{urllib.parse.quote(rc.BOT_LOGIN, safe='')}")
+        self.assertEqual(status, 200, body[:200])
+        user = json.loads(body)
+        self.assertEqual((user["login"], user["type"]), (rc.BOT_LOGIN, "Bot"))
+
+    def test_the_apps_slug_is_the_logins_and_akasecurity_owns_it(self):
+        slug = rc.BOT_LOGIN[: -len("[bot]")]
+        status, body = self.get(f"apps/{urllib.parse.quote(slug, safe='')}")
+        if status == 404:
+            self.skipTest("GitHub answers an unauthenticated read of /apps/<slug> only for a public App; this one "
+                          "is not public, so its owner cannot be read without a token")
+        self.assertEqual(status, 200, body[:200])
+        app = json.loads(body)
+        self.assertEqual((app["slug"], app["owner"]["login"]), (slug, "akasecurity"))
 
 
 def classify_pair(earlier, later):
