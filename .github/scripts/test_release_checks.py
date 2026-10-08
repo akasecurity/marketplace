@@ -2580,6 +2580,39 @@ class TestAuditRulesets(unittest.TestCase):
         routes = ruleset_routes({"tags-locked": {"conditions": {"ref_name": globs}}})
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
 
+    def test_a_rule_with_unreadable_parameters_is_named_and_does_not_crash(self):
+        def with_rule(kind, parameters):
+            routes = ruleset_routes()
+            body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+            next(r for r in body["rules"] if r["type"] == kind)["parameters"] = parameters
+            return routes
+        for parameters in (["x"], "x", [], ""):
+            for kind in ("pull_request", "required_status_checks"):
+                with self.subTest(parameters=parameters, rule=kind):
+                    problems = rc.audit_rulesets(fetch=ts.FakeFetch(with_rule(kind, parameters)))
+                    self.assertIn(f"ruleset 'main': its {kind} rule's parameters are {parameters!r}, not an object", problems)
+
+    def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
+        for rules in (5, "update"):
+            with self.subTest(rules=rules):
+                routes = ruleset_routes()
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"] = rules
+                problems = rc.audit_rulesets(fetch=ts.FakeFetch(routes))
+                self.assertIn(f"ruleset 'main': its rules are {rules!r}, not a list", problems)
+        routes = ruleset_routes()
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"].append("update")
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': a rule is 'update', not an object"])
+
+    def test_required_checks_that_are_not_a_list_read_as_missing_the_validate_check(self):
+        for checks in (1, "validate"):
+            with self.subTest(checks=checks):
+                routes = ruleset_routes()
+                body = routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]
+                next(r for r in body["rules"] if r["type"] == "required_status_checks")["parameters"]["required_status_checks"] = checks
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 ["ruleset 'main' does not require the validate check from the GitHub Actions app"])
+
     def test_tags_locked_on_all_is_caught(self):
         # ~ALL would cover every tag on a tag ruleset too (GitHub's own tag recipes use it), but
         # tags-locked must list the two explicit globs, so what it covers is spelled out and
@@ -2650,6 +2683,29 @@ class TestAuditRulesets(unittest.TestCase):
         problems = rc.audit_rulesets(fetch=ts.FakeFetch(ruleset_routes({"fleet-tags-immutable": {"conditions": {"ref_name": probe}}})))
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
+
+    def test_main_review_settings_must_be_the_right_type(self):
+        # True is an int, so an isinstance check alone lets it through as a count.
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        review = main["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': required_approving_review_count is True, not at least 1"])
+        routes = ruleset_routes()
+        next(r for r in routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"]
+             if r["type"] == "pull_request")["parameters"]["allowed_merge_methods"] = 1
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                         ["ruleset 'main': allowed_merge_methods is 1, not ['squash']"])
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            with self.subTest(key=key):
+                routes = ruleset_routes()
+                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+                main["rules"][2]["parameters"][key] = 1
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 [f"ruleset 'main': {key} is 1, not True"])
 
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()

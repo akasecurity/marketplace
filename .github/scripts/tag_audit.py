@@ -64,19 +64,55 @@ MAIN_REVIEW = {"required_approving_review_count": 1, "require_code_owner_review"
                "allowed_merge_methods": ["squash"]}
 
 
+def rule_parameters(name: str, rule: dict, problems: list[str]) -> dict | None:
+    """A rule's parameters: {} when missing or null, None (and a problem) when they are not an object."""
+    parameters = rule.get("parameters")
+    if parameters is None:
+        return {}
+    if not isinstance(parameters, dict):
+        problems.append(f"ruleset {name!r}: its {rule.get('type')} rule's parameters are {parameters!r}, not an object")
+        return None
+    return parameters
+
+
 def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
     problems = []
     if ruleset.get("enforcement") != "active":
         problems.append(f"ruleset {name!r} is {ruleset.get('enforcement')!r}, not active")
     if ruleset.get("target") != want["target"]:
         problems.append(f"ruleset {name!r} targets {ruleset.get('target')!r}, not {want['target']!r}")
-    rules = ruleset.get("rules") or []
+    rules = ruleset.get("rules")
+    if rules is None:
+        rules = []
+    if not isinstance(rules, list):
+        problems.append(f"ruleset {name!r}: its rules are {rules!r}, not a list")
+        rules = []
+    objects = []
+    for rule in rules:
+        if isinstance(rule, dict):
+            objects.append(rule)
+        else:
+            problems.append(f"ruleset {name!r}: a rule is {rule!r}, not an object")
+    rules = objects
     missing = want["rules"] - {rule.get("type") for rule in rules}
     if missing:
         problems.append(f"ruleset {name!r} lacks the rules {sorted(missing)}")
     for rule in rules:
-        if rule.get("type") == "update" and (rule.get("parameters") or {}).get("update_allows_fetch_and_merge") is not False:
+        parameters = rule_parameters(name, rule, problems)
+        if rule.get("type") != "update" or parameters is None:
+            continue
+        # GitHub's REST answer leaves out an update rule's parameters when the flag is false, its default,
+        # and this repository keeps the flag false even when a ruleset asks for true (checked 2026-10-08:
+        # GraphQL read the stored flag back as false, and REST showed no parameters to an admin or to an
+        # unauthenticated caller). So a missing or null parameters object, or a missing or null flag, is
+        # read as that default.
+        flag = parameters.get("update_allows_fetch_and_merge")
+        if flag is None:
+            flag = False
+        if flag is True:
             problems.append(f"ruleset {name!r}: its update rule allows fetch-and-merge")
+        elif flag is not False:
+            problems.append(f"ruleset {name!r}: its update rule's update_allows_fetch_and_merge is {flag!r}, not a boolean")
     ref_name = (ruleset.get("conditions") or {}).get("ref_name")
     if not isinstance(ref_name, dict):
         problems.append(f"ruleset {name!r}: its ref conditions are not readable")
@@ -92,16 +128,25 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
 
 def main_problems(rules: list[dict]) -> list[str]:
     problems = []
-    review = next(((rule.get("parameters") or {}) for rule in rules if rule.get("type") == "pull_request"), {})
+
+    def parameters_of(kind: str) -> dict:
+        # Unreadable parameters were named by ruleset_problems; here they read as empty.
+        rule = next((rule for rule in rules if rule.get("type") == kind), {})
+        return rule_parameters("main", rule, []) or {}
+
+    review = parameters_of("pull_request")
     for key, want in MAIN_REVIEW.items():
         got = review.get(key)
-        if key == "allowed_merge_methods":
-            got = sorted(got or [])
-        if got != want:
+        if key == "allowed_merge_methods" and isinstance(got, list):
+            got = sorted(got, key=repr)
+        # Compared with the type too: True is not a count of 1, and 1 is not True.
+        if type(got) is not type(want) or got != want:
             problems.append(f"ruleset 'main': pull_request {key} is {got!r}, expected {want!r}")
-    checks = next(((rule.get("parameters") or {}).get("required_status_checks", [])
-                   for rule in rules if rule.get("type") == "required_status_checks"), [])
-    if not any(check.get("context") == "validate" and check.get("integration_id") == release_checks.GITHUB_ACTIONS_APP_ID
+    checks = parameters_of("required_status_checks").get("required_status_checks")
+    if not isinstance(checks, list):
+        checks = []
+    if not any(isinstance(check, dict) and check.get("context") == "validate"
+               and check.get("integration_id") == release_checks.GITHUB_ACTIONS_APP_ID
                for check in checks):
         problems.append("ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing")
     return problems
