@@ -4,6 +4,8 @@ Not collected by the unit-test pattern (test_*.py), so CI never needs the networ
 them by hand before merging any change to the release checks, with npm 11.12 or later on PATH:
 
     python3 -m unittest discover -s .github/scripts -p 'live_*.py' -v
+
+Set GITHUB_TOKEN so the check of the bot App's owner runs; without it that check is skipped.
 """
 
 from __future__ import annotations
