@@ -4,12 +4,12 @@ import io
 import json
 import os
 import re
-import subprocess
 import tempfile
 import unittest
 import urllib.parse
 from unittest import mock
 
+import _testsupport as ts
 import release_checks
 import tag_release as tr
 from fakes import (CODEOWNERS, INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
@@ -69,13 +69,10 @@ def checks(head: str, runs: list | None = None, workflows: dict | None = None) -
 
 def scratch_repository(directory: str):
     """`git init` in `directory`, and a function that runs git there with a fixed identity and no user config."""
-    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-               GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
-               GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+    env = ts.git_env("test", "test@example.invalid")
 
     def sh(*args):
-        return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
-                              capture_output=True, text=True).stdout.strip()
+        return ts.git(directory, *args, env=env).strip()
 
     sh("init", "-q", "-b", "main")
     return sh
@@ -1223,13 +1220,7 @@ class TestCodeOwners(unittest.TestCase):
         # Read through the real Git, which decodes what it shows as UTF-8 and raises on a byte that is not: the
         # strict reader must turn that into its refusal, and only for bytes that are not text (a UTF-8 comment is fine).
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                       GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
-                       GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
-
-            def sh(*args):
-                return subprocess.run(["git", "-C", directory, *args], env=env, check=True,
-                                      capture_output=True, text=True).stdout.strip()
+            sh = scratch_repository(directory)
 
             def commit_owners(content: bytes) -> str:
                 with open(os.path.join(directory, ".github", "CODEOWNERS"), "wb") as handle:
@@ -1238,7 +1229,6 @@ class TestCodeOwners(unittest.TestCase):
                 sh("commit", "-q", "-m", "owners")
                 return sh("rev-parse", "HEAD")
 
-            sh("init", "-q", "-b", "main")
             os.makedirs(os.path.join(directory, ".github"))
             git = Git(directory)
             readable = commit_owners("# caf\u00e9 team\n* @a @b\n".encode("utf-8"))

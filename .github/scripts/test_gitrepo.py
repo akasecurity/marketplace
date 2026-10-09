@@ -1,9 +1,9 @@
 """Tests for gitrepo.py against a scratch repository (no network)."""
 import os
-import subprocess
 import tempfile
 import unittest
 
+import _testsupport as ts
 from gitrepo import Git, GitError
 
 
@@ -12,16 +12,13 @@ class Scratch(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = tmp.name
-        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                        GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.invalid",
-                        GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.invalid")
+        self.env = ts.git_env("test", "test@example.invalid")
         self.sh("init", "-q", "-b", "main")
         self.git = Git(self.dir)
 
     def sh(self, *args, when="2026-09-01T00:00:00+00:00"):
         env = dict(self.env, GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when)
-        return subprocess.run(["git", "-C", self.dir, *args], env=env, check=True,
-                              capture_output=True, text=True).stdout.strip()
+        return ts.git(self.dir, *args, env=env).strip()
 
     def commit(self, path, text, when="2026-09-01T00:00:00+00:00"):
         full = os.path.join(self.dir, path)
