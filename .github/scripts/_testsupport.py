@@ -468,18 +468,45 @@ class FakeFetch:
         return [url for url, _ in self.calls]
 
 
-# Hermetic git: no global or system config (so no signing prompt), a fixed identity.
-GIT_ENV = dict(os.environ)
-GIT_ENV.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-for _role in ("AUTHOR", "COMMITTER"):
-    GIT_ENV[f"GIT_{_role}_NAME"] = "test"
-    GIT_ENV[f"GIT_{_role}_EMAIL"] = "test"
+# Settings every test repository runs git with, passed through the environment (GIT_CONFIG_COUNT and its
+# numbered key and value variables) so no repository's own config has to carry them. Both turn off the
+# upkeep git starts after a commit: `git maintenance run --auto`, and the `gc --auto` it stands in for.
+# A newer git detaches that run, and it holds a lock file under .git/objects while it works, so a test
+# that ends first finds objects/ not empty when its temporary directory is removed (OSError, Errno 39).
+NO_BACKGROUND_UPKEEP = (("maintenance.auto", "false"), ("gc.auto", "0"))
 
 
-def git(repo, *args):
-    return subprocess.run(
-        ["git", "-C", repo, *args], check=True, capture_output=True, text=True, env=GIT_ENV
-    ).stdout
+def git_env(name="test", email="test"):
+    """The environment every git command in these tests runs under: no global or system config (so no
+    signing prompt), a fixed identity, and no automatic maintenance or gc. A test that built its own
+    environment for git would lose the last of those, so each one starts from here."""
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    for role in ("AUTHOR", "COMMITTER"):
+        env[f"GIT_{role}_NAME"] = name
+        env[f"GIT_{role}_EMAIL"] = email
+    # Added after any config the caller's shell already passed this way, never over it.
+    # Git reads the count with strtoul, which takes a sign and leading white space ("+1", " 1"), and int() gives
+    # the same count for every string git accepts; anything int() refuses (words, "²") counts as none, and so
+    # does a negative. (Git itself rejects some strings int() takes, e.g. "1_0"; it would refuse the caller's own
+    # count then, so nothing is lost.)
+    try:
+        first = max(int(env.get("GIT_CONFIG_COUNT", "")), 0)
+    except ValueError:
+        first = 0
+    for offset, (key, value) in enumerate(NO_BACKGROUND_UPKEEP):
+        env[f"GIT_CONFIG_KEY_{first + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{first + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(first + len(NO_BACKGROUND_UPKEEP))
+    return env
+
+
+GIT_ENV = git_env()
+
+
+def git(repo, *args, env=GIT_ENV):
+    """Run git in `repo` under `env` (the shared environment unless a test builds one with git_env, for its own
+    identity or dates) and return its stdout. A failing command raises CalledProcessError."""
+    return subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True, text=True, env=env).stdout
 
 
 class Repo:
