@@ -63,6 +63,12 @@
       "migrations": [
         "0037_finding_location"
       ]
+    },
+    "0.9.19": {
+      "classification": "additive",
+      "from": "395c41b0f3c75332b49ea9e347e56a4f19443e68",
+      "to": "8c0f671ee9d890eb5ad50e3ee3a9f03c3b8dd770",
+      "migrations": []
     }
   }
 }
