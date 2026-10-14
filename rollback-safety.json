@@ -55,6 +55,14 @@
       "migrations": [
         "0036_secret_vault_identity_fingerprint"
       ]
+    },
+    "0.9.18": {
+      "classification": "not-rollback-safe",
+      "from": "b65d0ab867e7827e21d0532ae2e1845885933449",
+      "to": "395c41b0f3c75332b49ea9e347e56a4f19443e68",
+      "migrations": [
+        "0037_finding_location"
+      ]
     }
   }
 }
