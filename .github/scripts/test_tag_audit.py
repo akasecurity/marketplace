@@ -28,8 +28,8 @@ def ruleset(number, name, target, include, rules, exclude=()):
 
 
 def good_rulesets():
-    review = {"required_approving_review_count": 1, "require_code_owner_review": True,
-              "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
+    review = {"required_approving_review_count": 0, "require_code_owner_review": False,
+              "dismiss_stale_reviews_on_push": False, "require_last_push_approval": False,
               "required_review_thread_resolution": False, "allowed_merge_methods": ["squash"]}
     checks = {"strict_required_status_checks_policy": False,
               "required_status_checks": [{"context": "validate", "integration_id": 15368}]}
@@ -166,17 +166,22 @@ class TestRulesets(unittest.TestCase):
                                  [f"ruleset 'fleet-tags-immutable': its update rule's parameters are {parameters!r}, "
                                   "not an object"])
 
-    def test_main_review_settings_are_compared_with_their_type(self):
+    def test_main_may_require_approving_reviews_or_none(self):
+        # Merging this change and flipping the ruleset can happen in either order without the audit going red.
+        for count, flag in ((0, False), (1, True), (2, True)):
+            with self.subTest(count=count):
+                sets = good_rulesets()
+                review = sets[1]["rules"][2]["parameters"]
+                review["required_approving_review_count"] = count
+                for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+                    review[key] = flag
+                self.assertEqual(ta.check_rulesets(github(sets)), [])
+
+    def test_main_merge_methods_are_compared_with_their_type(self):
         sets = good_rulesets()
-        review = sets[1]["rules"][2]["parameters"]
-        review["required_approving_review_count"] = True
-        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
-            review[key] = 1
+        sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = "squash"
         self.assertEqual(ta.check_rulesets(github(sets)), [
-            "ruleset 'main': pull_request required_approving_review_count is True, expected 1",
-            "ruleset 'main': pull_request require_code_owner_review is 1, expected True",
-            "ruleset 'main': pull_request dismiss_stale_reviews_on_push is 1, expected True",
-            "ruleset 'main': pull_request require_last_push_approval is 1, expected True"])
+            "ruleset 'main': pull_request allowed_merge_methods is 'squash', expected ['squash']"])
 
     def test_a_rule_whose_parameters_are_not_an_object_is_named_and_does_not_crash(self):
         for parameters in (["x"], "x"):
