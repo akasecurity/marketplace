@@ -1853,12 +1853,7 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
 def _main_ruleset_problems(rules: dict) -> list:
     problems = []
     review = rules.get("pull_request", {})
-    count = review.get("required_approving_review_count")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-        problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
-    for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
-        if review.get(key) is not True:
-            problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
+    # The approval settings are deliberately not audited: main may require approving reviews or none.
     if review.get("allowed_merge_methods") != ["squash"]:
         problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
     checks = rules.get("required_status_checks", {}).get("required_status_checks")

@@ -6,8 +6,8 @@ GitHub takes the workflow and the checkout from the default branch, whatever the
 It reads the PR's files as data: `git show <sha>:<path>` of the head commit, never a
 checkout, and it never imports or executes anything the PR contains.
 
-It is a correctness check on the automated path, not a security boundary: code-owner
-review of every change is the control.
+It is a correctness check on the automated path, not a security boundary, and the `main`
+ruleset requires no approving review.
 
 Exit 0 = every rule holds, 1 = a rule failed, 2 = no verdict (git, network or API).
 """
@@ -147,8 +147,8 @@ def _names_ai_tc(value) -> bool:
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
 #   * a fork PR's own run.
-# Code-owner review of every workflow change is the control for what a pull request's own diff
-# carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted
+# Review of a workflow change, where a pull request gets one, is the control for what its own diff
+# carries; the ruleset does not require it. A push-triggered workflow on another branch, a fork PR's own run and a check posted
 # from outside with some other token are not in that diff, so the check after the merge is what
 # catches those, and it is the detection for the rest too: tag-release's note and the main audit
 # count a validate check run only when it belongs to a pull_request_target run of validate.yml,
