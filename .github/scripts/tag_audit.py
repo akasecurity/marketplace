@@ -60,9 +60,9 @@ RULESETS: dict[str, dict] = {
 ENVIRONMENT = "marketplace-bot"
 ENVIRONMENT_POLICY = {"protected_branches": False, "custom_branch_policies": True}
 ENVIRONMENT_RULES = [{"name": "main", "type": "branch"}]
-MAIN_REVIEW = {"required_approving_review_count": 1, "require_code_owner_review": True,
-               "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
-               "allowed_merge_methods": ["squash"]}
+# The approval settings (count, code-owner review, stale-review dismissal, last-push approval) are deliberately
+# not audited: main may require approving reviews or none.
+MAIN_REVIEW = {"allowed_merge_methods": ["squash"]}
 
 
 def rule_parameters(name: str, rule: dict, problems: list[str]) -> dict | None:

@@ -268,6 +268,17 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("a `fleet-v` tag or a merged release-bot pull request has pinned",
                       ir.pr_body(forward_plan(reimport=True), "u"))
 
+    def test_no_body_asks_for_an_approval_and_each_says_nothing_gates_the_merge(self):
+        for label, plan in (("forward", forward_plan()), ("re-import", forward_plan(reimport=True)),
+                            ("rollback", rollback_plan()),
+                            ("below-floor rollback", rollback_plan(floor="0.9.14", below_floor=True))):
+            with self.subTest(label):
+                body = ir.pr_body(plan, "u")
+                self.assertNotIn("approv", body.lower())
+                self.assertIn("None of this gates the merge: auto-merge squash-merges this PR once `validate` is "
+                              "green, and tag-release then creates the next `fleet-v<N>` tag at the squash commit.",
+                              body)
+
     def test_a_rollback_body_states_the_floor_and_a_below_floor_dispatch(self):
         body = ir.pr_body(rollback_plan(floor="0.9.14", below_floor=True), "u")
         self.assertIn("**Rollback.**", body)
@@ -286,10 +297,10 @@ class TestPrBody(unittest.TestCase):
         self.assertNotIn("only if no code owner had approved", body)
         self.assertNotIn("main-audit", ir.pr_body(rollback_plan(floor="0.9.14"), "u"))
 
-    def test_a_rollback_body_asks_the_approver_to_rerun_validate_after_the_safety_file_moves(self):
+    def test_a_rollback_body_asks_to_rerun_validate_after_the_safety_file_moves(self):
         body = ir.pr_body(rollback_plan(), "u")
         self.assertIn("- [ ] If `rollback-safety.json` changed on `main` after `validate` ran (compare the "
-                      "`Main read at` row of its summary with `main`'s head), re-run `validate` before approving.", body)
+                      "`Main read at` row of its summary with `main`'s head), re-run `validate` before it merges.", body)
         # Only a rollback is judged against the floor, so a forward PR's checklist does not carry the line.
         self.assertNotIn("Main read at", ir.pr_body(forward_plan(), "u"))
 
@@ -802,7 +813,7 @@ class TestOpenPrForward(OpenPrCase):
         opened = self.gh.called("POST", R("pulls"))[0][2]
         self.assertEqual((opened["head"], opened["base"], opened["title"]),
                          ("bot/pin-ai-tc-0.9.15", "main", "feat: advance the ai-tc pin to 0.9.15"))
-        self.assertIn("**Approver checklist:**", opened["body"])
+        self.assertIn("**Release checklist:**", opened["body"])
         self.assertEqual(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")[0][2], {"id": "PR_12"})
         self.assertEqual(self.gh.called("POST", R("issues/12/labels")), [])
 

@@ -2593,10 +2593,10 @@ def ruleset_routes(overrides=None, missing=()):
                 {
                     "type": "pull_request",
                     "parameters": {
-                        "required_approving_review_count": 1,
-                        "require_code_owner_review": True,
-                        "dismiss_stale_reviews_on_push": True,
-                        "require_last_push_approval": True,
+                        "required_approving_review_count": 0,
+                        "require_code_owner_review": False,
+                        "dismiss_stale_reviews_on_push": False,
+                        "require_last_push_approval": False,
                         "required_review_thread_resolution": False,
                         "allowed_merge_methods": ["squash"],
                     },
@@ -2736,28 +2736,25 @@ class TestAuditRulesets(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("ruleset 'fleet-tags-immutable' covers include ['refs/tags/fleet-v*', 'refs/tags/ruleset-probe-*']"))
 
-    def test_main_review_settings_must_be_the_right_type(self):
-        # True is an int, so an isinstance check alone lets it through as a count.
-        routes = ruleset_routes()
-        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
-        review = main["rules"][2]["parameters"]
-        review["required_approving_review_count"] = True
-        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
-        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
-                         ["ruleset 'main': required_approving_review_count is True, not at least 1"])
+    def test_main_may_require_approving_reviews_or_none(self):
+        # Merging this change and flipping the ruleset can happen in either order without the audit going red.
+        for count, flag in ((0, False), (1, True), (2, True)):
+            with self.subTest(count=count):
+                routes = ruleset_routes()
+                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+                review = main["rules"][2]["parameters"]
+                review["required_approving_review_count"] = count
+                for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+                    review[key] = flag
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
+
+    def test_main_merge_methods_must_be_the_right_type(self):
         routes = ruleset_routes()
         next(r for r in routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]["rules"]
              if r["type"] == "pull_request")["parameters"]["allowed_merge_methods"] = 1
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
                          ["ruleset 'main': allowed_merge_methods is 1, not ['squash']"])
-        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
-            with self.subTest(key=key):
-                routes = ruleset_routes()
-                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
-                main["rules"][2]["parameters"][key] = 1
-                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
-                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
-                                 [f"ruleset 'main': {key} is 1, not True"])
 
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()
