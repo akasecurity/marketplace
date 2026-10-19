@@ -307,21 +307,63 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return pull_association(gh, sha, sleep)[0]
 
 
-def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
-    """The code owners whose latest review that takes a position approves `head`, the one who approved
-    last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review decides (a comment
-    or a pending review changes nothing, and `reviews` is in the API's chronological order), so an approval
-    its owner later withdrew, or that was dismissed, does not count. `exclude` names reviewers whose
-    approval is not allowed to count, such as the last pusher."""
+def latest_positions(reviews) -> dict[str, dict]:
+    """Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review, the one who took a position last
+    at the end. A comment or a pending review changes nothing, and `reviews` is in the API's chronological
+    order, so an approval its author later withdrew, or that was dismissed, is no longer the latest."""
     latest: dict[str, dict] = {}
     for review in reviews:
         login = (review.get("user") or {}).get("login")
         if login and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             latest.pop(login, None)
             latest[login] = review
-    return [login for login, review in latest.items()
+    return latest
+
+
+def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
+    """The code owners whose latest position approves `head`. `exclude` names reviewers whose approval is not
+    allowed to count, such as the last pusher."""
+    return [login for login, review in latest_positions(reviews).items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
             and login in owners and login not in exclude]
+
+
+REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
+                 "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+                 "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
+                 "nodes { state authorCanPushToRepository author { __typename login } commit { oid } } } } } }")
+
+
+def pull_reviews(gh: GitHub, number: int) -> list[dict]:
+    """The PR's reviews, oldest first, as {state, commit_id, user, can_push}. `can_push` is GitHub's own answer to
+    whether the reviewer may push to the repository, the access the main ruleset counts an approval by. It is
+    asked here, not read from `author_association`, which GitHub fills in per viewer: a token that cannot see a
+    private member's organisation membership is told CONTRIBUTOR for them, and an audit must not depend on what
+    the reading token can see. Only a user account can push: GitHub also answers true for an App that has write
+    access, and gives its login without the [bot] suffix, but an App's approval is no person's approval."""
+    owner, name = gh.repo.split("/", 1)
+    reviews: list[dict] = []
+    after = None
+    while True:
+        connection = gh.graphql(REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
+                                                "after": after})["repository"]["pullRequest"]["reviews"]
+        for node in connection["nodes"]:
+            author, commit = node.get("author"), node.get("commit")
+            reviews.append({"state": node["state"], "commit_id": commit["oid"] if commit else None,
+                            "user": {"login": author["login"]} if author else None,
+                            "can_push": node.get("authorCanPushToRepository") is True
+                            and author is not None and author.get("__typename") == "User"})
+        if not connection["pageInfo"]["hasNextPage"]:
+            return reviews
+        after = connection["pageInfo"]["endCursor"]
+
+
+def write_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The reviewers who can push to the repository and whose latest position approves `head`. `exclude` names
+    reviewers whose approval is not allowed to count, such as the last pusher."""
+    return [login for login, review in latest_positions(reviews).items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and review.get("can_push") is True and login not in exclude]
 
 
 def timestamp(text) -> datetime | None:

@@ -183,11 +183,10 @@ Expected:
 - `tags-locked` and `fleet-tags-immutable`: nobody.
 
 Keep `.github/CODEOWNERS` as one `*` line naming users:
-`tag-release` and `main-audit` read it strictly, at a commit's parent, and can match a reviewer's
+`tag-release` reads it strictly, at a commit's parent, and can match a reviewer's
 login only to a user, so a team, an email address, a path rule, a second rule, an entry that is
 not a file or a file that is not UTF-8 text is not read. A PR merged on top of such a file gets
-`approver: unknown` in its tag, if it moved the pin, and a `main-audit` issue, rather than a
-guess; once a commit is merged, the file at its parent can no longer change. The unit tests run on
+`approver: unknown` in its tag, if it moved the pin, rather than a guess; once a commit is merged, the file at its parent can no longer change. The unit tests run on
 every pull request, one that changes only the file included, and fail one the reader cannot read.
 Before pushing, validate the JSON and run the scripts' tests:
 
@@ -359,20 +358,23 @@ true only once it is.
   90 days, and dispatch `tag-audit` once after turning it on so a baseline exists before
   `tag-release` cuts the first tag after the frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
-  added that is not the merge of a PR with a code owner's approval of its final head, from someone
-  other than the head's last pusher and not since withdrawn, and a passing `validate` check from
-  GitHub Actions on that head (its latest run decides, and only a run of `validate.yml` that
-  `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
-  applies, so a green re-run after the merge clears nothing). The branch commits a merge-commit
+  added that is not the merge of a PR with an approval of its final head from someone with write
+  access, who is not the head's last pusher and has not since withdrawn it, and a passing `validate`
+  check from GitHub Actions on that head (its latest run decides, and only a run of `validate.yml`
+  that `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
+  applies, so a green re-run after the merge clears nothing). A reviewer has write access when GitHub
+  says the review's author can push to the repository (`authorCanPushToRepository`), the access the
+  ruleset counts, and only for a user account, because GitHub answers the same for an App with write
+  access and an App's approval is no person's. `author_association` is not used: GitHub fills it in
+  per viewer, so a token that cannot see a private member's organisation membership is told
+  `CONTRIBUTOR` for them. The branch commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
   pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
   or committer of the head commit (`web-flow` aside): the audit does not use GitHub's activity API,
   which does record pushers, because what it records for a push made by the App or by auto-merge is
   unverified, and a head that names neither is reported, since an approval could then be the
-  pusher's own. CODEOWNERS is read strictly at the commit's parent, and a file that cannot be read
-  (a team, a path rule, no file, an entry that is not a file, or bytes that are not UTF-8 text) is
-  that commit's problem: a red result for it while the rest of the push is still audited. A push
+  pusher's own. A push
   that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for

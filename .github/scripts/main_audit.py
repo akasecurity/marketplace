@@ -1,11 +1,10 @@
-"""main-audit: every commit a push adds to main's first-parent line must be the merge of a code-owner-approved PR that passed validate.
+"""main-audit: every commit a push adds to main's first-parent line must be the merge of an approved PR that passed validate.
 
 Red unless each commit is the merge commit of a PR with an approving review, on
-the PR's final head, from a code owner (CODEOWNERS at the commit's parent, read
-strictly: one `*` line of users, as tag-release reads it, and any other shape
-is that commit's problem rather than a guess) who is not its last pusher and has
-not since withdrawn it (an owner's latest approving, change-requesting or
-dismissed review decides), and whose final head has a passing `validate` check
+the PR's final head, from someone with write access (GitHub's authorCanPushToRepository, the
+access the main ruleset counts) who is not its last pusher and has not since withdrawn it (a
+reviewer's latest approving, change-requesting or dismissed review decides), and
+whose final head has a passing `validate` check
 from GitHub Actions (its latest run decides; only a run of validate.yml that
 `pull_request_target` started at or before the PR merged counts, the same rule
 tag-release applies). A commit that fails more than one of these gets one result. The head commit's author and committer stand in for
@@ -36,10 +35,10 @@ from typing import Callable
 
 from ghapi import GitHub
 from gitrepo import Git
-from import_release import Refused, write_output
+from import_release import write_output
 from issue_router import Result, results_to_json
-from tag_release import (VALIDATE_CHECK, code_owners, merged_into_main, owner_approvals, pull_association,
-                         validate_conclusion)
+from tag_release import (VALIDATE_CHECK, merged_into_main, pull_association, pull_reviews, validate_conclusion,
+                         write_approvals)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -60,31 +59,23 @@ def added_commits(git: Git, before: str, after: str) -> list[str]:
     return git.first_parent_after(before, after)
 
 
-def approval_problem(gh: GitHub, git: Git, sha: str, number: int, head: str) -> str | None:
-    parent = git.first_parent(sha)
-    try:
-        owners = code_owners(git, parent) if parent else []
-    except Refused as refusal:
-        # A CODEOWNERS this audit cannot read exactly (a team, a path rule, no file) must not decide who counts as
-        # an owner either way, so the commit is reported with the reason and the rest of the push is still audited.
-        return f"`{sha}` merged PR #{number}, but its approval could not be checked: {refusal}"
+def approval_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
     head_commit = gh.get(gh.repo_path(f"commits/{head}"))
     pushers = {login for login in ((head_commit.get("author") or {}).get("login"),
                                    (head_commit.get("committer") or {}).get("login"))
                if login and login not in NOT_A_PUSHER}
     if not pushers:
-        # With no login for either field the stand-in names nobody, and an empty set would let every owner's
+        # With no login for either field the stand-in names nobody, and an empty set would let every member's
         # approval through, the pusher's own included. Not knowing who pushed is not a pass.
         return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
                 "(neither its author nor its committer is a GitHub account other than web-flow), so an approval "
                 "could not be told from the pusher's own.")
-    # Each owner's latest approving, change-requesting or dismissed review decides, the same rule that names the
-    # approver in a fleet tag: an approval its owner later withdrew, or that was dismissed, does not count.
-    if owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners, exclude=pushers):
+    # Each member's latest approving, change-requesting or dismissed review decides: an approval its author later
+    # withdrew, or that was dismissed, does not count.
+    if write_approvals(pull_reviews(gh, number), head, exclude=pushers):
         return None
-    return (f"`{sha}` merged PR #{number} without an approving review from a code owner "
-            f"({', '.join(owners) or 'none listed'}) on its final head `{head}` by someone other than its last "
-            f"pusher ({', '.join(sorted(pushers))}).")
+    return (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its final "
+            f"head `{head}` by someone other than its last pusher ({', '.join(sorted(pushers))}).")
 
 
 def validate_problem(gh: GitHub, sha: str, number: int, head: str, merged_at: str | None) -> str | None:
@@ -121,14 +112,14 @@ def no_merge_problem(sha: str, linked: list[dict]) -> str:
     return f"{lead}: it was pushed to main directly."
 
 
-def audit_commit(gh: GitHub, git: Git, sha: str, sleep: Callable[[float], None]) -> str | None:
+def audit_commit(gh: GitHub, sha: str, sleep: Callable[[float], None]) -> str | None:
     """What is wrong with how `sha` reached main, or None. A commit with both problems gets one description."""
     pull, linked = pull_association(gh, sha, sleep)
     if pull is None:
         return no_merge_problem(sha, linked)
     number = pull["number"]
     head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
-    problems = [problem for problem in (approval_problem(gh, git, sha, number, head),
+    problems = [problem for problem in (approval_problem(gh, sha, number, head),
                                         validate_problem(gh, sha, number, head, pull.get("merged_at")))
                 if problem]
     return " ".join(problems) or None
@@ -189,11 +180,11 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
         for sha in commits:
             # Only a push's tip can be a merge that push has only just made, so only it waits for the
             # pull request association; every other commit is read once.
-            problem = audit_commit(gh, git, sha, sleep if sha == after else (lambda seconds: None))
+            problem = audit_commit(gh, sha, sleep if sha == after else (lambda seconds: None))
             if problem:
                 results.append(Result(
                     rule=f"main-audit-{sha[:12]}", label=LABEL,
-                    title=f"main-audit: {sha[:12]} reached main without a code-owner-approved PR that passed validate",
+                    title=f"main-audit: {sha[:12]} reached main without an approved PR that passed validate",
                     red=True,
                     auto_close=False,
                     detail=problem + "\n\nIf this was a break-glass merge, record the incident and who merged it "
@@ -225,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     for item in flagged:
         print(f"::error::{item.detail.splitlines()[0]}")
     commits = [item for item in flagged if not item.rule.startswith((REWRITE_RULE, UNAUDITED_RULE))]
-    print(f"{len(commits)} commit(s) in this push reached main without a code-owner-approved PR that passed validate")
+    print(f"{len(commits)} commit(s) in this push reached main without an approved PR that passed validate")
     print(f"{len(flagged) - len(commits)} other problem(s) with this push: main rewritten, or the audit unfinished")
     write_output("results", results_to_json(results))
     return 0
