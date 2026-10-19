@@ -311,7 +311,7 @@ class TestMainAudit(unittest.TestCase):
                               results[0].detail)
                 self.assertNotIn("rebase", results[0].detail)
 
-    def test_an_approval_from_a_member_who_is_not_a_code_owner_counts(self):
+    def test_an_approval_from_a_member_listed_nowhere_counts(self):
         reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"},
                     "author_association": "MEMBER"}]
         self.assertEqual(self.audit(github(reviews=reviews)), [])
@@ -327,17 +327,6 @@ class TestMainAudit(unittest.TestCase):
                 results = self.audit(github(reviews=[review]))
                 self.assertEqual(len(results), 1)
                 self.assertIn("without an approving review from an organisation member", results[0].detail)
-
-    def test_the_audit_does_not_read_codeowners(self):
-        # An approver is an organisation member, not a name in a file, so an unreadable or absent CODEOWNERS
-        # costs the audit nothing.
-        for label, git in (("no file", FakeGit(chain=["p", "s1", "s2"])),
-                           ("a team", FakeGit(chain=["p", "s1", "s2"], files={
-                               ("p", ".github/CODEOWNERS"): "* @akasecurity/maintainers\n"})),
-                           ("bytes that are not UTF-8", FakeGit(chain=["p", "s1", "s2"], files={
-                               ("p", ".github/CODEOWNERS"): b"# caf\xe9 team\n"}))):
-            with self.subTest(label):
-                self.assertEqual(self.audit(github(), git), [])
 
     def test_an_approval_on_a_stale_head_does_not_count(self):
         results = self.audit(github(reviews=[{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]))

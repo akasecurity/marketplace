@@ -12,7 +12,7 @@ from unittest import mock
 import _testsupport as ts
 import release_checks
 import tag_release as tr
-from fakes import (CODEOWNERS, INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
+from fakes import (INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
                    not_found, pull, pulls_route, safety, safety_entry)
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
@@ -92,7 +92,6 @@ def history(chain=("t8", "a", "b", "c", "d"), times=None) -> FakeGit:
     for sha, (text, table) in content.items():
         files[(sha, MANIFEST)] = text
         files[(sha, SAFETY_FILE)] = safety(table)
-        files[(sha, ".github/CODEOWNERS")] = CODEOWNERS
     return FakeGit(chain=list(chain), files=files, tags=[fleet_tag(7, "t7"), fleet_tag(8, "t8")], times=times)
 
 
@@ -105,16 +104,17 @@ def sweep_github() -> FakeGitHub:
                                         "base": {"ref": "main"}}],
         ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
         ("GET", R("pulls/13/reviews")): [
-            {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
-            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}],
+            {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}, "author_association": "MEMBER"},
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "author_association": "MEMBER"}],
         ("GET", R("commits/c/pulls")): [
             {"number": 15, "merge_commit_sha": "other", "merged_at": None, "base": {"ref": "main"}},
             {"number": 14, "merge_commit_sha": "c", "merged_at": "2026-10-03T00:00:00Z", "base": {"ref": "main"}}],
         ("GET", R("pulls/14")): {"head": {"sha": "h14"}, "labels": [{"name": "rollback"}, {"name": "drill"}],
                                  "merged_by": {"login": "org-owner-example"}},
         ("GET", R("pulls/14/reviews")): [
-            {"state": "APPROVED", "commit_id": "stale14", "user": {"login": "Vaishnav-OM"}},
-            {"state": "APPROVED", "commit_id": "h14", "user": {"login": "writer-example"}}],
+            {"state": "APPROVED", "commit_id": "stale14", "user": {"login": "Vaishnav-OM"}, "author_association": "MEMBER"},
+            {"state": "APPROVED", "commit_id": "h14", "user": {"login": "writer-example"},
+             "author_association": "CONTRIBUTOR"}],
         ("GET", R("commits/d/pulls")): [],
         **checks("h13"),
         **checks("h14"),
@@ -480,10 +480,9 @@ class TestMessage(unittest.TestCase):
         text = self.message(version="0.9.15\npr: 26", integrity="sha512-x\ty")
         self.assertIn("fleet-v10: ai-tc 0.9.15\\npr: 26\n", text)
         self.assertIn("\nversion: 0.9.15\\npr: 26\nintegrity: sha512-x\\ty\n", text)
-        plain = self.message(integrity=INTEGRITY["0.9.15"], facts=dict(self.FACTS, note="code owners could not be "
-                                                                         "read: `.github/CODEOWNERS` at abc (caf\u00e9)"))
+        plain = self.message(integrity=INTEGRITY["0.9.15"], facts=dict(self.FACTS, note="ruleset bypass by caf\u00e9"))
         self.assertIn(f"integrity: {INTEGRITY['0.9.15']}\n", plain)
-        self.assertIn("approver-note: code owners could not be read: `.github/CODEOWNERS` at abc (caf\u00e9)\n", plain)
+        self.assertIn("approver-note: ruleset bypass by caf\u00e9\n", plain)
 
     def test_a_version_with_a_line_break_is_still_tagged_as_recorded_in_one_line(self):
         # A version that is not x.y.z is not refused: a bypass edit has to be recorded, and tag-audit flags it.
@@ -513,14 +512,13 @@ class TestRestore(unittest.TestCase):
         for sha, (text, table) in content.items():
             files[(sha, MANIFEST)] = text
             files[(sha, SAFETY_FILE)] = safety(table)
-            files[(sha, ".github/CODEOWNERS")] = CODEOWNERS
         git = FakeGit(chain=["t8", "b", "d", "e"], files=files, tags=[fleet_tag(8, "t8")], times={"d": NOW - 7200})
         gh = sweep_github()
         gh.routes.update({
             ("GET", R("commits/e/pulls")): [{"number": 16, "merge_commit_sha": "e", "merged_at": "2026-10-04T00:00:00Z",
                                              "base": {"ref": "main"}}],
             ("GET", R("pulls/16")): {"head": {"sha": "h16"}, "labels": [], "merged_by": {"login": "venuverse"}},
-            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}}],
+            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}, "author_association": "MEMBER"}],
             **checks("h16")})
         return git, gh
 
@@ -701,19 +699,10 @@ class TestValuesOfTheWrongType(unittest.TestCase):
 
 
 class TestApprover(unittest.TestCase):
-    def test_the_last_owner_approval_on_the_final_head_is_named(self):
-        gh = FakeGitHub({
-            ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
-                                             "base": {"ref": "main"}}],
-            ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
-            ("GET", R("pulls/13/reviews")): [
-                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}],
-            **checks("h13")})
-        facts = tr.pr_facts(gh, "b", ["Vaishnav-OM", "venuverse"], sleep=lambda seconds: None)
-        self.assertEqual(facts["approver"], "Vaishnav-OM")
+    def review(self, state, login="venuverse", association="MEMBER", commit="h13"):
+        return {"state": state, "commit_id": commit, "user": {"login": login}, "author_association": association}
 
-    def facts_for(self, reviews, owners=("Vaishnav-OM", "venuverse"), unreadable=""):
+    def facts_for(self, reviews):
         gh = FakeGitHub({
             ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
                                              "base": {"ref": "main"}}],
@@ -721,77 +710,77 @@ class TestApprover(unittest.TestCase):
                                      "merged_by": {"login": "org-owner-example"}},
             ("GET", R("pulls/13/reviews")): reviews,
             **checks("h13")})
-        return tr.pr_facts(gh, "b", None if owners is None else list(owners), sleep=lambda seconds: None,
-                           unreadable=unreadable)
+        return tr.pr_facts(gh, "b", sleep=lambda seconds: None)
 
-    def test_owners_that_could_not_be_read_name_no_approver_and_claim_no_bypass(self):
-        facts = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}],
-                               owners=None, unreadable="the file names a team")
-        self.assertEqual(facts, {"pr": "13", "approver": "unknown", "drill": True,
-                                 "note": "code owners could not be read: the file names a team"})
+    def test_the_last_member_approval_on_the_final_head_is_named(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse"), self.review("APPROVED", "Vaishnav-OM")])
+        self.assertEqual(facts["approver"], "Vaishnav-OM")
 
-    def test_a_commit_no_pull_request_merged_has_no_approver_whether_or_not_the_owners_could_be_read(self):
-        # With no pull request there is no approval to match, so the owners do not matter.
+    def test_a_member_named_in_no_file_is_the_approver(self):
+        facts = self.facts_for([self.review("APPROVED", "a-member-nobody-listed")])
+        self.assertEqual((facts["approver"], facts["note"]), ("a-member-nobody-listed", None))
+
+    def test_an_owner_member_counts_like_any_member(self):
+        self.assertEqual(self.facts_for([self.review("APPROVED", "an-owner", "OWNER")])["approver"], "an-owner")
+
+    def test_a_reviewer_outside_the_organisation_is_not_the_approver(self):
+        for association in ("COLLABORATOR", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", None):
+            with self.subTest(association=association):
+                facts = self.facts_for([self.review("APPROVED", "venuverse", association)])
+                self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
+    def test_a_commit_no_pull_request_merged_has_no_approver(self):
         gh = FakeGitHub({("GET", R("commits/d/pulls")): []})
-        facts = tr.pr_facts(gh, "d", None, sleep=lambda seconds: None, unreadable="the file names a team")
+        facts = tr.pr_facts(gh, "d", sleep=lambda seconds: None)
         self.assertEqual((facts["pr"], facts["approver"]), ("none", "none"))
         self.assertEqual(facts["note"], "no pull request merged this commit")
 
-    def test_an_owner_who_approved_then_requested_changes_is_not_the_approver(self):
-        facts = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                                {"state": "CHANGES_REQUESTED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+    def test_a_member_who_approved_then_requested_changes_is_not_the_approver(self):
+        facts = self.facts_for([self.review("APPROVED"), self.review("CHANGES_REQUESTED")])
         self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
 
-    def test_an_owner_who_requested_changes_and_then_approved_is_the_approver(self):
-        facts = self.facts_for([{"state": "CHANGES_REQUESTED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                                {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+    def test_a_member_who_requested_changes_and_then_approved_is_the_approver(self):
+        facts = self.facts_for([self.review("CHANGES_REQUESTED"), self.review("APPROVED")])
         self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
 
     def test_a_dismissed_approval_does_not_count_and_a_later_comment_does_not_withdraw_one(self):
-        dismissed = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                                    {"state": "DISMISSED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        dismissed = self.facts_for([self.review("APPROVED"), self.review("DISMISSED")])
         self.assertEqual(dismissed["approver"], "none")
-        commented = self.facts_for([{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                                    {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "venuverse"}}])
+        commented = self.facts_for([self.review("APPROVED"), self.review("COMMENTED")])
         self.assertEqual(commented["approver"], "venuverse")
 
-    def test_the_approver_named_is_the_owner_who_approved_last(self):
-        reviews = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
-                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}}]
+    def test_the_approver_named_is_the_member_who_approved_last(self):
+        reviews = [self.review("APPROVED", "Vaishnav-OM"), self.review("APPROVED", "venuverse"),
+                   self.review("APPROVED", "Vaishnav-OM")]
         self.assertEqual(self.facts_for(reviews)["approver"], "Vaishnav-OM")
-        self.assertEqual(tr.owner_approvals(reviews, "h13", ["Vaishnav-OM", "venuverse"]), ["venuverse", "Vaishnav-OM"])
+        self.assertEqual(tr.org_approvals(reviews, "h13"), ["venuverse", "Vaishnav-OM"])
 
-    def test_owner_approvals_leaves_out_an_excluded_reviewer(self):
-        reviews = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}},
-                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}},
-                   {"state": "APPROVED", "commit_id": "h13", "user": {"login": "writer-example"}},
-                   {"state": "APPROVED", "commit_id": "old", "user": None}]
-        self.assertEqual(tr.owner_approvals(reviews, "h13", ["Vaishnav-OM", "venuverse"], exclude={"venuverse"}),
-                         ["Vaishnav-OM"])
+    def test_org_approvals_leaves_out_an_excluded_reviewer_a_stale_head_and_a_reviewer_with_no_login(self):
+        reviews = [self.review("APPROVED", "Vaishnav-OM"), self.review("APPROVED", "venuverse"),
+                   self.review("APPROVED", "writer-example", "COLLABORATOR"),
+                   {"state": "APPROVED", "commit_id": "old", "user": None, "author_association": "MEMBER"},
+                   self.review("APPROVED", "stale", commit="old")]
+        self.assertEqual(tr.org_approvals(reviews, "h13", exclude={"venuverse"}), ["Vaishnav-OM"])
 
-    def test_owners_are_read_from_the_merged_commits_parent(self):
+    def test_an_approval_is_found_without_any_file_in_the_checkout(self):
         git = history(chain=("t8", "b"))
-        git.files[("b", ".github/CODEOWNERS")] = "* @Vaishnav-OM @venuverse @added-by-the-merge\n"
         gh = sweep_github()
-        gh.routes[("GET", R("pulls/13/reviews"))] = [
-            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "added-by-the-merge"}}]
+        gh.routes[("GET", R("pulls/13/reviews"))] = [self.review("APPROVED", "a-member-nobody-listed")]
         tr.sweep(git, gh, sleep=lambda seconds: None)
         message = gh.called("POST", R("git/tags"))[0][2]["message"]
-        self.assertIn("approver: none\n", message)
-        self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
+        self.assertIn("approver: a-member-nobody-listed\n", message)
+        self.assertNotIn("approver-note", message)
 
 
 class TestValidateOnTheFinalHead(unittest.TestCase):
-    """A code owner's approval says nothing about the required `validate` check: an org owner can merge past a
+    """A reviewer's approval says nothing about the required `validate` check: an org owner can merge past a
     failed or missing one. The tag for such a merge says so in its approver-note, whoever approved it."""
 
     NOTE = "validate had not passed on the PR's final head"
     MERGER = "org-owner-example"
-    APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}}]
+    APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "author_association": "MEMBER"}]
 
-    def facts(self, runs, reviews=None, owners=("Vaishnav-OM", "venuverse"), unreadable="", workflows=None,
-              merged_at=MERGED_AT):
+    def facts(self, runs, reviews=None, workflows=None, merged_at=MERGED_AT):
         """The facts for PR 13 (final head h13, merged by an org owner at `merged_at`) whose head carries `runs`
         (in the check suites `workflows` describes, by default one pull_request_target run of validate.yml each),
         and the client."""
@@ -801,8 +790,7 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
             ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": self.MERGER}},
             ("GET", R("pulls/13/reviews")): self.APPROVED if reviews is None else reviews,
             **checks("h13", runs, workflows)})
-        facts = tr.pr_facts(gh, "b", None if owners is None else list(owners), sleep=lambda seconds: None,
-                            unreadable=unreadable)
+        facts = tr.pr_facts(gh, "b", sleep=lambda seconds: None)
         return facts, gh
 
     def test_an_approved_merge_whose_head_has_no_validate_run_is_noted(self):
@@ -854,18 +842,6 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
     def test_a_bypass_with_a_passing_run_keeps_its_own_note_only(self):
         facts, _ = self.facts([validate_run()], reviews=[])
         self.assertEqual((facts["approver"], facts["note"]), ("none", f"ruleset bypass by {self.MERGER}"))
-
-    def test_an_unknown_approver_with_a_failed_run_keeps_both_notes_and_names_the_merger(self):
-        facts, _ = self.facts([validate_run(conclusion="failure")], owners=None, unreadable="the file names a team")
-        self.assertEqual(facts["approver"], "unknown")
-        self.assertEqual(facts["note"], "code owners could not be read: the file names a team; "
-                                        f"{self.NOTE} (latest run: failure); merged by {self.MERGER}")
-        self.assertEqual(facts["note"].count(self.MERGER), 1)
-
-    def test_an_unknown_approver_with_a_passing_run_keeps_only_the_unreadable_note(self):
-        facts, _ = self.facts([validate_run()], owners=None, unreadable="the file names a team")
-        self.assertEqual((facts["approver"], facts["note"]),
-                         ("unknown", "code owners could not be read: the file names a team"))
 
     def test_runs_from_another_app_or_under_another_name_are_ignored(self):
         # Only the job named validate that GitHub Actions reports is the required check. A green run of that name
@@ -1092,7 +1068,7 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
     def test_no_pull_request_means_no_check_read(self):
         # The routes hold no check-runs answer: a read of one fails the test.
         gh = FakeGitHub({("GET", R("commits/d/pulls")): []})
-        facts = tr.pr_facts(gh, "d", None, sleep=lambda seconds: None)
+        facts = tr.pr_facts(gh, "d", sleep=lambda seconds: None)
         self.assertEqual((facts["pr"], facts["approver"]), ("none", "none"))
         self.assertEqual(facts["note"], "no pull request merged this commit")
 
@@ -1166,221 +1142,7 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         self.assertEqual(gh.writes(), [])
 
 
-class TestCodeOwners(unittest.TestCase):
-    def owners(self, text):
-        files = {} if text is None else {("x", ".github/CODEOWNERS"): text}
-        return tr.code_owners(FakeGit(chain=["x"], files=files), "x")
-
-    def test_one_star_line_of_users_is_read_whatever_surrounds_it(self):
-        cases = {
-            "the repository's own file": ("* @Vaishnav-OM @venuverse\n", ["Vaishnav-OM", "venuverse"]),
-            "comments and blank lines": ("# who reviews\n\n* @a_b @c-d  # everyone\n\n", ["a_b", "c-d"]),
-            "tabs and CRLF line ends": ("*\t@a\t@b\r\n", ["a", "b"]),
-            "no final newline": ("* @a", ["a"]),
-        }
-        for label, (text, expected) in cases.items():
-            with self.subTest(label):
-                self.assertEqual(self.owners(text), expected)
-
-    def test_the_repositorys_own_codeowners_file_can_be_read(self):
-        # Once a commit is merged, the CODEOWNERS of its parent can no longer change, so a pin change that a pull
-        # request merged on top of a file the strict reader cannot read is tagged with an unknown approver (a push
-        # with no pull request records `none`, whatever the file holds). This fails on the pull request first; the
-        # workflow that runs it is not a required check, so it does not stop the merge.
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "CODEOWNERS")
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-        self.assertEqual(self.owners(text), ["Vaishnav-OM", "venuverse"])
-
-    def test_anything_else_is_a_refusal_that_names_the_file(self):
-        cases = {
-            "no file": (None, "is missing"),
-            "an empty file": ("", "exactly one rule"),
-            "only comments": ("# nobody yet\n", "exactly one rule"),
-            "a team": ("* @akasecurity/maintainers\n", "`@akasecurity/maintainers`"),
-            "a team among users": ("* @a @org/team @b\n", "`@org/team`"),
-            "an email address": ("* @a b@example.com\n", "`b@example.com`"),
-            "a name without an at sign": ("* someone\n", "`someone`"),
-            "a bare at sign": ("* @\n", "`@`"),
-            "a handle that is not a login": ("* @a. @b[bot]\n", "`@a.`"),
-            "a path rule beside the star line": ("* @a\n/docs @b\n", "exactly one rule"),
-            "only a path rule": ("/docs @a\n", "exactly one rule"),
-            "two star lines": ("* @a\n* @b\n", "exactly one rule"),
-            "a different catch-all pattern": ("** @a\n", "exactly one rule"),
-            "a star line naming no owner": ("*\n", "names no owner"),
-        }
-        for label, (text, expected) in cases.items():
-            with self.subTest(label):
-                with self.assertRaises(Refused) as caught:
-                    self.owners(text)
-                self.assertIn(".github/CODEOWNERS at x", str(caught.exception))
-                self.assertIn(expected, str(caught.exception))
-
-    def test_a_file_that_is_not_utf8_text_is_a_refusal_that_names_the_file(self):
-        # Read through the real Git, which decodes what it shows as UTF-8 and raises on a byte that is not: the
-        # strict reader must turn that into its refusal, and only for bytes that are not text (a UTF-8 comment is fine).
-        with tempfile.TemporaryDirectory() as directory:
-            sh = scratch_repository(directory)
-
-            def commit_owners(content: bytes) -> str:
-                with open(os.path.join(directory, ".github", "CODEOWNERS"), "wb") as handle:
-                    handle.write(content)
-                sh("add", "-A")
-                sh("commit", "-q", "-m", "owners")
-                return sh("rev-parse", "HEAD")
-
-            os.makedirs(os.path.join(directory, ".github"))
-            git = Git(directory)
-            readable = commit_owners("# caf\u00e9 team\n* @a @b\n".encode("utf-8"))
-            self.assertEqual(tr.code_owners(git, readable), ["a", "b"])
-            unreadable = commit_owners(b"# caf\xe9 team\n* @a @b\n")  # one Latin-1 byte, in a comment
-            with self.assertRaises(Refused) as caught:
-                tr.code_owners(git, unreadable)
-            self.assertIn(f".github/CODEOWNERS at {unreadable[:12]}", str(caught.exception))
-            self.assertIn("not valid UTF-8", str(caught.exception))
-
-
-    def test_an_entry_that_is_not_a_file_is_a_refusal_that_names_the_kind(self):
-        # A submodule entry has no blob: Git.show raises GitError ("bad object") for it, and that must not escape
-        # as a statement about the checkout, because the sweep would stop on it for good.
-        for mode, kind in (("160000", "a submodule"), ("120000", "a symbolic link"), ("040000", "a directory")):
-            with self.subTest(kind):
-                git = FakeGit(chain=["x"], files={("x", ".github/CODEOWNERS"): "* @a\n"},
-                              modes={("x", ".github/CODEOWNERS"): mode})
-                with self.assertRaises(Refused) as caught:
-                    tr.code_owners(git, "x")
-                self.assertIn(f".github/CODEOWNERS at x is {kind}, not a file", str(caught.exception))
-        # An executable file is still a file.
-        git = FakeGit(chain=["x"], files={("x", ".github/CODEOWNERS"): "* @a\n"},
-                      modes={("x", ".github/CODEOWNERS"): "100755"})
-        self.assertEqual(tr.code_owners(git, "x"), ["a"])
-
-    def test_an_entry_that_is_not_a_file_is_a_refusal_in_a_real_repository(self):
-        # Read through the real Git: a gitlink at the path makes `git show` fail with "bad object", a symbolic link
-        # shows its target, and a directory lists its entries. None of them is a file of rules.
-        with tempfile.TemporaryDirectory() as directory:
-            sh = scratch_repository(directory)
-            path = os.path.join(directory, ".github", "CODEOWNERS")
-            os.makedirs(os.path.dirname(path))
-            git = Git(directory)
-
-            def commit(label):
-                sh("add", "-A")
-                sh("commit", "-q", "-m", label)
-                return sh("rev-parse", "HEAD")
-
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write("* @a @b\n")
-            plain = commit("file")
-            self.assertEqual(tr.code_owners(git, plain), ["a", "b"])
-
-            os.remove(path)
-            sh("update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},.github/CODEOWNERS")
-            sh("commit", "-q", "-m", "submodule")
-            submodule = sh("rev-parse", "HEAD")
-            self.assertEqual(sh("ls-tree", submodule, "--", ".github/CODEOWNERS").split()[:2], ["160000", "commit"])
-            with self.assertRaises(GitError):
-                git.show(submodule, ".github/CODEOWNERS")  # the failure Git.show reports for it
-            sh("rm", "-q", "--cached", ".github/CODEOWNERS")
-
-            os.symlink("elsewhere", path)
-            link = commit("symbolic link")
-            os.remove(path)
-            os.makedirs(path)
-            with open(os.path.join(path, "inner"), "w", encoding="utf-8") as handle:
-                handle.write("* @a\n")
-            directory_entry = commit("directory")
-
-            for label, sha, kind in (("submodule", submodule, "a submodule"), ("symbolic link", link, "a symbolic link"),
-                                     ("directory", directory_entry, "a directory")):
-                with self.subTest(label):
-                    with self.assertRaises(Refused) as caught:
-                        tr.code_owners(git, sha)
-                    self.assertIn(f".github/CODEOWNERS at {sha[:12]} is {kind}, not a file", str(caught.exception))
-
-
-    def test_a_damaged_checkout_still_raises_instead_of_reading_as_unreadable_owners(self):
-        # Git.show raises GitError for a blob the tree lists but the checkout lacks. That says the checkout is
-        # damaged, not that the file is unreadable, so it must stay an error and not become an unknown approver.
-        with tempfile.TemporaryDirectory() as directory:
-            sh = scratch_repository(directory)
-            os.makedirs(os.path.join(directory, ".github"))
-            with open(os.path.join(directory, ".github", "CODEOWNERS"), "w", encoding="utf-8") as handle:
-                handle.write("* @a\n")
-            sh("add", "-A")
-            sh("commit", "-q", "-m", "owners")
-            sha = sh("rev-parse", "HEAD")
-            blob = sh("rev-parse", f"{sha}:.github/CODEOWNERS")
-            loose = os.path.join(directory, ".git", "objects", blob[:2], blob[2:])
-            os.chmod(loose, 0o644)
-            os.remove(loose)
-            with self.assertRaises(GitError):
-                tr.code_owners(Git(directory), sha)
-
-
-class TestSweepOwners(unittest.TestCase):
-    """The owners come from the merged commit's parent, which is fixed history: no later pull request can change
-    that file. A file the strict reader cannot read must therefore never stop the sweep, or tagging would stop
-    for good. The tag says the approver is unknown instead."""
-
-    def test_a_codeowners_file_it_cannot_read_gives_an_unknown_approver_and_the_tag_is_cut(self):
-        cases = {
-            "a team owner": "* @akasecurity/maintainers\n",
-            "a path rule": "* @Vaishnav-OM @venuverse\n/docs @venuverse\n",
-            "no file": None,
-            "bytes that are not UTF-8": b"# caf\xe9 team\n* @Vaishnav-OM @venuverse\n",
-        }
-        for label, text in cases.items():
-            with self.subTest(label):
-                git = history(chain=("t8", "b"))
-                if text is None:
-                    del git.files[("t8", ".github/CODEOWNERS")]
-                else:
-                    git.files[("t8", ".github/CODEOWNERS")] = text
-                gh = sweep_github()
-                self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
-                                 ["fleet-v9 -> b (ai-tc 0.9.15)"])
-                message = gh.called("POST", R("git/tags"))[0][2]["message"]
-                # The PR is still named; nobody is named as its approver, and no bypass is claimed: venuverse
-                # approved it, and under the file as it stands nobody can say whether that counts.
-                self.assertIn("pr: 13\napprover: unknown\n", message)
-                self.assertRegex(message, r"(?m)^approver-note: code owners could not be read: "
-                                          r"\.github/CODEOWNERS at t8 \S")
-                self.assertEqual(message.count("approver-note:"), 1)
-                self.assertNotIn("bypass", message)
-                self.assertEqual(len(gh.called("POST", R("git/refs"))), 1)
-
-    def test_a_codeowners_entry_that_is_a_submodule_gives_an_unknown_approver_and_the_tag_is_cut(self):
-        # Reading it raises GitError in the checkout, not a Refused; the sweep must not stop on a parent that can
-        # never change. The commit after it is tagged with its own parent's file.
-        git = history(chain=("t8", "b", "c"))
-        git.modes[("t8", ".github/CODEOWNERS")] = "160000"
-        gh = sweep_github()
-        self.assertEqual(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW),
-                         ["fleet-v9 -> b (ai-tc 0.9.15)", "fleet-v10 -> c (ai-tc 0.9.14)"])
-        first, second = (call[2]["message"] for call in gh.called("POST", R("git/tags")))
-        self.assertIn("pr: 13\napprover: unknown\n", first)
-        self.assertRegex(first, r"(?m)^approver-note: code owners could not be read: "
-                                r"\.github/CODEOWNERS at t8 is a submodule, not a file")
-        self.assertIn("approver: none\n", second)  # c's parent (b) holds a readable file; nobody approved PR 14
-
-    def test_an_unreadable_file_marks_only_the_commits_whose_parent_holds_it(self):
-        # b's parent (t8) and d's parent (c) are readable; c's parent (b) is not. The catch that no longer refuses is
-        # what lets the sweep carry on past c; reading each commit's own parent is what gives d its real approver.
-        git = history(chain=("t8", "b", "c", "d"), times={"d": NOW - 7200})
-        git.files[("b", ".github/CODEOWNERS")] = "* @akasecurity/maintainers\n"
-        gh = sweep_github()
-        gh.routes[("GET", R("commits/d/pulls"))] = [
-            {"number": 17, "merge_commit_sha": "d", "merged_at": "2026-10-04T00:00:00Z", "base": {"ref": "main"}}]
-        gh.routes[("GET", R("pulls/17"))] = {"head": {"sha": "h17"}, "labels": [], "merged_by": {"login": "venuverse"}}
-        gh.routes[("GET", R("pulls/17/reviews"))] = [
-            {"state": "APPROVED", "commit_id": "h17", "user": {"login": "Vaishnav-OM"}}]
-        gh.routes.update(checks("h17"))
-        self.assertEqual(len(tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)), 3)
-        approvers = [re.search(r"(?m)^approver: (.*)$", call[2]["message"]).group(1)
-                     for call in gh.called("POST", R("git/tags"))]
-        self.assertEqual(approvers, ["venuverse", "unknown", "Vaishnav-OM"])
-
+class TestSweepRefusal(unittest.TestCase):
     def test_a_sweep_it_refuses_is_one_error_annotation(self):
         gh = sweep_github()
         gh.routes[("GET", R("git/ref/tags/fleet-v9"))] = {"ref": "refs/tags/fleet-v9"}
@@ -1388,22 +1150,6 @@ class TestSweepOwners(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue(out.startswith("::error::fleet-v9 already exists"), out)
         self.assertEqual(out.count("\n"), 1)
-
-    def test_a_root_commit_has_no_owners_to_read(self):
-        # Nothing precedes it, so there is no file to read and no approval to be recorded as a bypass.
-        class RootOnly(FakeGit):
-            def first_parent_after(self, base, tip):
-                return ["r"]
-
-        git = RootOnly(chain=["r"], tags=[fleet_tag(8, "t8")], files={
-            ("r", MANIFEST): manifest("0.9.15", INTEGRITY["0.9.15"]), ("r", SAFETY_FILE): safety({})})
-        gh = sweep_github()
-        gh.routes[("GET", R("commits/r/pulls"))] = [
-            {"number": 13, "merge_commit_sha": "r", "merged_at": "2026-10-02T00:00:00Z", "base": {"ref": "main"}}]
-        tr.sweep(git, gh, sleep=lambda seconds: None, now=lambda: NOW)
-        message = gh.called("POST", R("git/tags"))[0][2]["message"]
-        self.assertIn("approver: none\n", message)
-        self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
 
 
 def branch_ref(name: str, tip: str) -> dict:

@@ -61,8 +61,7 @@ class RouterCase(unittest.TestCase):
                 and ("labels" not in params or any(label["name"] == params["labels"] for label in issue["labels"]))]
 
     def router(self, escalation=None):
-        return rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=escalation,
-                         owners=["Vaishnav-OM", "venuverse"], now=NOW, run_url=RUN)
+        return rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=escalation, now=NOW, run_url=RUN)
 
 
 class TestRouter(RouterCase):
@@ -72,7 +71,7 @@ class TestRouter(RouterCase):
         self.assertEqual(sent["title"], "staleness: an unpinned release")
         self.assertEqual((sent["labels"], sent["assignees"]), (["staleness"], ["Vaishnav-OM", "venuverse"]))
         self.assertEqual(rt.read_marker(sent["body"], "rule"), "staleness-i")
-        self.assertIn("cc @Vaishnav-OM @venuverse", sent["body"])
+        self.assertNotIn("cc @", sent["body"])
         self.assertIn("npm has 0.9.15", sent["body"])
 
     def test_an_unchanged_red_rule_stays_quiet_within_a_day(self):
@@ -368,7 +367,7 @@ class TestQuoted(RouterCase):
         self.issues.append({"number": 40, "body": opened["body"], "created_at": "2026-10-01T10:00:00Z",
                             "labels": [{"name": "staleness"}], "assignees": []})
         del self.gh.calls[:]
-        later = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None, owners=["Vaishnav-OM"],
+        later = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None,
                           now=NOW + dt.timedelta(hours=1), run_url=RUN + "0")
         self.assertEqual(later.apply(red(detail=detail)), "staleness-i: #40 unchanged")
         self.assertEqual(self.gh.writes(), [])
@@ -392,8 +391,8 @@ class TestRoute(RouterCase):
 class TestFailedJobStaysQuiet(RouterCase):
     def test_a_job_that_keeps_failing_comments_once_however_many_runs_report_it(self):
         def run(number):
-            router = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None,
-                               owners=["Vaishnav-OM"], now=NOW, run_url=f"https://github.com/{REPO}/actions/runs/{number}")
+            router = rt.Router(self.gh, approvers=["Vaishnav-OM", "venuverse"], escalation=None, now=NOW,
+                               run_url=f"https://github.com/{REPO}/actions/runs/{number}")
             with mock.patch("sys.stdout", new_callable=io.StringIO):
                 return rt.route([], label="staleness", job_result="failure", router=router)
 
@@ -496,8 +495,7 @@ class TestWorkflowIssueLifetime(RouterCase):
         for job_result, ending in (("failure", "did not finish"), ("success", "reported no results")):
             with self.subTest(job_result):
                 gh = FakeGitHub({("GET", R("issues")): [], ("POST", R("issues")): {"number": 41}})
-                router = rt.Router(gh, approvers=["Vaishnav-OM"], escalation=None, owners=["Vaishnav-OM"], now=NOW,
-                                   run_url=RUN)
+                router = rt.Router(gh, approvers=["Vaishnav-OM"], escalation=None, now=NOW, run_url=RUN)
                 with mock.patch("sys.stdout", new_callable=io.StringIO):
                     rt.route(None if job_result == "success" else [], label="main-audit", job_result=job_result,
                              router=router, push="c" * 40)
@@ -525,12 +523,9 @@ class TestWorkflowIssueLifetime(RouterCase):
 class TestMain(unittest.TestCase):
     """main() end to end: the files it reads, the environment it takes, the exit code it returns."""
 
-    OWNERS = b"* @Vaishnav-OM\n"
-
-    def run_main(self, *, job_result, results_json=None, label="staleness", gh=None, extra_env=None,
-                 codeowners=OWNERS, issues=()):
-        """`codeowners` is the file's bytes, or None for no file. `gh` is a fake GitHub to use in place of the
-        default one (which holds `issues`), and `extra_env` adds to the environment. Leaves the fake GitHub and what
+    def run_main(self, *, job_result, results_json=None, label="staleness", gh=None, extra_env=None, issues=()):
+        """`gh` is a fake GitHub to use in place of the default one (which holds `issues`), and `extra_env` adds
+        to the environment. Leaves the fake GitHub and what
         main printed on self for a test that wants more than the exit code and the titles."""
         gh = gh or FakeGitHub({("GET", R("issues")): list(issues), ("POST", R("issues")): {"number": 41},
                                ("POST", R("issues/40/comments")): {"id": 1}, ("PATCH", R("issues/40")): {"number": 40}})
@@ -542,9 +537,6 @@ class TestMain(unittest.TestCase):
             os.makedirs(os.path.join(root, ".github"))
             with open(os.path.join(root, ".github", "release-approvers.json"), "w", encoding="utf-8") as handle:
                 json.dump({"approvers": ["Vaishnav-OM"], "escalation": None}, handle)
-            if codeowners is not None:
-                with open(os.path.join(root, ".github", "CODEOWNERS"), "wb") as handle:
-                    handle.write(codeowners)
             cwd = os.getcwd()
             os.chdir(root)
             try:
@@ -607,40 +599,22 @@ class TestMain(unittest.TestCase):
         self.assertEqual(self.run_main(job_result="cancelled", results_json="[]"),
                          (1, ["staleness: the evaluation job did not finish"]))
 
-    def test_the_code_owners_are_mentioned_when_the_file_reads(self):
+    def test_an_issue_mentions_nobody_beyond_its_assignees(self):
         self.run_main(job_result="success", results_json=rt.results_to_json([red()]))
-        self.assertIn("Filed by https://github.com/akasecurity/marketplace/actions/runs/9. cc @Vaishnav-OM\n",
-                      self.gh.called("POST", R("issues"))[0][2]["body"])
+        request = self.gh.called("POST", R("issues"))[0][2]
+        self.assertEqual(request["assignees"], ["Vaishnav-OM"])
+        self.assertNotIn("@", request["body"])
+        self.assertIn("Filed by https://github.com/akasecurity/marketplace/actions/runs/9.\n", request["body"])
+        self.assertNotIn("::warning::", self.printed)
 
-    def test_a_codeowners_file_that_is_missing_or_not_text_costs_only_the_mention(self):
-        # The alert is the point: a CODEOWNERS file nobody can read must not stop it being filed.
-        unreadable = {"missing": None, "not UTF-8": b"* @Vaishnav-OM \xff\xfe\n", "empty": b""}
-        for label, codeowners in unreadable.items():
-            with self.subTest(label):
-                code, titles = self.run_main(job_result="success", results_json=rt.results_to_json([red()]),
-                                             codeowners=codeowners)
-                self.assertEqual((code, titles), (1, ["staleness: an unpinned release"]))
-                body = self.gh.called("POST", R("issues"))[0][2]["body"]
-                self.assertNotIn("@", body)
-                self.assertIn("/actions/runs/9.\n", body)
-                self.assertEqual("::warning::" in self.printed, codeowners != b"")
-
-    def test_a_codeowners_file_that_cannot_be_read_still_closes_a_cleared_rules_issue(self):
-        issue = existing()
+    def test_a_cleared_rules_issue_closes_whatever_the_checkout_holds(self):
         clear = rt.results_to_json([rt.Result(rule="staleness-i", label="staleness", title="t", red=False)])
-        for label, codeowners in {"missing": None, "not UTF-8": b"\xff\xfe"}.items():
-            with self.subTest(label):
-                code, titles = self.run_main(job_result="success", results_json=clear, codeowners=codeowners,
-                                             issues=[issue])
-                self.assertEqual((code, titles), (0, []))
-                self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
+        code, titles = self.run_main(job_result="success", results_json=clear, issues=[existing()])
+        self.assertEqual((code, titles), (0, []))
+        self.assertEqual([call[2].get("state") for call in self.gh.called("PATCH", R("issues/40"))], ["closed"])
 
 
 class TestHelpers(unittest.TestCase):
-    def test_parse_codeowners_takes_the_last_star_line(self):
-        self.assertEqual(rt.parse_codeowners("# owners\n* @a @b\n/docs @c\n* @Vaishnav-OM @venuverse # all\n"),
-                         ["Vaishnav-OM", "venuverse"])
-
     def test_results_round_trip_through_json(self):
         results = [red(extra_labels=["rollback-hold"]),
                    rt.Result(rule="x", label="tag-audit", title="t", red=None, auto_close=False)]

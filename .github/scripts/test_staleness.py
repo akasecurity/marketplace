@@ -273,7 +273,7 @@ class TestRuleINoVerdict(StalenessCase):
         open_issue = {"number": 40, "created_at": "2026-10-05T01:00:00Z", "labels": [{"name": "staleness"}],
                       "assignees": [], "body": issue_router.marker("rule", "staleness-i") + "\nnpm has 0.9.16"}
         router_gh = FakeGitHub({("GET", R("issues")): [open_issue], ("POST", R("issues")): {"number": 41}})
-        router = issue_router.Router(router_gh, approvers=["venuverse"], escalation=None, owners=["venuverse"],
+        router = issue_router.Router(router_gh, approvers=["venuverse"], escalation=None,
                                      now=NOW, run_url="https://github.com/akasecurity/marketplace/actions/runs/9")
         # a pin change younger than an hour, so rule (iii) is clear and the new rule is the only one to file
         outcomes = [router.apply(item) for item in self.rules(repo(pin_change_age=dt.timedelta(minutes=30))).values()]
