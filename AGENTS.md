@@ -54,7 +54,7 @@ states it. Don't "fix" it by copying entries across.
 records that version's npm integrity in the entry's free-form `metadata.integrity` (Claude Code
 does not read it; fleet checks compare installed bytes against it). Claude Code honours the pin on
 install and in its plugin auto-update pass, so a new `@akasecurity/ai-tc-claude-code` publish
-reaches nobody through this marketplace until a pull request moves the pin (an
+reaches nobody through this marketplace until an approved pull request moves the pin (an
 org owner's break-glass merge aside, which `main-audit` reports unless that same push also changed
 the audit; see "The workflows"). That is the
 point: the pin is the audit trail, and it is what stops a fleet from advancing because a publish
@@ -70,12 +70,12 @@ field — so "change all four" does not apply to a version change.
   npm release: an exact `x.y.z`, the registry's dist, SLSA provenance whose signing certificate
   names ai-tc's release workflow at the version's own tag, and the certificate's commit on ai-tc's
   `main`. It changes the version and `metadata.integrity`, and adds the version's entry to
-  `rollback-safety.json`. Auto-merge squash-merges it once `validate` is green; the PR's
-  checklist lists checks a person can run, none of which gates the merge.
+  `rollback-safety.json`. One organisation member approves it after running the candidate in one real
+  session (the PR's checklist), and auto-merge squash-merges it once `validate` is green.
 - **A rollback** is a rollback-mode dispatch of the same workflow, with a version or a `fleet-v<N>`
   name. Its `bot/rollback-ai-tc-<from>-to-<v>` PR moves only the pin, down to a version a `fleet-v`
-  tag has pinned and not below the rollback floor that `rollback-safety.json` records;
-  auto-merge squash-merges it once `validate` is green. Never reset `main`
+  tag has pinned and not below the rollback floor that `rollback-safety.json` records; one organisation
+  member approves it, and auto-merge squash-merges it once `validate` is green. Never reset `main`
   backwards, and never restore a whole manifest from a tag: that would undo the other entries'
   edits.
 - **Nobody edits the ai-tc entry by hand.** `validate` fails any human change to it other than its
@@ -88,7 +88,7 @@ field — so "change all four" does not apply to a version change.
   a comment-only edit included. It recomputes an entry `main` already records for the
   version too, and fails one that runs up to another commit than the release's attested one or that
   is weaker than the computation (a stronger recorded class stands). A person changes an entry only
-  in a PR; `validate` calls a change toward `additive` out as lowering the
+  in a reviewed PR; `validate` calls a change toward `additive` out as lowering the
   rollback floor, and an edit that keeps the class names the fields it changes. A person may not
   add an entry for a version nothing pins.
 
@@ -141,7 +141,7 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 - **After the freeze, no `fleet-v` tag is cut by hand.** A tag on a pin change that did not come
   through the release bot's pull request stays red in `tag-audit`, and `tag-release` cuts nothing
   more, until a reviewed pull request re-freezes the list with it.
-- Managed fleets either follow `main`, which moves only through a pull request that passed `validate`
+- Managed fleets either follow `main`, which moves only through an approved pull request
   (an org owner's break-glass merge aside, which `main-audit` reports unless that same push also
   changed the audit), or register this marketplace at a `fleet-v<N>` tag, which never moves; a
   fleet on a tag moves only when its own configuration names a later one. A tag is also the only
@@ -163,16 +163,16 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 
 ## Workflow
 
-Every change reaches `main` through a pull request. The `main` ruleset requires the `validate`
-check to pass and requires no approving review: a pull request from the release bot merges itself
-once `validate` is green, and any other pull request merges on that check alone. `.github/CODEOWNERS`
-still names the code owners, which `tag-release` reads to name a tag's approver when one reviewed
-the PR. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
-audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
+Every change reaches `main` through a pull request, and the `main` ruleset requires one approving
+review from someone other than the PR's last pusher, and the `validate` check to pass. Any
+organisation member's approval counts, so a member's own PR needs another member. Code owners are
+not part of the rule: `.github/CODEOWNERS` grants no review right (the audit accepts the
+code-owner review setting either way), and only `tag-release`, to name a tag's approver, and the
+issue routing, to mention people, still read it. Merges are squash merges only: the `main` ruleset
+allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
-missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`,
-its merge methods and its required `validate` check), and `tag-release` creates no tag meanwhile.
-The approval settings are not audited: `main` may require approving reviews or none.
+missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
+settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
 
 The audit cannot see who may bypass a ruleset: GitHub returns a ruleset's bypass list only to a
 caller who can edit it, and the workflows' read-only tokens get nothing. So an organisation owner
@@ -188,9 +188,8 @@ Keep `.github/CODEOWNERS` as one `*` line naming users:
 `tag-release` reads it strictly, at a commit's parent, and can match a reviewer's
 login only to a user, so a team, an email address, a path rule, a second rule, an entry that is
 not a file or a file that is not UTF-8 text is not read. A PR merged on top of such a file gets
-`approver: unknown` in its tag, if it moved the pin, rather than a guess; once a commit is
-merged, the file at its parent can no longer change. The unit tests run on every pull request, one
-that changes only the file included, and fail one the reader cannot read.
+`approver: unknown` in its tag, if it moved the pin, rather than a guess; once a commit is merged, the file at its parent can no longer change. The unit tests run on
+every pull request, one that changes only the file included, and fail one the reader cannot read.
 Before pushing, validate the JSON and run the scripts' tests:
 
 ```bash
@@ -267,7 +266,7 @@ true only once it is.
 - **`validate`** (`pull_request_target`, required) checks every PR with `main`'s copy of its
   script, reading the PR's files as data: since 8 December 2025 GitHub takes a
   `pull_request_target` workflow from the default branch whatever the PR's base, so a PR into
-  another branch is judged against `main` too. A reader confirms the check run is
+  another branch is judged against `main` too. An approver confirms the check run is
   `validate.yml`'s run from `main`, and trusts its summary over the PR body. A check that cannot
   finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
   rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text and
@@ -282,8 +281,8 @@ true only once it is.
   anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
   that declares no permissions and so takes the repository's default token; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
-  PR's own run. No review is required, so a workflow change merges on this check alone; a
-  reviewer, where a PR gets one, is the further control for what its own diff carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
+  PR's own run. Review of workflow changes by an organisation member stays the control for what a PR's own diff
+  carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
   outside with some other token are not in that diff, so the check after the merge is what catches
   those, and it is the detection for the rest too: `tag-release`'s note and `main-audit` count only
   a `validate` check run that belongs to a `pull_request_target` run of `validate.yml`. That check
@@ -292,8 +291,8 @@ true only once it is.
   known limit). On a bot PR every commit must also carry GitHub's verified signature. The summary's
   `Main read at` row names the `main` commit whose pins and rollback floor it read, and every
   free-text value taken from the PR appears in it inside a code span. `validate` does not run again
-  when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, the
-  PR's checklist says to re-run the check before the PR merges.
+  when `main` moves, so if `rollback-safety.json` changed on `main` after a rollback PR's run, its
+  approver re-runs the check before approving (the PR's checklist says so).
 - **`tag-release`** (every push to `main`, and by manual dispatch to re-run a sweep) runs
   `tag-audit`'s ledger, ruleset and environment checks (not its comparison with the last green
   run's snapshot of the tags) and stops, red and creating nothing, while any of them fails. That
@@ -361,13 +360,20 @@ true only once it is.
   90 days, and dispatch `tag-audit` once after turning it on so a baseline exists before
   `tag-release` cuts the first tag after the frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
-  added that is not the merge of a PR whose final head has a passing `validate` check from GitHub
-  Actions (its latest run decides, and only a run of `validate.yml` that `pull_request_target`
-  started at or before the PR merged counts, the same rule `tag-release` applies, so a green re-run
-  after the merge clears nothing). Whether anyone reviewed the PR is not audited. The branch commits
-  a merge-commit merge brings in are not on that line and are not checked, and a rebase merge puts
-  every rebased commit on it, so each but the last is reported, worded as probably part of a rebase
-  merge of the pull request GitHub links it to, which is why merges are squash-only. A push
+  added that is not the merge of a PR with an organisation member's approval of its final head, from
+  someone other than the head's last pusher and not since withdrawn, and a passing `validate` check
+  from GitHub Actions on that head (its latest run decides, and only a run of `validate.yml` that
+  `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
+  applies, so a green re-run after the merge clears nothing). A review is a member's when GitHub
+  marks its author `OWNER` or `MEMBER` (`author_association`); a collaborator or contributor outside
+  the organisation does not count. The branch commits a merge-commit
+  merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
+  commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
+  pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
+  or committer of the head commit (`web-flow` aside): the audit does not use GitHub's activity API,
+  which does record pushers, because what it records for a push made by the App or by auto-merge is
+  unverified, and a head that names neither is reported, since an approval could then be the
+  pusher's own. A push
   that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for

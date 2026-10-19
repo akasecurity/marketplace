@@ -465,13 +465,7 @@ class TestOtherRules(StalenessCase):
         self.assertIn("#30", rule.detail)
         self.assertNotIn("#31", rule.detail)
         self.assertNotIn("#32", rule.detail)
-
-    def test_rule_ii_explains_a_stuck_bot_pr_without_an_approval(self):
-        self.pulls += [pull(30, "bot/pin-ai-tc-0.9.16", created_at=stamp(dt.timedelta(hours=25)))]
-        detail = self.rules()["staleness-ii"].detail
-        self.assertNotIn("approval", detail)
-        self.assertIn("A bot PR merges itself once `validate` is green, so one open this long has a failing "
-                      "`validate` or auto-merge off; a rollback PR waiting this long is an incident.", detail)
+        self.assertIn("One approval from an organisation member merges a bot PR;", rule.detail)
 
     def test_rule_ii_counts_only_prs_the_release_bot_opened(self):
         old = stamp(dt.timedelta(hours=30))

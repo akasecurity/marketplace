@@ -307,21 +307,37 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return pull_association(gh, sha, sleep)[0]
 
 
-def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
-    """The code owners whose latest review that takes a position approves `head`, the one who approved
-    last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review decides (a comment
-    or a pending review changes nothing, and `reviews` is in the API's chronological order), so an approval
-    its owner later withdrew, or that was dismissed, does not count. `exclude` names reviewers whose
-    approval is not allowed to count, such as the last pusher."""
+ORG_ASSOCIATIONS = ("OWNER", "MEMBER")
+
+
+def latest_positions(reviews) -> dict[str, dict]:
+    """Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review, the one who took a position last
+    at the end. A comment or a pending review changes nothing, and `reviews` is in the API's chronological
+    order, so an approval its author later withdrew, or that was dismissed, is no longer the latest."""
     latest: dict[str, dict] = {}
     for review in reviews:
         login = (review.get("user") or {}).get("login")
         if login and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             latest.pop(login, None)
             latest[login] = review
-    return [login for login, review in latest.items()
+    return latest
+
+
+def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
+    """The code owners whose latest position approves `head`. `exclude` names reviewers whose approval is not
+    allowed to count, such as the last pusher."""
+    return [login for login, review in latest_positions(reviews).items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
             and login in owners and login not in exclude]
+
+
+def org_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The organisation members whose latest position approves `head`: the review's author_association is
+    OWNER or MEMBER, which GitHub sets from the reviewer's membership of the repository's organisation.
+    `exclude` names reviewers whose approval is not allowed to count, such as the last pusher."""
+    return [login for login, review in latest_positions(reviews).items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and review.get("author_association") in ORG_ASSOCIATIONS and login not in exclude]
 
 
 def timestamp(text) -> datetime | None:

@@ -8,8 +8,8 @@ name: validate
 # stacked one) is therefore judged against main. The PR's files are read as data
 # (git show <head sha>:<path>); nothing from the head is executed.
 #
-# It is a correctness check on the automated path, not a security boundary, and the main
-# ruleset requires no approving review.
+# It is a correctness check on the automated path, not a security boundary: review of
+# every change by an organisation member is the control.
 #
 # There is one job, named exactly "validate", with no job-level if, no needs, and no path
 # or branch filter. A skipped job reports success, and a filtered-out required check
