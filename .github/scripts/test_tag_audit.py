@@ -28,8 +28,8 @@ def ruleset(number, name, target, include, rules, exclude=()):
 
 
 def good_rulesets():
-    review = {"required_approving_review_count": 0, "require_code_owner_review": False,
-              "dismiss_stale_reviews_on_push": False, "require_last_push_approval": False,
+    review = {"required_approving_review_count": 1, "require_code_owner_review": True,
+              "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
               "required_review_thread_resolution": False, "allowed_merge_methods": ["squash"]}
     checks = {"strict_required_status_checks_policy": False,
               "required_status_checks": [{"context": "validate", "integration_id": 15368}]}
@@ -117,8 +117,8 @@ class TestRulesets(unittest.TestCase):
         sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = ["merge", "squash"]
         sets[1]["rules"][3]["parameters"]["required_status_checks"] = [{"context": "validate"}]
         problems = ta.check_rulesets(github(sets))
-        self.assertIn("ruleset 'main': pull_request allowed_merge_methods is ['merge', 'squash'], expected ['squash']", problems)
-        self.assertIn("ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing", problems)
+        self.assertIn("ruleset 'main': allowed_merge_methods is ['merge', 'squash'], not ['squash']", problems)
+        self.assertIn("ruleset 'main' does not require the validate check from the GitHub Actions app", problems)
 
     def test_a_leftover_probe_pattern_is_named(self):
         sets = good_rulesets()
@@ -166,22 +166,24 @@ class TestRulesets(unittest.TestCase):
                                  [f"ruleset 'fleet-tags-immutable': its update rule's parameters are {parameters!r}, "
                                   "not an object"])
 
-    def test_main_may_require_approving_reviews_or_none(self):
-        # Merging this change and flipping the ruleset can happen in either order without the audit going red.
-        for count, flag in ((0, False), (1, True), (2, True)):
-            with self.subTest(count=count):
-                sets = good_rulesets()
-                review = sets[1]["rules"][2]["parameters"]
-                review["required_approving_review_count"] = count
-                for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
-                    review[key] = flag
-                self.assertEqual(ta.check_rulesets(github(sets)), [])
-
-    def test_main_merge_methods_are_compared_with_their_type(self):
+    def test_main_review_settings_are_compared_with_their_type(self):
         sets = good_rulesets()
-        sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = "squash"
+        review = sets[1]["rules"][2]["parameters"]
+        review["required_approving_review_count"] = True
+        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+            review[key] = 1
         self.assertEqual(ta.check_rulesets(github(sets)), [
-            "ruleset 'main': pull_request allowed_merge_methods is 'squash', expected ['squash']"])
+            "ruleset 'main': required_approving_review_count is True, not at least 1",
+            "ruleset 'main': dismiss_stale_reviews_on_push is 1, not True",
+            "ruleset 'main': require_last_push_approval is 1, not True",
+            "ruleset 'main': require_code_owner_review is 1, not a boolean"])
+
+    def test_main_may_or_may_not_require_a_code_owner(self):
+        for flag in (True, False):
+            with self.subTest(flag=flag):
+                sets = good_rulesets()
+                sets[1]["rules"][2]["parameters"]["require_code_owner_review"] = flag
+                self.assertEqual(ta.check_rulesets(github(sets)), [])
 
     def test_a_rule_whose_parameters_are_not_an_object_is_named_and_does_not_crash(self):
         for parameters in (["x"], "x"):
@@ -198,7 +200,7 @@ class TestRulesets(unittest.TestCase):
                 sets = good_rulesets()
                 sets[1]["rules"][2]["parameters"]["allowed_merge_methods"] = methods
                 self.assertEqual(ta.check_rulesets(github(sets)),
-                                 [f"ruleset 'main': pull_request allowed_merge_methods is {methods!r}, expected ['squash']"])
+                                 [f"ruleset 'main': allowed_merge_methods is {methods!r}, not ['squash']"])
 
     def test_rules_that_are_not_a_list_of_objects_are_named_and_do_not_crash(self):
         sets = good_rulesets()
@@ -218,7 +220,7 @@ class TestRulesets(unittest.TestCase):
                 sets = good_rulesets()
                 sets[1]["rules"][3]["parameters"]["required_status_checks"] = checks
                 self.assertEqual(ta.check_rulesets(github(sets)),
-                                 ["ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing"])
+                                 ["ruleset 'main' does not require the validate check from the GitHub Actions app"])
 
     def test_unreadable_conditions_are_named(self):
         sets = good_rulesets()

@@ -1,7 +1,8 @@
 name: main-audit
 
 # On every push to main: red unless every commit the push added to main's
-# first-parent line is the merge commit of a PR whose final head has a passing
+# first-parent line is the merge commit of a PR whose final head has an
+# approving review from an organisation member other than its last pusher, and a passing
 # validate check from GitHub Actions (AGENTS.md, "The workflows"): only a run of
 # validate.yml that pull_request_target started, at or before the PR merged, counts.
 # The branch commits a merge-commit merge brings in are not on that line and are not
@@ -65,7 +66,7 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - name: open an issue for each commit that reached main without a validated PR
+      - name: open an issue for each commit that reached main unapproved or unvalidated
         env:
           GH_TOKEN: ${{ github.token }}
           RESULTS_JSON: ${{ needs.audit.outputs.results }}

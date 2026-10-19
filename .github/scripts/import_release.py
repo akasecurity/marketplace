@@ -293,7 +293,7 @@ def pr_body(plan: dict, run_url: str) -> str:
         if plan.get("reimport"):
             lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
                       "`fleet-v` tag or a merged release-bot pull request has pinned, or a code owner closed an "
-                      "earlier PR for it. Re-import only once the reason it was rolled back or rejected is resolved."]
+                      "earlier PR for it. Approve only once the reason it was rolled back or rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
@@ -312,14 +312,14 @@ def pr_body(plan: dict, run_url: str) -> str:
                      "session. Auto-merge is off on any open forward pin PR until this resolves.")
     lines += [
         "",
-        "**Release checklist:**",
+        "**Approver checklist:**",
         "",
         "- [ ] Open the `validate` check run and confirm it is `validate.yml`'s run from `main` "
         "(event `pull_request_target`); read its summary.",
         # validate read the rollback floor from main when it ran, so a reviewed edit to rollback-safety.json
         # that reached main since is not in its verdict.
         *(["- [ ] If `rollback-safety.json` changed on `main` after `validate` ran (compare the `Main read at` "
-           "row of its summary with `main`'s head), re-run `validate` before it merges."]
+           "row of its summary with `main`'s head), re-run `validate` before approving."]
           if plan["mode"] == "rollback" else []),
         "- [ ] Open the ai-tc release run above and confirm its hook fail-open smoke tests passed.",
         f"- [ ] Run `{version}` in one real session on a machine or VM without AKA's managed settings, with a "
@@ -327,9 +327,10 @@ def pr_body(plan: dict, run_url: str) -> str:
         f"`claude plugin marketplace add akasecurity/marketplace#{branch}`, then "
         "`claude plugin install ai-tc@akasecurity`; send one clean prompt and one that must block; check "
         f"that hooks fire, the store records both, and `claude plugin list` shows `{version}`.",
-        "- [ ] If this is a drill, add the `drill` label before it merges.",
+        f"- [ ] Note `{version}` in your approval.",
+        "- [ ] If this is a drill, add the `drill` label before approving.",
         "",
-        "None of this gates the merge: auto-merge squash-merges this PR once `validate` is green, and "
+        "Approving is the only per-release act: auto-merge squash-merges this PR once `validate` is green, and "
         "tag-release then creates the next `fleet-v<N>` tag at the squash commit.",
     ]
     return "\n".join(lines) + "\n"
@@ -671,7 +672,7 @@ def hold_forward(gh: GitHub, number: int, kind: str = "rollback") -> list[int]:
                           f"PR #{number} is open; turn it off by hand")
         comment(gh, other["number"], f"Auto-merge is off: {kind} PR #{number} is open. If it merges, this PR "
                 "conflicts: close it and dispatch import-plugin-release with this version as `target` and "
-                "`reimport: true` to reopen it on the new `main`.")
+                "`reimport: true` to reopen it on the new `main` (it then needs a fresh approval).")
         held.append(other["number"])
     return held
 
@@ -713,8 +714,8 @@ def after_forward(gh: GitHub, plan: dict, pr: dict) -> str:
 
 
 def after_rollback(gh: GitHub, plan: dict, pr: dict) -> str:
-    # Hold the forward pin PRs first: if enabling auto-merge here then fails (red), no forward
-    # PR can still auto-merge past the open rollback.
+    # Hold the forward pin PRs first: if enabling auto-merge here then fails (red), no approved
+    # forward PR can still auto-merge past the open rollback.
     held = hold_forward(gh, pr["number"])
     enable_auto_merge(gh, pr)
     closed = close_other_rollbacks(gh, pr["number"], plan["branch"])
