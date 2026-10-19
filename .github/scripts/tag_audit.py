@@ -127,7 +127,7 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
 def main_problems(rules: list[dict]) -> list[str]:
     # Unreadable parameters were named by ruleset_problems; here they read as empty.
     by_type = {rule.get("type"): rule_parameters("main", rule, []) or {} for rule in rules}
-    return release_checks._main_ruleset_problems(by_type)
+    return release_checks.main_ruleset_problems(by_type)
 
 
 def check_rulesets(gh: GitHub) -> list[str]:

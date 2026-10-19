@@ -54,7 +54,7 @@ states it. Don't "fix" it by copying entries across.
 records that version's npm integrity in the entry's free-form `metadata.integrity` (Claude Code
 does not read it; fleet checks compare installed bytes against it). Claude Code honours the pin on
 install and in its plugin auto-update pass, so a new `@akasecurity/ai-tc-claude-code` publish
-reaches nobody through this marketplace until an approved pull request moves the pin (an
+reaches nobody through this marketplace until a code-owner-approved pull request moves the pin (an
 org owner's break-glass merge aside, which `main-audit` reports unless that same push also changed
 the audit; see "The workflows"). That is the
 point: the pin is the audit trail, and it is what stops a fleet from advancing because a publish
@@ -70,12 +70,12 @@ field — so "change all four" does not apply to a version change.
   npm release: an exact `x.y.z`, the registry's dist, SLSA provenance whose signing certificate
   names ai-tc's release workflow at the version's own tag, and the certificate's commit on ai-tc's
   `main`. It changes the version and `metadata.integrity`, and adds the version's entry to
-  `rollback-safety.json`. One organisation member approves it after running the candidate in one real
+  `rollback-safety.json`. One code owner approves it after running the candidate in one real
   session (the PR's checklist), and auto-merge squash-merges it once `validate` is green.
 - **A rollback** is a rollback-mode dispatch of the same workflow, with a version or a `fleet-v<N>`
   name. Its `bot/rollback-ai-tc-<from>-to-<v>` PR moves only the pin, down to a version a `fleet-v`
-  tag has pinned and not below the rollback floor that `rollback-safety.json` records; one organisation
-  member approves it, and auto-merge squash-merges it once `validate` is green. Never reset `main`
+  tag has pinned and not below the rollback floor that `rollback-safety.json` records; one code
+  owner approves it, and auto-merge squash-merges it once `validate` is green. Never reset `main`
   backwards, and never restore a whole manifest from a tag: that would undo the other entries'
   edits.
 - **Nobody edits the ai-tc entry by hand.** `validate` fails any human change to it other than its
@@ -88,7 +88,7 @@ field — so "change all four" does not apply to a version change.
   a comment-only edit included. It recomputes an entry `main` already records for the
   version too, and fails one that runs up to another commit than the release's attested one or that
   is weaker than the computation (a stronger recorded class stands). A person changes an entry only
-  in a reviewed PR; `validate` calls a change toward `additive` out as lowering the
+  in a code-owner-reviewed PR; `validate` calls a change toward `additive` out as lowering the
   rollback floor, and an edit that keeps the class names the fields it changes. A person may not
   add an entry for a version nothing pins.
 
@@ -141,7 +141,7 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 - **After the freeze, no `fleet-v` tag is cut by hand.** A tag on a pin change that did not come
   through the release bot's pull request stays red in `tag-audit`, and `tag-release` cuts nothing
   more, until a reviewed pull request re-freezes the list with it.
-- Managed fleets either follow `main`, which moves only through an approved pull request
+- Managed fleets either follow `main`, which moves only through a code-owner-approved pull request
   (an org owner's break-glass merge aside, which `main-audit` reports unless that same push also
   changed the audit), or register this marketplace at a `fleet-v<N>` tag, which never moves; a
   fleet on a tag moves only when its own configuration names a later one. A tag is also the only
@@ -163,13 +163,11 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 
 ## Workflow
 
-Every change reaches `main` through a pull request, and the `main` ruleset requires one approving
-review from someone other than the PR's last pusher, and the `validate` check to pass. Any
-organisation member's approval counts, so a member's own PR needs another member. Code owners are
-not part of the rule: `.github/CODEOWNERS` grants no review right (the audit accepts the
-code-owner review setting either way), and only `tag-release`, to name a tag's approver, and the
-issue routing, to mention people, still read it. Merges are squash merges only: the `main` ruleset
-allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
+Every change reaches `main` through a pull request. `.github/CODEOWNERS` names the code owners of
+every file, and the `main` ruleset requires one of them to approve (someone other than the PR's
+last pusher) and the `validate` check to pass, so a code owner's own PR needs the other code
+owner. Merges are squash merges only: the `main` ruleset allows no other method, and `main-audit`
+audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
 missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
 settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
@@ -281,7 +279,7 @@ true only once it is.
   anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
   that declares no permissions and so takes the repository's default token; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
-  PR's own run. Review of workflow changes by an organisation member stays the control for what a PR's own diff
+  PR's own run. Code-owner review of workflow changes stays the control for what a PR's own diff
   carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
   outside with some other token are not in that diff, so the check after the merge is what catches
   those, and it is the detection for the rest too: `tag-release`'s note and `main-audit` count only
@@ -360,13 +358,15 @@ true only once it is.
   90 days, and dispatch `tag-audit` once after turning it on so a baseline exists before
   `tag-release` cuts the first tag after the frozen list; `tag-release` asks for no comparison.
 - **`main-audit`** (every push to `main`) opens an issue for each first-parent commit the push
-  added that is not the merge of a PR with an organisation member's approval of its final head, from
-  someone other than the head's last pusher and not since withdrawn, and a passing `validate` check
-  from GitHub Actions on that head (its latest run decides, and only a run of `validate.yml` that
-  `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
-  applies, so a green re-run after the merge clears nothing). A review is a member's when GitHub
-  marks its author `OWNER` or `MEMBER` (`author_association`); a collaborator or contributor outside
-  the organisation does not count. The branch commits a merge-commit
+  added that is not the merge of a PR with an approval of its final head from someone with write
+  access, who is not the head's last pusher and has not since withdrawn it, and a passing `validate`
+  check from GitHub Actions on that head (its latest run decides, and only a run of `validate.yml`
+  that `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
+  applies, so a green re-run after the merge clears nothing). A reviewer has write access when GitHub
+  says the review's author can push to the repository (`authorCanPushToRepository`), the access the
+  ruleset counts; `author_association` is not used, because GitHub fills it in per viewer and a token
+  that cannot see a private member's organisation membership is told `CONTRIBUTOR` for them. The branch
+  commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
   pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author

@@ -238,7 +238,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
-            "the approving reviewer owns this classification",
+            "the approving code owner owns this classification",
             report.notes,
         )
 
@@ -249,7 +249,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "HUMAN EDIT of rollback-safety.json 0.9.13: additive -> not-rollback-safe; "
-            "the approving reviewer owns this classification",
+            "the approving code owner owns this classification",
             report.notes,
         )
         self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
@@ -272,7 +272,7 @@ class TestHumanRules(unittest.TestCase):
                 self.assertEqual((report.exit_code, report.failures), (0, []))
                 self.assertIn(
                     f"HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> not-rollback-safe "
-                    f"(class unchanged; changes {fields}); the approving reviewer owns this classification",
+                    f"(class unchanged; changes {fields}); the approving code owner owns this classification",
                     report.notes,
                 )
 
@@ -281,7 +281,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive "
-            "(also changes migrations); the approving reviewer owns this classification",
+            "(also changes migrations); the approving code owner owns this classification",
             report.notes,
         )
 

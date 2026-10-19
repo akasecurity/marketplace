@@ -90,7 +90,7 @@ def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=B
         ("GET", R(f"pulls/{number}")): {"head": {"sha": head}},
         ("GET", R(f"commits/{head}")): {"author": {"login": author}, "committer": {"login": committer}},
         ("GET", R(f"pulls/{number}/reviews")): reviews if reviews is not None else [
-            {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}, "author_association": "MEMBER"}],
+            {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}, "can_push": True}],
         ("GET", R(f"commits/{head}/check-runs")): {"total_count": len(runs), "check_runs": runs},
     }
 
@@ -311,37 +311,32 @@ class TestMainAudit(unittest.TestCase):
                               results[0].detail)
                 self.assertNotIn("rebase", results[0].detail)
 
-    def test_an_approval_from_a_member_who_is_not_a_code_owner_counts(self):
-        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"},
-                    "author_association": "MEMBER"}]
-        self.assertEqual(self.audit(github(reviews=reviews)), [])
-        reviews[0]["author_association"] = "OWNER"
+    def test_an_approval_from_someone_who_can_push_counts_whoever_else_they_are(self):
+        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}, "can_push": True}]
         self.assertEqual(self.audit(github(reviews=reviews)), [])
 
-    def test_an_approval_from_outside_the_organisation_does_not_count(self):
-        for association in ("COLLABORATOR", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", None):
+    def test_a_private_member_counts_whatever_association_the_token_is_shown(self):
+        # GitHub reports author_association per viewer: a token that cannot see a private member's membership is told
+        # CONTRIBUTOR. What counts is whether the reviewer can push, which does not depend on who is asking.
+        for association in ("MEMBER", "CONTRIBUTOR", "NONE", None):
             with self.subTest(association=association):
-                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"}}
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"}, "can_push": True}
                 if association is not None:
                     review["author_association"] = association
+                self.assertEqual(self.audit(github(reviews=[review])), [])
+
+    def test_an_approval_from_someone_who_cannot_push_does_not_count(self):
+        for can_push in (False, None):
+            with self.subTest(can_push=can_push):
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"},
+                          "can_push": can_push, "author_association": "MEMBER"}
                 results = self.audit(github(reviews=[review]))
                 self.assertEqual(len(results), 1)
-                self.assertIn("without an approving review from an organisation member", results[0].detail)
-
-    def test_the_audit_does_not_read_codeowners(self):
-        # An approver is an organisation member, not a name in a file, so an unreadable or absent CODEOWNERS
-        # costs the audit nothing.
-        for label, git in (("no file", FakeGit(chain=["p", "s1", "s2"])),
-                           ("a team", FakeGit(chain=["p", "s1", "s2"], files={
-                               ("p", ".github/CODEOWNERS"): "* @akasecurity/maintainers\n"})),
-                           ("bytes that are not UTF-8", FakeGit(chain=["p", "s1", "s2"], files={
-                               ("p", ".github/CODEOWNERS"): b"# caf\xe9 team\n"}))):
-            with self.subTest(label):
-                self.assertEqual(self.audit(github(), git), [])
+                self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def test_an_approval_on_a_stale_head_does_not_count(self):
         results = self.audit(github(reviews=[{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]))
-        self.assertIn("without an approving review from an organisation member", results[0].detail)
+        self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def test_an_approval_from_the_last_pusher_does_not_count(self):
         results = self.audit(github(author="venuverse", committer="web-flow"))
@@ -514,12 +509,12 @@ class TestMainAudit(unittest.TestCase):
         reviews = [{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]
         results = self.audit(github(reviews=reviews, runs=[]))
         self.assertEqual(len(results), 1)
-        self.assertIn("without an approving review from an organisation member", results[0].detail)
+        self.assertIn("without an approving review from someone with write access", results[0].detail)
         self.assertIn("without a passing `validate` check", results[0].detail)
 
     def test_an_approval_the_owner_later_withdrew_does_not_count(self):
         def review(state, login="venuverse", commit="h30"):
-            return {"state": state, "commit_id": commit, "user": {"login": login}, "author_association": "MEMBER"}
+            return {"state": state, "commit_id": commit, "user": {"login": login}, "can_push": True}
 
         for label, reviews, expected in (
                 ("changes requested after the approval", [review("APPROVED"), review("CHANGES_REQUESTED")], 1),
@@ -535,7 +530,7 @@ class TestMainAudit(unittest.TestCase):
                 results = self.audit(github(reviews=reviews))
                 self.assertEqual(len(results), expected)
                 if expected:
-                    self.assertIn("without an approving review from an organisation member", results[0].detail)
+                    self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def run_main(self, gh):
         env = {"AFTER": "s1", "BEFORE": "p", "GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
