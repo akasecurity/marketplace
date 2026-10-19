@@ -1,4 +1,4 @@
-"""Tests for main_audit.py: every first-parent commit a push adds must be a code-owner-approved PR merge that passed validate."""
+"""Tests for main_audit.py: every first-parent commit a push adds must be an organisation-member-approved PR merge that passed validate."""
 import contextlib
 import io
 import os
@@ -10,7 +10,7 @@ import _testsupport as ts
 import issue_router as rt
 import main_audit as ma
 import tag_release as tr
-from fakes import BOT, CODEOWNERS, REPO, FakeGit, FakeGitHub
+from fakes import BOT, REPO, FakeGit, FakeGitHub
 from ghapi import GitHubError
 from gitrepo import Git
 from release_checks import GITHUB_ACTIONS_APP_ID
@@ -21,7 +21,7 @@ def R(suffix):
 
 
 def repo() -> FakeGit:
-    return FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
+    return FakeGit(chain=["p", "s1", "s2"])
 
 
 @contextlib.contextmanager
@@ -90,7 +90,7 @@ def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=B
         ("GET", R(f"pulls/{number}")): {"head": {"sha": head}},
         ("GET", R(f"commits/{head}")): {"author": {"login": author}, "committer": {"login": committer}},
         ("GET", R(f"pulls/{number}/reviews")): reviews if reviews is not None else [
-            {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}}],
+            {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}, "can_push": True}],
         ("GET", R(f"commits/{head}/check-runs")): {"total_count": len(runs), "check_runs": runs},
     }
 
@@ -141,7 +141,7 @@ class TestMainAudit(unittest.TestCase):
         self.assertIn("only the new tip was audited", results[0].detail)
 
     def test_a_failure_part_way_keeps_what_was_found_and_is_recorded_against_the_push(self):
-        git = FakeGit(chain=["p", "s1", "s2"], files={(sha, ".github/CODEOWNERS"): CODEOWNERS for sha in ("p", "s1", "s2")})
+        git = repo()
         gh = FakeGitHub({("GET", R("commits/s1/pulls")): [],
                          ("GET", R("commits/s2/pulls")): GitHubError(502, "GET", "commits/s2/pulls", "bad gateway\nretry")})
         results = ma.audit(git, gh, "p", "s2", sleep=lambda seconds: None)
@@ -191,7 +191,7 @@ class TestMainAudit(unittest.TestCase):
         # A pull request merged with a merge commit puts the branch's own commits into the push too. They are
         # not on main's first-parent line and have no pull request of their own, so they are not audited.
         with scratch_repo() as (root, sh, commit):
-            base = commit(".github/CODEOWNERS", CODEOWNERS)
+            base = commit("base")
             sh("switch", "-q", "-c", "feature")
             first, second = commit("one", "1"), commit("two", "2")
             sh("switch", "-q", "main")
@@ -210,7 +210,7 @@ class TestMainAudit(unittest.TestCase):
         # the pull request's merge commit. Each earlier one is on the first-parent line with no pull request of its
         # own, so it is reported; the last is audited as the merge, and passes.
         with scratch_repo() as (root, sh, commit):
-            commit(".github/CODEOWNERS", CODEOWNERS)
+            commit("base")
             sh("switch", "-q", "-c", "feature")
             first_branch, second_branch = commit("one", "1"), commit("two", "2")
             sh("switch", "-q", "main")
@@ -235,7 +235,7 @@ class TestMainAudit(unittest.TestCase):
 
     def test_a_rewrite_audits_every_first_parent_commit_after_the_merge_base(self):
         with scratch_repo() as (root, sh, commit):
-            commit(".github/CODEOWNERS", CODEOWNERS)
+            commit("base")
             base = commit("a")
             old_tip = commit("b")
             sh("branch", "old", old_tip)  # the old tip is still in the checkout, so the merge base can be found
@@ -258,7 +258,7 @@ class TestMainAudit(unittest.TestCase):
 
     def test_a_rewrite_with_no_shared_history_audits_the_new_tip_only(self):
         with scratch_repo() as (root, sh, commit):
-            commit(".github/CODEOWNERS", CODEOWNERS)
+            commit("base")
             tip = commit("b")
             sh("switch", "-q", "--orphan", "other")
             unrelated = commit("x")
@@ -269,14 +269,6 @@ class TestMainAudit(unittest.TestCase):
                          [f"main-audit-rewrite-{tip[:12]}", f"main-audit-{tip[:12]}", "main-audit"])
         self.assertIn("share no history", results[0].detail)
         self.assertIn("only the new tip was audited", results[0].detail)
-
-    def test_the_owners_are_read_at_the_commits_parent_not_the_commit_itself(self):
-        # The PR's own tree makes its approver an owner; the parent's tree does not.
-        git = FakeGit(chain=["p", "s1", "s2"], files={
-            ("p", ".github/CODEOWNERS"): CODEOWNERS,
-            ("s1", ".github/CODEOWNERS"): "* @Vaishnav-OM @venuverse @writer-example\n"})
-        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}}]
-        self.assertEqual(len(self.audit(github(reviews=reviews), git)), 1)
 
     def test_a_direct_push_is_red_and_waits_for_a_person_to_close_it(self):
         results = self.audit(github(pulls=[]))
@@ -319,9 +311,41 @@ class TestMainAudit(unittest.TestCase):
                               results[0].detail)
                 self.assertNotIn("rebase", results[0].detail)
 
+    def test_an_approval_from_someone_who_can_push_counts_whoever_else_they_are(self):
+        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}, "can_push": True}]
+        self.assertEqual(self.audit(github(reviews=reviews)), [])
+
+    def test_a_private_member_counts_whatever_association_the_token_is_shown(self):
+        # GitHub reports author_association per viewer: a token that cannot see a private member's membership is told
+        # CONTRIBUTOR. What counts is whether the reviewer can push, which does not depend on who is asking.
+        for association in ("MEMBER", "CONTRIBUTOR", "NONE", None):
+            with self.subTest(association=association):
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"}, "can_push": True}
+                if association is not None:
+                    review["author_association"] = association
+                self.assertEqual(self.audit(github(reviews=[review])), [])
+
+    def test_an_approval_from_a_github_app_does_not_count_though_github_says_it_can_push(self):
+        for login in ("renovate-approve", "github-actions", "aka-marketplace-bot"):
+            with self.subTest(login):
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": login}, "can_push": True,
+                          "author_type": "Bot"}
+                results = self.audit(github(reviews=[review]))
+                self.assertEqual(len(results), 1)
+                self.assertIn("without an approving review from someone with write access", results[0].detail)
+
+    def test_an_approval_from_someone_who_cannot_push_does_not_count(self):
+        for can_push in (False, None):
+            with self.subTest(can_push=can_push):
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "venuverse"},
+                          "can_push": can_push, "author_association": "MEMBER"}
+                results = self.audit(github(reviews=[review]))
+                self.assertEqual(len(results), 1)
+                self.assertIn("without an approving review from someone with write access", results[0].detail)
+
     def test_an_approval_on_a_stale_head_does_not_count(self):
         results = self.audit(github(reviews=[{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]))
-        self.assertIn("without an approving review from a code owner", results[0].detail)
+        self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def test_an_approval_from_the_last_pusher_does_not_count(self):
         results = self.audit(github(author="venuverse", committer="web-flow"))
@@ -494,12 +518,12 @@ class TestMainAudit(unittest.TestCase):
         reviews = [{"state": "APPROVED", "commit_id": "old", "user": {"login": "venuverse"}}]
         results = self.audit(github(reviews=reviews, runs=[]))
         self.assertEqual(len(results), 1)
-        self.assertIn("without an approving review from a code owner", results[0].detail)
+        self.assertIn("without an approving review from someone with write access", results[0].detail)
         self.assertIn("without a passing `validate` check", results[0].detail)
 
     def test_an_approval_the_owner_later_withdrew_does_not_count(self):
         def review(state, login="venuverse", commit="h30"):
-            return {"state": state, "commit_id": commit, "user": {"login": login}}
+            return {"state": state, "commit_id": commit, "user": {"login": login}, "can_push": True}
 
         for label, reviews, expected in (
                 ("changes requested after the approval", [review("APPROVED"), review("CHANGES_REQUESTED")], 1),
@@ -515,54 +539,7 @@ class TestMainAudit(unittest.TestCase):
                 results = self.audit(github(reviews=reviews))
                 self.assertEqual(len(results), expected)
                 if expected:
-                    self.assertIn("without an approving review from a code owner", results[0].detail)
-
-    def test_a_codeowners_file_it_cannot_read_is_that_commits_problem(self):
-        files = {
-            "a team": "* @akasecurity/maintainers\n",
-            "a team beside a user": "* @akasecurity/maintainers @venuverse\n",
-            "an email address": "* owner@example.invalid @venuverse\n",
-            "a path rule": "/docs @writer-example\n* @Vaishnav-OM @venuverse\n",
-            "a second star rule": "* @Vaishnav-OM\n* @venuverse\n",
-            "no owner on the star line": "*\n",
-            "no file": None,
-            "bytes that are not UTF-8": b"# caf\xe9 team\n* @Vaishnav-OM @venuverse\n",
-        }
-        for label, text in files.items():
-            with self.subTest(label):
-                git = FakeGit(chain=["p", "s1", "s2"], files={
-                    **({("p", ".github/CODEOWNERS"): text} if text is not None else {}),
-                    ("s1", ".github/CODEOWNERS"): CODEOWNERS})
-                results = self.audit(github(), git)
-                self.assertEqual([item.rule for item in results], ["main-audit-s1"])
-                self.assertIn("its approval could not be checked: .github/CODEOWNERS at p", results[0].detail)
-
-    def test_an_unreadable_codeowners_file_does_not_stop_the_rest_of_the_push_being_audited(self):
-        # A file that is not UTF-8 text is as unreadable as a team owner: a red result for its commit, not a crash
-        # that would leave the later commits of the push unchecked.
-        for label, text in {"a team": "* @akasecurity/maintainers\n",
-                            "bytes that are not UTF-8": b"# caf\xe9 team\n* @Vaishnav-OM\n"}.items():
-            with self.subTest(label):
-                git = FakeGit(chain=["p", "s1", "s2"], files={("p", ".github/CODEOWNERS"): text,
-                                                               ("s1", ".github/CODEOWNERS"): CODEOWNERS})
-                gh = FakeGitHub({**pr_routes("s1"), **pr_routes("s2", number=31, head="h31", runs=[])})
-                results = ma.audit(git, gh, "p", "s2", sleep=lambda seconds: None)
-                self.assertEqual([(item.rule, item.red) for item in results],
-                                 [("main-audit-s1", True), ("main-audit-s2", True), ("main-audit", False)])
-                self.assertIn("could not be checked", results[0].detail)
-                self.assertNotIn("could not be checked", results[1].detail)  # s2 is read at s1, whose file is fine
-                self.assertIn("without a passing `validate` check", results[1].detail)
-
-    def test_an_unreadable_codeowners_file_and_a_failed_validate_are_one_result(self):
-        git = FakeGit(chain=["p", "s1"], files={("p", ".github/CODEOWNERS"): "* @akasecurity/maintainers\n"})
-        results = self.audit(github(runs=[validate_run(conclusion="failure")]), git)
-        self.assertEqual(len(results), 1)
-        self.assertIn("could not be checked", results[0].detail)
-        self.assertIn("without a passing `validate` check", results[0].detail)
-
-    def test_an_approver_who_is_not_a_code_owner_does_not_count(self):
-        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "writer-example"}}]
-        self.assertEqual(len(self.audit(github(reviews=reviews))), 1)
+                    self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def run_main(self, gh):
         env = {"AFTER": "s1", "BEFORE": "p", "GITHUB_REPOSITORY": REPO, "GH_TOKEN": "t"}
@@ -579,13 +556,13 @@ class TestMainAudit(unittest.TestCase):
     def test_a_clean_push_prints_a_zero_count_summary_line(self):
         code, out = self.run_main(github())
         self.assertEqual(code, 0)
-        self.assertIn("0 commit(s) in this push reached main without a code-owner-approved PR that passed validate", out)
+        self.assertIn("0 commit(s) in this push reached main without an approved PR that passed validate", out)
         self.assertNotIn("::error::", out)
 
     def test_a_flagged_push_counts_the_red_commits_in_the_summary_line(self):
         code, out = self.run_main(github(pulls=[]))
         self.assertEqual(code, 0)
-        self.assertIn("1 commit(s) in this push reached main without a code-owner-approved PR that passed validate", out)
+        self.assertIn("1 commit(s) in this push reached main without an approved PR that passed validate", out)
         self.assertIn("::error::", out)
 
     def test_a_rewrite_is_not_counted_as_a_commit_in_the_summary_line(self):
@@ -599,7 +576,7 @@ class TestMainAudit(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             code = ma.main(["--repo-dir", "."])
         self.assertEqual(code, 0)
-        self.assertIn("0 commit(s) in this push reached main without a code-owner-approved PR that passed validate", out.getvalue())
+        self.assertIn("0 commit(s) in this push reached main without an approved PR that passed validate", out.getvalue())
         self.assertIn("1 other problem(s) with this push", out.getvalue())
 
     def test_the_commits_a_push_added(self):

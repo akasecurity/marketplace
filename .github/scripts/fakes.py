@@ -183,7 +183,23 @@ class FakeGitHub:
         return iter(answer)
 
     def graphql(self, query, variables):
-        return self._answer("GRAPHQL", re.search(r"\{\s*(\w+)", query).group(1), variables)
+        field = re.search(r"\{\s*(\w+)", query).group(1)
+        if "reviews(" in query and ("GRAPHQL", field) not in self.routes:
+            return self._reviews_page(variables)
+        return self._answer("GRAPHQL", field, variables)
+
+    def _reviews_page(self, variables) -> dict:
+        """The reviews query answered, as one page, from the review list a test routes for the PR: dicts with
+        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push) and, to make
+        the author a GitHub App, `author_type`: "Bot"."""
+        reviews = self._answer("GET", self.repo_path(f"pulls/{variables['number']}/reviews"))
+        nodes = [{"state": review["state"], "authorCanPushToRepository": review.get("can_push", False),
+                  "author": ({"login": review["user"]["login"], "__typename": review.get("author_type", "User")}
+                             if review.get("user") else None),
+                  "commit": {"oid": review["commit_id"]} if review.get("commit_id") else None}
+                 for review in reviews]
+        return {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}
 
     def called(self, method: str, path: str) -> list[tuple]:
         return [call for call in self.calls if call[0] == method and call[1] == path]

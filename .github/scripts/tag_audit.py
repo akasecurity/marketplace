@@ -60,9 +60,6 @@ RULESETS: dict[str, dict] = {
 ENVIRONMENT = "marketplace-bot"
 ENVIRONMENT_POLICY = {"protected_branches": False, "custom_branch_policies": True}
 ENVIRONMENT_RULES = [{"name": "main", "type": "branch"}]
-MAIN_REVIEW = {"required_approving_review_count": 1, "require_code_owner_review": True,
-               "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True,
-               "allowed_merge_methods": ["squash"]}
 
 
 def rule_parameters(name: str, rule: dict, problems: list[str]) -> dict | None:
@@ -128,29 +125,9 @@ def ruleset_problems(name: str, want: dict, ruleset: dict) -> list[str]:
 
 
 def main_problems(rules: list[dict]) -> list[str]:
-    problems = []
-
-    def parameters_of(kind: str) -> dict:
-        # Unreadable parameters were named by ruleset_problems; here they read as empty.
-        rule = next((rule for rule in rules if rule.get("type") == kind), {})
-        return rule_parameters("main", rule, []) or {}
-
-    review = parameters_of("pull_request")
-    for key, want in MAIN_REVIEW.items():
-        got = review.get(key)
-        if key == "allowed_merge_methods" and isinstance(got, list):
-            got = sorted(got, key=repr)
-        # Compared with the type too: True is not a count of 1, and 1 is not True.
-        if type(got) is not type(want) or got != want:
-            problems.append(f"ruleset 'main': pull_request {key} is {got!r}, expected {want!r}")
-    checks = parameters_of("required_status_checks").get("required_status_checks")
-    if not isinstance(checks, list):
-        checks = []
-    if not any(isinstance(check, dict) and check.get("context") == "validate"
-               and check.get("integration_id") == release_checks.GITHUB_ACTIONS_APP_ID
-               for check in checks):
-        problems.append("ruleset 'main': the required check `validate` pinned to the GitHub Actions app is missing")
-    return problems
+    # Unreadable parameters were named by ruleset_problems; here they read as empty.
+    by_type = {rule.get("type"): rule_parameters("main", rule, []) or {} for rule in rules}
+    return release_checks.main_ruleset_problems(by_type)
 
 
 def check_rulesets(gh: GitHub) -> list[str]:

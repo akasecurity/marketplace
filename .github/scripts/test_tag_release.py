@@ -1406,6 +1406,72 @@ class TestSweepOwners(unittest.TestCase):
         self.assertIn("approver-note: ruleset bypass by venuverse\n", message)
 
 
+class TestPullReviews(unittest.TestCase):
+    def node(self, login, state="APPROVED", oid="h13", can_push=True, typename="User"):
+        return {"state": state, "authorCanPushToRepository": can_push,
+                "author": None if login is None else {"login": login, "__typename": typename},
+                "commit": None if oid is None else {"oid": oid}}
+
+    def page(self, nodes, cursor=None):
+        return {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}, "nodes": nodes}}}}
+
+    def test_every_page_is_read_oldest_first_in_the_shape_the_audits_use(self):
+        pages = {None: self.page([self.node("venuverse", "COMMENTED", "h12", False)], "c1"),
+                 "c1": self.page([self.node("Vaishnav-OM")])}
+        gh = FakeGitHub({("GRAPHQL", "repository"): lambda variables, params: pages[variables["after"]]})
+        self.assertEqual(tr.pull_reviews(gh, 13), [
+            {"state": "COMMENTED", "commit_id": "h12", "user": {"login": "venuverse"}, "can_push": False},
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}, "can_push": True}])
+        asked = gh.called("GRAPHQL", "repository")
+        self.assertEqual([call[2]["after"] for call in asked], [None, "c1"])
+        self.assertEqual({(call[2]["owner"], call[2]["name"], call[2]["number"]) for call in asked},
+                         {("akasecurity", "marketplace", 13)})
+
+    def test_a_deleted_author_and_a_deleted_commit_read_as_none(self):
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node(None, oid=None)])})
+        self.assertEqual(tr.pull_reviews(gh, 13), [{"state": "APPROVED", "commit_id": None, "user": None,
+                                                    "can_push": False}])
+
+    def test_a_github_app_never_counts_as_a_reviewer_who_can_push(self):
+        # GitHub answers authorCanPushToRepository: true for an App that has write access (renovate-approve exists
+        # to satisfy required reviews), and gives its login without the [bot] suffix. An approval by an App is no
+        # person's approval, so only a user account can count.
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("renovate-approve", typename="Bot"),
+                                                              self.node("a-person")])})
+        self.assertEqual([(review["user"]["login"], review["can_push"]) for review in tr.pull_reviews(gh, 13)],
+                         [("renovate-approve", False), ("a-person", True)])
+        self.assertIn("__typename", tr.REVIEWS_QUERY)
+
+    def test_only_a_true_answer_lets_a_reviewer_push(self):
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("a", can_push=None),
+                                                              self.node("b", can_push=False)])})
+        self.assertEqual([review["can_push"] for review in tr.pull_reviews(gh, 13)], [False, False])
+
+
+class TestWriteApprovals(unittest.TestCase):
+    def review(self, state, login, can_push=True, commit="h13"):
+        return {"state": state, "commit_id": commit, "user": {"login": login}, "can_push": can_push}
+
+    def test_the_last_approval_comes_last_and_a_withdrawn_one_is_gone(self):
+        reviews = [self.review("APPROVED", "a"), self.review("APPROVED", "b"), self.review("APPROVED", "a"),
+                   self.review("APPROVED", "c"), self.review("CHANGES_REQUESTED", "c"),
+                   self.review("APPROVED", "d"), self.review("DISMISSED", "d"),
+                   self.review("APPROVED", "e"), self.review("COMMENTED", "e")]
+        self.assertEqual(tr.write_approvals(reviews, "h13"), ["b", "a", "e"])
+
+    def test_an_excluded_reviewer_a_stale_head_a_reviewer_who_cannot_push_and_no_login_are_left_out(self):
+        reviews = [self.review("APPROVED", "a"), self.review("APPROVED", "b"), self.review("APPROVED", "c", False),
+                   self.review("APPROVED", "d", commit="old"),
+                   {"state": "APPROVED", "commit_id": "h13", "user": None, "can_push": True}]
+        self.assertEqual(tr.write_approvals(reviews, "h13", exclude={"b"}), ["a"])
+
+    def test_the_association_the_token_is_shown_decides_nothing(self):
+        reviews = [dict(self.review("APPROVED", "private-member"), author_association="CONTRIBUTOR"),
+                   dict(self.review("APPROVED", "outsider", False), author_association="MEMBER")]
+        self.assertEqual(tr.write_approvals(reviews, "h13"), ["private-member"])
+
+
 def branch_ref(name: str, tip: str) -> dict:
     return {"ref": f"refs/heads/{name}", "object": {"sha": tip, "type": "commit"}}
 

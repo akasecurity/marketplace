@@ -1850,7 +1850,7 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     return problems
 
 
-def _main_ruleset_problems(rules: dict) -> list:
+def main_ruleset_problems(rules: dict) -> list:
     problems = []
     review = rules.get("pull_request", {})
     count = review.get("required_approving_review_count")
@@ -1936,7 +1936,7 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
         if missing:
             problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")
         if name == "main":
-            problems.extend(_main_ruleset_problems(rules))
+            problems.extend(main_ruleset_problems(rules))
     return problems
 
 
