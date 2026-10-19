@@ -1,9 +1,9 @@
 """main-audit: every commit a push adds to main's first-parent line must be the merge of an approved PR that passed validate.
 
 Red unless each commit is the merge commit of a PR with an approving review, on
-the PR's final head, from an organisation member (the review's author_association
-is OWNER or MEMBER) who is not its last pusher and has not since withdrawn it (a
-member's latest approving, change-requesting or dismissed review decides), and
+the PR's final head, from someone with write access (GitHub's authorCanPushToRepository, the
+access the main ruleset counts) who is not its last pusher and has not since withdrawn it (a
+reviewer's latest approving, change-requesting or dismissed review decides), and
 whose final head has a passing `validate` check
 from GitHub Actions (its latest run decides; only a run of validate.yml that
 `pull_request_target` started at or before the PR merged counts, the same rule
@@ -37,7 +37,8 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
-from tag_release import VALIDATE_CHECK, merged_into_main, org_approvals, pull_association, validate_conclusion
+from tag_release import (VALIDATE_CHECK, merged_into_main, pull_association, pull_reviews, validate_conclusion,
+                         write_approvals)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -71,9 +72,9 @@ def approval_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None
                 "could not be told from the pusher's own.")
     # Each member's latest approving, change-requesting or dismissed review decides: an approval its author later
     # withdrew, or that was dismissed, does not count.
-    if org_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, exclude=pushers):
+    if write_approvals(pull_reviews(gh, number), head, exclude=pushers):
         return None
-    return (f"`{sha}` merged PR #{number} without an approving review from an organisation member on its final "
+    return (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its final "
             f"head `{head}` by someone other than its last pusher ({', '.join(sorted(pushers))}).")
 
 

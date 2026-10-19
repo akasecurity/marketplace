@@ -39,7 +39,7 @@ name: import-plugin-release
 # lands it). While a rollback PR is open the schedule opens nothing, and a pull
 # request that a forward dispatch opens gets no auto-merge.
 #
-# One organisation member's approval, after running the candidate in one real session
+# One code owner's approval, after running the candidate in one real session
 # (the PR's checklist), is the only human act per release; tag-release then
 # cuts the next fleet-v<N> tag at the squash commit.
 

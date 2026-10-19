@@ -174,16 +174,9 @@ class TestRulesets(unittest.TestCase):
             review[key] = 1
         self.assertEqual(ta.check_rulesets(github(sets)), [
             "ruleset 'main': required_approving_review_count is True, not at least 1",
+            "ruleset 'main': require_code_owner_review is 1, not True",
             "ruleset 'main': dismiss_stale_reviews_on_push is 1, not True",
-            "ruleset 'main': require_last_push_approval is 1, not True",
-            "ruleset 'main': require_code_owner_review is 1, not a boolean"])
-
-    def test_main_may_or_may_not_require_a_code_owner(self):
-        for flag in (True, False):
-            with self.subTest(flag=flag):
-                sets = good_rulesets()
-                sets[1]["rules"][2]["parameters"]["require_code_owner_review"] = flag
-                self.assertEqual(ta.check_rulesets(github(sets)), [])
+            "ruleset 'main': require_last_push_approval is 1, not True"])
 
     def test_a_rule_whose_parameters_are_not_an_object_is_named_and_does_not_crash(self):
         for parameters in (["x"], "x"):
