@@ -527,7 +527,7 @@ class TestBotRules(unittest.TestCase):
         entry = {"classification": "additive", "from": ts.ATTESTED["0.9.14"], "to": ATTESTED[NEXT], "migrations": []}
         report = self.recorded_forward(entry)
         failed_with(self, report, "records 0.9.15 as additive, but validate computes not-rollback-safe (0036_migration)")
-        failed_with(self, report, "a code owner corrects the entry in a reviewed PR")
+        failed_with(self, report, "a person corrects the entry in a reviewed PR")
 
     def test_a_recorded_entry_for_another_commit_fails(self):
         entry = {**NEXT_ENTRY, "to": "2" * 40}

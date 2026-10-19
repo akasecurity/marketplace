@@ -564,7 +564,7 @@ def _recorded_entry_rules(head_v, recorded, pinned, report: Report, *, verify, c
     if recorded["classification"] == "additive" and expected["classification"] == "not-rollback-safe":
         report.fail(
             f"{rc.SAFETY_FILE} records {head_v} as additive, but validate computes not-rollback-safe "
-            f"({', '.join(expected['migrations']) or 'none'}); a code owner corrects the entry in a "
+            f"({', '.join(expected['migrations']) or 'none'}); a person corrects the entry in a "
             "reviewed PR before this pin can merge"
         )
     if recorded["from"] != expected["from"]:

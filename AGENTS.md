@@ -115,9 +115,8 @@ relax the reader to pass a release.
 **`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
 annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
 and store-migration class, and for a rollback the version it rolled back from. The approver is the
-code owner whose latest review approves the PR's final head; with none, the message says
-`approver: none` and who merged it, and when CODEOWNERS at the commit's parent could not be read
-(or is not a file) the PR is still named but the approver is `unknown`, with the reason. Whoever
+organisation member (a reviewer GitHub marks `OWNER` or `MEMBER`) whose latest review approves the PR's
+final head; with none, the message says `approver: none` and who merged it. Whoever
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
 or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
 `pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
@@ -165,10 +164,9 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 
 Every change reaches `main` through a pull request, and the `main` ruleset requires one approving
 review from someone other than the PR's last pusher, and the `validate` check to pass. Any
-organisation member's approval counts, so a member's own PR needs another member. Code owners are
-not part of the rule: `.github/CODEOWNERS` grants no review right (the audit accepts the
-code-owner review setting either way), and only `tag-release`, to name a tag's approver, and the
-issue routing, to mention people, still read it. Merges are squash merges only: the `main` ruleset
+organisation member's approval counts, so a member's own PR needs another member. There are no
+code owners: the audit accepts the ruleset's code-owner review setting on or off, because with no
+CODEOWNERS file it has no effect. Merges are squash merges only: the `main` ruleset
 allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
 missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
@@ -184,12 +182,6 @@ Expected:
 - `x4-branches` and `x4-tags`: the x4 experimenters team;
 - `tags-locked` and `fleet-tags-immutable`: nobody.
 
-Keep `.github/CODEOWNERS` as one `*` line naming users:
-`tag-release` reads it strictly, at a commit's parent, and can match a reviewer's
-login only to a user, so a team, an email address, a path rule, a second rule, an entry that is
-not a file or a file that is not UTF-8 text is not read. A PR merged on top of such a file gets
-`approver: unknown` in its tag, if it moved the pin, rather than a guess; once a commit is merged, the file at its parent can no longer change. The unit tests run on
-every pull request, one that changes only the file included, and fail one the reader cannot read.
 Before pushing, validate the JSON and run the scripts' tests:
 
 ```bash
@@ -236,7 +228,7 @@ true only once it is.
   head of a PR the bot did not open: that run goes red until a person closes the PR. It tells its
   own PRs from anyone else's by their author (`release_checks.BOT_LOGIN`), so a person's PR from a
   `bot/` branch name neither stops the schedule nor is closed by it, and while no bot login is
-  configured it refuses, red. A version a code owner rejected (its PR closed unmerged), or one a
+  configured it refuses, red. A version whose bot PR was closed unmerged, or one a
   rollback moved away from, comes back only through a dispatch with `reimport: true`. A version
   `main` already records in `rollback-safety.json` is recomputed first, and the import stops, red,
   if the recorded entry runs up to another commit than the release's attested one or says
@@ -403,8 +395,7 @@ required check, the importer's `verify` job ends red (exit 1) and opens no pull 
 `staleness` carries on with the other versions and reports that one in its no-verdict issue (once
 it has been on npm for an hour).
 
-Issues go to the release approvers in `.github/release-approvers.json` and mention the code owners
-(an issue is still filed, with no mention, when CODEOWNERS is missing or is not UTF-8 text). An
+Issues go to the release approvers in `.github/release-approvers.json`. An
 alert's detail is quoted as code, so text taken from a tag or a PR cannot mention anyone or render
 as a link, and it is cut, with a note naming the run, before it passes GitHub's size limit for an
 issue body. Each rule has one issue, found by a hidden marker among the issues the workflow's own

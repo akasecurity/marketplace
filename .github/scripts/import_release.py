@@ -292,8 +292,8 @@ def pr_body(plan: dict, run_url: str) -> str:
                      else f"`{SAFETY_FILE}` already has an entry for `{version}`; this PR leaves it unchanged.")
         if plan.get("reimport"):
             lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
-                      "`fleet-v` tag or a merged release-bot pull request has pinned, or a code owner closed an "
-                      "earlier PR for it. Approve only once the reason it was rolled back or rejected is resolved."]
+                      "`fleet-v` tag or a merged release-bot pull request has pinned, or an "
+                      "earlier PR for it was closed. Approve only once the reason it was rolled back or rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
@@ -380,15 +380,15 @@ def check_recorded_entry(version: str, recorded: Any, computed: dict) -> None:
     problems = release_checks.safety_problems({"versions": {version: recorded}})
     if problems:
         raise Refused(f"main's {SAFETY_FILE} entry for {version} is malformed ({problems[0]}); validate would "
-                      "fail the pin PR, so a code owner corrects the entry in a reviewed PR first")
+                      "fail the pin PR, so a person corrects the entry in a reviewed PR first")
     if recorded["to"] != computed["to"]:
         raise Refused(f"main's {SAFETY_FILE} records {version} up to commit {recorded['to']}, but its attested "
-                      f"commit is {computed['to']}; validate would fail the pin PR, so a code owner corrects the "
+                      f"commit is {computed['to']}; validate would fail the pin PR, so a person corrects the "
                       "entry in a reviewed PR first")
     if recorded["classification"] == "additive" and computed["classification"] == "not-rollback-safe":
         raise Refused(f"main's {SAFETY_FILE} records {version} as additive, but the importer computes "
                       f"not-rollback-safe ({', '.join(computed['migrations']) or 'none'}); validate would fail "
-                      "the pin PR, so a code owner corrects the entry in a reviewed PR first")
+                      "the pin PR, so a person corrects the entry in a reviewed PR first")
 
 
 def plan_forward(ctx: Context) -> dict:
