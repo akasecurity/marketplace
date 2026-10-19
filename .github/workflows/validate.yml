@@ -9,7 +9,7 @@ name: validate
 # (git show <head sha>:<path>); nothing from the head is executed.
 #
 # It is a correctness check on the automated path, not a security boundary: review of
-# every change by an organisation member is the control.
+# every change by a reviewer is the control.
 #
 # There is one job, named exactly "validate", with no job-level if, no needs, and no path
 # or branch filter. A skipped job reports success, and a filtered-out required check

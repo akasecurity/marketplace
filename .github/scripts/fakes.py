@@ -97,10 +97,6 @@ class FakeGit:
         # A file held as bytes is decoded as UTF-8, as gitrepo.Git.show decodes what it reads.
         return content.decode("utf-8") if isinstance(content, bytes) else content
 
-    def entry_mode(self, rev: str, path: str) -> str | None:
-        key = (self.rev_parse(rev), path)
-        return self.modes.get(key) or ("100644" if key in self.files else None)
-
     def fleet_tags(self) -> list[dict]:
         return sorted(self.tags, key=lambda tag: tag["n"])
 
@@ -182,7 +178,21 @@ class FakeGitHub:
         return iter(answer)
 
     def graphql(self, query, variables):
-        return self._answer("GRAPHQL", re.search(r"\{\s*(\w+)", query).group(1), variables)
+        field = re.search(r"\{\s*(\w+)", query).group(1)
+        if "reviews(" in query and ("GRAPHQL", field) not in self.routes:
+            return self._reviews_page(variables)
+        return self._answer("GRAPHQL", field, variables)
+
+    def _reviews_page(self, variables) -> dict:
+        """The reviews query answered, as one page, from the review list a test routes for the PR: dicts with
+        `state`, `commit_id`, `user` and `can_push` (GitHub's answer to whether the reviewer may push)."""
+        reviews = self._answer("GET", self.repo_path(f"pulls/{variables['number']}/reviews"))
+        nodes = [{"state": review["state"], "authorCanPushToRepository": review.get("can_push", False),
+                  "author": {"login": review["user"]["login"]} if review.get("user") else None,
+                  "commit": {"oid": review["commit_id"]} if review.get("commit_id") else None}
+                 for review in reviews]
+        return {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}
 
     def called(self, method: str, path: str) -> list[tuple]:
         return [call for call in self.calls if call[0] == method and call[1] == path]

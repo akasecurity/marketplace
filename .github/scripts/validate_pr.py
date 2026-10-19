@@ -7,7 +7,7 @@ It reads the PR's files as data: `git show <sha>:<path>` of the head commit, nev
 checkout, and it never imports or executes anything the PR contains.
 
 It is a correctness check on the automated path, not a security boundary: review of
-every change by an organisation member is the control.
+every change by a reviewer is the control.
 
 Exit 0 = every rule holds, 1 = a rule failed, 2 = no verdict (git, network or API).
 """
@@ -147,7 +147,7 @@ def _names_ai_tc(value) -> bool:
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
 #   * a fork PR's own run.
-# Review of every workflow change by an organisation member is the control for what a pull request's own diff
+# Review of every workflow change is the control for what a pull request's own diff
 # carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted
 # from outside with some other token are not in that diff, so the check after the merge is what
 # catches those, and it is the detection for the rest too: tag-release's note and the main audit

@@ -1850,7 +1850,7 @@ def _audit_new_tag(repo_dir, name, row, here, previous, fetch) -> list:
     return problems
 
 
-def _main_ruleset_problems(rules: dict) -> list:
+def main_ruleset_problems(rules: dict) -> list:
     problems = []
     review = rules.get("pull_request", {})
     count = review.get("required_approving_review_count")
@@ -1859,10 +1859,11 @@ def _main_ruleset_problems(rules: dict) -> list:
     for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
         if review.get(key) is not True:
             problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
-    # Any organisation member's approval counts, so code-owner review may be on or off.
-    if not isinstance(review.get("require_code_owner_review"), bool):
+    # Any approval from someone with write access counts and there is no CODEOWNERS file, so the setting must be
+    # off: a file added later would otherwise hand every approval to whoever it names.
+    if review.get("require_code_owner_review") is not False:
         problems.append(f"ruleset 'main': require_code_owner_review is {review.get('require_code_owner_review')!r}, "
-                        "not a boolean")
+                        "not False")
     if review.get("allowed_merge_methods") != ["squash"]:
         problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
     checks = rules.get("required_status_checks", {}).get("required_status_checks")
@@ -1940,7 +1941,7 @@ def audit_rulesets(*, fetch: Fetch = http_fetch) -> list:
         if missing:
             problems.append(f"ruleset {name!r} lacks rules: {', '.join(missing)}")
         if name == "main":
-            problems.extend(_main_ruleset_problems(rules))
+            problems.extend(main_ruleset_problems(rules))
     return problems
 
 

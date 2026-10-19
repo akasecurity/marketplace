@@ -465,7 +465,7 @@ class TestOtherRules(StalenessCase):
         self.assertIn("#30", rule.detail)
         self.assertNotIn("#31", rule.detail)
         self.assertNotIn("#32", rule.detail)
-        self.assertIn("One approval from an organisation member merges a bot PR;", rule.detail)
+        self.assertIn("One approval from someone with write access merges a bot PR;", rule.detail)
 
     def test_rule_ii_counts_only_prs_the_release_bot_opened(self):
         old = stamp(dt.timedelta(hours=30))
