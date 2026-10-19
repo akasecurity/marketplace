@@ -104,17 +104,17 @@ def sweep_github() -> FakeGitHub:
                                         "base": {"ref": "main"}}],
         ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [], "merged_by": {"login": "venuverse"}},
         ("GET", R("pulls/13/reviews")): [
-            {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}, "author_association": "MEMBER"},
-            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "author_association": "MEMBER"}],
+            {"state": "COMMENTED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}, "can_push": True},
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "can_push": True}],
         ("GET", R("commits/c/pulls")): [
             {"number": 15, "merge_commit_sha": "other", "merged_at": None, "base": {"ref": "main"}},
             {"number": 14, "merge_commit_sha": "c", "merged_at": "2026-10-03T00:00:00Z", "base": {"ref": "main"}}],
         ("GET", R("pulls/14")): {"head": {"sha": "h14"}, "labels": [{"name": "rollback"}, {"name": "drill"}],
                                  "merged_by": {"login": "org-owner-example"}},
         ("GET", R("pulls/14/reviews")): [
-            {"state": "APPROVED", "commit_id": "stale14", "user": {"login": "Vaishnav-OM"}, "author_association": "MEMBER"},
+            {"state": "APPROVED", "commit_id": "stale14", "user": {"login": "Vaishnav-OM"}, "can_push": True},
             {"state": "APPROVED", "commit_id": "h14", "user": {"login": "writer-example"},
-             "author_association": "CONTRIBUTOR"}],
+             "can_push": False}],
         ("GET", R("commits/d/pulls")): [],
         **checks("h13"),
         **checks("h14"),
@@ -518,7 +518,7 @@ class TestRestore(unittest.TestCase):
             ("GET", R("commits/e/pulls")): [{"number": 16, "merge_commit_sha": "e", "merged_at": "2026-10-04T00:00:00Z",
                                              "base": {"ref": "main"}}],
             ("GET", R("pulls/16")): {"head": {"sha": "h16"}, "labels": [], "merged_by": {"login": "venuverse"}},
-            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}, "author_association": "MEMBER"}],
+            ("GET", R("pulls/16/reviews")): [{"state": "APPROVED", "commit_id": "h16", "user": {"login": "venuverse"}, "can_push": True}],
             **checks("h16")})
         return git, gh
 
@@ -699,8 +699,8 @@ class TestValuesOfTheWrongType(unittest.TestCase):
 
 
 class TestApprover(unittest.TestCase):
-    def review(self, state, login="venuverse", association="MEMBER", commit="h13"):
-        return {"state": state, "commit_id": commit, "user": {"login": login}, "author_association": association}
+    def review(self, state, login="venuverse", can_push=True, commit="h13"):
+        return {"state": state, "commit_id": commit, "user": {"login": login}, "can_push": can_push}
 
     def facts_for(self, reviews):
         gh = FakeGitHub({
@@ -720,13 +720,17 @@ class TestApprover(unittest.TestCase):
         facts = self.facts_for([self.review("APPROVED", "a-member-nobody-listed")])
         self.assertEqual((facts["approver"], facts["note"]), ("a-member-nobody-listed", None))
 
-    def test_an_owner_member_counts_like_any_member(self):
-        self.assertEqual(self.facts_for([self.review("APPROVED", "an-owner", "OWNER")])["approver"], "an-owner")
+    def test_a_private_member_is_the_approver_whatever_association_the_token_is_shown(self):
+        # author_association is reported per viewer: a token that cannot see a private member's membership is told
+        # CONTRIBUTOR. The permanent record must not depend on that, so only whether the reviewer can push counts.
+        review = dict(self.review("APPROVED", "a-private-member"), author_association="CONTRIBUTOR")
+        self.assertEqual(self.facts_for([review])["approver"], "a-private-member")
 
-    def test_a_reviewer_outside_the_organisation_is_not_the_approver(self):
-        for association in ("COLLABORATOR", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE", None):
-            with self.subTest(association=association):
-                facts = self.facts_for([self.review("APPROVED", "venuverse", association)])
+    def test_a_reviewer_who_cannot_push_is_not_the_approver(self):
+        for can_push in (False, None):
+            with self.subTest(can_push=can_push):
+                review = dict(self.review("APPROVED", "venuverse", can_push), author_association="MEMBER")
+                facts = self.facts_for([review])
                 self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
 
     def test_a_commit_no_pull_request_merged_has_no_approver(self):
@@ -753,14 +757,14 @@ class TestApprover(unittest.TestCase):
         reviews = [self.review("APPROVED", "Vaishnav-OM"), self.review("APPROVED", "venuverse"),
                    self.review("APPROVED", "Vaishnav-OM")]
         self.assertEqual(self.facts_for(reviews)["approver"], "Vaishnav-OM")
-        self.assertEqual(tr.org_approvals(reviews, "h13"), ["venuverse", "Vaishnav-OM"])
+        self.assertEqual(tr.write_approvals(reviews, "h13"), ["venuverse", "Vaishnav-OM"])
 
-    def test_org_approvals_leaves_out_an_excluded_reviewer_a_stale_head_and_a_reviewer_with_no_login(self):
+    def test_write_approvals_leaves_out_an_excluded_reviewer_a_stale_head_and_a_reviewer_who_cannot_push(self):
         reviews = [self.review("APPROVED", "Vaishnav-OM"), self.review("APPROVED", "venuverse"),
-                   self.review("APPROVED", "writer-example", "COLLABORATOR"),
-                   {"state": "APPROVED", "commit_id": "old", "user": None, "author_association": "MEMBER"},
+                   self.review("APPROVED", "writer-example", False),
+                   {"state": "APPROVED", "commit_id": "old", "user": None, "can_push": True},
                    self.review("APPROVED", "stale", commit="old")]
-        self.assertEqual(tr.org_approvals(reviews, "h13", exclude={"venuverse"}), ["Vaishnav-OM"])
+        self.assertEqual(tr.write_approvals(reviews, "h13", exclude={"venuverse"}), ["Vaishnav-OM"])
 
     def test_an_approval_is_found_without_any_file_in_the_checkout(self):
         git = history(chain=("t8", "b"))
@@ -772,13 +776,45 @@ class TestApprover(unittest.TestCase):
         self.assertNotIn("approver-note", message)
 
 
+class TestPullReviews(unittest.TestCase):
+    def node(self, login, state="APPROVED", oid="h13", can_push=True):
+        return {"state": state, "authorCanPushToRepository": can_push,
+                "author": None if login is None else {"login": login}, "commit": None if oid is None else {"oid": oid}}
+
+    def page(self, nodes, cursor=None):
+        return {"repository": {"pullRequest": {"reviews": {
+            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}, "nodes": nodes}}}}
+
+    def test_every_page_is_read_oldest_first_in_the_shape_the_audits_use(self):
+        pages = {None: self.page([self.node("venuverse", "COMMENTED", "h12", False)], "c1"),
+                 "c1": self.page([self.node("Vaishnav-OM")])}
+        gh = FakeGitHub({("GRAPHQL", "repository"): lambda variables, params: pages[variables["after"]]})
+        self.assertEqual(tr.pull_reviews(gh, 13), [
+            {"state": "COMMENTED", "commit_id": "h12", "user": {"login": "venuverse"}, "can_push": False},
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "Vaishnav-OM"}, "can_push": True}])
+        asked = gh.called("GRAPHQL", "repository")
+        self.assertEqual([call[2]["after"] for call in asked], [None, "c1"])
+        self.assertEqual({(call[2]["owner"], call[2]["name"], call[2]["number"]) for call in asked},
+                         {("akasecurity", "marketplace", 13)})
+
+    def test_a_deleted_author_and_a_deleted_commit_read_as_none(self):
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node(None, oid=None)])})
+        self.assertEqual(tr.pull_reviews(gh, 13), [{"state": "APPROVED", "commit_id": None, "user": None,
+                                                    "can_push": True}])
+
+    def test_only_a_true_answer_lets_a_reviewer_push(self):
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("a", can_push=None),
+                                                              self.node("b", can_push=False)])})
+        self.assertEqual([review["can_push"] for review in tr.pull_reviews(gh, 13)], [False, False])
+
+
 class TestValidateOnTheFinalHead(unittest.TestCase):
     """A reviewer's approval says nothing about the required `validate` check: an org owner can merge past a
     failed or missing one. The tag for such a merge says so in its approver-note, whoever approved it."""
 
     NOTE = "validate had not passed on the PR's final head"
     MERGER = "org-owner-example"
-    APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "author_association": "MEMBER"}]
+    APPROVED = [{"state": "APPROVED", "commit_id": "h13", "user": {"login": "venuverse"}, "can_push": True}]
 
     def facts(self, runs, reviews=None, workflows=None, merged_at=MERGED_AT):
         """The facts for PR 13 (final head h13, merged by an org owner at `merged_at`) whose head carries `runs`

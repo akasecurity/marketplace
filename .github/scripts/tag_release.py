@@ -24,8 +24,8 @@ after it, until it is an hour old: a slow link must not become a permanent
 dated more than five minutes ahead of the runner's clock is not young either
 (only a direct push can carry one, and waiting for its date would hold every
 later tag back): it is tagged at once, as an old one would be. A PR's approver is
-the organisation member (a reviewer GitHub marks OWNER or MEMBER) whose latest review
-approves its final head; with none, the tag records `approver: none` and a note that
+the reviewer with push access to the repository (an organisation member the repository
+gives write access) whose latest review approves its final head; with none, the tag records `approver: none` and a note that
 the merge bypassed the ruleset. A commit no pull request merged records
 `approver: none`, as there is no approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
@@ -257,16 +257,40 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return pull_association(gh, sha, sleep)[0]
 
 
-ORG_ASSOCIATIONS = ("OWNER", "MEMBER")
+REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
+                 "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+                 "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
+                 "nodes { state authorCanPushToRepository author { login } commit { oid } } } } } }")
 
 
-def org_approvals(reviews, head: str, exclude=()) -> list[str]:
-    """The organisation members whose latest review that takes a position approves `head`, the one who approved
-    last at the end. A member is a reviewer whose review GitHub marks OWNER or MEMBER (`author_association`).
-    Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review decides (a comment or a pending review
-    changes nothing, and `reviews` is in the API's chronological order), so an approval its author later
-    withdrew, or that was dismissed, does not count. `exclude` names reviewers whose approval is not allowed to
-    count, such as the last pusher."""
+def pull_reviews(gh: GitHub, number: int) -> list[dict]:
+    """The PR's reviews, oldest first, as {state, commit_id, user, can_push}. `can_push` is GitHub's own answer to
+    whether the reviewer may push to the repository, the access the main ruleset counts an approval by. It is
+    asked here, not read from `author_association`, which GitHub fills in per viewer: a token that cannot see a
+    private member's organisation membership is told CONTRIBUTOR for them, and a permanent record must not
+    depend on what the reading token can see."""
+    owner, name = gh.repo.split("/", 1)
+    reviews: list[dict] = []
+    after = None
+    while True:
+        connection = gh.graphql(REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
+                                                "after": after})["repository"]["pullRequest"]["reviews"]
+        for node in connection["nodes"]:
+            author, commit = node.get("author"), node.get("commit")
+            reviews.append({"state": node["state"], "commit_id": commit["oid"] if commit else None,
+                            "user": {"login": author["login"]} if author else None,
+                            "can_push": node.get("authorCanPushToRepository") is True})
+        if not connection["pageInfo"]["hasNextPage"]:
+            return reviews
+        after = connection["pageInfo"]["endCursor"]
+
+
+def write_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The reviewers who can push to the repository and whose latest review that takes a position approves
+    `head`, the one who approved last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED
+    review decides (a comment or a pending review changes nothing, and `reviews` is in the API's chronological
+    order), so an approval its author later withdrew, or that was dismissed, does not count. `exclude` names
+    reviewers whose approval is not allowed to count, such as the last pusher."""
     latest: dict[str, dict] = {}
     for review in reviews:
         login = (review.get("user") or {}).get("login")
@@ -275,7 +299,7 @@ def org_approvals(reviews, head: str, exclude=()) -> list[str]:
             latest[login] = review
     return [login for login, review in latest.items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
-            and review.get("author_association") in ORG_ASSOCIATIONS and login not in exclude]
+            and review.get("can_push") is True and login not in exclude]
 
 
 def timestamp(text) -> datetime | None:
@@ -348,9 +372,9 @@ def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str
 
 def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
              reader: GitHub | None = None) -> dict:
-    """What the tag records about the PR that merged `sha`: its number, the organisation member whose latest
-    review approves its final head (`none`, with a note that the merge bypassed the ruleset, when no member's
-    does), whether it carries the drill label, and a note. With no PR there is no approval to match.
+    """What the tag records about the PR that merged `sha`: its number, the reviewer with push access
+    whose latest review approves its final head (`none`, with a note that the merge bypassed the ruleset, when
+    nobody's does), whether it carries the drill label, and a note. With no PR there is no approval to match.
 
     Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
     to any other note: a below-floor rollback or any other merge past a red or missing check is then in the
@@ -364,7 +388,7 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    approvers = org_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head)
+    approvers = write_approvals(pull_reviews(gh, number), head)
     approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
     bypass = not approvers
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
