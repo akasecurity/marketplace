@@ -726,6 +726,11 @@ class TestApprover(unittest.TestCase):
         review = dict(self.review("APPROVED", "a-private-member"), author_association="CONTRIBUTOR")
         self.assertEqual(self.facts_for([review])["approver"], "a-private-member")
 
+    def test_a_github_app_is_not_the_approver_though_github_says_it_can_push(self):
+        review = dict(self.review("APPROVED", "aka-marketplace-bot"), author_type="Bot")
+        facts = self.facts_for([review])
+        self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
     def test_a_reviewer_who_cannot_push_is_not_the_approver(self):
         for can_push in (False, None):
             with self.subTest(can_push=can_push):
@@ -777,9 +782,10 @@ class TestApprover(unittest.TestCase):
 
 
 class TestPullReviews(unittest.TestCase):
-    def node(self, login, state="APPROVED", oid="h13", can_push=True):
+    def node(self, login, state="APPROVED", oid="h13", can_push=True, typename="User"):
         return {"state": state, "authorCanPushToRepository": can_push,
-                "author": None if login is None else {"login": login}, "commit": None if oid is None else {"oid": oid}}
+                "author": None if login is None else {"login": login, "__typename": typename},
+                "commit": None if oid is None else {"oid": oid}}
 
     def page(self, nodes, cursor=None):
         return {"repository": {"pullRequest": {"reviews": {
@@ -800,7 +806,17 @@ class TestPullReviews(unittest.TestCase):
     def test_a_deleted_author_and_a_deleted_commit_read_as_none(self):
         gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node(None, oid=None)])})
         self.assertEqual(tr.pull_reviews(gh, 13), [{"state": "APPROVED", "commit_id": None, "user": None,
-                                                    "can_push": True}])
+                                                    "can_push": False}])
+
+    def test_a_github_app_never_counts_as_a_reviewer_who_can_push(self):
+        # GitHub answers authorCanPushToRepository: true for an App that has write access (renovate-approve exists
+        # to satisfy required reviews), and gives its login without the [bot] suffix. An approval by an App is no
+        # person's approval, so only a user account can count.
+        gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("renovate-approve", typename="Bot"),
+                                                              self.node("a-person")])})
+        self.assertEqual([(review["user"]["login"], review["can_push"]) for review in tr.pull_reviews(gh, 13)],
+                         [("renovate-approve", False), ("a-person", True)])
+        self.assertIn("__typename", tr.REVIEWS_QUERY)
 
     def test_only_a_true_answer_lets_a_reviewer_push(self):
         gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("a", can_push=None),

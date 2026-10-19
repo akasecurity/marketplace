@@ -167,9 +167,11 @@ review from someone other than the PR's last pusher, and the `validate` check to
 approval from someone with write access counts, so a member's own PR needs another member. There are
 no code owners: the audit reads the ruleset's code-owner review setting as off, so a CODEOWNERS file
 added later cannot hand every approval to whoever it names. "Allow GitHub Actions to create and approve
-pull requests" must stay off too, or `github-actions[bot]` could supply the approval; `tag-audit` cannot
-read that setting, because it takes an admin token. Merges are squash merges only: the `main` ruleset
-allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is reported commit by commit. These protections are
+pull requests" must stay off too, or `github-actions[bot]` could supply the approval. `tag-audit` cannot
+read that setting, because it takes an admin token. `main-audit` counts user accounts only, so it reports
+a merge whose only approval came from an App, but cannot stop it. Merges are squash merges only: the
+`main` ruleset allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is
+reported commit by commit. These protections are
 repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
 missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
 settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
@@ -360,8 +362,10 @@ true only once it is.
   `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
   applies, so a green re-run after the merge clears nothing). A reviewer has write access when GitHub
   says the review's author can push to the repository (`authorCanPushToRepository`), the access the
-  ruleset counts. `author_association` is not used: GitHub fills it in per viewer, so a token that cannot
-  see a private member's organisation membership is told `CONTRIBUTOR` for them. The branch commits a merge-commit
+  ruleset counts, and only for a user account, because GitHub answers the same for an App with write
+  access and an App's approval is no person's. `author_association` is not used: GitHub fills it in
+  per viewer, so a token that cannot see a private member's organisation membership is told
+  `CONTRIBUTOR` for them. The branch commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
   pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
