@@ -325,6 +325,15 @@ class TestMainAudit(unittest.TestCase):
                     review["author_association"] = association
                 self.assertEqual(self.audit(github(reviews=[review])), [])
 
+    def test_an_approval_from_a_github_app_does_not_count_though_github_says_it_can_push(self):
+        for login in ("renovate-approve", "github-actions", "aka-marketplace-bot"):
+            with self.subTest(login):
+                review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": login}, "can_push": True,
+                          "author_type": "Bot"}
+                results = self.audit(github(reviews=[review]))
+                self.assertEqual(len(results), 1)
+                self.assertIn("without an approving review from someone with write access", results[0].detail)
+
     def test_an_approval_from_someone_who_cannot_push_does_not_count(self):
         for can_push in (False, None):
             with self.subTest(can_push=can_push):
