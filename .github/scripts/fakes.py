@@ -190,10 +190,12 @@ class FakeGitHub:
 
     def _reviews_page(self, variables) -> dict:
         """The reviews query answered, as one page, from the review list a test routes for the PR: dicts with
-        `state`, `commit_id`, `user` and `can_push` (GitHub's answer to whether the reviewer may push)."""
+        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push) and, to make
+        the author a GitHub App, `author_type`: "Bot"."""
         reviews = self._answer("GET", self.repo_path(f"pulls/{variables['number']}/reviews"))
         nodes = [{"state": review["state"], "authorCanPushToRepository": review.get("can_push", False),
-                  "author": {"login": review["user"]["login"]} if review.get("user") else None,
+                  "author": ({"login": review["user"]["login"], "__typename": review.get("author_type", "User")}
+                             if review.get("user") else None),
                   "commit": {"oid": review["commit_id"]} if review.get("commit_id") else None}
                  for review in reviews]
         return {"repository": {"pullRequest": {"reviews": {

@@ -331,7 +331,7 @@ def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[s
 REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
                  "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
                  "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
-                 "nodes { state authorCanPushToRepository author { login } commit { oid } } } } } }")
+                 "nodes { state authorCanPushToRepository author { __typename login } commit { oid } } } } } }")
 
 
 def pull_reviews(gh: GitHub, number: int) -> list[dict]:
@@ -339,7 +339,8 @@ def pull_reviews(gh: GitHub, number: int) -> list[dict]:
     whether the reviewer may push to the repository, the access the main ruleset counts an approval by. It is
     asked here, not read from `author_association`, which GitHub fills in per viewer: a token that cannot see a
     private member's organisation membership is told CONTRIBUTOR for them, and an audit must not depend on what
-    the reading token can see."""
+    the reading token can see. Only a user account can push: GitHub also answers true for an App that has write
+    access, and gives its login without the [bot] suffix, but an App's approval is no person's approval."""
     owner, name = gh.repo.split("/", 1)
     reviews: list[dict] = []
     after = None
@@ -350,7 +351,8 @@ def pull_reviews(gh: GitHub, number: int) -> list[dict]:
             author, commit = node.get("author"), node.get("commit")
             reviews.append({"state": node["state"], "commit_id": commit["oid"] if commit else None,
                             "user": {"login": author["login"]} if author else None,
-                            "can_push": node.get("authorCanPushToRepository") is True})
+                            "can_push": node.get("authorCanPushToRepository") is True
+                            and author is not None and author.get("__typename") == "User"})
         if not connection["pageInfo"]["hasNextPage"]:
             return reviews
         after = connection["pageInfo"]["endCursor"]

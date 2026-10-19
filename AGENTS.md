@@ -364,9 +364,10 @@ true only once it is.
   that `pull_request_target` started at or before the PR merged counts, the same rule `tag-release`
   applies, so a green re-run after the merge clears nothing). A reviewer has write access when GitHub
   says the review's author can push to the repository (`authorCanPushToRepository`), the access the
-  ruleset counts; `author_association` is not used, because GitHub fills it in per viewer and a token
-  that cannot see a private member's organisation membership is told `CONTRIBUTOR` for them. The branch
-  commits a merge-commit
+  ruleset counts, and only for a user account, because GitHub answers the same for an App with write
+  access and an App's approval is no person's. `author_association` is not used: GitHub fills it in
+  per viewer, so a token that cannot see a private member's organisation membership is told
+  `CONTRIBUTOR` for them. The branch commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
   pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
