@@ -299,10 +299,12 @@ true only once it is.
   `import-plugin-release.yml`, and there unless the job that asks itself enters the
   `marketplace-bot` environment (`environment: name`, or a `name:` under it; any other spelling,
   such as flow style or an expression, is refused); uses the App-token action at all anywhere but in
-  a job of `import-plugin-release.yml` or `tag-release.yml` that itself enters `marketplace-bot`
-  (with no `permission-*` input the action mints a token with every permission the App's
-  installation has, and the `INPUT_PERMISSION-*` variables it also reads count as the inputs they
-  name; where the bot's secrets are stored is what actually bounds that token, and this check backs
+  a job of `import-plugin-release.yml` or `tag-release.yml` that itself enters `marketplace-bot`,
+  and there without naming a `permission-*` input (with none the action mints a token with every
+  permission the App's installation has); sets an `INPUT_PERMISSION-*` variable, which the action
+  also reads, in an `env:` block or through `$GITHUB_ENV` (`pull-requests` is the importer's alone
+  and the others are refused); reads a `MARKETPLACE_BOT_*` secret outside such a job, whatever reads
+  it (where the bot's secrets are stored is what actually bounds that token, and these checks back
   it up); declares no `permissions:` at the top level while a job declares none of its own, so that
   job takes the repository's default token, which a repository setting can make write-capable; or
   defines a job whose id or `name:` is `validate` (in any file but `validate.yml` itself), since it
@@ -318,10 +320,10 @@ true only once it is.
   allows because the token it mints is the release bot's (whether a pull request could reach the
   secrets behind it rests on where they are stored, which an administrator reads back, as the start
   of this section says); a permission grant written with an anchor, an alias or an escape; the
-  action reached through a composite action under `.github/actions`, which it does not read, or the
-  bot's secrets read without the action; a top-level key spelled twice, such as two `permissions:`
-  blocks (the grant scan reads the whole text, so nothing hides behind whichever is in force); a job
-  name built from an expression or a matrix value; a check run or status
+  action reached through a composite action under `.github/actions`, which it does not read; a
+  top-level key spelled twice, such as two `permissions:` blocks (the grant scan reads the whole
+  text, so nothing hides behind whichever is in force); a job name built from an expression or a
+  matrix value; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
   PR's own run. The approving review of a workflow change stays the control for what a PR's own diff
   carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
