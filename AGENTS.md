@@ -287,7 +287,7 @@ true only once it is.
   token, which a repository setting can make write-capable; or defines a job whose id or `name:` is `validate`
   (in any file but `validate.yml` itself), since it could report a `validate` check of its own; a
   file that mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot
-  read with confidence, is refused too (write them in plain block style). That is a partial control,
+  read with confidence, or in which a job spells a key twice, is refused too (write them in plain block style). That is a partial control,
   a best-effort read of the text and not a YAML parser, so it also refuses a file that only prints
   one of those grants in a `run:`, and its messages say the words were written, not that the file
   grants them. It does not see: a flow-style or complex-key file whose `jobs` key is itself spelled
