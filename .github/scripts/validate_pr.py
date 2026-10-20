@@ -144,8 +144,8 @@ def _names_ai_tc(value) -> bool:
 #     administrator reads the secret scope back);
 #   * a step that uses the App-token action at all, anywhere but in a job of the importer's workflow
 #     or tag-release.yml that itself enters the marketplace-bot environment, and there without
-#     naming a permission-* input under its with: (the one place the action reads it): with none the
-#     action mints a token with every permission the
+#     naming a permission-* input under its with: (the one place the action reads it) with the value
+#     read or write (it skips an empty one): with none the action mints a token with every permission the
 #     App's installation has. The INPUT_PERMISSION-* variables the action also reads, set in an env:
 #     block or through $GITHUB_ENV, count as the inputs they name (pull-requests is the importer's
 #     alone), and any other is refused;
@@ -213,9 +213,12 @@ _APP_TOKEN_PRS = _grant("permission-pull-requests")
 # ask for a permission without writing the input, in an env: block or by appending to $GITHUB_ENV. The name is
 # matched wherever it appears and the value is not read: any such variable is refused as the grant it names.
 _INPUT_ENV = re.compile(r"INPUT_PERMISSION[-_]([a-z][a-z_-]*)", re.IGNORECASE)
-# A step written as one flow mapping, or a `with:` given in flow style, that names a permission input.
-_FLOW_WITH = re.compile(r"""["']?with["']?\s*:\s*\{[^{}]*?["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE)
-_FLOW_INPUTS = re.compile(r"""\{[^{}]*?["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE)
+# A step written as one flow mapping, or a `with:` given in flow style, that names a permission input with a
+# value the action reads: literally read or write. The action skips an input whose value is empty, so an empty
+# one, nothing at all and an expression that may be empty name no permission.
+_FLOW_PERMISSION = r"""["']?permission-[a-z-]+["']?\s*:\s*(?-i:read|write|"read"|"write"|'read'|'write')\s*[,}]"""
+_FLOW_WITH = re.compile(r"""["']?with["']?\s*:\s*\{[^{}]*?""" + _FLOW_PERMISSION, re.IGNORECASE)
+_FLOW_INPUTS = re.compile(r"""\{[^{}]*?""" + _FLOW_PERMISSION, re.IGNORECASE)
 # The bot's secrets, by name, and the ways to reach a secret without writing its name (`secrets[...]`,
 # `toJSON(secrets)`): only the bot jobs may read them, whatever reads them.
 _BOT_SECRET = re.compile(r"MARKETPLACE_BOT_|toJSON\(\s*secrets\b|\bsecrets\s*\[", re.IGNORECASE)
@@ -429,7 +432,8 @@ def _steps(job) -> list:
 
 def _names_permission(step: list) -> bool:
     """Whether the step names a `permission-*` input where the action reads it: as a key of its one `with:`
-    mapping. The words anywhere else (a `name:`, an `env:` key, a script) are not an input. A step written as a
+    mapping, with the value read or write. The words anywhere else (a `name:`, an `env:` key, a script) are
+    not an input, and neither is a key with an empty value or an expression, which the action may skip. A step written as a
     flow mapping is read by the flow patterns. A step with two `with:` keys names none, since neither is
     taken to be the one in force."""
     if not step:
@@ -450,8 +454,9 @@ def _names_permission(step: list) -> bool:
             if inner_indent <= indent:
                 break
             nested.append((inner_indent, inner))
-        keys = [(_key_line(inner) or (None,))[0] for inner_indent, inner in nested if inner_indent == nested[0][0]]
-        named = any(isinstance(name, str) and name.lower().startswith("permission-") for name in keys)
+        pairs = [_key_line(inner) or (None, "") for inner_indent, inner in nested if inner_indent == nested[0][0]]
+        named = any(isinstance(name, str) and name.lower().startswith("permission-") and _scalar(text) in ("read", "write")
+                    for name, text in pairs)
     return withs == 1 and named
 
 

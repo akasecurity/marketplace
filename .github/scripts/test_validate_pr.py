@@ -1137,6 +1137,38 @@ class TestWorkflowFiles(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("names no permission input", problems[0])
 
+    def test_a_permission_input_counts_only_with_a_value_the_action_reads(self):
+        # The action skips an input whose value is empty, so with no other input the token gets every permission.
+        def step(value, extra=""):
+            return ("- uses: actions/create-github-app-token@v3\n        with:\n"
+                    f"{extra}          permission-contents:{value}")
+        empty = {
+            "an empty string": step(' ""'), "an empty single-quoted string": step(" ''"), "no value at all": step(""),
+            "an expression": step(" ${{ vars.NOTHING }}"), "an expression in quotes": step(' "${{ vars.NOTHING }}"'),
+            "an alias": step(" *level"), "another word": step(" admin"), "the wrong case": step(" Read"),
+            "padding inside the quotes": step(' "write "'), "a block scalar": step(" |\n            read"),
+            "a flow with an empty value": "- uses: actions/create-github-app-token@v3\n        with: {permission-contents: ''}",
+            "a flow step with an expression": "- {uses: actions/create-github-app-token@v3, with: {permission-contents: '${{ x }}'}}",
+            "a flow step with no value": "- {uses: actions/create-github-app-token@v3, with: {permission-contents: }}",
+        }
+        for label, text in empty.items():
+            with self.subTest(label):
+                self.assert_refused(workflow_text(step=text, job_extra=self.BOT_JOB), "names no permission input",
+                                    path=vp.TAG_RELEASE_WORKFLOW)
+        named = {
+            "read": step(" read"), "write": step(" write"), "quoted": step(' "read"'), "single-quoted": step(" 'write'"),
+            "a trailing comment": step(" read # least"),
+            "one empty and one real": step(" read", extra="          permission-issues: ''\n"),
+            "a real one after an empty one": step(" ''", extra="          permission-issues: write\n"),
+            "a flow with a value": "- uses: actions/create-github-app-token@v3\n        with: {permission-contents: write}",
+            "a flow step with a quoted value": "- {uses: actions/create-github-app-token@v3, with: {permission-contents: 'read'}}",
+            "a flow step with several": "- {uses: actions/create-github-app-token@v3, with: {permission-contents: '', permission-issues: read}}",
+        }
+        for label, text in named.items():
+            with self.subTest(label):
+                report = workflow_pr(workflow_text(step=text, job_extra=self.BOT_JOB), path=vp.TAG_RELEASE_WORKFLOW)
+                self.assertEqual((report.exit_code, report.failures), (0, []), label)
+
     def test_the_secrets_are_not_reachable_without_their_names_outside_the_bot_jobs(self):
         walks = {
             "an index built with format": "${{ secrets[format('MARKETPLACE_{0}', 'BOT_PRIVATE_KEY')] }}",
