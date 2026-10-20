@@ -229,8 +229,13 @@ true only once it is.
   create-only ref, never a force-push, opens the PR, asks the people in `.github/release-approvers.json`
   to review it and enables auto-merge. The request is one call for each login, read from `main` at the
   commit the branch is made from, so a login GitHub refuses (one without write access) does not stop
-  the others; it is a nudge and not a gate, so a refusal, or a file the importer cannot read, warns
-  and the run goes on. It does this because no CODEOWNERS file asks anyone to review the bot's PRs.
+  the others. It is a nudge and not a gate: a refusal, a failed read, a path that is not a file, bytes
+  that are not text, or JSON that is invalid, too deeply nested or the wrong shape warns and the run
+  goes on, and auto-merge is still enabled. The ruleset still requires an approving review, so the PR
+  waits for one, and this is how an approver learns it is waiting. It is the request GitHub's own
+  CODEOWNERS routing makes while `.github/CODEOWNERS` exists, so a person named in both is asked twice;
+  once that file is deleted it is the only one. Logins are compared without regard to case, and neither
+  the PR's author nor the bot is asked.
   What it does with a branch that already exists depends on what used it: one with an open bot PR
   is skipped; one the bot's closed PR used is skipped on a plain forward run, and deleted and
   created again only by a `reimport` or rollback dispatch; one no PR ever used was left by a run
