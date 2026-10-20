@@ -856,14 +856,13 @@ class TestWorkflowFiles(unittest.TestCase):
     def test_the_app_token_input_for_pull_requests_is_allowed_only_in_the_importer_in_the_bot_environment(self):
         # The input mints the release bot's own token. Whether a pull request can reach the secrets behind it rests
         # on where they are stored, which nothing in the repository can read, so the carve-out is as narrow as
-        # the importer's own job: that one file, and only with a job in the marketplace-bot environment.
-        importer = ".github/workflows/import-plugin-release.yml"
-        allowed = workflow_pr(workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB), path=importer)
+        # the importer's own job: that one file, and only in a job that enters the marketplace-bot environment.
+        allowed = workflow_pr(workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB), path=vp.IMPORTER_WORKFLOW)
         self.assertEqual((allowed.exit_code, allowed.failures), (0, []))
         refused = {
             "another workflow, with the environment": dict(path=".github/workflows/extra.yml", job_extra=self.BOT_JOB),
-            "the importer, without the environment": dict(path=importer, job_extra=""),
-            "the importer, in another environment": dict(path=importer, job_extra="    environment: production"),
+            "the importer, without the environment": dict(path=vp.IMPORTER_WORKFLOW, job_extra=""),
+            "the importer, in another environment": dict(path=vp.IMPORTER_WORKFLOW, job_extra="    environment: production"),
             "a workflow with no environment, as a pull request would write it": dict(path=".github/workflows/extra.yml", job_extra=""),
         }
         for label, kwargs in refused.items():
@@ -872,7 +871,6 @@ class TestWorkflowFiles(unittest.TestCase):
                                              "asks the App-token action for pull-requests: write", path=kwargs["path"])
                 failed_with(self, report, "marketplace-bot")
 
-    IMPORTER = ".github/workflows/import-plugin-release.yml"
     SECOND_JOB = ("  second:\n    permissions:\n      contents: read\n    runs-on: ubuntu-latest\n    steps:\n"
                   "      - uses: actions/create-github-app-token@v3\n        with:\n"
                   "          permission-pull-requests: write\n")
@@ -881,11 +879,11 @@ class TestWorkflowFiles(unittest.TestCase):
         # A second job that asks for the token without entering the environment is not gated by its deployment rule,
         # whatever another job in the same file enters.
         text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + self.SECOND_JOB
-        report = self.assert_refused(text, "asks the App-token action for pull-requests: write", path=self.IMPORTER)
+        report = self.assert_refused(text, "asks the App-token action for pull-requests: write", path=vp.IMPORTER_WORKFLOW)
         failed_with(self, report, "only in a job that itself enters the marketplace-bot environment")
         both = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + self.SECOND_JOB.replace(
             "    permissions:\n", f"    environment: marketplace-bot\n    permissions:\n")
-        allowed = workflow_pr(both, path=self.IMPORTER)
+        allowed = workflow_pr(both, path=vp.IMPORTER_WORKFLOW)
         self.assertEqual((allowed.exit_code, allowed.failures), (0, []))
 
     def test_words_in_a_script_do_not_stand_for_the_environment(self):
@@ -893,11 +891,11 @@ class TestWorkflowFiles(unittest.TestCase):
                   "      - uses: actions/create-github-app-token@v3\n        with:\n"
                   "          permission-pull-requests: write")
         self.assert_refused(workflow_text(step=script), "asks the App-token action for pull-requests: write",
-                            path=self.IMPORTER)
+                            path=vp.IMPORTER_WORKFLOW)
 
     def test_an_app_token_request_outside_every_job_is_refused_in_the_importer(self):
         text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + "# kept\nenv:\n  permission-pull-requests: write\n"
-        self.assert_refused(text, "asks the App-token action for pull-requests: write", path=self.IMPORTER)
+        self.assert_refused(text, "asks the App-token action for pull-requests: write", path=vp.IMPORTER_WORKFLOW)
 
     def test_the_environment_is_read_in_the_forms_github_documents(self):
         entering = {
@@ -911,7 +909,7 @@ class TestWorkflowFiles(unittest.TestCase):
         }
         for label, job_extra in entering.items():
             with self.subTest(label):
-                report = workflow_pr(workflow_text(step=self.APP_TOKEN, job_extra=job_extra), path=self.IMPORTER)
+                report = workflow_pr(workflow_text(step=self.APP_TOKEN, job_extra=job_extra), path=vp.IMPORTER_WORKFLOW)
                 self.assertEqual((report.exit_code, report.failures), (0, []))
         other = {
             "another environment": "    environment: production",
@@ -923,12 +921,10 @@ class TestWorkflowFiles(unittest.TestCase):
         }
         for label, job_extra in other.items():
             with self.subTest(label):
-                text = workflow_text(step=self.APP_TOKEN, job_extra=job_extra)
-                self.assertTrue(any("asks the App-token action" in problem
-                                    for problem in vp.workflow_problems(self.IMPORTER, text)), label)
+                self.assert_refused(workflow_text(step=self.APP_TOKEN, job_extra=job_extra),
+                                    "asks the App-token action", path=vp.IMPORTER_WORKFLOW)
         on_a_step = workflow_text(step=self.APP_TOKEN + "\n        environment: marketplace-bot")
-        self.assertTrue(any("asks the App-token action" in problem
-                            for problem in vp.workflow_problems(self.IMPORTER, on_a_step)))
+        self.assert_refused(on_a_step, "asks the App-token action", path=vp.IMPORTER_WORKFLOW)
 
     def test_an_unreadable_validate_yml_is_refused_like_any_other_file(self):
         # validate.yml may define the job named validate, and that is all it is exempt from.
@@ -954,7 +950,7 @@ class TestWorkflowFiles(unittest.TestCase):
         for label, job_extra in duplicated.items():
             with self.subTest(label):
                 report = self.assert_refused(workflow_text(job_extra=job_extra, step=self.APP_TOKEN),
-                                             "is written in a form this check does not read", path=self.IMPORTER)
+                                             "is written in a form this check does not read", path=vp.IMPORTER_WORKFLOW)
                 failed_with(self, report, "twice")
         once = workflow_pr(workflow_text(job_extra="    timeout-minutes: 5"))
         self.assertEqual((once.exit_code, once.failures), (0, []))
@@ -976,7 +972,7 @@ class TestWorkflowFiles(unittest.TestCase):
     def test_a_file_is_read_once_and_an_unreadable_one_gets_one_answer(self):
         text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB)
         with mock.patch.object(vp, "_rows", wraps=vp._rows) as spy:
-            vp.workflow_problems(self.IMPORTER, text)
+            vp.workflow_problems(vp.IMPORTER_WORKFLOW, text)
         self.assertEqual(spy.call_count, 1)
         unread = "name: x\non: push\njobs: {build: {runs-on: x}}\n"
         for path in (vp.VALIDATE_WORKFLOW, EXTRA):
@@ -991,13 +987,13 @@ class TestWorkflowFiles(unittest.TestCase):
 
     def test_the_repositorys_importer_keeps_its_app_token_only_where_the_rule_allows(self):
         text = (WORKFLOWS_DIR / "import-plugin-release.yml").read_text(encoding="utf-8")
-        self.assertEqual(vp.workflow_problems(".github/workflows/import-plugin-release.yml", text), [])
+        self.assertEqual(vp.workflow_problems(vp.IMPORTER_WORKFLOW, text), [])
         copied = vp.workflow_problems(".github/workflows/copy.yml", text)
         self.assertEqual(len(copied), 1, copied)
         self.assertIn("asks the App-token action for pull-requests: write", copied[0])
         without = re.sub(r"(?m)^\s+environment: marketplace-bot\n", "", text)
         self.assertNotEqual(without, text)
-        self.assertEqual(len(vp.workflow_problems(".github/workflows/import-plugin-release.yml", without)), 1)
+        self.assertEqual(len(vp.workflow_problems(vp.IMPORTER_WORKFLOW, without)), 1)
 
     def test_the_read_form_of_the_app_token_input_is_fine_anywhere(self):
         step = "- uses: actions/create-github-app-token@v3\n        with:\n          permission-pull-requests: read"
