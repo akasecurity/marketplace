@@ -608,8 +608,8 @@ def release_approvers(gh: GitHub, ref: str) -> list[str]:
         raw = read_file(gh, APPROVERS_FILE, ref)
         listed = None if raw is None else json.loads(raw)["approvers"]
     except (GitHubError, OSError, TypeError, ValueError, KeyError, RecursionError) as error:
-        print(f"::warning::{APPROVERS_FILE} at {ref[:12]} could not be read ({type(error).__name__}), "
-              "so no review is requested")
+        print(f"::warning::{APPROVERS_FILE} at {ref[:12]} could not be read "
+              f"({type(error).__name__}: {' '.join(str(error).split())}), so no review is requested")
         return []
     if raw is None:
         print(f"::warning::{APPROVERS_FILE} is missing at {ref[:12]}, so no review is requested")
@@ -643,7 +643,7 @@ def request_reviews(gh: GitHub, pr: dict, ref: str) -> None:
         try:
             gh.post(gh.repo_path(f"pulls/{pr['number']}/requested_reviewers"), {"reviewers": [login]})
         except (GitHubError, OSError, ValueError) as error:
-            print(f"::warning::could not request a review from {login} on #{pr['number']}: {error}")
+            print(f"::warning::could not request a review from {login} on #{pr['number']}: {' '.join(str(error).split())}")
 
 
 def branch_exists(gh: GitHub, branch: str) -> bool:

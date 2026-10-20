@@ -29,8 +29,9 @@ and who did not push it. With none, the tag records `approver: none` and a note 
 bypassed the ruleset, or `approver: unknown` when an approval exists that this read cannot confirm
 (the reviewer's access is read when the sweep runs, not when the review was submitted), when the
 head's pusher cannot be named, or when the only approvals are by the head commit's author or committer
-and the activity feed does not say who pushed it. A commit no pull request merged records
-`approver: none`, as there is no approval to match.
+and the activity feed does not say who pushed it. Whatever the approver, a feed that was asked and
+refused is said in the note. A commit no pull request merged records `approver: none`, as there is no
+approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
 a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
 the sweep: every run reports it as a warning and goes on, comparing each later
@@ -299,26 +300,36 @@ def pull_reviews(gh: GitHub, number: int) -> list[dict]:
 PUSH_ACTIVITIES = ("push", "force_push", "branch_creation")
 
 
-def head_pusher(gh: GitHub, pull: dict) -> str | None:
-    """The login that pushed the PR's final head to its branch, as the repository's activity feed records it, or
-    None when the feed cannot say: a head in a fork (the push is in the fork's feed), a feed GitHub refuses to
-    serve, one whose newest hundred records hold no push that left the branch at this head, or a push by an
-    account that no longer exists. The feed outlives the branch, so a PR whose branch was deleted on merge is
-    read the same way. An App's push is recorded under the App's login, which no approval is made by."""
+def head_pusher(gh: GitHub, pull: dict) -> tuple[str | None, str | None]:
+    """(the login that pushed the PR's final head to its branch, why the feed could not be read). The login is as
+    the repository's activity feed records it, or None when the feed cannot say: a head in a fork (the push is in
+    the fork's feed), a feed GitHub refuses to serve, one whose newest hundred records hold no push that left the
+    branch at this head, or a push by an account that no longer exists. The feed outlives the branch, so a PR
+    whose branch was deleted on merge is read the same way. An App's push is recorded under the App's login,
+    which no approval is made by.
+
+    The feed is asked newest first, so the first record that left the branch at this head is the most recent
+    push to do so: a branch reset to a commit it held before is attributed to whoever reset it. The second item is
+    set only when the feed was asked and GitHub refused it or the request failed (a short reason, also printed as
+    a workflow annotation), which is not the same as a feed with no such push: a token the endpoint is not
+    served to would otherwise send every PR to the fallback with nothing to show for it."""
     head = pull.get("head") or {}
     ref, sha, repo = head.get("ref"), head.get("sha"), (head.get("repo") or {}).get("full_name")
     if not ref or not sha or not isinstance(repo, str) or repo.casefold() != gh.repo.casefold():
-        return None
+        return None, None
     try:
-        feed = gh.get(gh.repo_path("activity"), {"ref": f"refs/heads/{ref}", "per_page": 100})
-    except (GitHubError, OSError):
-        return None
+        feed = gh.get(gh.repo_path("activity"), {"ref": f"refs/heads/{ref}", "direction": "desc", "per_page": 100})
+    except (GitHubError, OSError) as error:
+        reason = f"HTTP {error.status}" if isinstance(error, GitHubError) else type(error).__name__
+        print(f"::warning::the activity feed for refs/heads/{ref} was not read ({' '.join(str(error).split())[:300]}); "
+              "the head commit's author and committer stand in for its pusher")
+        return None, reason
     for activity in feed if isinstance(feed, list) else ():
         if isinstance(activity, dict) and activity.get("activity_type") in PUSH_ACTIVITIES \
                 and activity.get("after") == sha:
             login = (activity.get("actor") or {}).get("login")
-            return login if isinstance(login, str) and login else None
-    return None
+            return (login if isinstance(login, str) and login else None), None
+    return None, None
 
 
 def last_pushers(gh: GitHub, head: str) -> set[str]:
@@ -338,27 +349,29 @@ class Approvals:
     whose approval is set aside because GitHub reports no push access for them now, and `undecided` the users
     with push access whose approval is set aside only because they authored or committed the head while the
     feed could not say who pushed it: GitHub counts their approval if someone else pushed. `pusher` is the
-    account the feed names, and `unnameable` is True when it names none and neither does the commit."""
+    account the feed names, and `unnameable` is True when it names none and neither does the commit. `feed_refused`
+    is why the feed could not be read, when it was asked and GitHub refused it or the request failed."""
     counted: list[str]
     unconfirmed: list[str]
     undecided: list[str]
     pusher: str | None
     unnameable: bool
+    feed_refused: str | None = None
 
 
 def approvals(gh: GitHub, number: int, pull: dict) -> Approvals:
     """The approvals of `pull`'s final head (`pulls/{number}`), judged against the account that pushed it."""
     head = pull["head"]["sha"]
     reviews = pull_reviews(gh, number)
-    pusher = head_pusher(gh, pull)
+    pusher, refused = head_pusher(gh, pull)
     candidates = set() if pusher else last_pushers(gh, head)
     if not pusher and not candidates:
-        return Approvals([], [], [], None, True)
+        return Approvals([], [], [], None, True, refused)
     counted = write_approvals(reviews, head, exclude={pusher} if pusher else candidates)
     if counted:
-        return Approvals(counted, [], [], pusher, False)
+        return Approvals(counted, [], [], pusher, False, refused)
     return Approvals([], unconfirmed_approvals(reviews, head, exclude={pusher} if pusher else ()),
-                     [login for login in write_approvals(reviews, head) if login in candidates], pusher, False)
+                     [login for login in write_approvals(reviews, head) if login in candidates], pusher, False, refused)
 
 
 def latest_positions(reviews) -> dict[str, dict]:
@@ -509,6 +522,10 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
         note = f"{'; '.join(parts)}; merged by {merger}"
     else:
         approver, note = "none", f"ruleset bypass by {merger}"
+    if found.feed_refused:
+        unread = (f"the activity feed was not read ({found.feed_refused}), so the head commit's author and "
+                  "committer stood in for the PR's pusher")
+        note = f"{note}; {unread}" if note else unread
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "

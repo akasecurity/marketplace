@@ -1,5 +1,6 @@
 """Tests for ghapi.py: headers, bodies, statuses, pagination, GraphQL errors, and (against loopback
 servers only) the real transport's refusal to follow a redirect."""
+import http.client
 import http.server
 import json
 import os
@@ -86,6 +87,13 @@ class _Origin(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.requests.append(dict(self.headers))
+        if self.server.truncate:
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b'{"ok"')
+            self.close_connection = True
+            return
         body = b"" if self.server.redirect_to else b'{"ok": true}'
         self.send_response(302 if self.server.redirect_to else 200)
         if self.server.redirect_to:
@@ -101,10 +109,11 @@ class _Origin(http.server.BaseHTTPRequestHandler):
 class TestUrllibTransport(unittest.TestCase):
     """The real transport, against loopback servers, never the network."""
 
-    def serve(self, redirect_to=None):
+    def serve(self, redirect_to=None, truncate=False):
         server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
         server.requests = []
         server.redirect_to = redirect_to
+        server.truncate = truncate
         thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         self.addCleanup(thread.join)
@@ -122,6 +131,26 @@ class TestUrllibTransport(unittest.TestCase):
         origin = self.serve()
         status, body = ghapi.urllib_transport("GET", f"http://127.0.0.1:{origin.server_port}/x", {}, None)
         self.assertEqual((status, json.loads(body)), (200, {"ok": True}))
+
+    def test_a_body_cut_short_on_the_wire_is_a_connection_error(self):
+        # http.client raises IncompleteRead, which is no OSError, so a caller guarding a failed transport would miss it.
+        origin = self.serve(truncate=True)
+        with self.assertRaises(OSError) as caught:
+            ghapi.urllib_transport("GET", f"http://127.0.0.1:{origin.server_port}/x", {}, None)
+        self.assertIsInstance(caught.exception.__cause__, http.client.IncompleteRead)
+        self.assertIn("IncompleteRead", str(caught.exception))
+        with mock.patch.object(ghapi, "API", f"http://127.0.0.1:{origin.server_port}"):
+            with self.assertRaises(OSError):
+                GitHub("", "o/r").get("repos/o/r/pulls")
+
+    def test_every_http_client_failure_is_a_connection_error(self):
+        for error in (http.client.IncompleteRead(b"{"), http.client.BadStatusLine("x"), http.client.LineTooLong("status line"),
+                      http.client.RemoteDisconnected("closed")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(ghapi._OPENER, "open", side_effect=error):
+                    with self.assertRaises(OSError) as caught:
+                        ghapi.urllib_transport("GET", "http://127.0.0.1:1/x", {}, None)
+                self.assertIs(caught.exception.__cause__, error)
 
     def test_a_redirect_comes_back_as_its_status_and_the_token_goes_no_further(self):
         # urllib's default handler copies every header onto the follow-up request, the credential

@@ -5,6 +5,7 @@ replace, so no test touches the network.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -40,13 +41,17 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 def urllib_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
     """One request; a status other than 2xx comes back as itself, and so does a redirect, which is
-    never followed: the bot's token must not reach a host the API named in a Location header."""
+    never followed: the bot's token must not reach a host the API named in a Location header. A
+    response cut short or garbled on the wire (http.client raises HTTPException, which is no OSError)
+    is raised as a ConnectionError, so every caller that guards a failed transport sees this one too."""
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with _OPENER.open(request, timeout=60) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
+    except http.client.HTTPException as error:
+        raise ConnectionError(f"{type(error).__name__}: {error}") from error
 
 
 class GitHub:

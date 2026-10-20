@@ -66,9 +66,10 @@ def approval_problem(gh: GitHub, sha: str, number: int, pull: dict) -> str | Non
     if found.unnameable:
         # With no login for the pusher, an empty exclusion would let every member's approval through, the pusher's
         # own included. Not knowing who pushed is not a pass.
+        unread = f" The activity feed was not read ({found.feed_refused})." if found.feed_refused else ""
         return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
                 "(the activity feed does not name them, and neither the commit's author nor its committer is a "
-                "GitHub account other than web-flow), so an approval could not be told from the pusher's own.")
+                f"GitHub account other than web-flow), so an approval could not be told from the pusher's own.{unread}")
     lead = (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its "
             f"final head `{head}`")
     problem = f"{lead} by someone other than its last pusher ({found.pusher})." if found.pusher else f"{lead}."
@@ -83,6 +84,9 @@ def approval_problem(gh: GitHub, sha: str, number: int, pull: dict) -> str | Non
         problem += (f" An approving review by {', '.join(found.unconfirmed)} was not counted: GitHub reports no push "
                     "access for them as of this audit (they may never have had it, or may have lost it since the "
                     "review).")
+    if found.feed_refused:
+        problem += (f" The activity feed was not read ({found.feed_refused}), so the head commit's author and "
+                    "committer stood in for the pusher.")
     return problem
 
 
