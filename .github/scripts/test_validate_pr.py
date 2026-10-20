@@ -872,6 +872,90 @@ class TestWorkflowFiles(unittest.TestCase):
                                              "asks the App-token action for pull-requests: write", path=kwargs["path"])
                 failed_with(self, report, "marketplace-bot")
 
+    IMPORTER = ".github/workflows/import-plugin-release.yml"
+    SECOND_JOB = ("  second:\n    permissions:\n      contents: read\n    runs-on: ubuntu-latest\n    steps:\n"
+                  "      - uses: actions/create-github-app-token@v3\n        with:\n"
+                  "          permission-pull-requests: write\n")
+
+    def test_the_carve_out_belongs_to_the_job_that_enters_the_environment_not_to_the_file(self):
+        # A second job that asks for the token without entering the environment is not gated by its deployment rule,
+        # whatever another job in the same file enters.
+        text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + self.SECOND_JOB
+        report = self.assert_refused(text, "asks the App-token action for pull-requests: write", path=self.IMPORTER)
+        failed_with(self, report, "only in a job that itself enters the marketplace-bot environment")
+        both = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + self.SECOND_JOB.replace(
+            "    permissions:\n", f"    environment: marketplace-bot\n    permissions:\n")
+        allowed = workflow_pr(both, path=self.IMPORTER)
+        self.assertEqual((allowed.exit_code, allowed.failures), (0, []))
+
+    def test_words_in_a_script_do_not_stand_for_the_environment(self):
+        script = ("- run: |\n          cat <<Y\n          environment: marketplace-bot\n          Y\n"
+                  "      - uses: actions/create-github-app-token@v3\n        with:\n"
+                  "          permission-pull-requests: write")
+        self.assert_refused(workflow_text(step=script), "asks the App-token action for pull-requests: write",
+                            path=self.IMPORTER)
+
+    def test_an_app_token_request_outside_every_job_is_refused_in_the_importer(self):
+        text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB) + "# kept\nenv:\n  permission-pull-requests: write\n"
+        self.assert_refused(text, "asks the App-token action for pull-requests: write", path=self.IMPORTER)
+
+    def test_the_environment_is_read_in_the_forms_github_documents(self):
+        entering = {
+            "a plain value": "    environment: marketplace-bot",
+            "a quoted value": '    environment: "marketplace-bot"',
+            "a single-quoted value": "    environment: 'marketplace-bot'",
+            "a quoted key": '    "environment": marketplace-bot',
+            "a name under it": "    environment:\n      name: marketplace-bot",
+            "a name and a url under it": "    environment:\n      url: https://example.org\n      name: marketplace-bot",
+            "a quoted name under it": "    environment:\n      \"name\": 'marketplace-bot'",
+        }
+        for label, job_extra in entering.items():
+            with self.subTest(label):
+                report = workflow_pr(workflow_text(step=self.APP_TOKEN, job_extra=job_extra), path=self.IMPORTER)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+        other = {
+            "another environment": "    environment: production",
+            "another name under it": "    environment:\n      name: production",
+            "the right name nested one level too deep": "    environment:\n      extra:\n        name: marketplace-bot",
+            "flow style": "    environment: {name: marketplace-bot}",
+            "an expression": "    environment: ${{ inputs.target }}",
+            "a similar name": "    environment: marketplace-bot-2",
+        }
+        for label, job_extra in other.items():
+            with self.subTest(label):
+                text = workflow_text(step=self.APP_TOKEN, job_extra=job_extra)
+                self.assertTrue(any("asks the App-token action" in problem
+                                    for problem in vp.workflow_problems(self.IMPORTER, text)), label)
+        on_a_step = workflow_text(step=self.APP_TOKEN + "\n        environment: marketplace-bot")
+        self.assertTrue(any("asks the App-token action" in problem
+                            for problem in vp.workflow_problems(self.IMPORTER, on_a_step)))
+
+    def test_an_unreadable_validate_yml_is_refused_like_any_other_file(self):
+        # validate.yml may define the job named validate, and that is all it is exempt from.
+        unread = "name: validate\non: pull_request_target\njobs: {validate: {runs-on: x}}\n"
+        for path in (vp.VALIDATE_WORKFLOW, EXTRA):
+            with self.subTest(path=path):
+                self.assert_refused(unread, "is written in a form this check does not read", path=path)
+        bare = "name: validate\non: pull_request_target\njobs:\n  validate:\n    runs-on: x\n"
+        self.assert_refused(bare, "declares no top-level permissions", path=vp.VALIDATE_WORKFLOW)
+        self.assertEqual(workflow_pr(bare.replace("jobs:", "permissions: {}\njobs:"), path=vp.VALIDATE_WORKFLOW).failures, [])
+
+    def test_a_file_is_read_once_and_an_unreadable_one_gets_one_answer(self):
+        text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB)
+        with mock.patch.object(vp, "_rows", wraps=vp._rows) as spy:
+            vp.workflow_problems(self.IMPORTER, text)
+        self.assertEqual(spy.call_count, 1)
+        unread = "name: x\non: push\njobs: {build: {runs-on: x}}\n"
+        for path in (vp.VALIDATE_WORKFLOW, EXTRA):
+            problems = vp.workflow_problems(path, unread)
+            self.assertEqual(len(problems), 1, problems)
+
+    def test_the_declares_message_agrees_in_number(self):
+        one = vp.workflow_problems(EXTRA, workflow_text(bare=True))
+        self.assertIn("`build` declares none of its own, so it takes the repository's default token", one[0])
+        many = vp.workflow_problems(EXTRA, "name: x\non: push\njobs:\n  one:\n    runs-on: x\n  two:\n    runs-on: x\n")
+        self.assertIn("`one`, `two` declare none of their own, so they take the repository's default token", many[0])
+
     def test_the_repositorys_importer_keeps_its_app_token_only_where_the_rule_allows(self):
         text = (WORKFLOWS_DIR / "import-plugin-release.yml").read_text(encoding="utf-8")
         self.assertEqual(vp.workflow_problems(".github/workflows/import-plugin-release.yml", text), [])
@@ -918,7 +1002,6 @@ class TestWorkflowFiles(unittest.TestCase):
         two_jobs = ("name: x\non: push\njobs:\n  one:\n    permissions: {}\n    runs-on: x\n"
                     "  two:\n    permissions:\n      contents: read\n    runs-on: x\n")
         for label, text in {"at the top": workflow_text(top="permissions:\n  contents: read"),
-                            "an empty mapping at the top": workflow_text(top="permissions: {}"),
                             "a quoted key at the top": workflow_text(top='"permissions": {}'),
                             "on every job": two_jobs}.items():
             with self.subTest(label):
@@ -928,12 +1011,6 @@ class TestWorkflowFiles(unittest.TestCase):
         report = self.assert_refused(one_missing, "declares no top-level permissions")
         failed_with(self, report, "`two`")
         self.assertFalse(any("`one`" in failure for failure in report.failures), report.failures)
-
-    def test_a_workflow_with_no_jobs_needs_no_permissions(self):
-        for text in ("name: nothing\non: push\n", ""):
-            with self.subTest(text=text):
-                report = workflow_pr(text)
-                self.assertEqual((report.exit_code, report.failures), (0, []))
 
     def test_forms_the_scan_cannot_read_with_confidence_fail(self):
         unreadable = {
@@ -1000,8 +1077,6 @@ class TestWorkflowFiles(unittest.TestCase):
 
     def test_the_repositorys_own_workflows_pass_and_the_scan_sees_validate_in_validate_yml(self):
         for workflow in sorted(WORKFLOWS_DIR.glob("*.yml")):
-            if workflow.name == "validate.yml":
-                continue
             with self.subTest(workflow.name):
                 self.assertEqual(vp.workflow_problems(f".github/workflows/{workflow.name}", workflow.read_text(encoding="utf-8")), [])
         text = (WORKFLOWS_DIR / "validate.yml").read_text(encoding="utf-8")
