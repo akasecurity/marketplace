@@ -44,6 +44,8 @@ from release_checks import (FLEET_TAG, INTEGRITY, MANIFEST, MIGRATION_TAG, PACKA
 PIN_BRANCH = re.compile(rf"bot/pin-ai-tc-({SEMVER.pattern})")
 ROLLBACK_BRANCH = re.compile(rf"bot/rollback-ai-tc-({SEMVER.pattern})-to-({SEMVER.pattern})")
 LABELS = {"rollback", "emergency-stop"}
+APPROVERS_FILE = ".github/release-approvers.json"
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 
 
 class Refused(Exception):
@@ -593,6 +595,48 @@ def read_file(gh: GitHub, path: str, ref: str) -> str | None:
     return base64.b64decode(answer["content"]).decode("utf-8")
 
 
+def release_approvers(gh: GitHub, ref: str) -> list[str]:
+    """The logins .github/release-approvers.json lists at `ref`, each once, in order; [] with a warning when the
+    file is missing or not in the shape the importer reads. An entry that is not a GitHub login is left out, so
+    nothing a file holds can reach a request as anything but a name."""
+    raw = read_file(gh, APPROVERS_FILE, ref)
+    if raw is None:
+        print(f"::warning::{APPROVERS_FILE} is missing at {ref[:12]}, so no review is requested")
+        return []
+    try:
+        listed = json.loads(raw).get("approvers")
+    except (ValueError, AttributeError):
+        listed = None
+    if not isinstance(listed, list):
+        print(f"::warning::{APPROVERS_FILE} at {ref[:12]} is not an object with an approvers list, "
+              "so no review is requested")
+        return []
+    logins: list[str] = []
+    for entry in listed:
+        if isinstance(entry, str) and LOGIN.fullmatch(entry):
+            if entry not in logins:
+                logins.append(entry)
+        else:
+            print(f"::warning::{APPROVERS_FILE} at {ref[:12]} lists an entry that is not a GitHub login, "
+                  "which is skipped")
+    return logins
+
+
+def request_reviews(gh: GitHub, pr: dict, ref: str) -> None:
+    """Ask the release approvers to review `pr`, one request each so a login GitHub refuses (one without write
+    access) does not stop the others. GitHub requests nobody by itself now that no CODEOWNERS file does, and a
+    verified release should not wait for the staleness issue to be noticed. A nudge, not a gate: a refusal
+    warns and the run goes on, because the PR and its auto-merge matter more."""
+    author = (pr.get("user") or {}).get("login")
+    for login in release_approvers(gh, ref):
+        if login == author or login == release_checks.BOT_LOGIN:
+            continue
+        try:
+            gh.post(gh.repo_path(f"pulls/{pr['number']}/requested_reviewers"), {"reviewers": [login]})
+        except GitHubError as error:
+            print(f"::warning::could not request a review from {login} on #{pr['number']}: {error}")
+
+
 def branch_exists(gh: GitHub, branch: str) -> bool:
     try:
         gh.get(gh.repo_path(f"git/ref/heads/{branch}"))
@@ -787,6 +831,7 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
         gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})
+    request_reviews(gh, pr, main_sha)
     return actions["after"](gh, plan, pr)
 
 

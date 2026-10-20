@@ -760,10 +760,13 @@ class OpenPrCase(unittest.TestCase):
         self.addCleanup(bot.stop)
         self.pulls: list[dict] = []
         self.main_manifest = manifest("0.9.14", INTEGRITY["0.9.14"])
+        self.approvers_file = json.dumps({"approvers": ["Vaishnav-OM", "venuverse"], "escalation": None})
         self.gh = FakeGitHub({
             ("GET", R("git/ref/heads/main")): {"object": {"sha": MAIN}},
             ("GET", R(f"contents/{MANIFEST}")): lambda body, params: contents(self.main_manifest),
             ("GET", R(f"contents/{SAFETY_FILE}")): contents(safety({"0.9.14": safety_entry("0.9.14", "0.9.13")})),
+            ("GET", R(f"contents/{ir.APPROVERS_FILE}")): lambda body, params: contents(self.approvers_file),
+            ("POST", R("pulls/12/requested_reviewers")): {"number": 12},
             ("GET", R("pulls")): pulls_route(self.pulls),
             ("GET", R(f"git/commits/{MAIN}")): {"tree": {"sha": TREE}},
             ("POST", R("git/trees")): {"sha": "f" * 40},
@@ -1007,6 +1010,87 @@ class TestOpenPrForward(OpenPrCase):
         with self.assertRaises(ir.Refused):
             self.open(forward_plan(integrity="sha512-short"))
         self.assertEqual(self.gh.calls, [])
+
+
+class TestReleaseApproversAreAskedToReview(OpenPrCase):
+    """With no CODEOWNERS file GitHub requests nobody, so the importer asks the people in release-approvers.json
+    itself: a verified release then does not sit unnoticed until staleness files its 24-hour issue."""
+
+    def requested(self) -> list[str]:
+        return [call[2]["reviewers"] for call in self.gh.called("POST", R("pulls/12/requested_reviewers"))]
+
+    def test_a_forward_pr_asks_each_approver_once_after_it_exists(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan())
+        self.assertEqual(self.requested(), [["Vaishnav-OM"], ["venuverse"]])
+        order = [call[1] for call in self.gh.writes()]
+        self.assertLess(order.index(R("pulls")), order.index(R("pulls/12/requested_reviewers")))
+        self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+
+    def test_a_rollback_pr_asks_them_too(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.open(rollback_plan())
+        self.assertEqual(self.requested(), [["Vaishnav-OM"], ["venuverse"]])
+
+    def test_the_approvers_are_read_from_the_commit_the_branch_is_made_from(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan())
+        asked = self.gh.called("GET", R(f"contents/{ir.APPROVERS_FILE}"))
+        self.assertEqual([call[3] for call in asked], [{"ref": MAIN}])
+
+    def test_a_name_listed_twice_or_the_bot_itself_is_not_asked(self):
+        self.approvers_file = json.dumps({"approvers": ["venuverse", "venuverse", BOT, "Vaishnav-OM"]})
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan())
+        self.assertEqual(self.requested(), [["venuverse"], ["Vaishnav-OM"]])
+
+    def test_an_approver_github_refuses_warns_and_the_others_and_auto_merge_still_go_ahead(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        answers = {"Vaishnav-OM": GitHubError(422, "POST", "pulls/12/requested_reviewers", "not a collaborator"),
+                   "venuverse": {"number": 12}}
+        self.gh.routes[("POST", R("pulls/12/requested_reviewers"))] = lambda body, params: answers[body["reviewers"][0]]
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+        self.assertEqual(self.requested(), [["Vaishnav-OM"], ["venuverse"]])
+        self.assertIn("::warning::could not request a review from Vaishnav-OM on #12", out.getvalue())
+        self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+
+    def test_a_file_that_is_missing_or_cannot_be_read_warns_and_asks_nobody(self):
+        cases = {
+            "missing": None,
+            "not JSON": "{approvers: ",
+            "not an object": json.dumps(["venuverse"]),
+            "no approvers key": json.dumps({"escalation": None}),
+            "approvers not a list": json.dumps({"approvers": "venuverse"}),
+            "an entry that is not a login": json.dumps({"approvers": ["venuverse", "a b", 7, "x`](https://evil.example)"]}),
+            "empty": json.dumps({"approvers": []}),
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.route_branch("bot/pin-ai-tc-0.9.15")
+                self.gh.routes[("GET", R(f"contents/{ir.APPROVERS_FILE}"))] = (
+                    not_found() if text is None else (lambda body, params, text=text: contents(text)))
+                self.pulls.clear()
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+                logins = self.requested()
+                self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+                if label == "an entry that is not a login":
+                    self.assertEqual(logins, [["venuverse"]])
+                    self.assertNotIn("evil", " ".join(login for group in logins for login in group))
+                else:
+                    self.assertEqual(logins, [])
+                    self.assertEqual("::warning::" in out.getvalue(), label != "empty")
+
+    def test_nobody_is_asked_when_no_pr_is_opened(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15", exists=True)
+        self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15"))
+        with self.assertRaises(ir.Refused):
+            self.open(forward_plan())
+        self.assertEqual(self.gh.called("POST", R("pulls/12/requested_reviewers")), [])
+        self.assertEqual(self.gh.called("GET", R(f"contents/{ir.APPROVERS_FILE}")), [])
 
 
 class TestOpenPrRollback(OpenPrCase):
