@@ -786,13 +786,15 @@ class TestApprover(unittest.TestCase):
                        {"author": {"login": None}, "committer": {"login": "venuverse"}},
                        {"author": {"login": "venuverse"}, "committer": {"login": "another-writer"}}):
             for feed in (None, [], GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")):
-                with self.subTest(pusher=pusher, feed=feed):
+                with self.subTest(pusher=pusher, feed=feed), mock.patch("sys.stdout", new_callable=io.StringIO):
                     facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher=pusher, feed=feed)
                     self.assertEqual(facts["approver"], "unknown")
                     self.assertNotIn("bypass", facts["note"])
                     self.assertIn("approval by venuverse not counted", facts["note"])
                     self.assertIn("does not say who pushed it", facts["note"])
-                    self.assertTrue(facts["note"].endswith("merged by org-owner-example"), facts["note"])
+                    self.assertIn("; merged by org-owner-example", facts["note"])
+                    if not isinstance(feed, GitHubError):
+                        self.assertTrue(facts["note"].endswith("merged by org-owner-example"), facts["note"])
 
     def test_an_approval_by_the_commits_author_counts_when_someone_else_is_the_recorded_pusher(self):
         # Bob rebased Alice's commit and pushed it, then Alice approved: GitHub counted that, so the tag names Alice.
@@ -808,6 +810,97 @@ class TestApprover(unittest.TestCase):
                                pusher={"author": {"login": "carol"}, "committer": {"login": "carol"}},
                                feed=[pushed("a-writer", "h13")])
         self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
+    def test_a_refused_feed_is_recorded_in_the_tag_whatever_the_outcome(self):
+        # The fallback names the same approver the feed would in the ordinary case, so without this a feed that is
+        # never served to the token would leave no trace in the permanent record.
+        refused = GitHubError(403, "GET", R("activity"), '{"message": "Resource not accessible by integration"}')
+        note = ("the activity feed was not read (HTTP 403: Resource not accessible by integration), so the head "
+                "commit's author and committer stood in for the PR's pusher")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            counted = self.facts_for([self.review("APPROVED", "venuverse")], feed=refused)
+            bypass = self.facts_for([self.review("COMMENTED", "venuverse")], feed=refused)
+            unnameable = self.facts_for([self.review("APPROVED", "venuverse")], pusher={"author": None, "committer": None},
+                                        feed=refused)
+            # The feed's own answer, and a plain-text body that gives no message to keep.
+            plain = self.facts_for([self.review("APPROVED", "venuverse")],
+                                   feed=GitHubError(403, "GET", R("activity"), "forbidden"))
+        self.assertEqual((counted["approver"], counted["note"]), ("venuverse", note))
+        self.assertEqual((bypass["approver"], bypass["note"]), ("none", f"ruleset bypass by org-owner-example; {note}"))
+        self.assertIn("(HTTP 403), so the head commit's author and committer stood in", plain["note"])
+        # Nothing stood in when neither the feed nor the commit names an account, and the note must not say so.
+        self.assertEqual(unnameable["approver"], "unknown")
+        self.assertIn("(the activity feed was not read (HTTP 403: Resource not accessible by integration), and "
+                      "neither the commit's author nor its committer is a GitHub account other than web-flow)",
+                      unnameable["note"])
+        self.assertNotIn("stood in", unnameable["note"])
+        self.assertNotIn("does not name them", unnameable["note"])
+        self.assertEqual(out.getvalue().count("::warning::the activity feed"), 4)
+
+    def test_an_unnameable_pusher_is_said_to_be_so_because_the_feed_named_nobody_when_it_answered(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher={"author": None, "committer": None},
+                               feed=[])
+        self.assertIn("(the activity feed does not name them, and neither", facts["note"])
+        self.assertNotIn("was not read", facts["note"])
+
+    def test_a_failure_that_a_re_run_may_not_repeat_stops_a_tag_instead_of_writing_the_fallback_into_it(self):
+        # A tag is permanent, so a 5xx, a rate limit, a dropped connection or an answer that is no JSON ends the
+        # sweep red (one InfraError, which main turns into one annotation): the next run reads the feed again.
+        transient = {
+            "a bad gateway": GitHubError(502, "GET", R("activity"), "bad gateway"),
+            "a server error": GitHubError(500, "GET", R("activity"), "boom"),
+            "a primary rate limit": GitHubError(429, "GET", R("activity"), "slow down"),
+            "a secondary rate limit": GitHubError(403, "GET", R("activity"), '{"message": "You have exceeded a secondary rate limit"}'),
+            "an unexpected status": GitHubError(418, "GET", R("activity"), "teapot"),
+            "a reset connection": ConnectionResetError("reset"),
+            "a body cut short": ConnectionError("IncompleteRead: IncompleteRead(5 bytes read)"),
+            "a timeout": TimeoutError(),
+            "an answer that is no JSON": ValueError("Expecting value: line 1 column 1 (char 0)"),
+            "an answer nested too deeply": RecursionError("maximum recursion depth exceeded"),
+        }
+        for label, error in transient.items():
+            with self.subTest(label), mock.patch("sys.stdout", new_callable=io.StringIO):
+                feed = error if isinstance(error, GitHubError) else raising(error)
+                with self.assertRaises(InfraError) as caught:
+                    self.facts_for([self.review("APPROVED", "venuverse")], feed=feed)
+                self.assertIn("the activity feed for refs/heads/feat/example could not be read", str(caught.exception))
+                self.assertIn("a re-run reads it again", str(caught.exception))
+                self.assertEqual(len(str(caught.exception).splitlines()), 1)
+
+    def test_the_sweep_ends_with_one_annotation_when_the_feed_cannot_be_read_and_tags_nothing(self):
+        gh = sweep_github()
+        gh.routes[("GET", R("pulls/13"))] = {"head": head_of("h13"), "labels": [], "merged_by": {"login": "venuverse"}}
+        gh.routes[("GET", R("activity"))] = GitHubError(502, "GET", R("activity"), "bad gateway")
+        code, out = run_main("sweep", history(chain=("t8", "b")), gh)
+        self.assertEqual(code, 1)
+        self.assertRegex(out, r"(?m)^::error::github: the activity feed for refs/heads/feat/example could not be read")
+        self.assertEqual(out.count("\n"), 1)
+        self.assertEqual(gh.called("POST", R("git/tags")), [])
+
+    def test_a_refusal_is_kept_in_the_tag_and_a_failure_that_is_not_one_is_not(self):
+        cases = {
+            401: "HTTP 401", 404: "HTTP 404", 410: "HTTP 410", 451: "HTTP 451",
+        }
+        for status, reason in cases.items():
+            with self.subTest(status=status), mock.patch("sys.stdout", new_callable=io.StringIO):
+                facts = self.facts_for([self.review("APPROVED", "venuverse")],
+                                       feed=GitHubError(status, "GET", R("activity"), "no"))
+                self.assertIn(f"the activity feed was not read ({reason})", facts["note"])
+
+    def test_the_message_github_gave_is_kept_short_in_the_tag(self):
+        body = '{"message": "' + "Resource not accessible by integration " * 10 + '", "documentation_url": "https://x"}'
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            facts = self.facts_for([self.review("APPROVED", "venuverse")],
+                                   feed=GitHubError(403, "GET", R("activity"), body))
+        reason = facts["note"].split("was not read (")[1].split("), so")[0]
+        self.assertTrue(reason.startswith("HTTP 403: Resource not accessible by integration Resource"), reason)
+        self.assertLessEqual(len(reason), len("HTTP 403: ") + 100)
+
+    def test_a_feed_that_was_read_leaves_no_note(self):
+        for feed in ([pushed("another-writer", "h13")], []):
+            with self.subTest(feed=feed):
+                facts = self.facts_for([self.review("APPROVED", "venuverse")], feed=feed)
+                self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
 
     def test_a_head_with_no_account_in_its_commit_is_judged_by_the_feed(self):
         # An author email GitHub cannot match to an account used to make every such PR unknown.
@@ -955,19 +1048,39 @@ class TestPullReviews(unittest.TestCase):
         self.assertEqual([review["can_push"] for review in tr.pull_reviews(gh, 13)], [False, False])
 
 
+def raising(error):
+    """A route that raises `error` (FakeGitHub raises a GitHubError route itself and returns any other value)."""
+    def route(body, params):
+        raise error
+    return route
+
+
+class TestJoinNote(unittest.TestCase):
+    def test_reasons_are_joined_after_a_semicolon_and_empty_ones_are_left_out(self):
+        self.assertEqual(tr.join_note(None, "a", "", "b"), "a; b")
+        self.assertEqual(tr.join_note("n", "a", None), "n; a")
+        self.assertEqual(tr.join_note("n"), "n")
+        self.assertIsNone(tr.join_note(None, ""))
+        self.assertEqual(tr.noted({"note": "n", "pr": "1"}, "x", ""), {"note": "n; x", "pr": "1"})
+
+
 class TestHeadPusher(unittest.TestCase):
     def pusher(self, feed, **head):
         """head_pusher for a PR whose head is `h13` on feat/example in this repository (`head` overrides that)."""
         gh = FakeGitHub({("GET", R("activity")): feed})
         pull = {"head": {**head_of("h13"), **head}}
-        return tr.head_pusher(gh, pull), gh
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            login, refused = tr.head_pusher(gh, pull)
+        self.printed, self.refused = out.getvalue(), refused
+        return login, gh
 
     def test_the_account_that_left_the_branch_at_the_head_is_the_pusher(self):
         login, gh = self.pusher([pushed("later-writer", "h14"), pushed("venuverse", "h13"), pushed("older", "h12")])
         self.assertEqual(login, "venuverse")
         asked = gh.called("GET", R("activity"))
         self.assertEqual(len(asked), 1)
-        self.assertEqual(asked[0][3], {"ref": "refs/heads/feat/example", "per_page": 100})
+        self.assertEqual(asked[0][3], {"ref": "refs/heads/feat/example", "direction": "desc", "per_page": 100})
+        self.assertEqual((self.refused, self.printed), (None, ""))
 
     def test_a_branch_created_at_the_head_counts_as_a_push_of_it(self):
         self.assertEqual(self.pusher([pushed(BOT, "h13", kind="branch_creation")])[0], BOT)
@@ -1004,13 +1117,61 @@ class TestHeadPusher(unittest.TestCase):
     def test_the_repository_is_compared_without_regard_to_case(self):
         self.assertEqual(self.pusher([pushed("venuverse", "h13")], repo={"full_name": REPO.upper()})[0], "venuverse")
 
-    def test_a_feed_github_refuses_or_cannot_deliver_names_nobody(self):
-        for error in (GitHubError(403, "GET", R("activity"), "Resource not accessible by integration"),
-                      GitHubError(404, "GET", R("activity"), "Not Found"), OSError("connection reset")):
+    def test_a_feed_github_refuses_or_cannot_deliver_names_nobody_and_says_so(self):
+        cases = ((GitHubError(403, "GET", R("activity"), '{"message": "Resource not accessible by integration"}'),
+                  "HTTP 403: Resource not accessible by integration"),
+                 (GitHubError(404, "GET", R("activity"), "Not Found"), "HTTP 404"),
+                 (GitHubError(502, "GET", R("activity"), "bad\ngateway"), "HTTP 502"),
+                 (OSError("connection reset"), "OSError"), (ConnectionError("cut short"), "ConnectionError"),
+                 (ValueError("not json"), "ValueError"))
+        for error, reason in cases:
             with self.subTest(error=error):
                 def refuse(body, params, error=error):
                     raise error
                 self.assertIsNone(self.pusher(refuse)[0])
+                self.assertEqual(self.refused, reason)
+                self.assertEqual(len(self.printed.splitlines()), 1, self.printed)
+                self.assertTrue(self.printed.startswith(
+                    "::warning::the activity feed for refs/heads/feat/example was not read ("), self.printed)
+                self.assertIn(type(error).__name__ + ": ", self.printed)
+                self.assertIn("stand in for its pusher", self.printed)
+
+    def test_the_warning_names_the_type_even_when_the_error_has_no_message(self):
+        def refuse(body, params):
+            raise TimeoutError()
+        self.pusher(refuse)
+        self.assertIn("was not read (TimeoutError: )", self.printed)
+
+    def test_a_refusal_is_told_from_a_failure_a_re_run_may_not_repeat(self):
+        refusals = {401: True, 403: True, 404: True, 410: True, 451: True,
+                    400: False, 422: False, 429: False, 500: False, 502: False, 503: False}
+        for status, refused in refusals.items():
+            with self.subTest(status=status):
+                self.assertEqual(tr.feed_refusal(GitHubError(status, "GET", "p", "x")) is not None, refused)
+        self.assertIsNone(tr.feed_refusal(GitHubError(403, "GET", "p", '{"message": "You have exceeded a secondary rate limit"}')))
+        self.assertIsNone(tr.feed_refusal(GitHubError(403, "GET", "p", "API Rate Limit exceeded")))
+        self.assertEqual(tr.feed_refusal(GitHubError(403, "GET", "p", "[1, 2]")), "HTTP 403")
+        self.assertEqual(tr.feed_refusal(GitHubError(403, "GET", "p", '{"message": 7}')), "HTTP 403")
+        self.assertEqual(tr.feed_refusal(GitHubError(404, "GET", "p", '{"message": "Not\\nFound"}')), "HTTP 404: Not Found")
+
+    def test_strict_stops_on_what_is_not_a_refusal_and_keeps_a_refusal(self):
+        for error in (GitHubError(502, "GET", R("activity"), "bad gateway"), OSError("reset"), ValueError("not json"),
+                      RecursionError("deep")):
+            with self.subTest(error=error):
+                gh = FakeGitHub({("GET", R("activity")): error if isinstance(error, GitHubError) else raising(error)})
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    with self.assertRaises(InfraError):
+                        tr.head_pusher(gh, {"head": head_of("h13")}, strict=True)
+                self.assertEqual(out.getvalue(), "")
+        gh = FakeGitHub({("GET", R("activity")): GitHubError(403, "GET", R("activity"), "no")})
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(tr.head_pusher(gh, {"head": head_of("h13")}, strict=True), (None, "HTTP 403"))
+
+    def test_a_feed_that_answered_without_a_push_to_the_head_is_not_a_refusal(self):
+        for feed in ([], [pushed("venuverse", "h12")], {"message": "unexpected"}):
+            with self.subTest(feed=feed):
+                self.assertIsNone(self.pusher(feed)[0])
+                self.assertEqual((self.refused, self.printed), (None, ""))
 
 
 class TestWriteApprovals(unittest.TestCase):
