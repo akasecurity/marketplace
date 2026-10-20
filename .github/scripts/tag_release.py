@@ -27,9 +27,10 @@ later tag back): it is tagged at once, as an old one would be. A PR's approver i
 the user account with push access to the repository whose latest review approves its final head
 and who did not push it. With none, the tag records `approver: none` and a note that the merge
 bypassed the ruleset, or `approver: unknown` when an approval exists that this read cannot confirm
-(the reviewer's access is read when the sweep runs, not when the review was submitted) or when the
-head's pusher cannot be named. A commit no pull request merged records `approver: none`, as there
-is no approval to match.
+(the reviewer's access is read when the sweep runs, not when the review was submitted), when the
+head's pusher cannot be named, or when the only approvals are by the head commit's author or committer
+and the activity feed does not say who pushed it. A commit no pull request merged records
+`approver: none`, as there is no approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
 a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
 the sweep: every run reports it as a warning and goes on, comparing each later
@@ -40,6 +41,7 @@ closed PR closed on, since only the bot may delete bot/** branches.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import sys
 import time
@@ -294,14 +296,69 @@ def pull_reviews(gh: GitHub, number: int) -> list[dict]:
         after = connection["pageInfo"]["endCursor"]
 
 
+PUSH_ACTIVITIES = ("push", "force_push", "branch_creation")
+
+
+def head_pusher(gh: GitHub, pull: dict) -> str | None:
+    """The login that pushed the PR's final head to its branch, as the repository's activity feed records it, or
+    None when the feed cannot say: a head in a fork (the push is in the fork's feed), a feed GitHub refuses to
+    serve, one whose newest hundred records hold no push that left the branch at this head, or a push by an
+    account that no longer exists. The feed outlives the branch, so a PR whose branch was deleted on merge is
+    read the same way. An App's push is recorded under the App's login, which no approval is made by."""
+    head = pull.get("head") or {}
+    ref, sha, repo = head.get("ref"), head.get("sha"), (head.get("repo") or {}).get("full_name")
+    if not ref or not sha or not isinstance(repo, str) or repo.casefold() != gh.repo.casefold():
+        return None
+    try:
+        feed = gh.get(gh.repo_path("activity"), {"ref": f"refs/heads/{ref}", "per_page": 100})
+    except (GitHubError, OSError):
+        return None
+    for activity in feed if isinstance(feed, list) else ():
+        if isinstance(activity, dict) and activity.get("activity_type") in PUSH_ACTIVITIES \
+                and activity.get("after") == sha:
+            login = (activity.get("actor") or {}).get("login")
+            return login if isinstance(login, str) and login else None
+    return None
+
+
 def last_pushers(gh: GitHub, head: str) -> set[str]:
-    """The logins that stand in for whoever pushed `head`: its commit's author and committer, with `web-flow`
-    aside. The activity API does record pushers, but what it records for a push made by an App or by auto-merge
-    is unverified, so the commit's own fields stand in. The set is empty when neither names a GitHub account,
-    and a caller must then not take an approval to be someone else's."""
+    """The logins that stand in for whoever pushed `head` when the activity feed does not name them: its commit's
+    author and committer, with `web-flow` aside. They are candidates, not the pusher: a commit can be rebased or
+    amended by someone else who pushes it, and can carry any author a pusher writes. The set is empty when
+    neither names a GitHub account, and a caller must then not take an approval to be someone else's."""
     commit = gh.get(gh.repo_path(f"commits/{head}"))
     return {login for login in ((commit.get("author") or {}).get("login"), (commit.get("committer") or {}).get("login"))
             if login and login not in NOT_A_PUSHER}
+
+
+@dataclasses.dataclass(frozen=True)
+class Approvals:
+    """What the reviews of a PR's final head settle about its approval. `counted` are the users with push access,
+    other than whoever pushed that head, whose latest review approves it. With none, `unconfirmed` are the users
+    whose approval is set aside because GitHub reports no push access for them now, and `undecided` the users
+    with push access whose approval is set aside only because they authored or committed the head while the
+    feed could not say who pushed it: GitHub counts their approval if someone else pushed. `pusher` is the
+    account the feed names, and `unnameable` is True when it names none and neither does the commit."""
+    counted: list[str]
+    unconfirmed: list[str]
+    undecided: list[str]
+    pusher: str | None
+    unnameable: bool
+
+
+def approvals(gh: GitHub, number: int, pull: dict) -> Approvals:
+    """The approvals of `pull`'s final head (`pulls/{number}`), judged against the account that pushed it."""
+    head = pull["head"]["sha"]
+    reviews = pull_reviews(gh, number)
+    pusher = head_pusher(gh, pull)
+    candidates = set() if pusher else last_pushers(gh, head)
+    if not pusher and not candidates:
+        return Approvals([], [], [], None, True)
+    counted = write_approvals(reviews, head, exclude={pusher} if pusher else candidates)
+    if counted:
+        return Approvals(counted, [], [], pusher, False)
+    return Approvals([], unconfirmed_approvals(reviews, head, exclude={pusher} if pusher else ()),
+                     [login for login in write_approvals(reviews, head) if login in candidates], pusher, False)
 
 
 def latest_positions(reviews) -> dict[str, dict]:
@@ -412,9 +469,11 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     and a note. The approver is `none` with a note that the merge bypassed the ruleset when nobody's approval
     counts, and `unknown` when it cannot be told: an approval exists whose reviewer cannot push as of this read
     (access is read when the sweep runs, so a reviewer who has since left or lost write access must not make a
-    properly approved merge look like a bypass in an immutable tag), or the head's pusher cannot be named. Every
-    note but an approver's names who merged, so an `unknown` never hides a break-glass merge's merger. With no
-    PR there is no approval to match.
+    properly approved merge look like a bypass in an immutable tag), the head's pusher cannot be named, or the
+    only approvals are by someone who authored or committed the head while the activity feed does not say who
+    pushed it (if another account pushed it, GitHub counted that approval, and a commit's author fields are
+    not proof of the pusher either way). Every note but an approver's names who merged, so an `unknown` never
+    hides a break-glass merge's merger. With no PR there is no approval to match.
 
     Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
     to any other note: a below-floor rollback or any other merge past a red or missing check is then in the
@@ -428,22 +487,26 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    reviews, pushers = pull_reviews(gh, number), last_pushers(gh, head)
-    approvers = write_approvals(reviews, head, exclude=pushers) if pushers else []
-    unconfirmed = unconfirmed_approvals(reviews, head, exclude=pushers) if pushers and not approvers else []
+    found = approvals(gh, number, full)
     merger_named = True
-    if approvers:
-        approver, note, merger_named = approvers[-1], None, False
-    elif not pushers:
+    if found.counted:
+        approver, note, merger_named = found.counted[-1], None, False
+    elif found.unnameable:
         approver = "unknown"
-        note = ("could not identify who pushed the PR's final head (neither its author nor its committer is a "
-                f"GitHub account other than web-flow), so an approval could not be told from the pusher's own; "
-                f"merged by {merger}")
-    elif unconfirmed:
+        note = ("could not identify who pushed the PR's final head (the activity feed does not name them, and "
+                "neither the commit's author nor its committer is a GitHub account other than web-flow), so an "
+                f"approval could not be told from the pusher's own; merged by {merger}")
+    elif found.undecided or found.unconfirmed:
         approver = "unknown"
-        note = (f"approval by {', '.join(unconfirmed)} not counted: GitHub reports no push access for them as of "
-                "this read (they may never have had it, or may have lost it since the review); "
-                f"merged by {merger}")
+        parts = []
+        if found.undecided:
+            parts.append(f"approval by {', '.join(found.undecided)} not counted: they authored or committed the PR's "
+                         "final head and GitHub does not say who pushed it, so it could not be told whether the "
+                         "approval is the pusher's own")
+        if found.unconfirmed:
+            parts.append(f"approval by {', '.join(found.unconfirmed)} not counted: GitHub reports no push access "
+                         "for them as of this read (they may never have had it, or may have lost it since the review)")
+        note = f"{'; '.join(parts)}; merged by {merger}"
     else:
         approver, note = "none", f"ruleset bypass by {merger}"
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])

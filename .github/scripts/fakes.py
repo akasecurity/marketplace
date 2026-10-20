@@ -199,6 +199,17 @@ class FakeGitHub:
         return [call for call in self.calls if call[0] != "GET"]
 
 
+def pushed(actor: str, after: str, *, kind: str = "push", ref: str = "feat/example") -> dict:
+    """A record of the repository activity feed: `actor` left `ref` at `after`."""
+    return {"activity_type": kind, "actor": {"login": actor}, "ref": f"refs/heads/{ref}", "before": "0" * 40,
+            "after": after, "timestamp": "2026-10-02T00:00:00Z"}
+
+
+def head_of(sha: str, *, ref: str | None = "feat/example", repo: str | None = REPO) -> dict:
+    """The `head` of a pull request read from the API: its commit, its branch and the repository holding it."""
+    return {"sha": sha, "ref": ref, "repo": None if repo is None else {"full_name": repo}}
+
+
 def not_found(path: str = "") -> GitHubError:
     return GitHubError(404, "GET", path, '{"message": "Not Found"}')
 

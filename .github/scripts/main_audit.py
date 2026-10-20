@@ -7,15 +7,13 @@ reviewer's latest approving, change-requesting or dismissed review decides), and
 whose final head has a passing `validate` check
 from GitHub Actions (its latest run decides; only a run of validate.yml that
 `pull_request_target` started at or before the PR merged counts, the same rule
-tag-release applies). A commit that fails more than one of these gets one result. The head commit's author and committer stand in for
-the last pusher (web-flow, GitHub's committer for web edits, is skipped), and a
-head for which they name nobody is red, since an approval could then be the
-pusher's own.
-GitHub's activity API does record who pushed, but it is not used here yet: what
-it records for a push made by the App or by auto-merge has not been verified.
-The stand-in can still name the wrong person (a force-push by someone who did
-not write the commit); the main ruleset's "most recent push approved by someone
-else" is what enforces the rule, and this records when it was bypassed.
+tag-release applies). A commit that fails more than one of these gets one result. The last pusher is the
+account the repository's activity feed records as leaving the PR's branch at its final head. Where the
+feed cannot say (a head in a fork, a feed GitHub refuses to serve), the head commit's author and committer
+(web-flow, GitHub's committer for web edits, is skipped) are only candidates: an approval by one of them is
+reported as undecided, since if someone else pushed the head GitHub counted it, and a head for which they
+name nobody is red, since an approval could then be the pusher's own. The main ruleset's "most recent push
+approved by someone else" is what enforces the rule, and this records when it was bypassed.
 Detective only, and it cannot vouch for itself: main-audit runs from the pushed
 commit, so a push that bypasses the `main` ruleset can also change, disable or
 remove main-audit. That push is then audited by the changed copy, or not at all,
@@ -37,8 +35,7 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
-from tag_release import (VALIDATE_CHECK, last_pushers, merged_into_main, pull_association, pull_reviews,
-                         unconfirmed_approvals, validate_conclusion, write_approvals)
+from tag_release import VALIDATE_CHECK, approvals, merged_into_main, pull_association, validate_conclusion
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -58,26 +55,32 @@ def added_commits(git: Git, before: str, after: str) -> list[str]:
     return git.first_parent_after(before, after)
 
 
-def approval_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
-    pushers = last_pushers(gh, head)
-    if not pushers:
-        # With no login for either field the stand-in names nobody, and an empty set would let every member's
-        # approval through, the pusher's own included. Not knowing who pushed is not a pass.
-        return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
-                "(neither its author nor its committer is a GitHub account other than web-flow), so an approval "
-                "could not be told from the pusher's own.")
-    # Each member's latest approving, change-requesting or dismissed review decides: an approval its author later
-    # withdrew, or that was dismissed, does not count.
-    reviews = pull_reviews(gh, number)
-    if write_approvals(reviews, head, exclude=pushers):
+def approval_problem(gh: GitHub, sha: str, number: int, pull: dict) -> str | None:
+    """Why `pull`, the PR (`pulls/{number}`) that merged as `sha`, has no approval of its final head that
+    counts, or None. Each member's latest approving, change-requesting or dismissed review decides: an approval
+    its author later withdrew, or that was dismissed, does not count."""
+    head = pull["head"]["sha"]
+    found = approvals(gh, number, pull)
+    if found.counted:
         return None
-    problem = (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its "
-               f"final head `{head}` by someone other than its last pusher ({', '.join(sorted(pushers))}).")
+    if found.unnameable:
+        # With no login for the pusher, an empty exclusion would let every member's approval through, the pusher's
+        # own included. Not knowing who pushed is not a pass.
+        return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
+                "(the activity feed does not name them, and neither the commit's author nor its committer is a "
+                "GitHub account other than web-flow), so an approval could not be told from the pusher's own.")
+    lead = (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its "
+            f"final head `{head}`")
+    problem = f"{lead} by someone other than its last pusher ({found.pusher})." if found.pusher else f"{lead}."
     # Access is read at audit time, as the tag's is: the issue keeps filing, since this is the detective control, but
     # says what it found instead of claiming no approving review exists.
-    unconfirmed = unconfirmed_approvals(reviews, head, exclude=pushers)
-    if unconfirmed:
-        problem += (f" An approving review by {', '.join(unconfirmed)} was not counted: GitHub reports no push "
+    if found.undecided:
+        problem += (f" An approving review by {', '.join(found.undecided)} was not counted: they authored or "
+                    "committed the head and GitHub does not say who pushed it, so it could not be told whether the "
+                    "approval is the pusher's own. If someone else pushed it, GitHub counted the approval and this "
+                    "report is a false alarm.")
+    if found.unconfirmed:
+        problem += (f" An approving review by {', '.join(found.unconfirmed)} was not counted: GitHub reports no push "
                     "access for them as of this audit (they may never have had it, or may have lost it since the "
                     "review).")
     return problem
@@ -123,8 +126,9 @@ def audit_commit(gh: GitHub, sha: str, sleep: Callable[[float], None]) -> str | 
     if pull is None:
         return no_merge_problem(sha, linked)
     number = pull["number"]
-    head = gh.get(gh.repo_path(f"pulls/{number}"))["head"]["sha"]
-    problems = [problem for problem in (approval_problem(gh, sha, number, head),
+    full = gh.get(gh.repo_path(f"pulls/{number}"))
+    head = full["head"]["sha"]
+    problems = [problem for problem in (approval_problem(gh, sha, number, full),
                                         validate_problem(gh, sha, number, head, pull.get("merged_at")))
                 if problem]
     return " ".join(problems) or None
