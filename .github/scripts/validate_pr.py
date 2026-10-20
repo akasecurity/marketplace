@@ -156,6 +156,8 @@ def _names_ai_tc(value) -> bool:
 #   * a change to validate.yml itself, for example another trigger: that file is exempt only from the
 #     rule against a job named validate, and a change to it is called out in the notes;
 #   * a permission grant written with an anchor, an alias or an escape: only plain grants match;
+#   * a top-level key spelled twice, such as two permissions: blocks: the grant scan reads the whole
+#     text, so nothing hides behind whichever one is in force;
 #   * a job name built from an expression or a matrix value;
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
@@ -323,7 +325,27 @@ def _has_key(rows: list, key: str, indent: int) -> bool:
 class _Job:
     id: str
     name: str | None  # its `name:`, None when it has none
+    environment: str | None  # the environment it enters, None when it names none or in a form that is not read
     rows: tuple  # (indent, text) of everything under its id
+
+
+def _environment_name(job_id: str, nested: list, indent: int):
+    """The `name:` under a job's `environment:` key, whose rows are `nested` (the rows after it, `indent` being
+    the key's own), or None when the mapping has none or reads it in a form that is not a name. A key the mapping
+    spells twice is unreadable, like one the job spells twice: neither is taken to be the one in force."""
+    name, seen = None, set()
+    for inner_indent, inner in nested:
+        if inner_indent <= indent:
+            break
+        if inner_indent != nested[0][0]:
+            continue
+        key, value = _read_key(inner, f"a key of the environment of job {_code(job_id)}")
+        if key in seen:
+            raise _Unreadable(f"the environment of job {_code(job_id)} has the key {_code(key)} twice")
+        seen.add(key)
+        if key == "name":
+            name = _scalar(value)
+    return name
 
 
 def _read_jobs(rows: list, found: list) -> None:
@@ -336,14 +358,17 @@ def _read_jobs(rows: list, found: list) -> None:
             job_id, rest = _read_key(content, "a job id")
             if _without_properties(rest) and not _is_required_check(job_id):
                 raise _Unreadable(f"job {_code(job_id)} is given in flow style, as an alias or as a scalar")
-            name, seen = None, set()
-            for indent, child in children:
+            name = environment = None
+            seen = set()
+            for at, (indent, child) in enumerate(children):
                 if indent != children[0][0]:
                     continue
                 key, value = _read_key(child, f"a key of job {_code(job_id)}")
                 if key in seen:
                     raise _Unreadable(f"job {_code(job_id)} has the key {_code(key)} twice")
                 seen.add(key)
+                if key == "environment":
+                    environment = _scalar(value) if value else _environment_name(job_id, children[at + 1:], indent)
                 if key != "name":
                     continue
                 name = _scalar(value)
@@ -351,7 +376,7 @@ def _read_jobs(rows: list, found: list) -> None:
                     raise _Unreadable(
                         f"the name of job {_code(job_id)} is an alias, a block scalar, an escape, an open quote or on the next line"
                     )
-            found.append(_Job(job_id, name, tuple(children)))
+            found.append(_Job(job_id, name, environment, tuple(children)))
 
 
 def _jobs_without_permissions(rows: list, jobs: list) -> list:
@@ -360,30 +385,6 @@ def _jobs_without_permissions(rows: list, jobs: list) -> list:
     if not rows or _has_key(rows, "permissions", rows[0][0]):
         return []
     return [job.id for job in jobs if not job.rows or not _has_key(job.rows, "permissions", job.rows[0][0])]
-
-
-def _environment(job: _Job):
-    """The environment a job enters, written `environment: name` or as a mapping with a `name:` key under it
-    (the key and the value quoted or not), or None: no environment, or one written in any other form (flow
-    style, an expression, an alias), which is not read as a name."""
-    if not job.rows:
-        return None
-    indent = job.rows[0][0]
-    for at, (row_indent, content) in enumerate(job.rows):
-        key, value = _key_line(content) or (None, "")
-        if row_indent != indent or key != "environment":
-            continue
-        if value:
-            return _scalar(value)
-        nested = job.rows[at + 1:]
-        for inner_indent, inner in nested:
-            if inner_indent <= indent:
-                break
-            inner_key, inner_value = _key_line(inner) or (None, "")
-            if inner_indent == nested[0][0] and inner_key == "name":
-                return _scalar(inner_value)
-        return None
-    return None
 
 
 def workflow_problems(path: str, text: str) -> list:
@@ -411,7 +412,7 @@ def workflow_problems(path: str, text: str) -> list:
     if _APP_TOKEN_PRS.search(body):
         entered = []
         if path == IMPORTER_WORKFLOW and unreadable is None:
-            entered = [job for job in jobs if _environment(job) == BOT_ENVIRONMENT]
+            entered = [job for job in jobs if job.environment == BOT_ENVIRONMENT]
         inside = sum(len(_APP_TOKEN_PRS.findall("\n".join(content for _, content in job.rows))) for job in entered)
         if len(_APP_TOKEN_PRS.findall(body)) > inside:
             problems.append(
