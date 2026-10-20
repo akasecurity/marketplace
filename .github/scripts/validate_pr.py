@@ -144,11 +144,13 @@ def _names_ai_tc(value) -> bool:
 #     administrator reads the secret scope back);
 #   * a step that uses the App-token action at all, anywhere but in a job of the importer's workflow
 #     or tag-release.yml that itself enters the marketplace-bot environment, and there without
-#     naming a permission-* input: with none the action mints a token with every permission the
+#     naming a permission-* input under its with: (the one place the action reads it): with none the
+#     action mints a token with every permission the
 #     App's installation has. The INPUT_PERMISSION-* variables the action also reads, set in an env:
 #     block or through $GITHUB_ENV, count as the inputs they name (pull-requests is the importer's
 #     alone), and any other is refused;
-#   * a reference to a MARKETPLACE_BOT_* secret outside such a job, whatever action or script reads it.
+#   * a reference to a MARKETPLACE_BOT_* secret outside such a job, whatever action or script reads it,
+#     and secrets[...] or toJSON(secrets), which reach a secret without writing its name.
 #     These are a backup to where the bot's secrets are stored, which is the control that bounds its
 #     token;
 #   * a file with jobs that declares no `permissions:` at the top level and has a job that declares
@@ -162,6 +164,9 @@ def _names_ai_tc(value) -> bool:
 # It does not see:
 #   * the action reached through a composite action (a file under .github/actions, which this scan does
 #     not read);
+#   * a name assembled in a script or at run time, such as a variable name or a secret name built from
+#     pieces: no scan of the text closes that, and the bot's secrets being scoped to the environment is
+#     what does;
 #   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
 #     refusal above looks for the word jobs, so a file that never spells it out is not refused);
 #   * a change to validate.yml itself, for example another trigger: that file is exempt only from the
@@ -208,10 +213,12 @@ _APP_TOKEN_PRS = _grant("permission-pull-requests")
 # ask for a permission without writing the input, in an env: block or by appending to $GITHUB_ENV. The name is
 # matched wherever it appears and the value is not read: any such variable is refused as the grant it names.
 _INPUT_ENV = re.compile(r"INPUT_PERMISSION[-_]([a-z][a-z_-]*)", re.IGNORECASE)
-# A permission input a step names, whatever its value.
-_PERMISSION_INPUT = re.compile(r"""(?:^|[\s{,])["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE | re.MULTILINE)
-# The bot's secrets, by name: only the bot jobs may read them, whatever reads them.
-_BOT_SECRET = re.compile(r"MARKETPLACE_BOT_", re.IGNORECASE)
+# A step written as one flow mapping, or a `with:` given in flow style, that names a permission input.
+_FLOW_WITH = re.compile(r"""["']?with["']?\s*:\s*\{[^{}]*?["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE)
+_FLOW_INPUTS = re.compile(r"""\{[^{}]*?["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE)
+# The bot's secrets, by name, and the ways to reach a secret without writing its name (`secrets[...]`,
+# `toJSON(secrets)`): only the bot jobs may read them, whatever reads them.
+_BOT_SECRET = re.compile(r"MARKETPLACE_BOT_|toJSON\(\s*secrets\b|\bsecrets\s*\[", re.IGNORECASE)
 # A step that uses the App-token action at all: with no permission-* input it mints a token carrying every
 # permission the App's installation has.
 _APP_TOKEN_STEP = re.compile(r"""(?:^|[\s{,])["']?uses["']?\s*:\s*["']?actions/create-github-app-token\b""",
@@ -393,8 +400,9 @@ def _bot_secrets(text: str) -> int:
 
 
 def _steps(job) -> list:
-    """The text of each step of the job's block-style `steps:` list, from one `- ` item to the next; [] when it
-    has none in that form."""
+    """The rows of each step of the job's block-style `steps:` list, one list a step: the first row starts at the
+    step's first key (the `- ` is left off and its width counted), the rest are as they are. [] when the job has
+    no `steps:` in that form."""
     rows = job.rows
     if not rows:
         return []
@@ -410,17 +418,48 @@ def _steps(job) -> list:
         steps = []
         for inner_indent, inner in body:
             if inner_indent == body[0][0] and inner.startswith("-"):
-                steps.append([inner])
+                rest = inner[1:]
+                key_text = rest.lstrip(" ")
+                steps.append([(inner_indent + 1 + len(rest) - len(key_text), key_text)] if key_text else [])
             elif steps:
-                steps[-1].append(inner)
-        return ["\n".join(step) for step in steps]
+                steps[-1].append((inner_indent, inner))
+        return steps
     return []
+
+
+def _names_permission(step: list) -> bool:
+    """Whether the step names a `permission-*` input where the action reads it: as a key of its one `with:`
+    mapping. The words anywhere else (a `name:`, an `env:` key, a script) are not an input. A step written as a
+    flow mapping is read by the flow patterns. A step with two `with:` keys names none, since neither is
+    taken to be the one in force."""
+    if not step:
+        return False
+    if len(step) == 1 and step[0][1].startswith("{"):
+        return bool(_FLOW_WITH.search(step[0][1]))
+    indent, named, withs = step[0][0], False, 0
+    for at, (row_indent, content) in enumerate(step):
+        key, value = _key_line(content) or (None, "")
+        if row_indent != indent or key != "with":
+            continue
+        withs += 1
+        if value:
+            named = bool(_FLOW_INPUTS.match(value))
+            continue
+        nested = []
+        for inner_indent, inner in step[at + 1:]:
+            if inner_indent <= indent:
+                break
+            nested.append((inner_indent, inner))
+        keys = [(_key_line(inner) or (None,))[0] for inner_indent, inner in nested if inner_indent == nested[0][0]]
+        named = any(isinstance(name, str) and name.lower().startswith("permission-") for name in keys)
+    return withs == 1 and named
 
 
 def _unnamed_token_steps(job) -> int:
     """How many of the job's App-token steps name no permission input. A step the job's `steps:` list does not
     show in block style counts as one that names none."""
-    named = sum(1 for step in _steps(job) if _token_steps(step) and _PERMISSION_INPUT.search(step))
+    named = sum(1 for step in _steps(job)
+                if _token_steps("\n".join(content for _, content in step)) and _names_permission(step))
     return max(_token_steps(_job_text(job)) - named, 0)
 
 
@@ -524,7 +563,8 @@ def workflow_problems(path: str, text: str) -> list:
         )
     if _bot_secrets(body) > inside(_bot_secrets, BOT_WORKFLOWS):
         problems.append(
-            f"reads a MARKETPLACE_BOT_* secret outside a job of {' and '.join(BOT_WORKFLOWS)} that itself enters the "
+            "reads a MARKETPLACE_BOT_* secret, or reaches the secrets by index or as a whole (`secrets[...]`, "
+            f"`toJSON(secrets)`), outside a job of {' and '.join(BOT_WORKFLOWS)} that itself enters the "
             f"{BOT_ENVIRONMENT} environment: whatever reads them, those are the release bot's credentials"
         )
     missing = _jobs_without_permissions(rows, jobs)

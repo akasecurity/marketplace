@@ -1094,6 +1094,69 @@ class TestWorkflowFiles(unittest.TestCase):
         self.assertIn("steps: [", flow_steps)
         self.assert_refused(flow_steps, "names no permission input", path=vp.TAG_RELEASE_WORKFLOW)
 
+    def test_a_permission_input_counts_only_where_the_action_reads_it(self):
+        # `permission-*` as a step's name, an env: key or a script says nothing to the action: only a key of its
+        # with: mapping is an input.
+        decoys = {
+            "the step's name": '- name: "permission-contents: read"\n        uses: actions/create-github-app-token@v3',
+            "an env key": "- uses: actions/create-github-app-token@v3\n        env:\n          permission-contents: read",
+            "a key of a mapping inside with": "- uses: actions/create-github-app-token@v3\n        with:\n"
+                                              "          extra:\n            permission-contents: read",
+            "a second step's input": "- uses: actions/create-github-app-token@v3\n"
+                                     "      - uses: actions/x@v1\n        with:\n          permission-contents: read",
+            "two with mappings": "- uses: actions/create-github-app-token@v3\n        with:\n"
+                                 "          permission-contents: read\n        with:\n          client-id: x",
+            "a script": "- uses: actions/create-github-app-token@v3\n      - run: echo permission-contents: read",
+            "a flow step with it in env": "- {uses: actions/create-github-app-token@v3, env: {permission-contents: read}}",
+        }
+        for label, step in decoys.items():
+            with self.subTest(label):
+                self.assert_refused(workflow_text(step=step, job_extra=self.BOT_JOB), "names no permission input",
+                                    path=vp.TAG_RELEASE_WORKFLOW)
+        real = {
+            "a block mapping": "- uses: actions/create-github-app-token@v3\n        with:\n          permission-contents: read",
+            "a key among others": "- uses: actions/create-github-app-token@v3\n        with:\n"
+                                  "          client-id: x\n          Permission-Contents: read",
+            "a quoted key": "- uses: actions/create-github-app-token@v3\n        with:\n"
+                            "          'permission-contents': read",
+            "a flow with": "- uses: actions/create-github-app-token@v3\n        with: {client-id: x, permission-contents: read}",
+            "with first": "- with:\n          permission-contents: read\n        uses: actions/create-github-app-token@v3",
+            "an id and a name first": "- id: app\n        name: token\n        uses: actions/create-github-app-token@v3\n"
+                                      "        with:\n          permission-contents: read",
+            "a flow step": "- {uses: actions/create-github-app-token@v3, with: {permission-contents: read}}",
+        }
+        for label, step in real.items():
+            with self.subTest(label):
+                report = workflow_pr(workflow_text(step=step, job_extra=self.BOT_JOB), path=vp.TAG_RELEASE_WORKFLOW)
+                self.assertEqual((report.exit_code, report.failures), (0, []), label)
+        text = (WORKFLOWS_DIR / "tag-release.yml").read_text(encoding="utf-8")
+        bare = re.sub(r"(?m)^\s+permission-[a-z-]+: \w+\n", "", text)
+        decorated = bare.replace("        id: app\n", '        id: app\n        name: "permission-contents: read"\n', 1)
+        self.assertNotEqual(decorated, bare)
+        problems = vp.workflow_problems(vp.TAG_RELEASE_WORKFLOW, decorated)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("names no permission input", problems[0])
+
+    def test_the_secrets_are_not_reachable_without_their_names_outside_the_bot_jobs(self):
+        walks = {
+            "an index built with format": "${{ secrets[format('MARKETPLACE_{0}', 'BOT_PRIVATE_KEY')] }}",
+            "an index": "${{ secrets['SOMETHING'] }}",
+            "an index with spaces": "${{ secrets [ 'SOMETHING' ] }}",
+            "the whole object": "${{ toJSON(secrets) }}",
+            "the whole object, spaced and cased": "${{ toJson( secrets ) }}",
+        }
+        for label, expression in walks.items():
+            step = f'- run: ./use.sh\n        env:\n          ALL: "{expression}"'
+            for path in (EXTRA, vp.VALIDATE_WORKFLOW):
+                with self.subTest(label=label, path=path):
+                    self.assert_refused(workflow_text(step=step), "reaches the secrets by index or as a whole", path=path)
+            with self.subTest(label=label, shape="a bot job"):
+                report = workflow_pr(workflow_text(step=step, job_extra=self.BOT_JOB), path=vp.TAG_RELEASE_WORKFLOW)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+        fine = ("- run: echo '${{ toJSON(github.event) }} ${{ secrets.GITHUB_TOKEN }} ${{ vars.secrets }}'\n"
+                "        env:\n          T: ${{ secrets.OTHER_TOKEN }}")
+        self.assertEqual(workflow_pr(workflow_text(step=fine)).failures, [])
+
     def test_a_permission_variable_set_in_a_script_is_seen_too(self):
         # The action reads INPUT_PERMISSION-* from the environment, and a step can append to $GITHUB_ENV.
         for line in ('echo "INPUT_PERMISSION-PULL-REQUESTS=write" >> "$GITHUB_ENV"',
