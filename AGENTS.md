@@ -269,8 +269,11 @@ true only once it is.
   finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
   rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text and
   never runs it, and fails the PR if the file grants `checks: write`, `statuses: write` or
-  `write-all` written out plainly, or defines a job whose id or `name:` is `validate` (in any file
-  but `validate.yml` itself), since either could report a `validate` check of its own; a file that
+  `write-all` written out plainly, which lets a job report a check named `validate`; grants
+  `pull-requests: write` written out plainly, which lets a job approve a pull request when the repository
+  allows workflows to (and `github-actions[bot]` has write access, so its approval could supply the one
+  the `main` ruleset needs); or defines a job whose id or `name:` is `validate` (in any file
+  but `validate.yml` itself), since it could report a `validate` check of its own; a file that
   mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot read with
   confidence, is refused too (write them in plain block style). That is a partial control, a
   best-effort read of the text and not a YAML parser. It does not see: a flow-style or complex-key

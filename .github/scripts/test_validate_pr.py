@@ -831,6 +831,30 @@ class TestWorkflowFiles(unittest.TestCase):
             with self.subTest(label):
                 self.assert_refused(workflow_text(**kwargs), "grants checks: write, statuses: write or write-all")
 
+    def test_a_workflow_that_may_approve_a_pull_request_fails(self):
+        # With "Allow GitHub Actions to create and approve pull requests" on, the workflow token's approval counts
+        # toward the one the main ruleset needs, and `github-actions[bot]` has write access. Neither the setting nor
+        # the grant can be audited from the repository, so the grant is refused where a PR would add it.
+        grants = {
+            "top level": dict(top="permissions:\n  pull-requests: write"),
+            "one job": dict(job_extra="    permissions:\n      pull-requests: write"),
+            "mixed in": dict(top="permissions:\n  contents: read\n  pull-requests: write\n  issues: read"),
+            "flow": dict(top="permissions: {pull-requests: write}"),
+            "flow, quoted": dict(top="permissions: { 'pull-requests': \"write\", contents: read }"),
+            "quoted key": dict(top='permissions:\n  "pull-requests": "write"'),
+        }
+        for label, kwargs in grants.items():
+            with self.subTest(label):
+                report = self.assert_refused(workflow_text(**kwargs), "grants pull-requests: write")
+                failed_with(self, report, "approve a pull request")
+
+    def test_the_app_token_input_for_pull_requests_is_not_the_workflow_token_grant(self):
+        # The importer asks the App-token action for pull-requests: write so the release bot can open its PRs; that
+        # is the bot's own token, minted from a secret only main can reach, not the workflow's GITHUB_TOKEN.
+        step = "- uses: actions/create-github-app-token@v3\n        with:\n          permission-pull-requests: write"
+        report = workflow_pr(workflow_text(step=step))
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+
     def test_forms_the_scan_cannot_read_with_confidence_fail(self):
         unreadable = {
             "jobs in flow style": "name: x\non: push\njobs: {build: {runs-on: ubuntu-latest}}\n",
@@ -875,7 +899,10 @@ class TestWorkflowFiles(unittest.TestCase):
             "an expression name": workflow_text(name="${{ matrix.name }}"),
             "read permissions": workflow_text(top="permissions:\n  checks: read\n  statuses: read\n  contents: write"),
             "no permissions": workflow_text(top="permissions: {}"),
-            "write to others": workflow_text(job_extra="    permissions:\n      contents: write\n      pull-requests: write"),
+            "write to others": workflow_text(job_extra="    permissions:\n      contents: write\n      issues: write"),
+            "read pull requests": workflow_text(top="permissions:\n  pull-requests: read"),
+            "a comment about pull requests": workflow_text() + "# pull-requests: write\n",
+            "the app token input": workflow_text(step="- uses: actions/create-github-app-token@v3\n        with:\n          permission-pull-requests: write"),
             "a comment about it": workflow_text() + "# name: validate\n# checks: write\n# permissions: write-all\n",
             "a trailing comment": workflow_text(top="permissions:\n  checks: read # never write"),
             "a shell script that says so": workflow_text(step="- run: |\n          echo 'name: validate'\n          echo 'checks: read'"),
@@ -910,11 +937,13 @@ class TestWorkflowFiles(unittest.TestCase):
         report = workflow_pr(text, path=path)
         self.assertEqual((report.exit_code, report.failures), (0, []))
         self.assertTrue(any(path in note for note in report.notes), report.notes)  # still called out for review
-        for grant in ("permissions: write-all", "permissions:\n  checks: write"):
+        for grant, fragment in (("permissions: write-all", "grants checks: write"),
+                                ("permissions:\n  checks: write", "grants checks: write"),
+                                ("permissions:\n  pull-requests: write", "grants pull-requests: write")):
             with self.subTest(grant):
                 changed = text.replace("permissions:\n  contents: read", grant, 1)
                 self.assertNotEqual(changed, text)
-                failed_with(self, workflow_pr(changed, path=path), "grants checks: write")
+                failed_with(self, workflow_pr(changed, path=path), fragment)
 
     def test_only_workflow_files_in_the_prs_diff_are_read(self):
         bad = workflow_text("validate")

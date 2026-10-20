@@ -128,6 +128,9 @@ def _names_ai_tc(value) -> bool:
 # check is matched by name, so any such job can stand beside this one. validate reads each such file
 # as text, never runs it, and fails the PR for what it can see plainly:
 #   * a job id, or a job `name:`, written out as validate;
+#   * pull-requests: write permission written out plainly, which lets a job approve a pull request
+#     when the repository allows workflows to (not the permission-pull-requests input of the
+#     App-token action, which is the release bot's own token);
 #   * checks: write, statuses: write or write-all permissions written out plainly (or the
 #     permission-checks and permission-statuses inputs of the App-token action), which let a job
 #     create a check run or a status named validate through the API;
@@ -161,6 +164,9 @@ REQUIRED_CHECK = "validate"
 SAME_NAME = f"any job named {REQUIRED_CHECK} satisfies the required check, so only {VALIDATE_WORKFLOW} may have one"
 _CREATES_CHECKS = re.compile(r"""(?:^|[\s{,])["']?(?:permission-)?(?:checks|statuses)["']?\s*:\s*["']?write\b""", re.MULTILINE)
 _WRITE_ALL = re.compile(r"""(?:^|[\s{,])["']?permissions["']?\s*:\s*["']?write-all\b""", re.MULTILINE)
+# The workflow token's own grant. The permission-pull-requests input of the App-token action is another key and
+# does not match: it mints the release bot's token, which only main can reach.
+_APPROVES_PRS = re.compile(r"""(?:^|[\s{,])["']?pull-requests["']?\s*:\s*["']?write\b""", re.MULTILINE)
 _PLAIN_KEY_END = re.compile(r":(?:\s|$)")
 _QUOTED_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s+(.*))?$""")
 
@@ -313,6 +319,12 @@ def workflow_problems(path: str, text: str) -> list:
         problems.append(
             "grants checks: write, statuses: write or write-all, which lets a job create a check run or a status "
             f"named {REQUIRED_CHECK}, and any such check satisfies the required check"
+        )
+    if _APPROVES_PRS.search(body):
+        problems.append(
+            "grants pull-requests: write, which lets a job approve a pull request when the repository allows "
+            "workflows to, and `github-actions[bot]` has write access, so its approval could supply the one the "
+            "main ruleset needs"
         )
     if path != VALIDATE_WORKFLOW:
         try:
