@@ -1009,16 +1009,86 @@ class TestWorkflowFiles(unittest.TestCase):
         text = (WORKFLOWS_DIR / "import-plugin-release.yml").read_text(encoding="utf-8")
         self.assertEqual(vp.workflow_problems(vp.IMPORTER_WORKFLOW, text), [])
         copied = vp.workflow_problems(".github/workflows/copy.yml", text)
-        self.assertEqual(len(copied), 1, copied)
-        self.assertIn("asks the App-token action for pull-requests: write", copied[0])
+        self.assertEqual(len(copied), 2, copied)
+        self.assertTrue(any("asks the App-token action for pull-requests: write" in problem for problem in copied))
+        self.assertTrue(any("uses the App-token action" in problem for problem in copied))
         without = re.sub(r"(?m)^\s+environment: marketplace-bot\n", "", text)
         self.assertNotEqual(without, text)
-        self.assertEqual(len(vp.workflow_problems(vp.IMPORTER_WORKFLOW, without)), 1)
+        self.assertEqual(len(vp.workflow_problems(vp.IMPORTER_WORKFLOW, without)), 2)
 
-    def test_the_read_form_of_the_app_token_input_is_fine_anywhere(self):
-        step = "- uses: actions/create-github-app-token@v3\n        with:\n          permission-pull-requests: read"
-        report = workflow_pr(workflow_text(step=step))
+    def test_the_repositorys_tag_release_keeps_its_app_token_only_where_the_rule_allows(self):
+        text = (WORKFLOWS_DIR / "tag-release.yml").read_text(encoding="utf-8")
+        self.assertEqual(vp.workflow_problems(vp.TAG_RELEASE_WORKFLOW, text), [])
+        copied = vp.workflow_problems(".github/workflows/copy.yml", text)
+        self.assertEqual(len(copied), 1, copied)
+        self.assertIn("uses the App-token action", copied[0])
+        without = re.sub(r"(?m)^\s+environment: marketplace-bot\n", "", text)
+        self.assertNotEqual(without, text)
+        problems = vp.workflow_problems(vp.TAG_RELEASE_WORKFLOW, without)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("uses the App-token action", problems[0])
+        # The importer alone may ask for pull-requests: write, whatever the other bot workflow enters.
+        elevated = text.replace("permission-pull-requests: read", "permission-pull-requests: write")
+        self.assertNotEqual(elevated, text)
+        problems = vp.workflow_problems(vp.TAG_RELEASE_WORKFLOW, elevated)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("asks the App-token action for pull-requests: write", problems[0])
+
+    def test_the_app_token_action_with_no_permission_input_is_refused_outside_the_bot_jobs(self):
+        # With no permission-* input the action mints a token with every permission the installation has.
+        step = ("- uses: actions/create-github-app-token@v3\n        with:\n"
+                "          client-id: ${{ secrets.MARKETPLACE_BOT_CLIENT_ID }}\n"
+                "          private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}")
+        for path in (EXTRA, vp.VALIDATE_WORKFLOW):
+            with self.subTest(path=path):
+                report = self.assert_refused(workflow_text(step=step), "uses the App-token action", path=path)
+                failed_with(self, report, "with no permission input it mints a token with every permission")
+        second = workflow_text(step=step, job_extra=self.BOT_JOB) + (
+            "  other:\n    permissions: {}\n    runs-on: x\n    steps:\n      " + step + "\n")
+        for path in vp.BOT_WORKFLOWS:
+            with self.subTest(path=path, shape="a second job that does not enter the environment"):
+                self.assert_refused(second, "uses the App-token action", path=path)
+            with self.subTest(path=path, shape="the job that enters it"):
+                report = workflow_pr(workflow_text(step=step, job_extra=self.BOT_JOB), path=path)
+                self.assertEqual((report.exit_code, report.failures), (0, []))
+
+    def test_the_action_is_found_however_the_step_spells_it(self):
+        spellings = ["actions/create-github-app-token@v3", '"actions/create-github-app-token@v3"',
+                     "'actions/create-github-app-token@abc # v3'", "Actions/Create-GitHub-App-Token@v3",
+                     "actions/create-github-app-token"]
+        for spelling in spellings:
+            with self.subTest(spelling):
+                self.assert_refused(workflow_text(step=f"- uses: {spelling}"), "uses the App-token action")
+        self.assert_refused(workflow_text(step='- "uses": actions/create-github-app-token@v3'), "uses the App-token action")
+        self.assert_refused(workflow_text(step="- {uses: actions/create-github-app-token@v3}"), "uses the App-token action")
+        elsewhere = workflow_text(step="- uses: actions/checkout@v4\n      - run: echo create-github-app-token")
+        self.assertEqual(workflow_pr(elsewhere).failures, [])
+
+    def test_the_permission_variables_the_action_reads_are_refused_as_the_grants_they_name(self):
+        # The action reads INPUT_PERMISSION-* from the environment, so a step can ask without writing the input.
+        for variable in ("INPUT_PERMISSION-PULL-REQUESTS", "INPUT_PERMISSION_PULL_REQUESTS",
+                         "input_permission-pull-requests", '"INPUT_PERMISSION-PULL-REQUESTS"'):
+            for path in (EXTRA, vp.TAG_RELEASE_WORKFLOW):
+                with self.subTest(variable=variable, path=path):
+                    text = workflow_text(job_extra=f"    environment: marketplace-bot\n    env:\n      {variable}: write")
+                    self.assert_refused(text, "asks the App-token action for pull-requests: write", path=path)
+        for variable in ("INPUT_PERMISSION-CHECKS", "INPUT_PERMISSION_STATUSES"):
+            with self.subTest(variable=variable):
+                self.assert_refused(workflow_text(job_extra=f"    env:\n      {variable}: write"),
+                                    "writes checks: write, statuses: write or write-all out plainly")
+        allowed = workflow_text(step=self.APP_TOKEN,
+                                job_extra=f"{self.BOT_JOB}\n    env:\n      INPUT_PERMISSION-PULL-REQUESTS: write")
+        report = workflow_pr(allowed, path=vp.IMPORTER_WORKFLOW)
         self.assertEqual((report.exit_code, report.failures), (0, []))
+
+    def test_the_read_form_of_the_app_token_input_is_not_a_second_rule_for_the_bot_jobs(self):
+        # It is the step that is refused outside the bot jobs, not the input: there it is fine, and elsewhere the
+        # action itself is the problem, so the read form does not make the step acceptable.
+        step = "- uses: actions/create-github-app-token@v3\n        with:\n          permission-pull-requests: read"
+        report = workflow_pr(workflow_text(step=step, job_extra=self.BOT_JOB), path=vp.TAG_RELEASE_WORKFLOW)
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+        report = self.assert_refused(workflow_text(step=step), "uses the App-token action")
+        self.assertEqual(len(report.failures), 1, report.failures)
 
     def test_a_workflow_that_grants_both_reports_both(self):
         # Two unrelated powers, found by independent scans: neither may hide the other.

@@ -142,6 +142,11 @@ def _names_ai_tc(value) -> bool:
 #     secrets behind it rests on where they are stored, which nothing here can read, so the
 #     exception is as narrow as the importer's own job (AGENTS.md, "The workflows", says an
 #     administrator reads the secret scope back);
+#   * a step that uses the App-token action at all, anywhere but in a job of the importer's workflow
+#     or tag-release.yml that itself enters the marketplace-bot environment: with no permission
+#     input the action mints a token with every permission the App's installation has. The
+#     INPUT_PERMISSION-* variables the action also reads count as the inputs they name. This is a
+#     backup to where the bot's secrets are stored, which is the control that bounds its token;
 #   * a file with jobs that declares no `permissions:` at the top level and has a job that declares
 #     none of its own: that job takes the repository's default token, and a repository setting nobody
 #     here can read decides whether it can write, so the scan fails closed;
@@ -151,6 +156,8 @@ def _names_ai_tc(value) -> bool:
 #     twice), which it refuses rather than guess at.
 # This is a best-effort read of the text, not a YAML parser, and it refuses only what it finds.
 # It does not see:
+#   * the action reached through a composite action (a file under .github/actions, which this scan does
+#     not read), or the bot's secrets read without the action;
 #   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
 #     refusal above looks for the word jobs, so a file that never spells it out is not refused);
 #   * a change to validate.yml itself, for example another trigger: that file is exempt only from the
@@ -177,6 +184,8 @@ VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
 REQUIRED_CHECK = "validate"
 SAME_NAME = f"any job named {REQUIRED_CHECK} satisfies the required check, so only {VALIDATE_WORKFLOW} may have one"
 IMPORTER_WORKFLOW = ".github/workflows/import-plugin-release.yml"
+TAG_RELEASE_WORKFLOW = ".github/workflows/tag-release.yml"
+BOT_WORKFLOWS = (IMPORTER_WORKFLOW, TAG_RELEASE_WORKFLOW)
 BOT_ENVIRONMENT = "marketplace-bot"
 
 
@@ -191,6 +200,15 @@ _WRITE_ALL = _grant("permissions", "write-all")
 # matched on its own: it asks for the release bot's token, not the workflow's.
 _APPROVES_PRS = _grant("pull-requests")
 _APP_TOKEN_PRS = _grant("permission-pull-requests")
+# The App-token action takes its inputs from INPUT_PERMISSION-* environment variables as well, so a step can
+# ask for a permission without writing the input. The value is not read: any such variable is refused as the
+# grant it names.
+_INPUT_ENV = re.compile(r"""(?:^|[\s{,])["']?INPUT_PERMISSION[-_](checks|statuses|pull[-_]requests)["']?\s*:""",
+                        re.IGNORECASE | re.MULTILINE)
+# A step that uses the App-token action at all: with no permission-* input it mints a token carrying every
+# permission the App's installation has.
+_APP_TOKEN_STEP = re.compile(r"""(?:^|[\s{,])["']?uses["']?\s*:\s*["']?actions/create-github-app-token\b""",
+                             re.IGNORECASE | re.MULTILINE)
 _PLAIN_KEY_END = re.compile(r":(?:\s|$)")
 _QUOTED_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s+(.*))?$""")
 
@@ -348,6 +366,19 @@ def _environment_name(job_id: str, nested: list, indent: int):
     return name
 
 
+def _pr_token_asks(text: str) -> int:
+    """How many times `text` asks the App-token action for pull-requests: write, as the input or as the variable."""
+    return len(_APP_TOKEN_PRS.findall(text)) + sum(1 for kind in _INPUT_ENV.findall(text) if kind.lower().startswith("pull"))
+
+
+def _token_steps(text: str) -> int:
+    return len(_APP_TOKEN_STEP.findall(text))
+
+
+def _job_text(job) -> str:
+    return "\n".join(content for _, content in job.rows)
+
+
 def _read_jobs(rows: list, found: list) -> None:
     """Append every job under a top-level `jobs:` key to `found`, in order, each read for the checks below. It
     raises _Unreadable at the first job it cannot read, so `found` then holds the jobs before it. A key a job
@@ -392,7 +423,8 @@ def workflow_problems(path: str, text: str) -> list:
     clean = [_uncommented(line) for line in text.splitlines()]
     body = "\n".join(clean)
     problems = []
-    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body):
+    env_kinds = [kind.lower() for kind in _INPUT_ENV.findall(body)]
+    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body) or any(kind[0] in "cs" for kind in env_kinds):
         problems.append(
             "writes checks: write, statuses: write or write-all out plainly, which would let a job create a check "
             f"run or a status named {REQUIRED_CHECK}, and any such check satisfies the required check"
@@ -409,18 +441,25 @@ def workflow_problems(path: str, text: str) -> list:
         _read_jobs(rows, jobs)
     except _Unreadable as exc:
         unreadable = exc
-    if _APP_TOKEN_PRS.search(body):
-        entered = []
-        if path == IMPORTER_WORKFLOW and unreadable is None:
-            entered = [job for job in jobs if job.environment == BOT_ENVIRONMENT]
-        inside = sum(len(_APP_TOKEN_PRS.findall("\n".join(content for _, content in job.rows))) for job in entered)
-        if len(_APP_TOKEN_PRS.findall(body)) > inside:
-            problems.append(
-                "asks the App-token action for pull-requests: write, which only "
-                f"{IMPORTER_WORKFLOW} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
-                "environment (`environment: name`, or a `name:` under it): the token it mints is the release bot's, "
-                "and nothing here can read where its secrets are stored"
-            )
+    entering = [job for job in jobs if job.environment == BOT_ENVIRONMENT] if unreadable is None else []
+
+    def inside(count, files):
+        return sum(count(_job_text(job)) for job in entering) if path in files else 0
+
+    if _pr_token_asks(body) > inside(_pr_token_asks, (IMPORTER_WORKFLOW,)):
+        problems.append(
+            "asks the App-token action for pull-requests: write, which only "
+            f"{IMPORTER_WORKFLOW} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
+            "environment (`environment: name`, or a `name:` under it): the token it mints is the release bot's, "
+            "and nothing here can read where its secrets are stored"
+        )
+    if _token_steps(body) > inside(_token_steps, BOT_WORKFLOWS):
+        problems.append(
+            "uses the App-token action, which only "
+            f"{' and '.join(BOT_WORKFLOWS)} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
+            "environment: with no permission input it mints a token with every permission the App's installation "
+            "has, and nothing here can read where its secrets are stored"
+        )
     missing = _jobs_without_permissions(rows, jobs)
     if missing:
         names = ", ".join(_code(job) for job in missing)
