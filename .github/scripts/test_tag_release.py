@@ -879,7 +879,7 @@ class TestApprover(unittest.TestCase):
 
     def test_a_refusal_is_kept_in_the_tag_and_a_failure_that_is_not_one_is_not(self):
         cases = {
-            401: "HTTP 401", 404: "HTTP 404", 410: "HTTP 410", 422: "HTTP 422", 451: "HTTP 451",
+            401: "HTTP 401", 404: "HTTP 404", 410: "HTTP 410", 451: "HTTP 451",
         }
         for status, reason in cases.items():
             with self.subTest(status=status), mock.patch("sys.stdout", new_callable=io.StringIO):
@@ -1143,8 +1143,8 @@ class TestHeadPusher(unittest.TestCase):
         self.assertIn("was not read (TimeoutError: )", self.printed)
 
     def test_a_refusal_is_told_from_a_failure_a_re_run_may_not_repeat(self):
-        refusals = {401: True, 403: True, 404: True, 410: True, 422: True, 451: True,
-                    400: False, 429: False, 500: False, 502: False, 503: False}
+        refusals = {401: True, 403: True, 404: True, 410: True, 451: True,
+                    400: False, 422: False, 429: False, 500: False, 502: False, 503: False}
         for status, refused in refusals.items():
             with self.subTest(status=status):
                 self.assertEqual(tr.feed_refusal(GitHubError(status, "GET", "p", "x")) is not None, refused)
