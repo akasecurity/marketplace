@@ -147,8 +147,8 @@ def _names_ai_tc(value) -> bool:
 #     here can read decides whether it can write, so the scan fails closed;
 #   * a file that has the word jobs in it but no top-level `jobs:` key in block style, and a file
 #     with such a key whose jobs it cannot read with confidence (flow style under it, anchors and
-#     aliases, merge keys, an escape in a quoted name, a name on the next line), which it refuses
-#     rather than guess at.
+#     aliases, merge keys, an escape in a quoted name, a name on the next line, a key a job spells
+#     twice), which it refuses rather than guess at.
 # This is a best-effort read of the text, not a YAML parser, and it refuses only what it finds.
 # It does not see:
 #   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
@@ -323,22 +323,27 @@ def _has_key(rows: list, key: str, indent: int) -> bool:
 class _Job:
     id: str
     name: str | None  # its `name:`, None when it has none
-    rows: list  # (indent, text) of everything under its id
+    rows: tuple  # (indent, text) of everything under its id
 
 
 def _read_jobs(rows: list, found: list) -> None:
     """Append every job under a top-level `jobs:` key to `found`, in order, each read for the checks below. It
-    raises _Unreadable at the first job it cannot read, so `found` then holds the jobs before it."""
+    raises _Unreadable at the first job it cannot read, so `found` then holds the jobs before it. A key a job
+    spells twice is unreadable, as a duplicate key is in the manifests: neither the first nor the last is taken
+    to be the one in force."""
     for block in _jobs_blocks(rows):
         for content, children in _split_jobs(block):
             job_id, rest = _read_key(content, "a job id")
             if _without_properties(rest) and not _is_required_check(job_id):
                 raise _Unreadable(f"job {_code(job_id)} is given in flow style, as an alias or as a scalar")
-            name = None
+            name, seen = None, set()
             for indent, child in children:
                 if indent != children[0][0]:
                     continue
                 key, value = _read_key(child, f"a key of job {_code(job_id)}")
+                if key in seen:
+                    raise _Unreadable(f"job {_code(job_id)} has the key {_code(key)} twice")
+                seen.add(key)
                 if key != "name":
                     continue
                 name = _scalar(value)
@@ -346,7 +351,7 @@ def _read_jobs(rows: list, found: list) -> None:
                     raise _Unreadable(
                         f"the name of job {_code(job_id)} is an alias, a block scalar, an escape, an open quote or on the next line"
                     )
-            found.append(_Job(job_id, name, children))
+            found.append(_Job(job_id, name, tuple(children)))
 
 
 def _jobs_without_permissions(rows: list, jobs: list) -> list:
@@ -431,9 +436,12 @@ def workflow_problems(path: str, text: str) -> list:
             if job.name is not None and _is_required_check(job.name):
                 problems.append(f"names job {_code(job.id)} {REQUIRED_CHECK}: {SAME_NAME}")
     if unreadable is not None:
+        # validate.yml is exempt from the rule on job names, so only the permissions are at stake there.
+        cannot_tell = ("which token permissions its jobs take" if path == VALIDATE_WORKFLOW
+                       else "what its jobs are named or which token permissions they take")
         problems.append(
-            f"is written in a form this check does not read ({unreadable}), so it cannot tell what its jobs are "
-            "named or which token permissions they take; write its jobs in plain block style"
+            f"is written in a form this check does not read ({unreadable}), so it cannot tell {cannot_tell}; "
+            "write its jobs in plain block style"
         )
     return [f"{_code(path)} {problem}" for problem in problems]
 

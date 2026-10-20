@@ -940,6 +940,39 @@ class TestWorkflowFiles(unittest.TestCase):
         self.assert_refused(bare, "declares no top-level permissions", path=vp.VALIDATE_WORKFLOW)
         self.assertEqual(workflow_pr(bare.replace("jobs:", "permissions: {}\njobs:"), path=vp.VALIDATE_WORKFLOW).failures, [])
 
+    def test_a_key_a_job_spells_twice_is_unreadable_whichever_comes_first(self):
+        # Neither the first nor the last of two `name:` or `environment:` keys is taken to be the one in force, the
+        # way a duplicate key in a manifest is refused instead of resolved.
+        duplicated = {
+            "the first name is validate": "    name: validate\n    name: build",
+            "the last name is validate": "    name: build\n    name: validate",
+            "two other names": "    name: one\n    name: two",
+            "the bot environment first": "    environment: marketplace-bot\n    environment: production",
+            "the bot environment last": "    environment: production\n    environment: marketplace-bot",
+            "another key": "    timeout-minutes: 5\n    timeout-minutes: 6",
+        }
+        for label, job_extra in duplicated.items():
+            with self.subTest(label):
+                report = self.assert_refused(workflow_text(job_extra=job_extra, step=self.APP_TOKEN),
+                                             "is written in a form this check does not read", path=self.IMPORTER)
+                failed_with(self, report, "twice")
+        once = workflow_pr(workflow_text(job_extra="    timeout-minutes: 5"))
+        self.assertEqual((once.exit_code, once.failures), (0, []))
+
+    def test_the_unreadable_failure_names_only_what_applies_to_the_file(self):
+        unread = "name: x\non: push\njobs: {build: {runs-on: x}}\n"
+        other = vp.workflow_problems(EXTRA, unread)[0]
+        self.assertIn("what its jobs are named or which token permissions they take", other)
+        validate = vp.workflow_problems(vp.VALIDATE_WORKFLOW, unread)[0]
+        self.assertIn("so it cannot tell which token permissions its jobs take;", validate)
+        self.assertNotIn("named", validate)
+
+    def test_a_job_can_be_hashed_though_it_holds_rows(self):
+        jobs = []
+        vp._read_jobs(vp._rows(["jobs:", "  build:", "    runs-on: x"]), jobs)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(len({jobs[0], jobs[0]}), 1)
+
     def test_a_file_is_read_once_and_an_unreadable_one_gets_one_answer(self):
         text = workflow_text(step=self.APP_TOKEN, job_extra=self.BOT_JOB)
         with mock.patch.object(vp, "_rows", wraps=vp._rows) as spy:
