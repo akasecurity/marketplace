@@ -18,9 +18,11 @@ name: validate
 # Before trusting a green run, open the check run and confirm it is this workflow's run
 # from main, with event pull_request_target. Any GitHub Actions job named "validate" on
 # the head commit would satisfy the required check too. This workflow fails a PR whose
-# diff adds or changes another workflow file in which it can plainly see such a job, or a
-# permission to post a check of that name. validate_pr.py lists what it reads and what it
-# cannot see; the check after the merge is the detection for the rest.
+# diff adds or changes a workflow file in which it can plainly see such a job (in any file
+# but this one), a permission to post a check of that name or to approve a pull request,
+# or a job whose token permissions are left to the repository default. validate_pr.py
+# lists what it reads and what it cannot see; the check after the merge is the detection
+# for the rest.
 
 on:
   pull_request_target:

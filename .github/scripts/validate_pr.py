@@ -125,15 +125,25 @@ def _names_ai_tc(value) -> bool:
 
 
 # A workflow file a pull request adds or changes can define a job named validate, and the required
-# check is matched by name, so any such job can stand beside this one. validate reads each such file
-# as text, never runs it, and fails the PR for what it can see plainly:
+# check is matched by name, so any such job can stand beside this one. It can also hold the power to
+# approve a pull request, or run with a token whose power nothing in the repository can read. These
+# are two unrelated threats. validate reads each such file as text, never runs it, and fails the PR
+# for what it can see plainly:
 #   * a job id, or a job `name:`, written out as validate;
-#   * pull-requests: write permission written out plainly, which lets a job approve a pull request
-#     when the repository allows workflows to (not the permission-pull-requests input of the
-#     App-token action, which is the release bot's own token);
-#   * checks: write, statuses: write or write-all permissions written out plainly (or the
-#     permission-checks and permission-statuses inputs of the App-token action), which let a job
-#     create a check run or a status named validate through the API;
+#   * checks: write, statuses: write or write-all written out plainly (or the permission-checks and
+#     permission-statuses inputs of the App-token action), which would let a job create a check run
+#     or a status named validate through the API;
+#   * pull-requests: write written out plainly, which would let a job approve a pull request when the
+#     repository allows workflows to, and comment on, label, retitle or close pull requests;
+#   * the permission-pull-requests: write input of the App-token action, anywhere but in the
+#     importer's own workflow, and there only when the file has a job in the marketplace-bot
+#     environment. The token it mints is the release bot's. Whether a pull request could reach the
+#     secrets behind it rests on where they are stored, which nothing here can read, so the
+#     exception is as narrow as the importer's own job (AGENTS.md, "The workflows", says an
+#     administrator reads the secret scope back);
+#   * a file with jobs that declares no `permissions:` at the top level and has a job that declares
+#     none of its own: that job takes the repository's default token, and a repository setting nobody
+#     here can read decides whether it can write, so the scan fails closed;
 #   * a file that has the word jobs in it but no top-level `jobs:` key in block style, and a file
 #     with such a key whose jobs it cannot read with confidence (flow style under it, anchors and
 #     aliases, merge keys, an escape in a quoted name, a name on the next line), which it refuses
@@ -146,7 +156,6 @@ def _names_ai_tc(value) -> bool:
 #     rule and a change to it is only called out in the notes;
 #   * a permission grant written with an anchor, an alias or an escape: only plain grants match;
 #   * a job name built from an expression or a matrix value;
-#   * a workflow that declares no permissions and so takes the repository's default token;
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
 #   * a fork PR's own run.
@@ -158,15 +167,28 @@ def _names_ai_tc(value) -> bool:
 # so a job that only shares the name does not count there. That tie runs through the check run's
 # check suite, so a check run created through the API with a workflow token and filed by GitHub
 # under that suite could still count (a known limit, not reproduced).
+# The match is on words, not on structure, so a file that only prints one of the grants above in a
+# `run:` is refused too; the messages say the words were written, not that the file grants them.
 WORKFLOW_FILE = re.compile(r"\.github/workflows/[^/]+\.ya?ml", re.IGNORECASE)
 VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
 REQUIRED_CHECK = "validate"
 SAME_NAME = f"any job named {REQUIRED_CHECK} satisfies the required check, so only {VALIDATE_WORKFLOW} may have one"
-_CREATES_CHECKS = re.compile(r"""(?:^|[\s{,])["']?(?:permission-)?(?:checks|statuses)["']?\s*:\s*["']?write\b""", re.MULTILINE)
-_WRITE_ALL = re.compile(r"""(?:^|[\s{,])["']?permissions["']?\s*:\s*["']?write-all\b""", re.MULTILINE)
-# The workflow token's own grant. The permission-pull-requests input of the App-token action is another key and
-# does not match: it mints the release bot's token, which only main can reach.
-_APPROVES_PRS = re.compile(r"""(?:^|[\s{,])["']?pull-requests["']?\s*:\s*["']?write\b""", re.MULTILINE)
+IMPORTER_WORKFLOW = ".github/workflows/import-plugin-release.yml"
+BOT_ENVIRONMENT = "marketplace-bot"
+
+
+def _grant(key: str, value: str = "write") -> re.Pattern:
+    """A `key: value` written out plainly, block or flow style, with either side quoted."""
+    return re.compile(rf"""(?:^|[\s{{,])["']?{key}["']?\s*:\s*["']?{value}\b""", re.MULTILINE)
+
+
+_CREATES_CHECKS = _grant(r"(?:permission-)?(?:checks|statuses)")
+_WRITE_ALL = _grant("permissions", "write-all")
+# The workflow token's own grant. The App-token action's permission-pull-requests input is another key and is
+# matched on its own: it asks for the release bot's token, not the workflow's.
+_APPROVES_PRS = _grant("pull-requests")
+_APP_TOKEN_PRS = _grant("permission-pull-requests")
+_BOT_ENVIRONMENT = re.compile(rf"""^[ \t]*environment[ \t]*:[ \t]*["']?{BOT_ENVIRONMENT}["']?[ \t]*$""", re.MULTILINE)
 _PLAIN_KEY_END = re.compile(r":(?:\s|$)")
 _QUOTED_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s+(.*))?$""")
 
@@ -276,11 +298,11 @@ def _jobs_blocks(rows: list) -> list:
     return blocks
 
 
-def _scan_jobs(block: list, problems: list) -> None:
-    """Add what is wrong with the jobs under one `jobs:` key. Job ids sit at the first row's
+def _split_jobs(block: list) -> list:
+    """(the row of each job id, its child rows) under one `jobs:` key. Job ids sit at the first row's
     indent, and each job's own keys at the indent of its first row."""
     if not block:
-        return
+        return []
     first, jobs = block[0][0], []
     for indent, content in block:
         if indent == first:
@@ -289,7 +311,31 @@ def _scan_jobs(block: list, problems: list) -> None:
             jobs[-1][1].append((indent, content))
         else:
             raise _Unreadable("its jobs are not indented consistently")
-    for content, children in jobs:
+    return jobs
+
+
+def _has_key(rows: list, key: str, indent: int) -> bool:
+    """Whether one of the rows at `indent` is the key `key`."""
+    return any(row_indent == indent and (_key_line(content) or (None,))[0] == key for row_indent, content in rows)
+
+
+def _jobs_without_permissions(rows: list) -> list:
+    """The ids of the jobs that declare no `permissions:` of their own, when the file declares none at the top
+    level: they take the repository's default token. [] when the file declares one at the top, or has no jobs."""
+    if not rows or _has_key(rows, "permissions", rows[0][0]):
+        return []
+    missing = []
+    for block in _jobs_blocks(rows):
+        for content, children in _split_jobs(block):
+            job_id = _read_key(content, "a job id")[0]
+            if not children or not _has_key(children, "permissions", children[0][0]):
+                missing.append(job_id)
+    return missing
+
+
+def _scan_jobs(block: list, problems: list) -> None:
+    """Add what is wrong with the jobs under one `jobs:` key."""
+    for content, children in _split_jobs(block):
         job_id, rest = _read_key(content, "a job id")
         if _is_required_check(job_id):
             problems.append(f"defines a job with the id {REQUIRED_CHECK}: {SAME_NAME}")
@@ -317,14 +363,32 @@ def workflow_problems(path: str, text: str) -> list:
     problems = []
     if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body):
         problems.append(
-            "grants checks: write, statuses: write or write-all, which lets a job create a check run or a status "
-            f"named {REQUIRED_CHECK}, and any such check satisfies the required check"
+            "writes checks: write, statuses: write or write-all out plainly, which would let a job create a check "
+            f"run or a status named {REQUIRED_CHECK}, and any such check satisfies the required check"
         )
     if _APPROVES_PRS.search(body):
         problems.append(
-            "grants pull-requests: write, which lets a job approve a pull request when the repository allows "
-            "workflows to, and `github-actions[bot]` has write access, so its approval could supply the one the "
-            "main ruleset needs"
+            "writes pull-requests: write out plainly, which would let a job approve a pull request when the "
+            "repository allows workflows to, and comment on, label, retitle or close pull requests; "
+            "`github-actions[bot]` has write access, so once the main ruleset stops requiring code-owner review "
+            "its approval would count toward the one the ruleset needs"
+        )
+    if _APP_TOKEN_PRS.search(body) and not (path == IMPORTER_WORKFLOW and _BOT_ENVIRONMENT.search(body)):
+        problems.append(
+            "asks the App-token action for pull-requests: write, which only "
+            f"{IMPORTER_WORKFLOW} may do, and only with a job in the {BOT_ENVIRONMENT} environment: the token "
+            "it mints is the release bot's, and nothing here can read where its secrets are stored"
+        )
+    try:
+        missing = _jobs_without_permissions(_rows(clean))
+    except _Unreadable:
+        missing = []  # a file the job scan below cannot read is refused there; validate.yml's jobs are not scanned
+    if missing:
+        problems.append(
+            "declares no top-level permissions and "
+            f"{', '.join(_code(job) for job in missing)} declare{'s' if len(missing) == 1 else ''} none of "
+            "their own, so they take the repository's default token, which a repository setting can make "
+            "write-capable; write `permissions: {}` at the top level, or the grants each job needs"
         )
     if path != VALIDATE_WORKFLOW:
         try:
