@@ -280,7 +280,9 @@ true only once it is.
   approve a pull request when the repository allows workflows to, and comment on, label, retitle or
   close pull requests (an approval by `github-actions[bot]` is not a review by a person); asks the
   App-token action for `permission-pull-requests: write` anywhere but in `import-plugin-release.yml`,
-  and there unless the file has a job in the `marketplace-bot` environment; declares no `permissions:`
+  and there unless the job that asks itself enters the `marketplace-bot` environment (`environment:
+  name`, or a `name:` under it; any other spelling, such as flow style or an expression, is
+  refused); declares no `permissions:`
   at the top level while a job declares none of its own, so that job takes the repository's default
   token, which a repository setting can make write-capable; or defines a job whose id or `name:` is `validate`
   (in any file but `validate.yml` itself), since it could report a `validate` check of its own; a
@@ -289,8 +291,8 @@ true only once it is.
   a best-effort read of the text and not a YAML parser, so it also refuses a file that only prints
   one of those grants in a `run:`, and its messages say the words were written, not that the file
   grants them. It does not see: a flow-style or complex-key file whose `jobs` key is itself spelled
-  with an escape; a change to `validate.yml` itself, such as another trigger (it is only called out
-  for review); the `permission-pull-requests: write` input in the importer's own workflow, which it
+  with an escape; a change to `validate.yml` itself, such as another trigger (it is exempt only from
+  the rule against a job named `validate`, and is called out for review); the `permission-pull-requests: write` input in the importer's own workflow, which it
   allows because the token it mints is the release bot's (whether a pull request could reach the
   secrets behind it rests on where they are stored, which an administrator reads back, as the
   start of this section says); a permission grant written with an anchor, an alias or an escape; a
