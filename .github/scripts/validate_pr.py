@@ -370,8 +370,7 @@ def workflow_problems(path: str, text: str) -> list:
         problems.append(
             "writes pull-requests: write out plainly, which would let a job approve a pull request when the "
             "repository allows workflows to, and comment on, label, retitle or close pull requests; "
-            "`github-actions[bot]` has write access, so once the main ruleset stops requiring code-owner review "
-            "its approval would count toward the one the ruleset needs"
+            "an approval by `github-actions[bot]` is not a review by a person"
         )
     if _APP_TOKEN_PRS.search(body) and not (path == IMPORTER_WORKFLOW and _BOT_ENVIRONMENT.search(body)):
         problems.append(
