@@ -23,7 +23,6 @@ INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64))
 # The real attested commits through 0.9.14, then invented stand-ins for every later version.
 # 0.9.15 is a real release too, but these tests use it as an invented next release.
 ATTESTED = {**ts.ATTESTED, **{v: v.split(".")[2] * 20 for v in VERSIONS if v not in ts.ATTESTED}}
-CODEOWNERS = "* @Vaishnav-OM @venuverse\n"
 
 
 def manifest(version: str | None = "0.9.14", integrity: str | None = None, *, entry: bool = True) -> str:
@@ -97,10 +96,6 @@ class FakeGit:
         content = self.files.get(key)
         # A file held as bytes is decoded as UTF-8, as gitrepo.Git.show decodes what it reads.
         return content.decode("utf-8") if isinstance(content, bytes) else content
-
-    def entry_mode(self, rev: str, path: str) -> str | None:
-        key = (self.rev_parse(rev), path)
-        return self.modes.get(key) or ("100644" if key in self.files else None)
 
     def fleet_tags(self) -> list[dict]:
         return sorted(self.tags, key=lambda tag: tag["n"])

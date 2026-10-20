@@ -620,20 +620,13 @@ class TagReleaseWorkflow(WorkflowCase):
 class ScriptTestsWorkflow(WorkflowCase):
     name = "script-tests.yml"
 
-    def test_a_pull_request_that_changes_only_the_code_owners_file_runs_the_unit_tests(self):
-        # tag-release reads that file strictly, and a tag cut for a commit whose parent holds a shape it cannot read
-        # records an unknown approver. validate, the required check, does not read it, so the unit test that reads
-        # the repository's own copy is the only check on the PR: once a commit is merged, the file at its parent can
-        # no longer change. The workflow therefore runs on every pull request. A path filter would have to name this
-        # file, and a branch or type filter could leave the PR out altogether, so none may be nested under the trigger
-        # (only whole-line comments are left out; the workflow's `on:` block is plain).
+    def test_a_pull_request_runs_the_unit_tests_whatever_files_it_changes(self):
+        # A path filter has to name every file a test reads, and a branch or type filter could leave the PR out
+        # altogether, so none may be nested under the trigger (only whole-line comments are left out; the
+        # workflow's `on:` block is plain).
         trigger = re.sub(r"(?m)^[ \t]*#.*\n", "", self.head)
         self.assertRegex(trigger, r"(?m)^  pull_request:[ \t]*\n(?=  \S|\S)",
                          "the pull_request trigger has a filter under it, so some pull requests run no unit tests")
-
-    def test_the_test_that_reads_the_code_owners_file_is_still_there_for_a_pull_request_to_run(self):
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_tag_release.py"), encoding="utf-8") as handle:
-            self.assertIn("def test_the_repositorys_own_codeowners_file_can_be_read(", handle.read())
 
 
 class StalenessWorkflow(WorkflowCase):

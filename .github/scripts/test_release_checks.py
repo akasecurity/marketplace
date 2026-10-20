@@ -2594,7 +2594,7 @@ def ruleset_routes(overrides=None, missing=()):
                     "type": "pull_request",
                     "parameters": {
                         "required_approving_review_count": 1,
-                        "require_code_owner_review": True,
+                        "require_code_owner_review": False,
                         "dismiss_stale_reviews_on_push": True,
                         "require_last_push_approval": True,
                         "required_review_thread_resolution": False,
@@ -2750,7 +2750,7 @@ class TestAuditRulesets(unittest.TestCase):
              if r["type"] == "pull_request")["parameters"]["allowed_merge_methods"] = 1
         self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
                          ["ruleset 'main': allowed_merge_methods is 1, not ['squash']"])
-        for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+        for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
             with self.subTest(key=key):
                 routes = ruleset_routes()
                 main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
@@ -2758,6 +2758,18 @@ class TestAuditRulesets(unittest.TestCase):
                 routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
                 self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
                                  [f"ruleset 'main': {key} is 1, not True"])
+
+    def test_main_must_not_require_code_owner_review(self):
+        # With no CODEOWNERS file the setting has no effect, but a file added later would hand every approval to
+        # whoever it names, so the audit reads it off.
+        for flag in (True, 1, None, "false"):
+            with self.subTest(flag=flag):
+                routes = ruleset_routes()
+                main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+                main["rules"][2]["parameters"]["require_code_owner_review"] = flag
+                routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+                self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
+                                 [f"ruleset 'main': require_code_owner_review is {flag!r}, not False"])
 
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()

@@ -3,9 +3,7 @@
 staleness, tag-audit and main-audit evaluate their rules in a job that cannot write
 issues, and hand the results to a job that can do nothing else. Each rule has one issue,
 found by a hidden rule marker among those the workflow's token filed; it is assigned to
-the release approvers in .github/release-approvers.json and mentions the code owners in
-.github/CODEOWNERS (a file that is missing or is not UTF-8 text costs the mention, never
-the issue). A red rule comments only when its detail changes, or once a day; after 48
+the release approvers in .github/release-approvers.json. A red rule comments only when its detail changes, or once a day; after 48
 hours the escalation owner is assigned; a rule that clears closes its issue, unless its
 result says otherwise (main-audit's results never do: the next run audits only its own
 push, so a person closes them; its failed-job result is keyed to the push as well).
@@ -31,7 +29,6 @@ ACTIONS_BOT = "github-actions[bot]"
 # A rule that goes red again this soon after the router closed its issue reopens that issue (apply).
 REOPEN_WITHIN = dt.timedelta(hours=48)
 APPROVERS_FILE = ".github/release-approvers.json"
-CODEOWNERS_FILE = ".github/CODEOWNERS"
 COMMENT_EVERY = dt.timedelta(hours=24)
 ESCALATE_AFTER = dt.timedelta(hours=48)
 # The labels whose run audits only its own push: their results do not auto-close, and a failed job is filed under
@@ -63,30 +60,6 @@ def results_to_json(results: list[Result]) -> str:
 
 def results_from_json(text: str) -> list[Result]:
     return [Result(**item) for item in json.loads(text or "[]")]
-
-
-def parse_codeowners(text: str) -> list[str]:
-    """The owners of `*`; as in CODEOWNERS, the last matching line wins."""
-    owners: list[str] = []
-    for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        pattern, *handles = line.split()
-        if pattern == "*":
-            owners = [handle[1:] for handle in handles if handle.startswith("@")]
-    return owners
-
-
-def read_owners(path: str = CODEOWNERS_FILE) -> list[str]:
-    """The owners to mention. A file that is missing, cannot be opened or is not UTF-8 text gives none and a
-    warning: the mention is a courtesy, and an alert that cannot be filed because of it is lost for good."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return parse_codeowners(handle.read())
-    except (OSError, UnicodeDecodeError) as error:
-        print(f"::warning::{path} was not read ({type(error).__name__}), so no code owner is mentioned")
-        return []
 
 
 def marker(name: str, value: str) -> str:
@@ -160,12 +133,10 @@ def stamp(moment: dt.datetime) -> str:
 
 
 class Router:
-    def __init__(self, gh, *, approvers: list[str], escalation: str | None, owners: list[str],
-                 now: dt.datetime, run_url: str) -> None:
+    def __init__(self, gh, *, approvers: list[str], escalation: str | None, now: dt.datetime, run_url: str) -> None:
         self.gh = gh
         self.approvers = approvers
         self.escalation = escalation
-        self.owners = owners
         self.now = now
         self.run_url = run_url
 
@@ -231,12 +202,11 @@ class Router:
         return f"{result.rule}: clear"
 
     def _open(self, result: Result) -> str:
-        cc = " ".join(f"@{owner}" for owner in self.owners)
         closing = ("It closes by itself when the rule clears." if result.auto_close
                    else "A person closes it once it is explained.")
         body = "\n".join([marker("rule", result.rule), marker("state", digest(result.detail)),
                           marker("last-comment", stamp(self.now)), "", quoted(result.detail, self.run_url), "", "---",
-                          f"Filed by {self.run_url}." + (f" cc {cc}" if cc else ""),
+                          f"Filed by {self.run_url}.",
                           "Assigned to the release approvers; after 48 hours the escalation owner is assigned too. "
                           + closing])
         issue = self.gh.post(self.gh.repo_path("issues"), {"title": result.title, "body": body,
@@ -354,10 +324,8 @@ def main(argv: list[str] | None = None) -> int:
     run_url = f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}"
     with open(APPROVERS_FILE, encoding="utf-8") as handle:
         config = json.load(handle)
-    owners = read_owners()
     router = Router(GitHub(env.get("GH_TOKEN", ""), env["GITHUB_REPOSITORY"]), approvers=config["approvers"],
-                    escalation=config.get("escalation"), owners=owners, now=dt.datetime.now(dt.timezone.utc),
-                    run_url=run_url)
+                    escalation=config.get("escalation"), now=dt.datetime.now(dt.timezone.utc), run_url=run_url)
     job_result = env.get("JOB_RESULT", "")
     results: list[Result] | None = []
     if job_result == "success":
