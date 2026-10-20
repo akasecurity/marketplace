@@ -1016,8 +1016,8 @@ class TestOpenPrForward(OpenPrCase):
 
 
 class TestReleaseApproversAreAskedToReview(OpenPrCase):
-    """With no CODEOWNERS file GitHub requests nobody, so the importer asks the people in release-approvers.json
-    itself: a verified release then does not sit unnoticed until staleness files its 24-hour issue."""
+    """The importer asks the people in release-approvers.json to review the PR it opens, so a verified release does
+    not sit unnoticed until staleness files its 24-hour issue."""
 
     def requested(self) -> list[str]:
         return [call[2]["reviewers"] for call in self.gh.called("POST", R("pulls/12/requested_reviewers"))]
@@ -1029,6 +1029,39 @@ class TestReleaseApproversAreAskedToReview(OpenPrCase):
         order = [call[1] for call in self.gh.writes()]
         self.assertLess(order.index(R("pulls")), order.index(R("pulls/12/requested_reviewers")))
         self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+
+    def test_auto_merge_is_enabled_before_any_review_is_requested(self):
+        # By order, not by the errors the request happens to catch: a request that dies in a way nobody foresaw must
+        # find auto-merge already on, because the next scheduled run does not repair a PR left without it.
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan())
+        steps = [(call[0], call[1]) for call in self.gh.calls]
+        self.assertLess(steps.index(("GRAPHQL", "enablePullRequestAutoMerge")),
+                        steps.index(("POST", R("pulls/12/requested_reviewers"))))
+
+    def test_a_request_that_fails_in_a_way_nobody_foresaw_leaves_the_auto_merge_on(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+
+        def post(body, params):
+            raise RuntimeError("unforeseen")
+
+        self.gh.routes[("POST", R("pulls/12/requested_reviewers"))] = post
+        with self.assertRaises(RuntimeError):
+            self.open(forward_plan())
+        self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+
+    def test_an_answer_that_is_not_json_warns_like_any_other_refusal(self):
+        # GitHub.request decodes every 2xx body, so a 2xx answer that is no JSON raises ValueError.
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+
+        def post(body, params):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        self.gh.routes[("POST", R("pulls/12/requested_reviewers"))] = post
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+        self.assertEqual(self.requested(), [["Vaishnav-OM"], ["venuverse"]])
+        self.assertIn("::warning::could not request a review from Vaishnav-OM on #12", out.getvalue())
 
     def test_a_rollback_pr_asks_them_too(self):
         self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
