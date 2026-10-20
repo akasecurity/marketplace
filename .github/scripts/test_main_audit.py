@@ -334,6 +334,31 @@ class TestMainAudit(unittest.TestCase):
                 self.assertEqual(len(results), 1)
                 self.assertIn("without an approving review from someone with write access", results[0].detail)
 
+    def test_main_audit_says_what_it_found_when_the_only_approval_is_one_it_cannot_confirm(self):
+        # It keeps filing: it is the detective control and errs toward reporting. But the reviewer may have left or
+        # lost write access since approving, as the tag's `unknown` says, so the issue names them and does not claim
+        # that no approving review exists.
+        review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "a-passing-contributor"}, "can_push": False}
+        results = self.audit(github(reviews=[review]))
+        self.assertEqual(len(results), 1)
+        self.assertIn("without an approving review from someone with write access on its final head", results[0].detail)
+        self.assertIn("approving review by a-passing-contributor was not counted: GitHub reports no push access for "
+                      "them as of this audit (they may never have had it, or may have lost it since the review)",
+                      results[0].detail)
+
+    def test_the_extra_sentence_is_left_out_when_the_only_approvals_are_not_a_person_who_could_have_had_access(self):
+        for label, review in {
+                "an App": {"state": "APPROVED", "commit_id": "h30", "user": {"login": "renovate-approve"},
+                           "can_push": True, "author_type": "Bot"},
+                "a stale head": {"state": "APPROVED", "commit_id": "old", "user": {"login": "a"}, "can_push": False},
+                "a withdrawn approval": {"state": "CHANGES_REQUESTED", "commit_id": "h30", "user": {"login": "a"},
+                                         "can_push": False},
+                "no approval": {"state": "COMMENTED", "commit_id": "h30", "user": {"login": "a"}, "can_push": False}}.items():
+            with self.subTest(label):
+                results = self.audit(github(reviews=[review]))
+                self.assertEqual(len(results), 1)
+                self.assertNotIn("was not counted", results[0].detail)
+
     def test_an_approval_from_someone_who_cannot_push_does_not_count(self):
         for can_push in (False, None):
             with self.subTest(can_push=can_push):

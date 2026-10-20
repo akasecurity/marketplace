@@ -328,8 +328,10 @@ def write_approvals(reviews, head: str, exclude=()) -> list[str]:
 
 def unconfirmed_approvals(reviews, head: str, exclude=()) -> list[str]:
     """The user accounts whose latest position approves `head` but who cannot push as of this read. That is not
-    proof the merge bypassed the ruleset: the reviewer may have left the organisation or lost write access since
-    approving. An App never appears here, and neither does an excluded reviewer."""
+    proof the merge bypassed the ruleset, because the reviewer may have left the organisation or lost write access
+    since approving, and not proof of the opposite either: this repository is public, so any account can submit an
+    approving review, and a break-glass merge could be hidden behind one. A caller must report it as unconfirmed
+    and name the merger. An App never appears here, and neither does an excluded reviewer."""
     return [login for login, review in latest_positions(reviews).items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
             and review.get("user_account") is True and review.get("can_push") is not True and login not in exclude]
@@ -410,7 +412,8 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     and a note. The approver is `none` with a note that the merge bypassed the ruleset when nobody's approval
     counts, and `unknown` when it cannot be told: an approval exists whose reviewer cannot push as of this read
     (access is read when the sweep runs, so a reviewer who has since left or lost write access must not make a
-    properly approved merge look like a bypass in an immutable tag), or the head's pusher cannot be named. With no
+    properly approved merge look like a bypass in an immutable tag), or the head's pusher cannot be named. Every
+    note but an approver's names who merged, so an `unknown` never hides a break-glass merge's merger. With no
     PR there is no approval to match.
 
     Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
@@ -428,25 +431,27 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     reviews, pushers = pull_reviews(gh, number), last_pushers(gh, head)
     approvers = write_approvals(reviews, head, exclude=pushers) if pushers else []
     unconfirmed = unconfirmed_approvals(reviews, head, exclude=pushers) if pushers and not approvers else []
-    bypass = False
+    merger_named = True
     if approvers:
-        approver, note = approvers[-1], None
+        approver, note, merger_named = approvers[-1], None, False
     elif not pushers:
         approver = "unknown"
         note = ("could not identify who pushed the PR's final head (neither its author nor its committer is a "
-                "GitHub account other than web-flow), so an approval could not be told from the pusher's own")
+                f"GitHub account other than web-flow), so an approval could not be told from the pusher's own; "
+                f"merged by {merger}")
     elif unconfirmed:
         approver = "unknown"
-        note = (f"approval by {', '.join(unconfirmed)} not counted: GitHub reports no push access for them when "
-                "the tag is cut, which may have changed since the review")
+        note = (f"approval by {', '.join(unconfirmed)} not counted: GitHub reports no push access for them as of "
+                "this read (they may never have had it, or may have lost it since the review); "
+                f"merged by {merger}")
     else:
-        approver, note, bypass = "none", f"ruleset bypass by {merger}", True
+        approver, note = "none", f"ruleset bypass by {merger}"
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "
                        f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")
-        # The merger is already named by a bypass note; otherwise the note names who merged past the check.
-        unvalidated += "" if bypass else f"; merged by {merger}"
+        # The merger is already named by every note but an approver's; there it names who merged past the check.
+        unvalidated += f"; merged by {merger}" if not merger_named else ""
         note = f"{note}; {unvalidated}" if note else unvalidated
     return {"pr": str(number), "approver": approver, "note": note, "drill": drill}
 
