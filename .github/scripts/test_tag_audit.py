@@ -178,6 +178,11 @@ class TestRulesets(unittest.TestCase):
             "ruleset 'main': require_last_push_approval is 1, not True",
             "ruleset 'main': require_code_owner_review is 1, not False"])
 
+    def test_a_missing_code_owner_review_key_reads_as_off(self):
+        sets = good_rulesets()
+        del sets[1]["rules"][2]["parameters"]["require_code_owner_review"]
+        self.assertEqual(ta.check_rulesets(github(sets)), [])
+
     def test_main_must_not_require_code_owner_review(self):
         sets = good_rulesets()
         sets[1]["rules"][2]["parameters"]["require_code_owner_review"] = True

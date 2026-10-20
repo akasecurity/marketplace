@@ -24,10 +24,12 @@ after it, until it is an hour old: a slow link must not become a permanent
 dated more than five minutes ahead of the runner's clock is not young either
 (only a direct push can carry one, and waiting for its date would hold every
 later tag back): it is tagged at once, as an old one would be. A PR's approver is
-the reviewer with push access to the repository (an organisation member the repository
-gives write access) whose latest review approves its final head; with none, the tag records `approver: none` and a note that
-the merge bypassed the ruleset. A commit no pull request merged records
-`approver: none`, as there is no approval to match.
+the user account with push access to the repository whose latest review approves its final head
+and who did not push it. With none, the tag records `approver: none` and a note that the merge
+bypassed the ruleset, or `approver: unknown` when an approval exists that this read cannot confirm
+(the reviewer's access is read when the sweep runs, not when the review was submitted) or when the
+head's pusher cannot be named. A commit no pull request merged records `approver: none`, as there
+is no approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
 a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
 the sweep: every run reports it as a warning and goes on, comparing each later
@@ -39,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -260,49 +261,78 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
 REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
                  "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
                  "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
-                 "nodes { state authorCanPushToRepository author { __typename login } commit { oid } } } } } }")
+                 "nodes { state submittedAt authorCanPushToRepository author { __typename login } "
+                 "commit { oid } } } } } }")
+# GitHub's committer for an edit made on the web; it names nobody who pushed.
+NOT_A_PUSHER = {"web-flow"}
 
 
 def pull_reviews(gh: GitHub, number: int) -> list[dict]:
-    """The PR's reviews, oldest first, as {state, commit_id, user, can_push}. `can_push` is GitHub's own answer to
-    whether the reviewer may push to the repository, the access the main ruleset counts an approval by. It is
-    asked here, not read from `author_association`, which GitHub fills in per viewer: a token that cannot see a
-    private member's organisation membership is told CONTRIBUTOR for them, and a permanent record must not
-    depend on what the reading token can see. Only a user account can push: GitHub also answers true for an App
-    that has write access, and gives its login without the [bot] suffix, but an App's approval is no person's
-    approval."""
+    """The PR's reviews, oldest submitted first, as {state, commit_id, user, user_account, can_push}. `can_push`
+    is GitHub's own answer to whether the reviewer may push to the repository, the access the main ruleset counts
+    an approval by, as of this read, not of the review. It is asked here, not read from `author_association`,
+    which GitHub fills in per viewer: a token that cannot see a private member's organisation membership is told
+    CONTRIBUTOR for them, and a permanent record must not depend on what the reading token can see. Only a user
+    account can push: GitHub also answers true for an App that has write access, and gives its login without the
+    [bot] suffix, but an App's approval is no person's approval. The order is made here: `reviews` documents no
+    order and takes no orderBy, and a review with no timestamp sorts first, in the order it arrived."""
     owner, name = gh.repo.split("/", 1)
-    reviews: list[dict] = []
+    reviews: list[tuple[str, dict]] = []
     after = None
     while True:
         connection = gh.graphql(REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
                                                 "after": after})["repository"]["pullRequest"]["reviews"]
         for node in connection["nodes"]:
             author, commit = node.get("author"), node.get("commit")
-            reviews.append({"state": node["state"], "commit_id": commit["oid"] if commit else None,
-                            "user": {"login": author["login"]} if author else None,
-                            "can_push": node.get("authorCanPushToRepository") is True
-                            and author is not None and author.get("__typename") == "User"})
+            user_account = author is not None and author.get("__typename") == "User"
+            reviews.append((node.get("submittedAt") or "",
+                            {"state": node["state"], "commit_id": commit["oid"] if commit else None,
+                             "user": {"login": author["login"]} if author else None, "user_account": user_account,
+                             "can_push": node.get("authorCanPushToRepository") is True and user_account}))
         if not connection["pageInfo"]["hasNextPage"]:
-            return reviews
+            return [review for _, review in sorted(reviews, key=lambda pair: pair[0])]
         after = connection["pageInfo"]["endCursor"]
 
 
-def write_approvals(reviews, head: str, exclude=()) -> list[str]:
-    """The reviewers who can push to the repository and whose latest review that takes a position approves
-    `head`, the one who approved last at the end. Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED
-    review decides (a comment or a pending review changes nothing, and `reviews` is in the API's chronological
-    order), so an approval its author later withdrew, or that was dismissed, does not count. `exclude` names
-    reviewers whose approval is not allowed to count, such as the last pusher."""
+def last_pushers(gh: GitHub, head: str) -> set[str]:
+    """The logins that stand in for whoever pushed `head`: its commit's author and committer, with `web-flow`
+    aside. The activity API does record pushers, but what it records for a push made by an App or by auto-merge
+    is unverified, so the commit's own fields stand in. The set is empty when neither names a GitHub account,
+    and a caller must then not take an approval to be someone else's."""
+    commit = gh.get(gh.repo_path(f"commits/{head}"))
+    return {login for login in ((commit.get("author") or {}).get("login"), (commit.get("committer") or {}).get("login"))
+            if login and login not in NOT_A_PUSHER}
+
+
+def latest_positions(reviews) -> dict[str, dict]:
+    """Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review, the one who took a position last
+    at the end. A comment or a pending review changes nothing, and `reviews` is in the order they were submitted
+    (pull_reviews), so an approval its author later withdrew, or that was dismissed, is no longer the latest."""
     latest: dict[str, dict] = {}
     for review in reviews:
         login = (review.get("user") or {}).get("login")
         if login and review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             latest.pop(login, None)
             latest[login] = review
-    return [login for login, review in latest.items()
+    return latest
+
+
+def write_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The reviewers who can push to the repository and whose latest position approves `head`, the one who
+    approved last at the end. `exclude` names reviewers whose approval is not allowed to count, such as the last
+    pusher."""
+    return [login for login, review in latest_positions(reviews).items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
             and review.get("can_push") is True and login not in exclude]
+
+
+def unconfirmed_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The user accounts whose latest position approves `head` but who cannot push as of this read. That is not
+    proof the merge bypassed the ruleset: the reviewer may have left the organisation or lost write access since
+    approving. An App never appears here, and neither does an excluded reviewer."""
+    return [login for login, review in latest_positions(reviews).items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and review.get("user_account") is True and review.get("can_push") is not True and login not in exclude]
 
 
 def timestamp(text) -> datetime | None:
@@ -375,9 +405,13 @@ def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str
 
 def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
              reader: GitHub | None = None) -> dict:
-    """What the tag records about the PR that merged `sha`: its number, the reviewer with push access
-    whose latest review approves its final head (`none`, with a note that the merge bypassed the ruleset, when
-    nobody's does), whether it carries the drill label, and a note. With no PR there is no approval to match.
+    """What the tag records about the PR that merged `sha`: its number, the user account with push access, other
+    than whoever pushed the final head, whose latest review approves it, whether it carries the drill label,
+    and a note. The approver is `none` with a note that the merge bypassed the ruleset when nobody's approval
+    counts, and `unknown` when it cannot be told: an approval exists whose reviewer cannot push as of this read
+    (access is read when the sweep runs, so a reviewer who has since left or lost write access must not make a
+    properly approved merge look like a bypass in an immutable tag), or the head's pusher cannot be named. With no
+    PR there is no approval to match.
 
     Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
     to any other note: a below-floor rollback or any other merge past a red or missing check is then in the
@@ -391,9 +425,22 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    approvers = write_approvals(pull_reviews(gh, number), head)
-    approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
-    bypass = not approvers
+    reviews, pushers = pull_reviews(gh, number), last_pushers(gh, head)
+    approvers = write_approvals(reviews, head, exclude=pushers) if pushers else []
+    unconfirmed = unconfirmed_approvals(reviews, head, exclude=pushers) if pushers and not approvers else []
+    bypass = False
+    if approvers:
+        approver, note = approvers[-1], None
+    elif not pushers:
+        approver = "unknown"
+        note = ("could not identify who pushed the PR's final head (neither its author nor its committer is a "
+                "GitHub account other than web-flow), so an approval could not be told from the pusher's own")
+    elif unconfirmed:
+        approver = "unknown"
+        note = (f"approval by {', '.join(unconfirmed)} not counted: GitHub reports no push access for them when "
+                "the tag is cut, which may have changed since the review")
+    else:
+        approver, note, bypass = "none", f"ruleset bypass by {merger}", True
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "

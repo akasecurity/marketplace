@@ -75,7 +75,7 @@ register this marketplace at a `fleet-v<N>` tag and move only when their own con
 later one.
 
 The one exception is break-glass: a few organisation owners can merge past the `main` ruleset's
-approval and `validate` requirements when no other organisation member is reachable, for example to roll a bad
+approval and `validate` requirements when nobody else with write access is reachable, for example to roll a bad
 release back. An automated audit of `main` opens an issue for each commit that reached it without an
 approved pull request whose final head passed `validate`. The audit runs from the pushed
 commit, so a push that bypasses the `main` ruleset can also change, disable or remove it; that push

@@ -115,8 +115,11 @@ relax the reader to pass a release.
 **`fleet-v<N>` tags are cut automatically.** When a pin change merges, `tag-release` creates the next
 annotated `fleet-v<N>` tag at its commit. The message records the version, integrity, PR, approver
 and store-migration class, and for a rollback the version it rolled back from. The approver is the
-reviewer with push access to the repository (the access the `main` ruleset counts) whose latest review
-approves the PR's final head; with none, the message says `approver: none` and who merged it. Whoever
+user account with push access to the repository (the access the `main` ruleset counts), other than whoever
+pushed the final head, whose latest review approves it; with none, the message says `approver: none` and who
+merged it. Access is read when the sweep runs, not when the review was submitted, so an approval whose
+reviewer cannot push by then gives `approver: unknown` and a note naming them, never a claim of bypass; the
+approver is `unknown` too when the final head's pusher cannot be named. Whoever
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
 or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
 `pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
@@ -163,16 +166,19 @@ manifest cannot add a line of its own to the message. Rulesets let only the rele
 ## Workflow
 
 Every change reaches `main` through a pull request, and the `main` ruleset requires one approving
-review from someone other than the PR's last pusher, and the `validate` check to pass. Any
-approval from someone with write access counts, so a member's own PR needs another member. There are
-no code owners: the audit reads the ruleset's code-owner review setting as off, so a CODEOWNERS file
-added later cannot hand every approval to whoever it names. "Allow GitHub Actions to create and approve
-pull requests" must stay off too, or `github-actions[bot]` could supply the approval. `tag-audit` cannot
-read that setting, because it takes an admin token. `main-audit` counts user accounts only, so it reports
-a merge whose only approval came from an App, but cannot stop it. Merges are squash merges only: the
-`main` ruleset allows no other method, and `main-audit` audits one commit per merge, so a rebase merge is
-reported commit by commit. These protections are
-repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
+review from someone other than the PR's last pusher, and the `validate` check to pass. Any approval
+from someone with write access counts, so a member's own PR needs another member. That includes an
+ai-tc pin PR: nothing restricts who may supply the approval that auto-merges one, and
+`.github/release-approvers.json` is read only to assign alert issues. There are no code owners: the
+audit reads the ruleset's code-owner review setting as off, so a CODEOWNERS file added later cannot
+hand every approval to whoever it names.
+
+"Allow GitHub Actions to create and approve pull requests" must stay off too, or `github-actions[bot]`
+could supply the approval. `tag-audit` cannot read that setting, because it takes an admin token.
+`main-audit` counts user accounts only, so it reports a merge whose only approval came from an App,
+but cannot stop it. Merges are squash merges only: the `main` ruleset allows no other method, and
+`main-audit` audits one commit per merge, so a rebase merge is reported commit by commit. These
+protections are repository settings: `tag-audit` checks the rulesets every day and opens an issue when one is
 missing, not active, lacks one of its rules, or has other target or ref patterns (and, for `main`, its review
 settings and its required `validate` check), and `tag-release` creates no tag meanwhile.
 
@@ -277,7 +283,7 @@ true only once it is.
   anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
   that declares no permissions and so takes the repository's default token; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
-  PR's own run. Review of workflow changes stays the control for what a PR's own diff
+  PR's own run. The approving review of a workflow change stays the control for what a PR's own diff
   carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
   outside with some other token are not in that diff, so the check after the merge is what catches
   those, and it is the detection for the rest too: `tag-release`'s note and `main-audit` count only

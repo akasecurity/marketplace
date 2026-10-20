@@ -3,9 +3,9 @@
 staleness, tag-audit and main-audit evaluate their rules in a job that cannot write
 issues, and hand the results to a job that can do nothing else. Each rule has one issue,
 found by a hidden rule marker among those the workflow's token filed; it is assigned to
-the release approvers in .github/release-approvers.json. A red rule comments only when its detail changes, or once a day; after 48
-hours the escalation owner is assigned; a rule that clears closes its issue, unless its
-result says otherwise (main-audit's results never do: the next run audits only its own
+the release approvers in .github/release-approvers.json. A red rule comments only when its
+detail changes, or once a day; after 48 hours the escalation owner is assigned; a rule that
+clears closes its issue, unless its result says otherwise (main-audit's results never do: the next run audits only its own
 push, so a person closes them; its failed-job result is keyed to the push as well).
 GitHub mails a failed scheduled run only to whoever last edited its cron line or last
 re-enabled the workflow, which is why red goes to an issue.

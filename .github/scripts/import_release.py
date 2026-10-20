@@ -293,7 +293,8 @@ def pr_body(plan: dict, run_url: str) -> str:
         if plan.get("reimport"):
             lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
                       "`fleet-v` tag or a merged release-bot pull request has pinned, or an "
-                      "earlier PR for it was closed. Approve only once the reason it was rolled back or rejected is resolved."]
+                      "earlier PR for it was closed. Approve only once the reason it was rolled back or "
+                      "rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
