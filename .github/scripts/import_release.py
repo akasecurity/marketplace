@@ -10,8 +10,8 @@ ref, never a force-push (an existing branch with an open bot PR is skipped, and 
 open PR of anyone else's is a red refusal, since deleting the branch would close that PR; one
 the bot's closed PR used is skipped on a plain forward run, and deleted and created again only
 by a reimport or rollback dispatch; one no PR ever used was left by a run that died before
-opening it, and any run deletes it and creates it again), opens the PR and enables
-auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
+opening it, and any run deletes it and creates it again), opens the PR, enables auto-merge and
+asks the release approvers to review it. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
 version while a higher one has no verdict. Every decision about an open or closed PR looks at
 the pull requests the release bot opened and no others (release_checks.BOT_LOGIN), so a person's
@@ -35,6 +35,7 @@ from typing import Any, Callable
 import release_checks
 from ghapi import GitHub, GitHubError
 from gitrepo import Git
+from issue_router import APPROVERS_FILE
 from release_checks import (FLEET_TAG, INTEGRITY, MANIFEST, MIGRATION_TAG, PACKAGE, RUN_URL, SAFETY_FILE, SEMVER,
                             SHA40, SHASUM, dump_json, vkey)
 
@@ -44,6 +45,8 @@ from release_checks import (FLEET_TAG, INTEGRITY, MANIFEST, MIGRATION_TAG, PACKA
 PIN_BRANCH = re.compile(rf"bot/pin-ai-tc-({SEMVER.pattern})")
 ROLLBACK_BRANCH = re.compile(rf"bot/rollback-ai-tc-({SEMVER.pattern})-to-({SEMVER.pattern})")
 LABELS = {"rollback", "emergency-stop"}
+# A GitHub login: 1 to 39 characters, alphanumeric or hyphen, a hyphen only between two alphanumerics.
+LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 
 class Refused(Exception):
@@ -292,8 +295,9 @@ def pr_body(plan: dict, run_url: str) -> str:
                      else f"`{SAFETY_FILE}` already has an entry for `{version}`; this PR leaves it unchanged.")
         if plan.get("reimport"):
             lines += ["", f"**Re-import** (`reimport: true`): `{version}` is not above every version `main`, a "
-                      "`fleet-v` tag or a merged release-bot pull request has pinned, or a code owner closed an "
-                      "earlier PR for it. Approve only once the reason it was rolled back or rejected is resolved."]
+                      "`fleet-v` tag or a merged release-bot pull request has pinned, or an "
+                      "earlier PR for it was closed. Approve only once the reason it was rolled back or "
+                      "rejected is resolved."]
     else:
         floor = plan.get("floor")
         lines.append(f"**Rollback floor** (from `main`'s `{SAFETY_FILE}`): "
@@ -380,15 +384,15 @@ def check_recorded_entry(version: str, recorded: Any, computed: dict) -> None:
     problems = release_checks.safety_problems({"versions": {version: recorded}})
     if problems:
         raise Refused(f"main's {SAFETY_FILE} entry for {version} is malformed ({problems[0]}); validate would "
-                      "fail the pin PR, so a code owner corrects the entry in a reviewed PR first")
+                      "fail the pin PR, so a person corrects the entry in a reviewed PR first")
     if recorded["to"] != computed["to"]:
         raise Refused(f"main's {SAFETY_FILE} records {version} up to commit {recorded['to']}, but its attested "
-                      f"commit is {computed['to']}; validate would fail the pin PR, so a code owner corrects the "
+                      f"commit is {computed['to']}; validate would fail the pin PR, so a person corrects the "
                       "entry in a reviewed PR first")
     if recorded["classification"] == "additive" and computed["classification"] == "not-rollback-safe":
         raise Refused(f"main's {SAFETY_FILE} records {version} as additive, but the importer computes "
                       f"not-rollback-safe ({', '.join(computed['migrations']) or 'none'}); validate would fail "
-                      "the pin PR, so a code owner corrects the entry in a reviewed PR first")
+                      "the pin PR, so a person corrects the entry in a reviewed PR first")
 
 
 def plan_forward(ctx: Context) -> dict:
@@ -593,6 +597,55 @@ def read_file(gh: GitHub, path: str, ref: str) -> str | None:
     return base64.b64decode(answer["content"]).decode("utf-8")
 
 
+def release_approvers(gh: GitHub, ref: str) -> list[str]:
+    """The logins .github/release-approvers.json lists at `ref`, each once (GitHub logins are case-insensitive),
+    in order; [] with a warning when the file cannot be read as a list of approvers, whatever the reason: a
+    failed or rate-limited read, a path that is not a file, bytes that are not UTF-8, JSON that is invalid or
+    nested too deeply, or a shape the importer does not read. The request is a courtesy, and runs after auto-merge
+    is enabled, so a failure here costs the request and nothing else. An entry that is not a GitHub login is left
+    out, so nothing a file holds can reach a request as anything but a name."""
+    try:
+        raw = read_file(gh, APPROVERS_FILE, ref)
+        listed = None if raw is None else json.loads(raw)["approvers"]
+    except (GitHubError, OSError, TypeError, ValueError, KeyError, RecursionError) as error:
+        print(f"::warning::{APPROVERS_FILE} at {ref[:12]} could not be read ({type(error).__name__}), "
+              "so no review is requested")
+        return []
+    if raw is None:
+        print(f"::warning::{APPROVERS_FILE} is missing at {ref[:12]}, so no review is requested")
+        return []
+    if not isinstance(listed, list):
+        print(f"::warning::{APPROVERS_FILE} at {ref[:12]} is not an object with an approvers list, "
+              "so no review is requested")
+        return []
+    logins: list[str] = []
+    for entry in listed:
+        if isinstance(entry, str) and LOGIN.fullmatch(entry):
+            if entry.casefold() not in {login.casefold() for login in logins}:
+                logins.append(entry)
+        else:
+            print(f"::warning::{APPROVERS_FILE} at {ref[:12]} lists an entry that is not a GitHub login, "
+                  "which is skipped")
+    return logins
+
+
+def request_reviews(gh: GitHub, pr: dict, ref: str) -> None:
+    """Ask the release approvers to review `pr`, one request each so a login GitHub refuses (one without write
+    access) does not stop the others. A PR waits for its approval, and this is how an approver learns it is
+    waiting. A nudge, not a gate: it runs after auto-merge is enabled, and a refusal or a failure to deliver
+    warns and the run goes on. The PR's author and the bot are never asked (GitHub refuses a review request to
+    a PR's author); the bot's login carries a [bot] suffix that no entry can, so both are compared without it."""
+    skipped = {name.removesuffix("[bot]").casefold()
+               for name in ((pr.get("user") or {}).get("login"), release_checks.BOT_LOGIN) if name}
+    for login in release_approvers(gh, ref):
+        if login.casefold() in skipped:
+            continue
+        try:
+            gh.post(gh.repo_path(f"pulls/{pr['number']}/requested_reviewers"), {"reviewers": [login]})
+        except (GitHubError, OSError, ValueError) as error:
+            print(f"::warning::could not request a review from {login} on #{pr['number']}: {error}")
+
+
 def branch_exists(gh: GitHub, branch: str) -> bool:
     try:
         gh.get(gh.repo_path(f"git/ref/heads/{branch}"))
@@ -787,7 +840,9 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
         gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})
-    return actions["after"](gh, plan, pr)
+    result = actions["after"](gh, plan, pr)
+    request_reviews(gh, pr, main_sha)
+    return result
 
 
 def write_output(key: str, value: str) -> None:

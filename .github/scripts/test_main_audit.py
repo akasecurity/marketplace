@@ -10,7 +10,7 @@ import _testsupport as ts
 import issue_router as rt
 import main_audit as ma
 import tag_release as tr
-from fakes import BOT, REPO, FakeGit, FakeGitHub
+from fakes import BOT, REPO, FakeGit, FakeGitHub, head_of, pushed
 from ghapi import GitHubError
 from gitrepo import Git
 from release_checks import GITHUB_ACTIONS_APP_ID
@@ -72,10 +72,11 @@ def workflow_run(suite: int, *, event=tr.VALIDATE_EVENT, path=tr.VALIDATE_WORKFL
 
 
 def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=BOT, reviews=None, runs=None,
-              workflows=None, merged_at=MERGED_AT) -> dict:
+              workflows=None, merged_at=MERGED_AT, feed=None) -> dict:
     """The routes main-audit reads for the pull request that merged `sha`. `workflows` maps a check suite's id to
     the workflow runs the API lists for it (a suite it does not name lists none); left out, every suite is one
-    pull_request_target run of validate.yml."""
+    pull_request_target run of validate.yml. `feed` is the activity feed's answer for the PR's branch (a list, or
+    an error to raise); left out, the PR's head names no branch and the feed is not asked."""
     runs = [validate_run()] if runs is None else runs
 
     def listed(body, params):
@@ -87,11 +88,12 @@ def pr_routes(sha, *, number=30, head="h30", pulls=None, author=BOT, committer=B
         ("GET", R("actions/runs")): listed,
         ("GET", R(f"commits/{sha}/pulls")): pulls if pulls is not None else [
             {"number": number, "merge_commit_sha": sha, "merged_at": merged_at, "base": {"ref": "main"}}],
-        ("GET", R(f"pulls/{number}")): {"head": {"sha": head}},
+        ("GET", R(f"pulls/{number}")): {"head": {"sha": head} if feed is None else head_of(head)},
         ("GET", R(f"commits/{head}")): {"author": {"login": author}, "committer": {"login": committer}},
         ("GET", R(f"pulls/{number}/reviews")): reviews if reviews is not None else [
             {"state": "APPROVED", "commit_id": head, "user": {"login": "venuverse"}, "can_push": True}],
         ("GET", R(f"commits/{head}/check-runs")): {"total_count": len(runs), "check_runs": runs},
+        **({} if feed is None else {("GET", R("activity")): feed}),
     }
 
 
@@ -334,6 +336,31 @@ class TestMainAudit(unittest.TestCase):
                 self.assertEqual(len(results), 1)
                 self.assertIn("without an approving review from someone with write access", results[0].detail)
 
+    def test_main_audit_says_what_it_found_when_the_only_approval_is_one_it_cannot_confirm(self):
+        # It keeps filing: it is the detective control and errs toward reporting. But the reviewer may have left or
+        # lost write access since approving, as the tag's `unknown` says, so the issue names them and does not claim
+        # that no approving review exists.
+        review = {"state": "APPROVED", "commit_id": "h30", "user": {"login": "a-passing-contributor"}, "can_push": False}
+        results = self.audit(github(reviews=[review]))
+        self.assertEqual(len(results), 1)
+        self.assertIn("without an approving review from someone with write access on its final head", results[0].detail)
+        self.assertIn("approving review by a-passing-contributor was not counted: GitHub reports no push access for "
+                      "them as of this audit (they may never have had it, or may have lost it since the review)",
+                      results[0].detail)
+
+    def test_the_extra_sentence_is_left_out_when_the_only_approvals_are_not_a_person_who_could_have_had_access(self):
+        for label, review in {
+                "an App": {"state": "APPROVED", "commit_id": "h30", "user": {"login": "renovate-approve"},
+                           "can_push": True, "author_type": "Bot"},
+                "a stale head": {"state": "APPROVED", "commit_id": "old", "user": {"login": "a"}, "can_push": False},
+                "a withdrawn approval": {"state": "CHANGES_REQUESTED", "commit_id": "h30", "user": {"login": "a"},
+                                         "can_push": False},
+                "no approval": {"state": "COMMENTED", "commit_id": "h30", "user": {"login": "a"}, "can_push": False}}.items():
+            with self.subTest(label):
+                results = self.audit(github(reviews=[review]))
+                self.assertEqual(len(results), 1)
+                self.assertNotIn("was not counted", results[0].detail)
+
     def test_an_approval_from_someone_who_cannot_push_does_not_count(self):
         for can_push in (False, None):
             with self.subTest(can_push=can_push):
@@ -348,7 +375,7 @@ class TestMainAudit(unittest.TestCase):
         self.assertIn("without an approving review from someone with write access", results[0].detail)
 
     def test_an_approval_from_the_last_pusher_does_not_count(self):
-        results = self.audit(github(author="venuverse", committer="web-flow"))
+        results = self.audit(github(author="venuverse", committer="web-flow", feed=[pushed("venuverse", "h30")]))
         self.assertEqual(len(results), 1)
         self.assertIn("last pusher (venuverse)", results[0].detail)
 
@@ -366,6 +393,7 @@ class TestMainAudit(unittest.TestCase):
                 results = self.audit(github(**kwargs))
                 self.assertEqual(len(results), 1)
                 self.assertIn("could not identify who pushed its final head `h30`", results[0].detail)
+                self.assertIn("the activity feed does not name them", results[0].detail)
         routes = pr_routes("s1")
         routes[("GET", R("commits/h30"))] = {"author": None, "committer": None}  # no author or committer object at all
         results = self.audit(FakeGitHub(routes))
@@ -376,10 +404,42 @@ class TestMainAudit(unittest.TestCase):
         for kwargs in (dict(author=None, committer="Vaishnav-OM"), dict(author="Vaishnav-OM", committer=None)):
             with self.subTest(**kwargs):
                 self.assertEqual(self.audit(github(**kwargs)), [])
-        # ... and it is still the pusher's own approval that is refused.
-        results = self.audit(github(author=None, committer="venuverse"))
+
+    def test_a_reviewer_who_authored_the_head_is_reported_as_undecided_while_the_pusher_is_unnamed(self):
+        # The author and committer are candidates for the pusher, not the pusher: if someone else pushed the head,
+        # GitHub counted this approval, so the issue says what it could not tell instead of claiming a self-approval.
+        for kwargs in (dict(author=None, committer="venuverse"), dict(author="venuverse", committer="web-flow"),
+                       dict(author="venuverse", committer="another-writer")):
+            for feed in (None, [], GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")):
+                with self.subTest(feed=feed, **kwargs):
+                    results = self.audit(github(feed=feed, **kwargs))
+                    self.assertEqual(len(results), 1)
+                    detail = results[0].detail
+                    self.assertIn("without an approving review from someone with write access", detail)
+                    self.assertNotIn("last pusher", detail)
+                    self.assertIn("An approving review by venuverse was not counted: they authored or committed the "
+                                  "head and GitHub does not say who pushed it", detail)
+                    self.assertIn("false alarm", detail)
+
+    def test_the_recorded_pusher_is_the_one_whose_approval_is_refused(self):
+        results = self.audit(github(author="venuverse", committer="web-flow", feed=[pushed("venuverse", "h30")]))
         self.assertEqual(len(results), 1)
         self.assertIn("last pusher (venuverse)", results[0].detail)
+        self.assertNotIn("false alarm", results[0].detail)
+
+    def test_an_approval_by_the_commits_author_counts_when_someone_else_is_the_recorded_pusher(self):
+        gh = github(author="venuverse", committer="another-writer", feed=[pushed("another-writer", "h30")])
+        self.assertEqual(self.audit(gh), [])
+
+    def test_a_writer_who_pushed_a_commit_under_another_identity_is_refused(self):
+        reviews = [{"state": "APPROVED", "commit_id": "h30", "user": {"login": "a-writer"}, "can_push": True}]
+        results = self.audit(github(author="carol", committer="carol", reviews=reviews,
+                                    feed=[pushed("a-writer", "h30")]))
+        self.assertEqual(len(results), 1)
+        self.assertIn("last pusher (a-writer)", results[0].detail)
+
+    def test_a_head_with_no_account_in_its_commit_is_judged_by_the_feed(self):
+        self.assertEqual(self.audit(github(author=None, committer=None, feed=[pushed("another-writer", "h30")])), [])
 
     def test_a_web_commit_counts_its_author_not_web_flow(self):
         self.assertEqual(self.audit(github(author="Vaishnav-OM", committer="web-flow")), [])
