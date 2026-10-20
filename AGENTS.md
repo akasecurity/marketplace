@@ -119,7 +119,9 @@ user account with push access to the repository (the access the `main` ruleset c
 pushed the final head, whose latest review approves it; with none, the message says `approver: none` and who
 merged it. Access is read when the sweep runs, not when the review was submitted, so an approval whose
 reviewer cannot push by then gives `approver: unknown` and a note naming them and who merged, never a
-claim of bypass; the approver is `unknown` too when the final head's pusher cannot be named. `unknown`
+claim of bypass. The pusher is the account the repository's activity feed records as leaving the PR's
+branch at its final head; the approver is `unknown` too when that cannot be told, and the only approvals
+are by the head commit's author or committer, or the commit names no account either. `unknown`
 is not a clearance: this repository is public, so any account can submit an approving review, and a
 break-glass merge could be hidden behind one. The note says as much and names the merger, and
 `main-audit` still files its issue. Whoever
@@ -379,11 +381,17 @@ true only once it is.
   names that account instead of saying no approving review exists. The branch commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
-  pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author
-  or committer of the head commit (`web-flow` aside): the audit does not use GitHub's activity API,
-  which does record pushers, because what it records for a push made by the App or by auto-merge is
-  unverified, and a head that names neither is reported, since an approval could then be the
-  pusher's own. A push
+  pull request GitHub links it to, which is why merges are squash-only. The last pusher is the
+  account the repository's activity feed (`GET /repos/{owner}/{repo}/activity`, the PR's branch) records
+  as leaving the branch at the final head; the feed keeps its records after the branch is deleted and
+  names the App when the App made the push. Where it cannot say (a head in a fork, an answer GitHub
+  refuses, no record of a push to that head among the newest hundred), the head commit's author and
+  committer (`web-flow` aside) are candidates only: an approval by one of them is reported as not
+  counted and says GitHub counts it if someone else pushed the head, and a head that names neither is
+  reported, since an approval could then be the pusher's own. That fallback can name the wrong person
+  both ways (a commit carries whatever author fields its pusher wrote), so it never writes a bypass
+  into a tag, and it cannot see a writer who pushed under another identity. A feed refused to the
+  workflow's token falls back the same way and does not fail the job. A push
   that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for

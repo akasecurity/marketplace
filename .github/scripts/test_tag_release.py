@@ -10,8 +10,8 @@ from unittest import mock
 
 import release_checks
 import tag_release as tr
-from fakes import (INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
-                   not_found, pull, pulls_route, safety, safety_entry)
+from fakes import (BOT, INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, head_of,
+                   manifest, not_found, pull, pulls_route, pushed, safety, safety_entry)
 from ghapi import GitHub, GitHubError
 from gitrepo import GitError
 from import_release import Refused
@@ -692,15 +692,19 @@ class TestApprover(unittest.TestCase):
     def review(self, state, login="venuverse", can_push=True, commit="h13"):
         return {"state": state, "commit_id": commit, "user": {"login": login}, "can_push": can_push}
 
-    def facts_for(self, reviews, pusher=None):
-        gh = FakeGitHub({
+    def facts_for(self, reviews, pusher=None, feed=None):
+        """`pusher` is the head commit's author and committer. `feed` is the activity feed's answer for the PR's
+        branch: left out, the PR's head names no branch and the feed is not asked."""
+        routes = {
             ("GET", R("commits/b/pulls")): [{"number": 13, "merge_commit_sha": "b", "merged_at": "2026-10-02T00:00:00Z",
                                              "base": {"ref": "main"}}],
-            ("GET", R("pulls/13")): {"head": {"sha": "h13"}, "labels": [{"name": "drill"}],
-                                     "merged_by": {"login": "org-owner-example"}},
+            ("GET", R("pulls/13")): {"head": {"sha": "h13"} if feed is None else head_of("h13"),
+                                     "labels": [{"name": "drill"}], "merged_by": {"login": "org-owner-example"}},
             ("GET", R("pulls/13/reviews")): reviews,
-            **checks("h13", pusher=pusher)})
-        return tr.pr_facts(gh, "b", sleep=lambda seconds: None)
+            **checks("h13", pusher=pusher)}
+        if feed is not None:
+            routes[("GET", R("activity"))] = feed
+        return tr.pr_facts(FakeGitHub(routes), "b", sleep=lambda seconds: None)
 
     def test_the_last_member_approval_on_the_final_head_is_named(self):
         facts = self.facts_for([self.review("APPROVED", "venuverse"), self.review("APPROVED", "Vaishnav-OM")])
@@ -766,12 +770,69 @@ class TestApprover(unittest.TestCase):
 
     def test_the_last_pusher_cannot_approve_their_own_pull_request(self):
         # The ruleset requires approval of the most recent push by someone else, so a self-approval reaches main only
-        # through a break-glass merge, and the record must say bypass, as main-audit's issue does.
+        # through a break-glass merge, and the record says bypass once the activity feed names the pusher.
         for pusher in ({"author": {"login": "venuverse"}, "committer": {"login": "web-flow"}},
                        {"author": {"login": None}, "committer": {"login": "venuverse"}}):
             with self.subTest(pusher=pusher):
-                facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher=pusher)
+                facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher=pusher,
+                                       feed=[pushed("venuverse", "h13")])
                 self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
+    def test_an_approval_by_the_commits_author_is_unknown_not_a_bypass_while_the_pusher_is_unnamed(self):
+        # A commit's author and committer are candidates for whoever pushed it, not proof: Bob can rebase or amend
+        # Alice's commit and push it, and GitHub then counts Alice's approval. Without the feed the tag must not
+        # write a bypass it cannot show, and it must still name who merged.
+        for pusher in ({"author": {"login": "venuverse"}, "committer": {"login": "web-flow"}},
+                       {"author": {"login": None}, "committer": {"login": "venuverse"}},
+                       {"author": {"login": "venuverse"}, "committer": {"login": "another-writer"}}):
+            for feed in (None, [], GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")):
+                with self.subTest(pusher=pusher, feed=feed):
+                    facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher=pusher, feed=feed)
+                    self.assertEqual(facts["approver"], "unknown")
+                    self.assertNotIn("bypass", facts["note"])
+                    self.assertIn("approval by venuverse not counted", facts["note"])
+                    self.assertIn("does not say who pushed it", facts["note"])
+                    self.assertTrue(facts["note"].endswith("merged by org-owner-example"), facts["note"])
+
+    def test_an_approval_by_the_commits_author_counts_when_someone_else_is_the_recorded_pusher(self):
+        # Bob rebased Alice's commit and pushed it, then Alice approved: GitHub counted that, so the tag names Alice.
+        facts = self.facts_for([self.review("APPROVED", "venuverse")],
+                               pusher={"author": {"login": "venuverse"}, "committer": {"login": "another-writer"}},
+                               feed=[pushed("another-writer", "h13")])
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_writer_who_pushed_a_commit_under_another_identity_cannot_approve_it(self):
+        # The commit names only Carol, who is nobody's reviewer; the feed says the writer pushed it. Reading the
+        # commit alone would name the writer as the approver of a merge that only a bypass could have completed.
+        facts = self.facts_for([self.review("APPROVED", "a-writer")],
+                               pusher={"author": {"login": "carol"}, "committer": {"login": "carol"}},
+                               feed=[pushed("a-writer", "h13")])
+        self.assertEqual((facts["approver"], facts["note"]), ("none", "ruleset bypass by org-owner-example"))
+
+    def test_a_head_with_no_account_in_its_commit_is_judged_by_the_feed(self):
+        # An author email GitHub cannot match to an account used to make every such PR unknown.
+        facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher={"author": None, "committer": None},
+                               feed=[pushed("another-writer", "h13")])
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_bot_that_pushed_the_head_is_no_reviewer(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse")],
+                               pusher={"author": {"login": "aka-marketplace-bot"}, "committer": {"login": "web-flow"}},
+                               feed=[pushed(BOT, "h13", kind="branch_creation")])
+        self.assertEqual((facts["approver"], facts["note"]), ("venuverse", None))
+
+    def test_a_reviewer_who_authored_the_head_does_not_hide_another_reviewers_approval(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse"), self.review("APPROVED", "Vaishnav-OM")],
+                               pusher={"author": {"login": "venuverse"}, "committer": {"login": "venuverse"}})
+        self.assertEqual((facts["approver"], facts["note"]), ("Vaishnav-OM", None))
+
+    def test_both_kinds_of_approval_set_aside_are_named_in_one_note(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse"), self.review("APPROVED", "a-passing", False)],
+                               pusher={"author": {"login": "venuverse"}, "committer": {"login": "venuverse"}})
+        self.assertEqual(facts["approver"], "unknown")
+        self.assertIn("approval by venuverse not counted", facts["note"])
+        self.assertIn("approval by a-passing not counted: GitHub reports no push access", facts["note"])
+        self.assertEqual(facts["note"].count("merged by"), 1)
 
     def test_another_reviewers_approval_counts_when_the_pusher_is_someone_else(self):
         facts = self.facts_for([self.review("APPROVED", "venuverse"), self.review("APPROVED", "Vaishnav-OM")],
@@ -892,6 +953,64 @@ class TestPullReviews(unittest.TestCase):
         gh = FakeGitHub({("GRAPHQL", "repository"): self.page([self.node("a", can_push=None),
                                                               self.node("b", can_push=False)])})
         self.assertEqual([review["can_push"] for review in tr.pull_reviews(gh, 13)], [False, False])
+
+
+class TestHeadPusher(unittest.TestCase):
+    def pusher(self, feed, **head):
+        """head_pusher for a PR whose head is `h13` on feat/example in this repository (`head` overrides that)."""
+        gh = FakeGitHub({("GET", R("activity")): feed})
+        pull = {"head": {**head_of("h13"), **head}}
+        return tr.head_pusher(gh, pull), gh
+
+    def test_the_account_that_left_the_branch_at_the_head_is_the_pusher(self):
+        login, gh = self.pusher([pushed("later-writer", "h14"), pushed("venuverse", "h13"), pushed("older", "h12")])
+        self.assertEqual(login, "venuverse")
+        asked = gh.called("GET", R("activity"))
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(asked[0][3], {"ref": "refs/heads/feat/example", "per_page": 100})
+
+    def test_a_branch_created_at_the_head_counts_as_a_push_of_it(self):
+        self.assertEqual(self.pusher([pushed(BOT, "h13", kind="branch_creation")])[0], BOT)
+        self.assertEqual(self.pusher([pushed("venuverse", "h13", kind="force_push")])[0], "venuverse")
+
+    def test_the_newest_push_that_left_the_branch_at_the_head_decides(self):
+        # A branch reset to a commit it held before is pushed to it again by whoever reset it.
+        feed = [pushed("resetting-writer", "h13", kind="force_push"), pushed("later-writer", "h14"),
+                pushed("first-writer", "h13", kind="branch_creation")]
+        self.assertEqual(self.pusher(feed)[0], "resetting-writer")
+
+    def test_a_record_that_is_not_a_push_to_the_head_names_nobody(self):
+        for label, feed in {
+                "the branch was deleted": [pushed("venuverse", "0" * 40, kind="branch_deletion")],
+                "the merge into the base": [pushed("venuverse", "h13", kind="pr_merge")],
+                "pushes of other commits": [pushed("venuverse", "h12"), pushed("venuverse", "h14")],
+                "an empty feed": [],
+                "an answer that is no list": {"message": "unexpected"},
+                "a record that is no object": ["push", None],
+                "an actor that is gone": [{**pushed("x", "h13"), "actor": None}],
+                "an actor with no login": [{**pushed("x", "h13"), "actor": {"login": None}}]}.items():
+            with self.subTest(label):
+                self.assertIsNone(self.pusher(feed)[0])
+
+    def test_a_head_the_feed_cannot_be_asked_about_is_not_asked(self):
+        for label, head in {"no branch": dict(ref=None), "an empty branch": dict(ref=""),
+                            "a fork": dict(repo={"full_name": "someone-else/marketplace"}),
+                            "a deleted fork": dict(repo=None), "no commit": dict(sha=None)}.items():
+            with self.subTest(label):
+                login, gh = self.pusher([pushed("venuverse", "h13")], **head)
+                self.assertIsNone(login)
+                self.assertEqual(gh.called("GET", R("activity")), [])
+
+    def test_the_repository_is_compared_without_regard_to_case(self):
+        self.assertEqual(self.pusher([pushed("venuverse", "h13")], repo={"full_name": REPO.upper()})[0], "venuverse")
+
+    def test_a_feed_github_refuses_or_cannot_deliver_names_nobody(self):
+        for error in (GitHubError(403, "GET", R("activity"), "Resource not accessible by integration"),
+                      GitHubError(404, "GET", R("activity"), "Not Found"), OSError("connection reset")):
+            with self.subTest(error=error):
+                def refuse(body, params, error=error):
+                    raise error
+                self.assertIsNone(self.pusher(refuse)[0])
 
 
 class TestWriteApprovals(unittest.TestCase):
