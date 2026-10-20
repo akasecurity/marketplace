@@ -13,7 +13,6 @@ from typing import Any, Callable
 import _testsupport as ts
 import release_checks
 from ghapi import GitHubError
-from gitrepo import GitError
 
 REPO = "akasecurity/marketplace"
 BOT = "aka-marketplace-bot[bot]"
@@ -23,7 +22,6 @@ INTEGRITY = {v: "sha512-" + base64.b64encode(bytes([int(v.split(".")[2])] * 64))
 # The real attested commits through 0.9.14, then invented stand-ins for every later version.
 # 0.9.15 is a real release too, but these tests use it as an invented next release.
 ATTESTED = {**ts.ATTESTED, **{v: v.split(".")[2] * 20 for v in VERSIONS if v not in ts.ATTESTED}}
-CODEOWNERS = "* @Vaishnav-OM @venuverse\n"
 
 
 def manifest(version: str | None = "0.9.14", integrity: str | None = None, *, entry: bool = True) -> str:
@@ -72,12 +70,10 @@ class FakeGit:
 
     def __init__(self, *, chain: list[str], files: dict | None = None, tags: list[dict] | None = None,
                  messages: dict | None = None, times: dict | None = None,
-                 remote_refs: list[str] | None = None, modes: dict | None = None) -> None:
+                 remote_refs: list[str] | None = None) -> None:
         self.repo_dir = "/fake/marketplace"
         self.chain = list(chain)
         self.files = dict(files or {})
-        # (commit, path) -> a git mode, for an entry that is not a plain file (160000 is a submodule).
-        self.modes = dict(modes or {})
         self.tags = list(tags or [])
         self.messages = dict(messages or {})
         self.times = dict(times or {})
@@ -91,16 +87,9 @@ class FakeGit:
 
     def show(self, rev: str, path: str) -> str | None:
         key = (self.rev_parse(rev), path)
-        if self.modes.get(key) == "160000":
-            # What `git show` says of a submodule entry: there is no blob to read.
-            raise GitError(f"git show {key[0]}:{path} failed: fatal: bad object {'0' * 40}")
         content = self.files.get(key)
         # A file held as bytes is decoded as UTF-8, as gitrepo.Git.show decodes what it reads.
         return content.decode("utf-8") if isinstance(content, bytes) else content
-
-    def entry_mode(self, rev: str, path: str) -> str | None:
-        key = (self.rev_parse(rev), path)
-        return self.modes.get(key) or ("100644" if key in self.files else None)
 
     def fleet_tags(self) -> list[dict]:
         return sorted(self.tags, key=lambda tag: tag["n"])
@@ -190,10 +179,12 @@ class FakeGitHub:
 
     def _reviews_page(self, variables) -> dict:
         """The reviews query answered, as one page, from the review list a test routes for the PR: dicts with
-        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push) and, to make
-        the author a GitHub App, `author_type`: "Bot"."""
+        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push), `submitted_at`
+        (the timestamp pull_reviews orders by; left out, the review has none) and, to make the author a GitHub App,
+        `author_type`: "Bot"."""
         reviews = self._answer("GET", self.repo_path(f"pulls/{variables['number']}/reviews"))
-        nodes = [{"state": review["state"], "authorCanPushToRepository": review.get("can_push", False),
+        nodes = [{"state": review["state"], "submittedAt": review.get("submitted_at"),
+                  "authorCanPushToRepository": review.get("can_push", False),
                   "author": ({"login": review["user"]["login"], "__typename": review.get("author_type", "User")}
                              if review.get("user") else None),
                   "commit": {"oid": review["commit_id"]} if review.get("commit_id") else None}
@@ -206,6 +197,17 @@ class FakeGitHub:
 
     def writes(self) -> list[tuple]:
         return [call for call in self.calls if call[0] != "GET"]
+
+
+def pushed(actor: str, after: str, *, kind: str = "push", ref: str = "feat/example") -> dict:
+    """A record of the repository activity feed: `actor` left `ref` at `after`."""
+    return {"activity_type": kind, "actor": {"login": actor}, "ref": f"refs/heads/{ref}", "before": "0" * 40,
+            "after": after, "timestamp": "2026-10-02T00:00:00Z"}
+
+
+def head_of(sha: str, *, ref: str | None = "feat/example", repo: str | None = REPO) -> dict:
+    """The `head` of a pull request read from the API: its commit, its branch and the repository holding it."""
+    return {"sha": sha, "ref": ref, "repo": None if repo is None else {"full_name": repo}}
 
 
 def not_found(path: str = "") -> GitHubError:
