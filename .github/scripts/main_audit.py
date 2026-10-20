@@ -37,15 +37,14 @@ from ghapi import GitHub
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
-from tag_release import (VALIDATE_CHECK, merged_into_main, pull_association, pull_reviews, validate_conclusion,
-                         write_approvals)
+from tag_release import (VALIDATE_CHECK, last_pushers, merged_into_main, pull_association, pull_reviews,
+                         validate_conclusion, write_approvals)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
 REWRITE_RULE = "main-audit-rewrite-"
 UNAUDITED_RULE = "main-audit-unaudited-"
 ZERO = re.compile(r"0{40}")
-NOT_A_PUSHER = {"web-flow"}
 
 
 def added_commits(git: Git, before: str, after: str) -> list[str]:
@@ -60,10 +59,7 @@ def added_commits(git: Git, before: str, after: str) -> list[str]:
 
 
 def approval_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None:
-    head_commit = gh.get(gh.repo_path(f"commits/{head}"))
-    pushers = {login for login in ((head_commit.get("author") or {}).get("login"),
-                                   (head_commit.get("committer") or {}).get("login"))
-               if login and login not in NOT_A_PUSHER}
+    pushers = last_pushers(gh, head)
     if not pushers:
         # With no login for either field the stand-in names nobody, and an empty set would let every member's
         # approval through, the pusher's own included. Not knowing who pushed is not a pass.

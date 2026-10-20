@@ -2761,7 +2761,7 @@ class TestAuditRulesets(unittest.TestCase):
 
     def test_main_must_not_require_code_owner_review(self):
         # With no CODEOWNERS file the setting has no effect, but a file added later would hand every approval to
-        # whoever it names, so the audit reads it off.
+        # whoever it names, so the audit reads it off. A key GitHub leaves out reads as off: silence is not "required".
         for flag in (True, 1, None, "false"):
             with self.subTest(flag=flag):
                 routes = ruleset_routes()
@@ -2770,6 +2770,13 @@ class TestAuditRulesets(unittest.TestCase):
                 routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
                 self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)),
                                  [f"ruleset 'main': require_code_owner_review is {flag!r}, not False"])
+
+    def test_a_missing_code_owner_review_key_reads_as_off(self):
+        routes = ruleset_routes()
+        main = json.loads(json.dumps(routes[f"{rc.MARKETPLACE_API}/rulesets/1"][1]))
+        del main["rules"][2]["parameters"]["require_code_owner_review"]
+        routes[f"{rc.MARKETPLACE_API}/rulesets/1"] = (200, main)
+        self.assertEqual(rc.audit_rulesets(fetch=ts.FakeFetch(routes)), [])
 
     def test_main_must_be_squash_only_and_require_validate_from_actions(self):
         routes = ruleset_routes()
