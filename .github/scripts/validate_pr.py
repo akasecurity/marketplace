@@ -125,25 +125,56 @@ def _names_ai_tc(value) -> bool:
 
 
 # A workflow file a pull request adds or changes can define a job named validate, and the required
-# check is matched by name, so any such job can stand beside this one. validate reads each such file
-# as text, never runs it, and fails the PR for what it can see plainly:
+# check is matched by name, so any such job can stand beside this one. It can also hold the power to
+# approve a pull request, or run with a token whose power nothing in the repository can read. These
+# are two unrelated threats. validate reads each such file as text, never runs it, and fails the PR
+# for what it can see plainly:
 #   * a job id, or a job `name:`, written out as validate;
-#   * checks: write, statuses: write or write-all permissions written out plainly (or the
-#     permission-checks and permission-statuses inputs of the App-token action), which let a job
-#     create a check run or a status named validate through the API;
+#   * checks: write, statuses: write or write-all written out plainly (or the permission-checks and
+#     permission-statuses inputs of the App-token action), which would let a job create a check run
+#     or a status named validate through the API;
+#   * pull-requests: write written out plainly, which would let a job approve a pull request when the
+#     repository allows workflows to, and comment on, label, retitle or close pull requests;
+#   * the permission-pull-requests: write input of the App-token action, anywhere but in the
+#     importer's own workflow, and there only in a job that itself enters the marketplace-bot
+#     environment (`environment: name`, or a `name:` under it; any other spelling is refused). The
+#     token it mints is the release bot's. Whether a pull request could reach the
+#     secrets behind it rests on where they are stored, which nothing here can read, so the
+#     exception is as narrow as the importer's own job (AGENTS.md, "The workflows", says an
+#     administrator reads the secret scope back);
+#   * a step that uses the App-token action at all, anywhere but in a job of the importer's workflow
+#     or tag-release.yml that itself enters the marketplace-bot environment, and there without
+#     naming a permission-* input under its with: (the one place the action reads it) with the value
+#     read or write (it skips an empty one): with none the action mints a token with every permission the
+#     App's installation has. The INPUT_PERMISSION-* variables the action also reads, set in an env:
+#     block or through $GITHUB_ENV, count as the inputs they name (pull-requests is the importer's
+#     alone), and any other is refused;
+#   * a reference to a MARKETPLACE_BOT_* secret outside such a job, whatever action or script reads it,
+#     and secrets[...] or toJSON(secrets), which reach a secret without writing its name.
+#     These are a backup to where the bot's secrets are stored, which is the control that bounds its
+#     token;
+#   * a file with jobs that declares no `permissions:` at the top level and has a job that declares
+#     none of its own: that job takes the repository's default token, and a repository setting nobody
+#     here can read decides whether it can write, so the scan fails closed;
 #   * a file that has the word jobs in it but no top-level `jobs:` key in block style, and a file
 #     with such a key whose jobs it cannot read with confidence (flow style under it, anchors and
-#     aliases, merge keys, an escape in a quoted name, a name on the next line), which it refuses
-#     rather than guess at.
+#     aliases, merge keys, an escape in a quoted name, a name on the next line, a key a job spells
+#     twice), which it refuses rather than guess at.
 # This is a best-effort read of the text, not a YAML parser, and it refuses only what it finds.
 # It does not see:
+#   * the action reached through a composite action (a file under .github/actions, which this scan does
+#     not read);
+#   * a name assembled in a script or at run time, such as a variable name or a secret name built from
+#     pieces: no scan of the text closes that, and the bot's secrets being scoped to the environment is
+#     what does;
 #   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
 #     refusal above looks for the word jobs, so a file that never spells it out is not refused);
-#   * a change to validate.yml itself, for example another trigger: that file is exempt from the job
-#     rule and a change to it is only called out in the notes;
+#   * a change to validate.yml itself, for example another trigger: that file is exempt only from the
+#     rule against a job named validate, and a change to it is called out in the notes;
 #   * a permission grant written with an anchor, an alias or an escape: only plain grants match;
+#   * a top-level key spelled twice, such as two permissions: blocks: the grant scan reads the whole
+#     text, so nothing hides behind whichever one is in force;
 #   * a job name built from an expression or a matrix value;
-#   * a workflow that declares no permissions and so takes the repository's default token;
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
 #   * a fork PR's own run.
@@ -155,12 +186,46 @@ def _names_ai_tc(value) -> bool:
 # so a job that only shares the name does not count there. That tie runs through the check run's
 # check suite, so a check run created through the API with a workflow token and filed by GitHub
 # under that suite could still count (a known limit, not reproduced).
+# The match is on words, not on structure, so a file that only prints one of the grants above in a
+# `run:` is refused too; the messages say the words were written, not that the file grants them.
 WORKFLOW_FILE = re.compile(r"\.github/workflows/[^/]+\.ya?ml", re.IGNORECASE)
 VALIDATE_WORKFLOW = ".github/workflows/validate.yml"
 REQUIRED_CHECK = "validate"
 SAME_NAME = f"any job named {REQUIRED_CHECK} satisfies the required check, so only {VALIDATE_WORKFLOW} may have one"
-_CREATES_CHECKS = re.compile(r"""(?:^|[\s{,])["']?(?:permission-)?(?:checks|statuses)["']?\s*:\s*["']?write\b""", re.MULTILINE)
-_WRITE_ALL = re.compile(r"""(?:^|[\s{,])["']?permissions["']?\s*:\s*["']?write-all\b""", re.MULTILINE)
+IMPORTER_WORKFLOW = ".github/workflows/import-plugin-release.yml"
+TAG_RELEASE_WORKFLOW = ".github/workflows/tag-release.yml"
+BOT_WORKFLOWS = (IMPORTER_WORKFLOW, TAG_RELEASE_WORKFLOW)
+BOT_ENVIRONMENT = "marketplace-bot"
+
+
+def _grant(key: str, value: str = "write") -> re.Pattern:
+    """A `key: value` written out plainly, block or flow style, with either side quoted."""
+    return re.compile(rf"""(?:^|[\s{{,])["']?{key}["']?\s*:\s*["']?{value}\b""", re.MULTILINE)
+
+
+_CREATES_CHECKS = _grant(r"(?:permission-)?(?:checks|statuses)")
+_WRITE_ALL = _grant("permissions", "write-all")
+# The workflow token's own grant. The App-token action's permission-pull-requests input is another key and is
+# matched on its own: it asks for the release bot's token, not the workflow's.
+_APPROVES_PRS = _grant("pull-requests")
+_APP_TOKEN_PRS = _grant("permission-pull-requests")
+# The App-token action takes its inputs from INPUT_PERMISSION-* environment variables as well, so a step can
+# ask for a permission without writing the input, in an env: block or by appending to $GITHUB_ENV. The name is
+# matched wherever it appears and the value is not read: any such variable is refused as the grant it names.
+_INPUT_ENV = re.compile(r"INPUT_PERMISSION[-_]([a-z][a-z_-]*)", re.IGNORECASE)
+# A step written as one flow mapping, or a `with:` given in flow style, that names a permission input with a
+# value the action reads: literally read or write. The action skips an input whose value is empty, so an empty
+# one, nothing at all and an expression that may be empty name no permission.
+_FLOW_PERMISSION = r"""["']?permission-[a-z-]+["']?\s*:\s*(?-i:read|write|"read"|"write"|'read'|'write')\s*[,}]"""
+_FLOW_WITH = re.compile(r"""["']?with["']?\s*:\s*\{[^{}]*?""" + _FLOW_PERMISSION, re.IGNORECASE)
+_FLOW_INPUTS = re.compile(r"""\{[^{}]*?""" + _FLOW_PERMISSION, re.IGNORECASE)
+# The bot's secrets, by name, and the ways to reach a secret without writing its name (`secrets[...]`,
+# `toJSON(secrets)`): only the bot jobs may read them, whatever reads them.
+_BOT_SECRET = re.compile(r"MARKETPLACE_BOT_|toJSON\(\s*secrets\b|\bsecrets\s*\[", re.IGNORECASE)
+# A step that uses the App-token action at all: with no permission-* input it mints a token carrying every
+# permission the App's installation has.
+_APP_TOKEN_STEP = re.compile(r"""(?:^|[\s{,])["']?uses["']?\s*:\s*["']?actions/create-github-app-token\b""",
+                             re.IGNORECASE | re.MULTILINE)
 _PLAIN_KEY_END = re.compile(r":(?:\s|$)")
 _QUOTED_KEY = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s+(.*))?$""")
 
@@ -270,11 +335,11 @@ def _jobs_blocks(rows: list) -> list:
     return blocks
 
 
-def _scan_jobs(block: list, problems: list) -> None:
-    """Add what is wrong with the jobs under one `jobs:` key. Job ids sit at the first row's
+def _split_jobs(block: list) -> list:
+    """(the row of each job id, its child rows) under one `jobs:` key. Job ids sit at the first row's
     indent, and each job's own keys at the indent of its first row."""
     if not block:
-        return
+        return []
     first, jobs = block[0][0], []
     for indent, content in block:
         if indent == first:
@@ -283,25 +348,171 @@ def _scan_jobs(block: list, problems: list) -> None:
             jobs[-1][1].append((indent, content))
         else:
             raise _Unreadable("its jobs are not indented consistently")
-    for content, children in jobs:
-        job_id, rest = _read_key(content, "a job id")
-        if _is_required_check(job_id):
-            problems.append(f"defines a job with the id {REQUIRED_CHECK}: {SAME_NAME}")
-        elif _without_properties(rest):
-            raise _Unreadable(f"job {_code(job_id)} is given in flow style, as an alias or as a scalar")
-        for indent, child in children:
-            if indent != children[0][0]:
-                continue
-            key, value = _read_key(child, f"a key of job {_code(job_id)}")
-            if key != "name":
-                continue
+    return jobs
+
+
+def _has_key(rows: list, key: str, indent: int) -> bool:
+    """Whether one of the rows at `indent` is the key `key`."""
+    return any(row_indent == indent and (_key_line(content) or (None,))[0] == key for row_indent, content in rows)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Job:
+    id: str
+    name: str | None  # its `name:`, None when it has none
+    environment: str | None  # the environment it enters, None when it names none or in a form that is not read
+    rows: tuple  # (indent, text) of everything under its id
+
+
+def _environment_name(job_id: str, nested: list, indent: int):
+    """The `name:` under a job's `environment:` key, whose rows are `nested` (the rows after it, `indent` being
+    the key's own), or None when the mapping has none or reads it in a form that is not a name. A key the mapping
+    spells twice is unreadable, like one the job spells twice: neither is taken to be the one in force."""
+    name, seen = None, set()
+    for inner_indent, inner in nested:
+        if inner_indent <= indent:
+            break
+        if inner_indent != nested[0][0]:
+            continue
+        key, value = _read_key(inner, f"a key of the environment of job {_code(job_id)}")
+        if key in seen:
+            raise _Unreadable(f"the environment of job {_code(job_id)} has the key {_code(key)} twice")
+        seen.add(key)
+        if key == "name":
             name = _scalar(value)
-            if name is None:
-                raise _Unreadable(
-                    f"the name of job {_code(job_id)} is an alias, a block scalar, an escape, an open quote or on the next line"
-                )
-            if _is_required_check(name):
-                problems.append(f"names job {_code(job_id)} {REQUIRED_CHECK}: {SAME_NAME}")
+    return name
+
+
+def _env_kinds(text: str) -> list:
+    """The permission each INPUT_PERMISSION-* variable in `text` names, as the input is spelled."""
+    return [kind.lower().replace("_", "-") for kind in _INPUT_ENV.findall(text)]
+
+
+def _pr_token_asks(text: str) -> int:
+    """How many times `text` asks the App-token action for pull-requests: write, as the input or as the variable."""
+    return len(_APP_TOKEN_PRS.findall(text)) + _env_kinds(text).count("pull-requests")
+
+
+def _other_env_inputs(text: str) -> int:
+    """How many INPUT_PERMISSION-* variables in `text` name a permission other than the three the rules above know."""
+    return sum(1 for kind in _env_kinds(text) if kind not in ("checks", "statuses", "pull-requests"))
+
+
+def _bot_secrets(text: str) -> int:
+    return len(_BOT_SECRET.findall(text))
+
+
+def _steps(job) -> list:
+    """The rows of each step of the job's block-style `steps:` list, one list a step: the first row starts at the
+    step's first key (the `- ` is left off and its width counted), the rest are as they are. [] when the job has
+    no `steps:` in that form."""
+    rows = job.rows
+    if not rows:
+        return []
+    indent = rows[0][0]
+    for at, (row_indent, content) in enumerate(rows):
+        if row_indent != indent or (_key_line(content) or (None,))[0] != "steps":
+            continue
+        body = []
+        for inner_indent, inner in rows[at + 1:]:
+            if inner_indent <= indent:
+                break
+            body.append((inner_indent, inner))
+        steps = []
+        for inner_indent, inner in body:
+            if inner_indent == body[0][0] and inner.startswith("-"):
+                rest = inner[1:]
+                key_text = rest.lstrip(" ")
+                steps.append([(inner_indent + 1 + len(rest) - len(key_text), key_text)] if key_text else [])
+            elif steps:
+                steps[-1].append((inner_indent, inner))
+        return steps
+    return []
+
+
+def _names_permission(step: list) -> bool:
+    """Whether the step names a `permission-*` input where the action reads it: as a key of its one `with:`
+    mapping, with the value read or write. The words anywhere else (a `name:`, an `env:` key, a script) are
+    not an input, and neither is a key with an empty value or an expression, which the action may skip. A step written as a
+    flow mapping is read by the flow patterns. A step with two `with:` keys names none, since neither is
+    taken to be the one in force."""
+    if not step:
+        return False
+    if len(step) == 1 and step[0][1].startswith("{"):
+        return bool(_FLOW_WITH.search(step[0][1]))
+    indent, named, withs = step[0][0], False, 0
+    for at, (row_indent, content) in enumerate(step):
+        key, value = _key_line(content) or (None, "")
+        if row_indent != indent or key != "with":
+            continue
+        withs += 1
+        if value:
+            named = bool(_FLOW_INPUTS.match(value))
+            continue
+        nested = []
+        for inner_indent, inner in step[at + 1:]:
+            if inner_indent <= indent:
+                break
+            nested.append((inner_indent, inner))
+        pairs = [_key_line(inner) or (None, "") for inner_indent, inner in nested if inner_indent == nested[0][0]]
+        named = any(isinstance(name, str) and name.lower().startswith("permission-") and _scalar(text) in ("read", "write")
+                    for name, text in pairs)
+    return withs == 1 and named
+
+
+def _unnamed_token_steps(job) -> int:
+    """How many of the job's App-token steps name no permission input. A step the job's `steps:` list does not
+    show in block style counts as one that names none."""
+    named = sum(1 for step in _steps(job)
+                if _token_steps("\n".join(content for _, content in step)) and _names_permission(step))
+    return max(_token_steps(_job_text(job)) - named, 0)
+
+
+def _token_steps(text: str) -> int:
+    return len(_APP_TOKEN_STEP.findall(text))
+
+
+def _job_text(job) -> str:
+    return "\n".join(content for _, content in job.rows)
+
+
+def _read_jobs(rows: list, found: list) -> None:
+    """Append every job under a top-level `jobs:` key to `found`, in order, each read for the checks below. It
+    raises _Unreadable at the first job it cannot read, so `found` then holds the jobs before it. A key a job
+    spells twice is unreadable, as a duplicate key is in the manifests: neither the first nor the last is taken
+    to be the one in force."""
+    for block in _jobs_blocks(rows):
+        for content, children in _split_jobs(block):
+            job_id, rest = _read_key(content, "a job id")
+            if _without_properties(rest) and not _is_required_check(job_id):
+                raise _Unreadable(f"job {_code(job_id)} is given in flow style, as an alias or as a scalar")
+            name = environment = None
+            seen = set()
+            for at, (indent, child) in enumerate(children):
+                if indent != children[0][0]:
+                    continue
+                key, value = _read_key(child, f"a key of job {_code(job_id)}")
+                if key in seen:
+                    raise _Unreadable(f"job {_code(job_id)} has the key {_code(key)} twice")
+                seen.add(key)
+                if key == "environment":
+                    environment = _scalar(value) if value else _environment_name(job_id, children[at + 1:], indent)
+                if key != "name":
+                    continue
+                name = _scalar(value)
+                if name is None:
+                    raise _Unreadable(
+                        f"the name of job {_code(job_id)} is an alias, a block scalar, an escape, an open quote or on the next line"
+                    )
+            found.append(_Job(job_id, name, environment, tuple(children)))
+
+
+def _jobs_without_permissions(rows: list, jobs: list) -> list:
+    """The ids of the jobs that declare no `permissions:` of their own, when the file declares none at the top
+    level: they take the repository's default token. [] when the file declares one at the top."""
+    if not rows or _has_key(rows, "permissions", rows[0][0]):
+        return []
+    return [job.id for job in jobs if not job.rows or not _has_key(job.rows, "permissions", job.rows[0][0])]
 
 
 def workflow_problems(path: str, text: str) -> list:
@@ -309,20 +520,81 @@ def workflow_problems(path: str, text: str) -> list:
     clean = [_uncommented(line) for line in text.splitlines()]
     body = "\n".join(clean)
     problems = []
-    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body):
+    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body) or {"checks", "statuses"} & set(_env_kinds(body)):
         problems.append(
-            "grants checks: write, statuses: write or write-all, which lets a job create a check run or a status "
-            f"named {REQUIRED_CHECK}, and any such check satisfies the required check"
+            "writes checks: write, statuses: write or write-all out plainly, which would let a job create a check "
+            f"run or a status named {REQUIRED_CHECK}, and any such check satisfies the required check"
+        )
+    if _APPROVES_PRS.search(body):
+        problems.append(
+            "writes pull-requests: write out plainly, which would let a job approve a pull request when the "
+            "repository allows workflows to, and comment on, label, retitle or close pull requests; "
+            "an approval by `github-actions[bot]` is not a review by a person"
+        )
+    rows, jobs, unreadable = [], [], None
+    try:
+        rows = _rows(clean)
+        _read_jobs(rows, jobs)
+    except _Unreadable as exc:
+        unreadable = exc
+    entering = [job for job in jobs if job.environment == BOT_ENVIRONMENT] if unreadable is None else []
+
+    def inside(count, files):
+        return sum(count(_job_text(job)) for job in entering) if path in files else 0
+
+    if _pr_token_asks(body) > inside(_pr_token_asks, (IMPORTER_WORKFLOW,)):
+        problems.append(
+            "asks the App-token action for pull-requests: write, which only "
+            f"{IMPORTER_WORKFLOW} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
+            "environment (`environment: name`, or a `name:` under it): the token it mints is the release bot's, "
+            "and nothing here can read where its secrets are stored"
+        )
+    if _token_steps(body) > inside(_token_steps, BOT_WORKFLOWS):
+        problems.append(
+            "uses the App-token action, which only "
+            f"{' and '.join(BOT_WORKFLOWS)} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
+            "environment: with no permission input it mints a token with every permission the App's installation "
+            "has, and nothing here can read where its secrets are stored"
+        )
+    if path in BOT_WORKFLOWS and sum(_unnamed_token_steps(job) for job in entering):
+        problems.append(
+            "has an App-token step that names no permission input, so it mints a token with every permission the "
+            "App's installation has: name each permission the step needs (`permission-contents: write`)"
+        )
+    if _other_env_inputs(body):
+        problems.append(
+            "sets an INPUT_PERMISSION-* variable the App-token action reads, which changes what it mints behind "
+            "the inputs the step names: write the permission as an input"
+        )
+    if _bot_secrets(body) > inside(_bot_secrets, BOT_WORKFLOWS):
+        problems.append(
+            "reads a MARKETPLACE_BOT_* secret, or reaches the secrets by index or as a whole (`secrets[...]`, "
+            f"`toJSON(secrets)`), outside a job of {' and '.join(BOT_WORKFLOWS)} that itself enters the "
+            f"{BOT_ENVIRONMENT} environment: whatever reads them, those are the release bot's credentials"
+        )
+    missing = _jobs_without_permissions(rows, jobs)
+    if missing:
+        names = ", ".join(_code(job) for job in missing)
+        own = "declares none of its own, so it takes" if len(missing) == 1 else "declare none of their own, so they take"
+        problems.append(
+            f"declares no top-level permissions and {names} {own} the repository's default token, which a "
+            "repository setting can make write-capable; write `permissions: {}` at the top level, or the grants "
+            "each job needs"
         )
     if path != VALIDATE_WORKFLOW:
-        try:
-            for block in _jobs_blocks(_rows(clean)):
-                _scan_jobs(block, problems)
-        except _Unreadable as exc:
-            problems.append(
-                f"is written in a form this check does not read ({exc}), so it cannot tell whether a job in it is "
-                f"named {REQUIRED_CHECK}; write its jobs in plain block style"
-            )
+        for job in jobs:
+            if _is_required_check(job.id):
+                problems.append(f"defines a job with the id {REQUIRED_CHECK}: {SAME_NAME}")
+            if job.name is not None and _is_required_check(job.name):
+                problems.append(f"names job {_code(job.id)} {REQUIRED_CHECK}: {SAME_NAME}")
+    if unreadable is not None:
+        # validate.yml is exempt from the rule on job names, so only the permissions are at stake there.
+        cannot_tell = ("which token permissions its jobs take" if path == VALIDATE_WORKFLOW
+                       else "what its jobs are named or which token permissions they take")
+        problems.append(
+            f"is written in a form this check does not read ({unreadable}), so it cannot tell {cannot_tell}; "
+            "write its jobs in plain block style"
+        )
     return [f"{_code(path)} {problem}" for problem in problems]
 
 
