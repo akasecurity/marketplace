@@ -209,6 +209,12 @@ release bot, through the `marketplace-bot` environment, which only `main` may us
 checks the environment's deployment branches every day). Both refuse, before any write, unless the
 App their token was made for (the token step's `app-slug`) is the App `release_checks.BOT_LOGIN`
 names, so a `MARKETPLACE_BOT_CLIENT_ID` secret naming another App ends the run with that cause.
+Which secrets sit behind that environment is not checked, and the tag-audit comment says so. An
+administrator reads back that `MARKETPLACE_BOT_CLIENT_ID` and `MARKETPLACE_BOT_PRIVATE_KEY` are
+secrets of the `marketplace-bot` environment and that the repository holds no secret of either name,
+because `validate` lets the importer's workflow ask the App-token action for `pull-requests: write`
+on the strength of that environment; and that "Allow GitHub Actions to create and approve pull
+requests" is off. Neither can be read from the repository.
 
 GitHub disables a public repository's scheduled workflows after 60 days with no repository
 activity. A disabled workflow makes no failed run and files no issue, so `import-plugin-release`,
@@ -268,19 +274,28 @@ true only once it is.
   `validate.yml`'s run from `main`, and trusts its summary over the PR body. A check that cannot
   finish reports NO VERDICT and fails the required check; it is never reported as the PR breaking a
   rule. It also reads each workflow file (`.yml` or `.yaml`) a PR adds or changes, as text and
-  never runs it, and fails the PR if the file grants `checks: write`, `statuses: write` or
-  `write-all` written out plainly, which lets a job report a check named `validate`; grants
-  `pull-requests: write` written out plainly, which lets a job approve a pull request when the repository
-  allows workflows to (and `github-actions[bot]` has write access, so its approval could supply the one
-  the `main` ruleset needs); or defines a job whose id or `name:` is `validate` (in any file
-  but `validate.yml` itself), since it could report a `validate` check of its own; a file that
-  mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot read with
-  confidence, is refused too (write them in plain block style). That is a partial control, a
-  best-effort read of the text and not a YAML parser. It does not see: a flow-style or complex-key
-  file whose `jobs` key is itself spelled with an escape; a change to `validate.yml` itself, such
-  as another trigger (it is only called out for review); a permission grant written with an
-  anchor, an alias or an escape; a job name built from an expression or a matrix value; a workflow
-  that declares no permissions and so takes the repository's default token; a check run or status
+  never runs it, and fails the PR if the file writes `checks: write`, `statuses: write` or
+  `write-all` out plainly, which would let a job report a check named `validate` (`write-all` also
+  grants `pull-requests: write`); writes `pull-requests: write` out plainly, which would let a job
+  approve a pull request when the repository allows workflows to, and comment on, label, retitle or
+  close pull requests (`github-actions[bot]` has write access, so once the ruleset stops requiring
+  code-owner review its approval counts toward the one the ruleset needs); asks the App-token action
+  for `permission-pull-requests: write` anywhere but in `import-plugin-release.yml`, and there unless
+  the file has a job in the `marketplace-bot` environment; declares no `permissions:` at the top
+  level while a job declares none of its own, so that job takes the repository's default token, which
+  a repository setting can make write-capable; or defines a job whose id or `name:` is `validate`
+  (in any file but `validate.yml` itself), since it could report a `validate` check of its own; a
+  file that mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot
+  read with confidence, is refused too (write them in plain block style). That is a partial control,
+  a best-effort read of the text and not a YAML parser, so it also refuses a file that only prints
+  one of those grants in a `run:`, and its messages say the words were written, not that the file
+  grants them. It does not see: a flow-style or complex-key file whose `jobs` key is itself spelled
+  with an escape; a change to `validate.yml` itself, such as another trigger (it is only called out
+  for review); the `permission-pull-requests: write` input in the importer's own workflow, which it
+  allows because the token it mints is the release bot's (whether a pull request could reach the
+  secrets behind it rests on where they are stored, which an administrator reads back, as the
+  start of this section says); a permission grant written with an anchor, an alias or an escape; a
+  job name built from an expression or a matrix value; a check run or status
   posted with some other token or secret; a push-triggered workflow on another branch; or a fork
   PR's own run. Code-owner review of workflow changes stays the control for what a PR's own diff
   carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted from
