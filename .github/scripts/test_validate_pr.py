@@ -955,6 +955,26 @@ class TestWorkflowFiles(unittest.TestCase):
         once = workflow_pr(workflow_text(job_extra="    timeout-minutes: 5"))
         self.assertEqual((once.exit_code, once.failures), (0, []))
 
+    def test_a_key_the_environment_mapping_spells_twice_is_unreadable_whichever_comes_first(self):
+        # The carve-out grants pull-requests: write on the strength of the environment's name, so the name inside the
+        # mapping is the one place where guessing which of two is in force would hand out the grant.
+        duplicated = {
+            "the bot environment first": "    environment:\n      name: marketplace-bot\n      name: production",
+            "the bot environment last": "    environment:\n      name: production\n      name: marketplace-bot",
+            "two copies of the bot environment": "    environment:\n      name: marketplace-bot\n      name: marketplace-bot",
+            "another key": "    environment:\n      name: marketplace-bot\n      url: https://a.example\n      url: https://b.example",
+        }
+        for label, job_extra in duplicated.items():
+            with self.subTest(label):
+                report = self.assert_refused(workflow_text(job_extra=job_extra, step=self.APP_TOKEN),
+                                             "is written in a form this check does not read", path=vp.IMPORTER_WORKFLOW)
+                failed_with(self, report, "environment of job `build` has the key")
+                failed_with(self, report, "asks the App-token action")
+        once = workflow_text(job_extra="    environment:\n      name: marketplace-bot\n      url: https://a.example",
+                             step=self.APP_TOKEN)
+        report = workflow_pr(once, path=vp.IMPORTER_WORKFLOW)
+        self.assertEqual((report.exit_code, report.failures), (0, []))
+
     def test_the_unreadable_failure_names_only_what_applies_to_the_file(self):
         unread = "name: x\non: push\njobs: {build: {runs-on: x}}\n"
         other = vp.workflow_problems(EXTRA, unread)[0]
