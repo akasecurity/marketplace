@@ -278,12 +278,11 @@ true only once it is.
   `write-all` out plainly, which would let a job report a check named `validate` (`write-all` also
   grants `pull-requests: write`); writes `pull-requests: write` out plainly, which would let a job
   approve a pull request when the repository allows workflows to, and comment on, label, retitle or
-  close pull requests (`github-actions[bot]` has write access, so once the ruleset stops requiring
-  code-owner review its approval counts toward the one the ruleset needs); asks the App-token action
-  for `permission-pull-requests: write` anywhere but in `import-plugin-release.yml`, and there unless
-  the file has a job in the `marketplace-bot` environment; declares no `permissions:` at the top
-  level while a job declares none of its own, so that job takes the repository's default token, which
-  a repository setting can make write-capable; or defines a job whose id or `name:` is `validate`
+  close pull requests (an approval by `github-actions[bot]` is not a review by a person); asks the
+  App-token action for `permission-pull-requests: write` anywhere but in `import-plugin-release.yml`,
+  and there unless the file has a job in the `marketplace-bot` environment; declares no `permissions:`
+  at the top level while a job declares none of its own, so that job takes the repository's default
+  token, which a repository setting can make write-capable; or defines a job whose id or `name:` is `validate`
   (in any file but `validate.yml` itself), since it could report a `validate` check of its own; a
   file that mentions `jobs` but has no top-level `jobs:` key in block style, or whose jobs it cannot
   read with confidence, is refused too (write them in plain block style). That is a partial control,
