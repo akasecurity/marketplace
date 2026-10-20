@@ -8,7 +8,6 @@ import unittest
 import urllib.parse
 from unittest import mock
 
-import _testsupport as ts
 import release_checks
 import tag_release as tr
 from fakes import (INTEGRITY, REPO, SLUG, UNREADABLE_MANIFESTS, FakeGit, FakeGitHub, fleet_tag, manifest,
@@ -734,6 +733,25 @@ class TestApprover(unittest.TestCase):
                 self.assertIn("venuverse", facts["note"])
                 self.assertIn("push access", facts["note"])
 
+    def test_an_approval_that_cannot_be_confirmed_never_hides_who_merged(self):
+        # This repository is public, so any account can submit an approving review: an unconfirmed one must not turn a
+        # break-glass merge into a tag that names nobody. The merger is in the note whether or not validate passed.
+        facts = self.facts_for([self.review("APPROVED", "a-passing-contributor", False)])
+        self.assertEqual(facts["approver"], "unknown")
+        self.assertEqual(facts["note"].count("org-owner-example"), 1)
+        self.assertTrue(facts["note"].endswith("merged by org-owner-example"), facts["note"])
+
+    def test_the_unknown_note_does_not_suggest_the_access_was_lost(self):
+        # Never having had write access is as likely as losing it, and the note must say so.
+        facts = self.facts_for([self.review("APPROVED", "a-passing-contributor", False)])
+        self.assertIn("may never have had it, or may have lost it since the review", facts["note"])
+        self.assertNotIn("may have changed", facts["note"])
+
+    def test_a_head_whose_pusher_cannot_be_named_also_names_the_merger(self):
+        facts = self.facts_for([self.review("APPROVED", "venuverse")], pusher={"author": None, "committer": None})
+        self.assertEqual(facts["approver"], "unknown")
+        self.assertTrue(facts["note"].endswith("merged by org-owner-example"), facts["note"])
+
     def test_an_app_that_approved_is_still_recorded_as_a_bypass(self):
         # An App is no person: it never counts as an approval, and it never makes the outcome unknown either.
         review = dict(self.review("APPROVED", "renovate-approve"), author_type="Bot")
@@ -968,6 +986,13 @@ class TestValidateOnTheFinalHead(unittest.TestCase):
         facts, _ = self.facts([], reviews=[])
         self.assertEqual(facts["note"], f"ruleset bypass by {self.MERGER}; {self.NOTE} (no run)")
         self.assertEqual(facts["note"].count(self.MERGER), 1)
+
+    def test_an_unconfirmed_approval_with_a_failed_run_names_the_merger_once(self):
+        facts, _ = self.facts([validate_run(conclusion="failure")], reviews=[
+            {"state": "APPROVED", "commit_id": "h13", "user": {"login": "gone"}, "can_push": False}])
+        self.assertEqual(facts["approver"], "unknown")
+        self.assertEqual(facts["note"].count(self.MERGER), 1)
+        self.assertIn(f"{self.NOTE} (latest run: failure)", facts["note"])
 
     def test_a_bypass_with_a_passing_run_keeps_its_own_note_only(self):
         facts, _ = self.facts([validate_run()], reviews=[])

@@ -74,7 +74,6 @@ class FakeGit:
         self.repo_dir = "/fake/marketplace"
         self.chain = list(chain)
         self.files = dict(files or {})
-        # (commit, path) -> a git mode, for an entry that is not a plain file (160000 is a submodule).
         self.tags = list(tags or [])
         self.messages = dict(messages or {})
         self.times = dict(times or {})
@@ -180,8 +179,9 @@ class FakeGitHub:
 
     def _reviews_page(self, variables) -> dict:
         """The reviews query answered, as one page, from the review list a test routes for the PR: dicts with
-        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push) and, to make
-        the author a GitHub App, `author_type`: "Bot"."""
+        `state`, `commit_id`, `user`, `can_push` (GitHub's answer to whether the reviewer may push), `submitted_at`
+        (the timestamp pull_reviews orders by; left out, the review has none) and, to make the author a GitHub App,
+        `author_type`: "Bot"."""
         reviews = self._answer("GET", self.repo_path(f"pulls/{variables['number']}/reviews"))
         nodes = [{"state": review["state"], "submittedAt": review.get("submitted_at"),
                   "authorCanPushToRepository": review.get("can_push", False),

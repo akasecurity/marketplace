@@ -80,8 +80,9 @@ release back. An automated audit of `main` opens an issue for each commit that r
 approved pull request whose final head passed `validate`. The audit runs from the pushed
 commit, so a push that bypasses the `main` ruleset can also change, disable or remove it; that push
 is then audited by the changed copy, or not at all, and no later run looks at it again. If the merge
-moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and who merged it, or a
-note that `validate` had not passed on the final head.
+moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and who merged it;
+`approver: unknown` and who merged it, when an approval cannot be confirmed or the final head's pusher
+cannot be named; or a note that `validate` had not passed on the final head.
 
 `preflight` and `aka-claude-tools` still float on their default branches.
 

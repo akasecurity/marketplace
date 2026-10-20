@@ -118,8 +118,11 @@ and store-migration class, and for a rollback the version it rolled back from. T
 user account with push access to the repository (the access the `main` ruleset counts), other than whoever
 pushed the final head, whose latest review approves it; with none, the message says `approver: none` and who
 merged it. Access is read when the sweep runs, not when the review was submitted, so an approval whose
-reviewer cannot push by then gives `approver: unknown` and a note naming them, never a claim of bypass; the
-approver is `unknown` too when the final head's pusher cannot be named. Whoever
+reviewer cannot push by then gives `approver: unknown` and a note naming them and who merged, never a
+claim of bypass; the approver is `unknown` too when the final head's pusher cannot be named. `unknown`
+is not a clearance: this repository is public, so any account can submit an approving review, and a
+break-glass merge could be hidden behind one. The note says as much and names the merger, and
+`main-audit` still files its issue. Whoever
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
 or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
 `pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
@@ -371,7 +374,9 @@ true only once it is.
   ruleset counts, and only for a user account, because GitHub answers the same for an App with write
   access and an App's approval is no person's. `author_association` is not used: GitHub fills it in
   per viewer, so a token that cannot see a private member's organisation membership is told
-  `CONTRIBUTOR` for them. The branch commits a merge-commit
+  `CONTRIBUTOR` for them. Access is read at audit time, as the tag's is, so when the only approving
+  review on the head is by a user account GitHub reports no push access for, the issue still files and
+  names that account instead of saying no approving review exists. The branch commits a merge-commit
   merge brings in are not on that line and are not checked, and a rebase merge puts every rebased
   commit on it, so each but the last is reported, worded as probably part of a rebase merge of the
   pull request GitHub links it to, which is why merges are squash-only. The last pusher is the author

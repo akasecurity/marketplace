@@ -38,7 +38,7 @@ from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
 from tag_release import (VALIDATE_CHECK, last_pushers, merged_into_main, pull_association, pull_reviews,
-                         validate_conclusion, write_approvals)
+                         unconfirmed_approvals, validate_conclusion, write_approvals)
 
 LABEL = "main-audit"
 SUMMARY_RULE = "main-audit"
@@ -68,10 +68,19 @@ def approval_problem(gh: GitHub, sha: str, number: int, head: str) -> str | None
                 "could not be told from the pusher's own.")
     # Each member's latest approving, change-requesting or dismissed review decides: an approval its author later
     # withdrew, or that was dismissed, does not count.
-    if write_approvals(pull_reviews(gh, number), head, exclude=pushers):
+    reviews = pull_reviews(gh, number)
+    if write_approvals(reviews, head, exclude=pushers):
         return None
-    return (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its final "
-            f"head `{head}` by someone other than its last pusher ({', '.join(sorted(pushers))}).")
+    problem = (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its "
+               f"final head `{head}` by someone other than its last pusher ({', '.join(sorted(pushers))}).")
+    # Access is read at audit time, as the tag's is: the issue keeps filing, since this is the detective control, but
+    # says what it found instead of claiming no approving review exists.
+    unconfirmed = unconfirmed_approvals(reviews, head, exclude=pushers)
+    if unconfirmed:
+        problem += (f" An approving review by {', '.join(unconfirmed)} was not counted: GitHub reports no push "
+                    "access for them as of this audit (they may never have had it, or may have lost it since the "
+                    "review).")
+    return problem
 
 
 def validate_problem(gh: GitHub, sha: str, number: int, head: str, merged_at: str | None) -> str | None:
