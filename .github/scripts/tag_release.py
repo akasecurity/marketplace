@@ -23,16 +23,14 @@ after it, until it is an hour old: a slow link must not become a permanent
 `pr: none` tag. After that hour it is tagged as a push without a PR. A commit
 dated more than five minutes ahead of the runner's clock is not young either
 (only a direct push can carry one, and waiting for its date would hold every
-later tag back): it is tagged at once, as an old one would be. The owners that decide
-whether a PR was approved come from CODEOWNERS at the merged commit's parent,
-read strictly: one `*` line of user owners. That file is fixed history, which
-no later pull request can change, so a parent whose file is anything else (a
-team, a path rule, bytes that are not text, no file, or an entry that is not a
-file at all, such as a submodule) never stops the sweep, which would stop
-tagging for good: a commit a pull request merged is tagged with
-`approver: unknown` and an approver-note saying why, rather than a guess at who
-counts. A commit no pull request merged records `approver: none`
-whatever the file holds, as there is no approval to match.
+later tag back): it is tagged at once, as an old one would be. A PR's approver is
+the user account with push access to the repository whose latest review approves its final head
+and who did not push it. With none, the tag records `approver: none` and a note that the merge
+bypassed the ruleset, or `approver: unknown` when an approval exists that this read cannot confirm
+(the reviewer's access is read when the sweep runs, not when the review was submitted), when the
+head's pusher cannot be named, or when the only approvals are by the head commit's author or committer
+and the activity feed does not say who pushed it. A commit no pull request merged records
+`approver: none`, as there is no approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
 a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
 the sweep: every run reports it as a warning and goes on, comparing each later
@@ -43,8 +41,8 @@ closed PR closed on, since only the bot may delete bot/** branches.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -54,16 +52,11 @@ import release_checks
 from ghapi import GitHub, GitHubError
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
-from issue_router import CODEOWNERS_FILE
 from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, parse_json, vkey
 
 ABSENT = "entry removed"
 # Not a version: what the manifest at a commit says when it cannot be read at all (see Unreadable).
 UNREADABLE = "manifest unreadable"
-# The modes git gives a regular file; any other mode at the CODEOWNERS path (120000 a symbolic link, 160000 a
-# submodule, 040000 a directory) holds nothing a reader can take rules from.
-FILE_MODES = ("100644", "100755")
-ENTRY_KINDS = {"120000": "a symbolic link", "160000": "a submodule", "040000": "a directory"}
 # The required check on main: the job validate.yml runs, which GitHub Actions reports under this name.
 VALIDATE_CHECK = "validate"
 # Only a check run of that workflow file, run for the event below, is the required check. A job of any other
@@ -82,8 +75,6 @@ UNLINKED_GRACE = 3600
 # made on a machine with the wrong time (only a direct push can carry one), and it is not young: waiting
 # for its date would hold every later tag back until then. It is handled as an old unlinked commit.
 CLOCK_SKEW = 300
-# A user owner in CODEOWNERS: "@" and a login. A team ("@org/team") or an email address matches no reviewer's login.
-USER_OWNER = re.compile(r"@[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class Unreadable(Refused):
@@ -146,44 +137,6 @@ def last_pinned(git: Git, sha: str | None) -> str:
             return version
         sha = git.first_parent(sha)
     return ABSENT
-
-
-def code_owners(git: Git, sha: str) -> list[str]:
-    """The logins CODEOWNERS names at `sha`, read strictly. The file must hold exactly one rule, a `*` line
-    naming user owners (comments and blank lines aside). A team, an email address, a path rule, a second rule,
-    a file that is not UTF-8 text, an entry that is not a file (a submodule, a symbolic link, a directory) or no
-    file at all is a Refused, not a guess: a reviewer's login can be matched only to a user, so any other shape
-    would turn a real approval into a recorded bypass. What a caller does with the Refused is its own call: for
-    a commit a pull request merged, the sweep tags with an unknown approver, because the file it reads is fixed
-    history (a commit no pull request merged records `none`). Only a checkout that cannot be read at all
-    (a missing object) raises GitError, as Git.show says."""
-    where = f"{CODEOWNERS_FILE} at {sha[:12]}"
-    mode = git.entry_mode(sha, CODEOWNERS_FILE)
-    if mode is not None and mode not in FILE_MODES:
-        # Git.show cannot read a submodule entry (there is no blob) and would raise GitError, which is not a
-        # statement about the file; the entry's kind is.
-        raise Refused(f"{where} is {ENTRY_KINDS.get(mode, f'a tree entry of mode {mode}')}, not a file; code owners "
-                      "can only be read from a file of one `*` line naming users.")
-    try:
-        raw = git.show(sha, CODEOWNERS_FILE)
-    except UnicodeDecodeError as error:
-        # Git.show decodes what it reads as UTF-8; a file that is not text is no more readable than a team owner.
-        raise Refused(f"{where} is not valid UTF-8 text (byte {error.start} is not); code owners can only be "
-                      "read from a file of one `*` line naming users.") from error
-    if raw is None:
-        raise Refused(f"{where} is missing; code owners can only be read from a file of one `*` line naming users.")
-    rules = [fields for fields in (line.split("#", 1)[0].split() for line in raw.splitlines()) if fields]
-    if len(rules) != 1 or rules[0][0] != "*":
-        raise Refused(f"{where} does not hold exactly one rule, a `*` line; code owners can only be read from a "
-                      "file of one `*` line naming users, with no path rules.")
-    owners = rules[0][1:]
-    if not owners:
-        raise Refused(f"{where} names no owner on its `*` line.")
-    unusable = [owner for owner in owners if not USER_OWNER.fullmatch(owner)]
-    if unusable:
-        raise Refused(f"{where} names {', '.join(f'`{owner}`' for owner in unusable)}, which is not a user "
-                      "(`@login`); a team or an email address cannot be matched to a reviewer.")
-    return [owner[1:] for owner in owners]
 
 
 def integrity_at(git: Git, sha: str) -> tuple[str, str]:
@@ -307,10 +260,111 @@ def merged_pull(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.slee
     return pull_association(gh, sha, sleep)[0]
 
 
+REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
+                 "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+                 "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
+                 "nodes { state submittedAt authorCanPushToRepository author { __typename login } "
+                 "commit { oid } } } } } }")
+# GitHub's committer for an edit made on the web; it names nobody who pushed.
+NOT_A_PUSHER = {"web-flow"}
+
+
+def pull_reviews(gh: GitHub, number: int) -> list[dict]:
+    """The PR's reviews, oldest submitted first, as {state, commit_id, user, user_account, can_push}. `can_push`
+    is GitHub's own answer to whether the reviewer may push to the repository, the access the main ruleset counts
+    an approval by, as of this read, not of the review. It is asked here, not read from `author_association`,
+    which GitHub fills in per viewer: a token that cannot see a private member's organisation membership is told
+    CONTRIBUTOR for them, and a permanent record must not depend on what the reading token can see. Only a user
+    account can push: GitHub also answers true for an App that has write access, and gives its login without the
+    [bot] suffix, but an App's approval is no person's approval. The order is made here: `reviews` documents no
+    order and takes no orderBy, and a review with no timestamp sorts first, in the order it arrived."""
+    owner, name = gh.repo.split("/", 1)
+    reviews: list[tuple[str, dict]] = []
+    after = None
+    while True:
+        connection = gh.graphql(REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
+                                                "after": after})["repository"]["pullRequest"]["reviews"]
+        for node in connection["nodes"]:
+            author, commit = node.get("author"), node.get("commit")
+            user_account = author is not None and author.get("__typename") == "User"
+            reviews.append((node.get("submittedAt") or "",
+                            {"state": node["state"], "commit_id": commit["oid"] if commit else None,
+                             "user": {"login": author["login"]} if author else None, "user_account": user_account,
+                             "can_push": node.get("authorCanPushToRepository") is True and user_account}))
+        if not connection["pageInfo"]["hasNextPage"]:
+            return [review for _, review in sorted(reviews, key=lambda pair: pair[0])]
+        after = connection["pageInfo"]["endCursor"]
+
+
+PUSH_ACTIVITIES = ("push", "force_push", "branch_creation")
+
+
+def head_pusher(gh: GitHub, pull: dict) -> str | None:
+    """The login that pushed the PR's final head to its branch, as the repository's activity feed records it, or
+    None when the feed cannot say: a head in a fork (the push is in the fork's feed), a feed GitHub refuses to
+    serve, one whose newest hundred records hold no push that left the branch at this head, or a push by an
+    account that no longer exists. The feed outlives the branch, so a PR whose branch was deleted on merge is
+    read the same way. An App's push is recorded under the App's login, which no approval is made by."""
+    head = pull.get("head") or {}
+    ref, sha, repo = head.get("ref"), head.get("sha"), (head.get("repo") or {}).get("full_name")
+    if not ref or not sha or not isinstance(repo, str) or repo.casefold() != gh.repo.casefold():
+        return None
+    try:
+        feed = gh.get(gh.repo_path("activity"), {"ref": f"refs/heads/{ref}", "per_page": 100})
+    except (GitHubError, OSError):
+        return None
+    for activity in feed if isinstance(feed, list) else ():
+        if isinstance(activity, dict) and activity.get("activity_type") in PUSH_ACTIVITIES \
+                and activity.get("after") == sha:
+            login = (activity.get("actor") or {}).get("login")
+            return login if isinstance(login, str) and login else None
+    return None
+
+
+def last_pushers(gh: GitHub, head: str) -> set[str]:
+    """The logins that stand in for whoever pushed `head` when the activity feed does not name them: its commit's
+    author and committer, with `web-flow` aside. They are candidates, not the pusher: a commit can be rebased or
+    amended by someone else who pushes it, and can carry any author a pusher writes. The set is empty when
+    neither names a GitHub account, and a caller must then not take an approval to be someone else's."""
+    commit = gh.get(gh.repo_path(f"commits/{head}"))
+    return {login for login in ((commit.get("author") or {}).get("login"), (commit.get("committer") or {}).get("login"))
+            if login and login not in NOT_A_PUSHER}
+
+
+@dataclasses.dataclass(frozen=True)
+class Approvals:
+    """What the reviews of a PR's final head settle about its approval. `counted` are the users with push access,
+    other than whoever pushed that head, whose latest review approves it. With none, `unconfirmed` are the users
+    whose approval is set aside because GitHub reports no push access for them now, and `undecided` the users
+    with push access whose approval is set aside only because they authored or committed the head while the
+    feed could not say who pushed it: GitHub counts their approval if someone else pushed. `pusher` is the
+    account the feed names, and `unnameable` is True when it names none and neither does the commit."""
+    counted: list[str]
+    unconfirmed: list[str]
+    undecided: list[str]
+    pusher: str | None
+    unnameable: bool
+
+
+def approvals(gh: GitHub, number: int, pull: dict) -> Approvals:
+    """The approvals of `pull`'s final head (`pulls/{number}`), judged against the account that pushed it."""
+    head = pull["head"]["sha"]
+    reviews = pull_reviews(gh, number)
+    pusher = head_pusher(gh, pull)
+    candidates = set() if pusher else last_pushers(gh, head)
+    if not pusher and not candidates:
+        return Approvals([], [], [], None, True)
+    counted = write_approvals(reviews, head, exclude={pusher} if pusher else candidates)
+    if counted:
+        return Approvals(counted, [], [], pusher, False)
+    return Approvals([], unconfirmed_approvals(reviews, head, exclude={pusher} if pusher else ()),
+                     [login for login in write_approvals(reviews, head) if login in candidates], pusher, False)
+
+
 def latest_positions(reviews) -> dict[str, dict]:
     """Each reviewer's latest APPROVED, CHANGES_REQUESTED or DISMISSED review, the one who took a position last
-    at the end. A comment or a pending review changes nothing, and `reviews` is in the API's chronological
-    order, so an approval its author later withdrew, or that was dismissed, is no longer the latest."""
+    at the end. A comment or a pending review changes nothing, and `reviews` is in the order they were submitted
+    (pull_reviews), so an approval its author later withdrew, or that was dismissed, is no longer the latest."""
     latest: dict[str, dict] = {}
     for review in reviews:
         login = (review.get("user") or {}).get("login")
@@ -320,50 +374,24 @@ def latest_positions(reviews) -> dict[str, dict]:
     return latest
 
 
-def owner_approvals(reviews, head: str, owners: list[str], exclude=()) -> list[str]:
-    """The code owners whose latest position approves `head`. `exclude` names reviewers whose approval is not
-    allowed to count, such as the last pusher."""
-    return [login for login, review in latest_positions(reviews).items()
-            if review["state"] == "APPROVED" and review.get("commit_id") == head
-            and login in owners and login not in exclude]
-
-
-REVIEWS_QUERY = ("query($owner: String!, $name: String!, $number: Int!, $after: String) { "
-                 "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
-                 "reviews(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
-                 "nodes { state authorCanPushToRepository author { __typename login } commit { oid } } } } } }")
-
-
-def pull_reviews(gh: GitHub, number: int) -> list[dict]:
-    """The PR's reviews, oldest first, as {state, commit_id, user, can_push}. `can_push` is GitHub's own answer to
-    whether the reviewer may push to the repository, the access the main ruleset counts an approval by. It is
-    asked here, not read from `author_association`, which GitHub fills in per viewer: a token that cannot see a
-    private member's organisation membership is told CONTRIBUTOR for them, and an audit must not depend on what
-    the reading token can see. Only a user account can push: GitHub also answers true for an App that has write
-    access, and gives its login without the [bot] suffix, but an App's approval is no person's approval."""
-    owner, name = gh.repo.split("/", 1)
-    reviews: list[dict] = []
-    after = None
-    while True:
-        connection = gh.graphql(REVIEWS_QUERY, {"owner": owner, "name": name, "number": number,
-                                                "after": after})["repository"]["pullRequest"]["reviews"]
-        for node in connection["nodes"]:
-            author, commit = node.get("author"), node.get("commit")
-            reviews.append({"state": node["state"], "commit_id": commit["oid"] if commit else None,
-                            "user": {"login": author["login"]} if author else None,
-                            "can_push": node.get("authorCanPushToRepository") is True
-                            and author is not None and author.get("__typename") == "User"})
-        if not connection["pageInfo"]["hasNextPage"]:
-            return reviews
-        after = connection["pageInfo"]["endCursor"]
-
-
 def write_approvals(reviews, head: str, exclude=()) -> list[str]:
-    """The reviewers who can push to the repository and whose latest position approves `head`. `exclude` names
-    reviewers whose approval is not allowed to count, such as the last pusher."""
+    """The reviewers who can push to the repository and whose latest position approves `head`, the one who
+    approved last at the end. `exclude` names reviewers whose approval is not allowed to count, such as the last
+    pusher."""
     return [login for login, review in latest_positions(reviews).items()
             if review["state"] == "APPROVED" and review.get("commit_id") == head
             and review.get("can_push") is True and login not in exclude]
+
+
+def unconfirmed_approvals(reviews, head: str, exclude=()) -> list[str]:
+    """The user accounts whose latest position approves `head` but who cannot push as of this read. That is not
+    proof the merge bypassed the ruleset, because the reviewer may have left the organisation or lost write access
+    since approving, and not proof of the opposite either: this repository is public, so any account can submit an
+    approving review, and a break-glass merge could be hidden behind one. A caller must report it as unconfirmed
+    and name the merger. An App never appears here, and neither does an excluded reviewer."""
+    return [login for login, review in latest_positions(reviews).items()
+            if review["state"] == "APPROVED" and review.get("commit_id") == head
+            and review.get("user_account") is True and review.get("can_push") is not True and login not in exclude]
 
 
 def timestamp(text) -> datetime | None:
@@ -434,12 +462,18 @@ def validate_conclusion(reader: GitHub, head: str, merged_at: str | None) -> str
     return None
 
 
-def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[float], None] = time.sleep,
-             unreadable: str = "", reader: GitHub | None = None) -> dict:
-    """What the tag records about the PR that merged `sha`. `owners` is None when CODEOWNERS could not be read
-    at the commit's parent, and `unreadable` says why: the PR is still named, but nobody can be matched to an
-    approval, so the approver is unknown and no bypass is claimed. With no PR there is no approval to match,
-    so the owners do not matter.
+def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
+             reader: GitHub | None = None) -> dict:
+    """What the tag records about the PR that merged `sha`: its number, the user account with push access, other
+    than whoever pushed the final head, whose latest review approves it, whether it carries the drill label,
+    and a note. The approver is `none` with a note that the merge bypassed the ruleset when nobody's approval
+    counts, and `unknown` when it cannot be told: an approval exists whose reviewer cannot push as of this read
+    (access is read when the sweep runs, so a reviewer who has since left or lost write access must not make a
+    properly approved merge look like a bypass in an immutable tag), the head's pusher cannot be named, or the
+    only approvals are by someone who authored or committed the head while the activity feed does not say who
+    pushed it (if another account pushed it, GitHub counted that approval, and a commit's author fields are
+    not proof of the pusher either way). Every note but an approver's names who merged, so an `unknown` never
+    hides a break-glass merge's merger. With no PR there is no approval to match.
 
     Whoever approved it, a PR whose final head has no passing `validate` run gets that said in the note, joined
     to any other note: a below-floor rollback or any other merge past a red or missing check is then in the
@@ -453,20 +487,34 @@ def pr_facts(gh: GitHub, sha: str, owners: list[str] | None, sleep: Callable[[fl
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    bypass = False
-    if owners is None:
+    found = approvals(gh, number, full)
+    merger_named = True
+    if found.counted:
+        approver, note, merger_named = found.counted[-1], None, False
+    elif found.unnameable:
         approver = "unknown"
-        note = f"code owners could not be read: {unreadable or 'CODEOWNERS is not one line of users'}"
+        note = ("could not identify who pushed the PR's final head (the activity feed does not name them, and "
+                "neither the commit's author nor its committer is a GitHub account other than web-flow), so an "
+                f"approval could not be told from the pusher's own; merged by {merger}")
+    elif found.undecided or found.unconfirmed:
+        approver = "unknown"
+        parts = []
+        if found.undecided:
+            parts.append(f"approval by {', '.join(found.undecided)} not counted: they authored or committed the PR's "
+                         "final head and GitHub does not say who pushed it, so it could not be told whether the "
+                         "approval is the pusher's own")
+        if found.unconfirmed:
+            parts.append(f"approval by {', '.join(found.unconfirmed)} not counted: GitHub reports no push access "
+                         "for them as of this read (they may never have had it, or may have lost it since the review)")
+        note = f"{'; '.join(parts)}; merged by {merger}"
     else:
-        approvers = owner_approvals(gh.paginate(gh.repo_path(f"pulls/{number}/reviews")), head, owners)
-        approver, note = (approvers[-1], None) if approvers else ("none", f"ruleset bypass by {merger}")
-        bypass = not approvers
+        approver, note = "none", f"ruleset bypass by {merger}"
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "
                        f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")
-        # The merger is already named by a bypass note; otherwise the note names who merged past the check.
-        unvalidated += "" if bypass else f"; merged by {merger}"
+        # The merger is already named by every note but an approver's; there it names who merged past the check.
+        unvalidated += f"; merged by {merger}" if not merger_named else ""
         note = f"{note}; {unvalidated}" if note else unvalidated
     return {"pr": str(number), "approver": approver, "note": note, "drill": drill}
 
@@ -533,14 +581,7 @@ def sweep(git: Git, gh: GitHub, sleep: Callable[[float], None] = time.sleep,
         if previous == ABSENT:
             # A restore after a removal moves the Macs from the last version pinned before the removal.
             previous = last_pinned(git, parent)
-        # The parent's file is fixed history: refusing here would keep every later commit untagged for good, as no
-        # pull request can change it. An unreadable file means an unknown approver, recorded on the tag of a commit
-        # a pull request merged.
-        try:
-            owners, unreadable = (code_owners(git, parent) if parent else []), ""
-        except Refused as refusal:
-            owners, unreadable = None, " ".join(str(refusal).split())
-        facts = pr_facts(gh, sha, owners, sleep, unreadable, reader)
+        facts = pr_facts(gh, sha, sleep, reader)
         if facts["pr"] == "none" and -CLOCK_SKEW <= now() - git.commit_time(sha) < UNLINKED_GRACE:
             raise Refused(f"{sha[:12]} changed the ai-tc version, but GitHub links no merged pull request into main "
                           "to it yet, so nothing from it on was tagged. A commit under an hour old is left untagged "

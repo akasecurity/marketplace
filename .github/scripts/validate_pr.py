@@ -6,8 +6,8 @@ GitHub takes the workflow and the checkout from the default branch, whatever the
 It reads the PR's files as data: `git show <sha>:<path>` of the head commit, never a
 checkout, and it never imports or executes anything the PR contains.
 
-It is a correctness check on the automated path, not a security boundary: code-owner
-review of every change is the control.
+It is a correctness check on the automated path, not a security boundary: an approving
+review from someone with write access, other than the PR's last pusher, is the control.
 
 Exit 0 = every rule holds, 1 = a rule failed, 2 = no verdict (git, network or API).
 """
@@ -147,7 +147,7 @@ def _names_ai_tc(value) -> bool:
 #   * a check run or status posted with some other token or secret;
 #   * a push-triggered workflow on another branch posting on the PR's head commit;
 #   * a fork PR's own run.
-# Code-owner review of every workflow change is the control for what a pull request's own diff
+# The approving review of a workflow change is the control for what a pull request's own diff
 # carries. A push-triggered workflow on another branch, a fork PR's own run and a check posted
 # from outside with some other token are not in that diff, so the check after the merge is what
 # catches those, and it is the detection for the rest too: tag-release's note and the main audit
@@ -444,7 +444,7 @@ def _safety_edit_notes(base, head, changed, report: Report, *, pinned) -> None:
         lowers = "LOWERS THE ROLLBACK FLOOR: " if new == "additive" and old != "additive" else ""
         report.note(
             f"{lowers}HUMAN EDIT of {rc.SAFETY_FILE} {version}: {old} -> {new}{_other_fields(before, after, old == new)}; "
-            "the approving code owner owns this classification"
+            "the approving reviewer owns this classification"
         )
 
 
@@ -564,7 +564,7 @@ def _recorded_entry_rules(head_v, recorded, pinned, report: Report, *, verify, c
     if recorded["classification"] == "additive" and expected["classification"] == "not-rollback-safe":
         report.fail(
             f"{rc.SAFETY_FILE} records {head_v} as additive, but validate computes not-rollback-safe "
-            f"({', '.join(expected['migrations']) or 'none'}); a code owner corrects the entry in a "
+            f"({', '.join(expected['migrations']) or 'none'}); a person corrects the entry in a "
             "reviewed PR before this pin can merge"
         )
     if recorded["from"] != expected["from"]:

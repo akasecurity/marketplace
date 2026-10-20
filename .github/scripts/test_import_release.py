@@ -441,7 +441,7 @@ class TestPlanForward(PlanCase):
         self.candidates = ["0.9.15"]
         self.pulls.append(pull(6, "bot/pin-ai-tc-0.9.15", author="some-writer"))
         self.assertEqual(self.plan()["version"], "0.9.15")
-        # Nor does a closed one stand as a code owner's rejection: it was not the bot's PR.
+        # Nor does a closed one stand as a rejection: it was not the bot's PR.
         self.pulls[:] = [pull(7, "bot/pin-ai-tc-0.9.15", state="closed", author="some-writer")]
         self.assertEqual(self.plan()["version"], "0.9.15")
 
