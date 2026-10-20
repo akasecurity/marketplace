@@ -1,6 +1,7 @@
 """Tests for import_release.py (import-plugin-release.yml's logic)."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -8,10 +9,12 @@ import os
 import tempfile
 import types
 import unittest
+import urllib.error
 from unittest import mock
 
 import _testsupport as ts
 import import_release as ir
+import issue_router
 import release_checks
 from fakes import (ATTESTED, BOT, INTEGRITY, REPO, SLUG, FakeGit, FakeGitHub, contents, fleet_tag, manifest,
                    not_found, pull, pulls_route, safety, safety_entry)
@@ -1039,11 +1042,96 @@ class TestReleaseApproversAreAskedToReview(OpenPrCase):
         asked = self.gh.called("GET", R(f"contents/{ir.APPROVERS_FILE}"))
         self.assertEqual([call[3] for call in asked], [{"ref": MAIN}])
 
-    def test_a_name_listed_twice_or_the_bot_itself_is_not_asked(self):
-        self.approvers_file = json.dumps({"approvers": ["venuverse", "venuverse", BOT, "Vaishnav-OM"]})
+    def test_the_path_is_the_one_the_issue_router_reads(self):
+        # One definition, so a rename cannot leave one reader quiet and the other crashing.
+        self.assertIs(ir.APPROVERS_FILE, issue_router.APPROVERS_FILE)
+
+    def test_a_name_listed_twice_in_any_case_is_asked_once(self):
+        self.approvers_file = json.dumps({"approvers": ["venuverse", "Venuverse", "VENUVERSE", "Vaishnav-OM"]})
         self.route_branch("bot/pin-ai-tc-0.9.15")
         self.open(forward_plan())
         self.assertEqual(self.requested(), [["venuverse"], ["Vaishnav-OM"]])
+
+    def test_the_bot_is_never_asked_whatever_its_spelling_and_is_not_called_a_bad_login(self):
+        # release_checks.BOT_LOGIN carries a [bot] suffix that is no part of a login, and GitHub logins are
+        # case-insensitive: the bot's name as the App's slug, in any case, is the bot.
+        self.approvers_file = json.dumps({"approvers": ["aka-marketplace-bot", "AKA-Marketplace-Bot", "venuverse"]})
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.open(forward_plan())
+        self.assertEqual(self.requested(), [["venuverse"]])
+        self.assertNotIn("not a GitHub login", out.getvalue())
+
+    def test_the_author_of_the_pr_is_never_asked(self):
+        # GitHub refuses a review request to the PR's own author. The author comes from the API's answer, in any case.
+        self.gh.routes[("POST", R("pulls"))] = {"number": 12, "node_id": "PR_12", "user": {"login": "Venuverse"}}
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.open(forward_plan())
+        self.assertEqual(self.requested(), [["Vaishnav-OM"]])
+
+    def test_only_a_valid_github_login_is_asked(self):
+        valid = ["a", "a-b", "A1-b2", "a" * 39, "x-y-z"]
+        invalid = ["a-", "a--b", "-a", "a" * 40, "a_b", "", " a", "a b"]
+        self.approvers_file = json.dumps({"approvers": invalid + valid})
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.open(forward_plan())
+        self.assertEqual(self.requested(), [[login] for login in valid])
+        self.assertEqual(out.getvalue().count("not a GitHub login"), len(invalid))
+
+    def test_a_read_that_fails_in_any_way_warns_and_the_pr_still_gets_its_auto_merge(self):
+        # The request is a nudge: nothing it reads may end the run with the PR open and no auto-merge, which the next
+        # scheduled run would not repair.
+        unreadable = {
+            "a server error": GitHubError(500, "GET", "contents", "boom"),
+            "a rate limit": GitHubError(403, "GET", "contents", "secondary rate limit"),
+            "a directory": [{"name": "release-approvers.json", "type": "file"}],
+            "bytes that are not UTF-8": {"content": base64.b64encode(b"\xff\xfe{").decode(), "encoding": "base64"},
+            "JSON nested too deeply": contents("[" * 200000 + "]" * 200000),
+            "a transport failure": urllib.error.URLError("connection reset"),
+        }
+        for label, answer in unreadable.items():
+            with self.subTest(label):
+                self.gh.calls.clear()
+                self.pulls.clear()
+                self.route_branch("bot/pin-ai-tc-0.9.15")
+
+                def route(body, params, answer=answer):
+                    if isinstance(answer, BaseException):
+                        raise answer
+                    return answer
+
+                self.gh.routes[("GET", R(f"contents/{ir.APPROVERS_FILE}"))] = route
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                    self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+                self.assertEqual(self.requested(), [])
+                self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
+                self.assertIn("::warning::", out.getvalue())
+
+    def test_a_read_that_fails_does_not_stop_a_rollback_holding_the_forward_prs(self):
+        self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")
+        self.pulls.append(pull(8, "bot/pin-ai-tc-0.9.15"))
+        self.gh.routes[("POST", R("issues/8/comments"))] = {"id": 8}
+        self.gh.routes[("POST", R("issues/12/labels"))] = [{"name": "rollback"}]
+        self.gh.routes[("GRAPHQL", "disablePullRequestAutoMerge")] = {"disablePullRequestAutoMerge": {"pullRequest": {"number": 8}}}
+        self.gh.routes[("GET", R(f"contents/{ir.APPROVERS_FILE}"))] = GitHubError(403, "GET", "contents", "rate limit")
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(self.open(rollback_plan()),
+                             "opened rollback #12 with auto-merge (squash); auto-merge off on [8]; closed []")
+
+    def test_a_request_that_fails_on_the_wire_warns_and_the_others_still_go_ahead(self):
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+
+        def post(body, params):
+            if body["reviewers"] == ["Vaishnav-OM"]:
+                raise urllib.error.URLError("timed out")
+            return {"number": 12}
+
+        self.gh.routes[("POST", R("pulls/12/requested_reviewers"))] = post
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.open(forward_plan()), "opened #12 with auto-merge (squash); superseded []")
+        self.assertEqual(self.requested(), [["Vaishnav-OM"], ["venuverse"]])
+        self.assertIn("::warning::could not request a review from Vaishnav-OM on #12", out.getvalue())
 
     def test_an_approver_github_refuses_warns_and_the_others_and_auto_merge_still_go_ahead(self):
         self.route_branch("bot/pin-ai-tc-0.9.15")
