@@ -1088,7 +1088,7 @@ class TestReleaseApproversAreAskedToReview(OpenPrCase):
     def test_the_bot_is_never_asked_whatever_its_spelling_and_is_not_called_a_bad_login(self):
         # release_checks.BOT_LOGIN carries a [bot] suffix that is no part of a login, and GitHub logins are
         # case-insensitive: the bot's name as the App's slug, in any case, is the bot.
-        self.approvers_file = json.dumps({"approvers": ["aka-marketplace-bot", "AKA-Marketplace-Bot", "venuverse"]})
+        self.approvers_file = json.dumps({"approvers": [SLUG, SLUG.upper(), "venuverse"]})
         self.route_branch("bot/pin-ai-tc-0.9.15")
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.open(forward_plan())
@@ -1140,6 +1140,17 @@ class TestReleaseApproversAreAskedToReview(OpenPrCase):
                 self.assertEqual(self.requested(), [])
                 self.assertEqual(len(self.gh.called("GRAPHQL", "enablePullRequestAutoMerge")), 1)
                 self.assertIn("::warning::", out.getvalue())
+
+    def test_the_warning_for_a_read_that_fails_says_why_in_one_line(self):
+        # A rate limit, a missing path and an outage all raise GitHubError: the status and body are what tell them apart.
+        self.route_branch("bot/pin-ai-tc-0.9.15")
+        self.gh.routes[("GET", R(f"contents/{ir.APPROVERS_FILE}"))] = GitHubError(
+            403, "GET", "contents", "secondary rate limit\nretry later")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.open(forward_plan())
+        warning = next(line for line in out.getvalue().splitlines() if "could not be read" in line)
+        self.assertIn("GitHubError: GET contents -> HTTP 403: secondary rate limit retry later", warning)
+        self.assertIn("so no review is requested", warning)
 
     def test_a_read_that_fails_does_not_stop_a_rollback_holding_the_forward_prs(self):
         self.route_branch("bot/rollback-ai-tc-0.9.14-to-0.9.13")

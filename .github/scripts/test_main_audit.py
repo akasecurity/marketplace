@@ -421,6 +421,22 @@ class TestMainAudit(unittest.TestCase):
                                   "head and GitHub does not say who pushed it", detail)
                     self.assertIn("false alarm", detail)
 
+    def test_a_refused_feed_is_named_in_the_issue(self):
+        refused = GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            results = self.audit(github(author="venuverse", committer="web-flow", feed=refused))
+            unnameable = self.audit(github(author=None, committer=None, feed=refused))
+            clean = self.audit(github(feed=refused))
+        self.assertIn("The activity feed was not read (HTTP 403), so the head commit's author and committer stood in "
+                      "for the pusher.", results[0].detail)
+        self.assertIn("The activity feed was not read (HTTP 403).", unnameable[0].detail)
+        self.assertEqual(clean, [])
+        self.assertEqual(out.getvalue().count("::warning::the activity feed"), 3)
+
+    def test_a_feed_that_was_read_adds_nothing_to_the_issue(self):
+        results = self.audit(github(author="venuverse", committer="web-flow", feed=[pushed("venuverse", "h30")]))
+        self.assertNotIn("activity feed was not read", results[0].detail)
+
     def test_the_recorded_pusher_is_the_one_whose_approval_is_refused(self):
         results = self.audit(github(author="venuverse", committer="web-flow", feed=[pushed("venuverse", "h30")]))
         self.assertEqual(len(results), 1)

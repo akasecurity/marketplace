@@ -124,7 +124,8 @@ branch at its final head; the approver is `unknown` too when that cannot be told
 are by the head commit's author or committer, or the commit names no account either. `unknown`
 is not a clearance: this repository is public, so any account can submit an approving review, and a
 break-glass merge could be hidden behind one. The note says as much and names the merger, and
-`main-audit` still files its issue. Whoever
+`main-audit` still files its issue. A tag cut while the activity feed was refused says so in its
+`approver-note`, whatever its approver. Whoever
 approved it, a merge whose final head has no passing `validate` run (none, or its latest run failed
 or had not finished) also gets an `approver-note` saying so. Only a run of `validate.yml` that the
 `pull_request_target` event started, at or before the time the PR merged, counts: a job of that name
@@ -397,9 +398,13 @@ true only once it is.
   committer (`web-flow` aside) are candidates only: an approval by one of them is reported as not
   counted and says GitHub counts it if someone else pushed the head, and a head that names neither is
   reported, since an approval could then be the pusher's own. That fallback can name the wrong person
-  both ways (a commit carries whatever author fields its pusher wrote), so it never writes a bypass
-  into a tag, and it cannot see a writer who pushed under another identity. A feed refused to the
-  workflow's token falls back the same way and does not fail the job. A push
+  both ways (a commit carries whatever author fields its pusher wrote), so it never turns an approval
+  into a bypass: an approval by a candidate is reported as not counted, never dropped. It cannot see a
+  writer who pushed under another identity. The feed is asked newest first, so the first record that
+  left the branch at the head is the latest push to do so. A feed refused to the workflow's token falls
+  back the same way and does not fail the job, but it is not silent: the run prints a `::warning::`,
+  the tag's `approver-note` says the activity feed was not read, and the audit's issue says so too.
+  A push
   that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for
