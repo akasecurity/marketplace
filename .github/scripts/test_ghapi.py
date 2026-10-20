@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import ghapi
+import release_checks
 from ghapi import GitHub, GitHubError
 
 
@@ -83,12 +84,13 @@ class TestGitHub(unittest.TestCase):
 
 class _Origin(http.server.BaseHTTPRequestHandler):
     """A loopback server: records each request's headers on its server, and answers 302 to the
-    server's redirect_to, or 200 with a small JSON body when it has none."""
+    server's redirect_to, or 200 with a small JSON body when it has none. With `truncate` it answers
+    the server's `status` and promises a long body, sends a few bytes of it and hangs up."""
 
     def do_GET(self):
         self.server.requests.append(dict(self.headers))
         if self.server.truncate:
-            self.send_response(200)
+            self.send_response(self.server.status)
             self.send_header("Content-Length", "100")
             self.end_headers()
             self.wfile.write(b'{"ok"')
@@ -109,11 +111,12 @@ class _Origin(http.server.BaseHTTPRequestHandler):
 class TestUrllibTransport(unittest.TestCase):
     """The real transport, against loopback servers, never the network."""
 
-    def serve(self, redirect_to=None, truncate=False):
+    def serve(self, redirect_to=None, truncate=False, status=200):
         server = http.server.HTTPServer(("127.0.0.1", 0), _Origin)
         server.requests = []
         server.redirect_to = redirect_to
         server.truncate = truncate
+        server.status = status
         thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
         thread.start()
         self.addCleanup(thread.join)
@@ -143,14 +146,32 @@ class TestUrllibTransport(unittest.TestCase):
             with self.assertRaises(OSError):
                 GitHub("", "o/r").get("repos/o/r/pulls")
 
+    def test_an_error_status_whose_body_is_cut_short_is_a_connection_error_too(self):
+        # A secondary rate limit has this shape, and reading the body of an error status is a second place the
+        # same failure can come from.
+        for status in (403, 429, 502):
+            with self.subTest(status=status):
+                origin = self.serve(truncate=True, status=status)
+                with self.assertRaises(OSError) as caught:
+                    ghapi.urllib_transport("GET", f"http://127.0.0.1:{origin.server_port}/x", {}, None)
+                self.assertIsInstance(caught.exception.__cause__, http.client.IncompleteRead)
+
     def test_every_http_client_failure_is_a_connection_error(self):
         for error in (http.client.IncompleteRead(b"{"), http.client.BadStatusLine("x"), http.client.LineTooLong("status line"),
                       http.client.RemoteDisconnected("closed")):
             with self.subTest(error=type(error).__name__):
-                with mock.patch.object(ghapi._OPENER, "open", side_effect=error):
+                with mock.patch.object(release_checks._OPENER, "open", side_effect=error):
                     with self.assertRaises(OSError) as caught:
                         ghapi.urllib_transport("GET", "http://127.0.0.1:1/x", {}, None)
                 self.assertIs(caught.exception.__cause__, error)
+
+    def test_one_line_error_names_the_type_and_cuts_the_message(self):
+        error = GitHubError(502, "GET", "p", "bad\n   gateway " + "x" * 600)
+        line = ghapi.one_line_error(error)
+        self.assertTrue(line.startswith("GitHubError: GET p -> HTTP 502: bad gateway xxx"), line)
+        self.assertEqual(len(line), len("GitHubError: ") + 300)
+        self.assertEqual(ghapi.one_line_error(TimeoutError()), "TimeoutError: ")
+        self.assertEqual(ghapi.one_line_error(ValueError("a\nb"), 2), "ValueError: a ")
 
     def test_a_redirect_comes_back_as_its_status_and_the_token_goes_no_further(self):
         # urllib's default handler copies every header onto the follow-up request, the credential

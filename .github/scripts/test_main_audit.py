@@ -20,6 +20,13 @@ def R(suffix):
     return f"repos/{REPO}/{suffix}"
 
 
+def raising(error):
+    """A route that raises `error` (FakeGitHub raises a GitHubError route itself and returns any other value)."""
+    def route(body, params):
+        raise error
+    return route
+
+
 def repo() -> FakeGit:
     return FakeGit(chain=["p", "s1", "s2"])
 
@@ -411,7 +418,7 @@ class TestMainAudit(unittest.TestCase):
         for kwargs in (dict(author=None, committer="venuverse"), dict(author="venuverse", committer="web-flow"),
                        dict(author="venuverse", committer="another-writer")):
             for feed in (None, [], GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")):
-                with self.subTest(feed=feed, **kwargs):
+                with self.subTest(feed=feed, **kwargs), mock.patch("sys.stdout", new_callable=io.StringIO):
                     results = self.audit(github(feed=feed, **kwargs))
                     self.assertEqual(len(results), 1)
                     detail = results[0].detail
@@ -422,16 +429,38 @@ class TestMainAudit(unittest.TestCase):
                     self.assertIn("false alarm", detail)
 
     def test_a_refused_feed_is_named_in_the_issue(self):
-        refused = GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")
+        refused = GitHubError(403, "GET", R("activity"), '{"message": "Resource not accessible by integration"}')
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             results = self.audit(github(author="venuverse", committer="web-flow", feed=refused))
             unnameable = self.audit(github(author=None, committer=None, feed=refused))
-            clean = self.audit(github(feed=refused))
-        self.assertIn("The activity feed was not read (HTTP 403), so the head commit's author and committer stood in "
-                      "for the pusher.", results[0].detail)
-        self.assertIn("The activity feed was not read (HTTP 403).", unnameable[0].detail)
-        self.assertEqual(clean, [])
-        self.assertEqual(out.getvalue().count("::warning::the activity feed"), 3)
+        self.assertIn("The activity feed was not read (HTTP 403: Resource not accessible by integration), so the head "
+                      "commit's author and committer stood in for the pusher.", results[0].detail)
+        # Nothing stood in when the commit names no account either, and the message says why the feed gave nobody.
+        self.assertIn("(the activity feed was not read (HTTP 403: Resource not accessible by integration), and "
+                      "neither the commit's author nor its committer is a GitHub account other than web-flow)",
+                      unnameable[0].detail)
+        self.assertNotIn("does not name them", unnameable[0].detail)
+        self.assertNotIn("stood in", unnameable[0].detail)
+        self.assertEqual(out.getvalue().count("::warning::the activity feed"), 2)
+
+    def test_a_refused_feed_files_nothing_when_an_approval_still_counts(self):
+        # The audit files an issue for a merge it cannot clear, and an approval that counts clears it. So a feed
+        # that is refused while approvals are still found leaves only the run's annotation: this is the limit
+        # AGENTS.md states, and the tag-release note is the permanent trace for the merges that get a tag.
+        refused = GitHubError(403, "GET", R("activity"), "Resource not accessible by integration")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(self.audit(github(feed=refused)), [])
+        self.assertEqual(out.getvalue().count("::warning::the activity feed"), 1)
+
+    def test_a_failure_that_is_not_a_refusal_falls_back_in_the_audit_and_says_why(self):
+        # An issue can be closed and a tag cannot, so the audit does not stop on a bad gateway as a sweep does.
+        for error in (GitHubError(502, "GET", R("activity"), "bad gateway"), ConnectionError("cut short")):
+            with self.subTest(error=error), mock.patch("sys.stdout", new_callable=io.StringIO):
+                feed = error if isinstance(error, GitHubError) else raising(error)
+                results = self.audit(github(author="venuverse", committer="web-flow", feed=feed))
+                self.assertEqual(len(results), 1)
+                reason = "HTTP 502" if isinstance(error, GitHubError) else "ConnectionError"
+                self.assertIn(f"The activity feed was not read ({reason})", results[0].detail)
 
     def test_a_feed_that_was_read_adds_nothing_to_the_issue(self):
         results = self.audit(github(author="venuverse", committer="web-flow", feed=[pushed("venuverse", "h30")]))

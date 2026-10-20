@@ -29,9 +29,10 @@ and who did not push it. With none, the tag records `approver: none` and a note 
 bypassed the ruleset, or `approver: unknown` when an approval exists that this read cannot confirm
 (the reviewer's access is read when the sweep runs, not when the review was submitted), when the
 head's pusher cannot be named, or when the only approvals are by the head commit's author or committer
-and the activity feed does not say who pushed it. Whatever the approver, a feed that was asked and
-refused is said in the note. A commit no pull request merged records `approver: none`, as there is no
-approval to match.
+and the activity feed does not say who pushed it. Whatever the approver, a feed that GitHub declined to
+serve is said in the note; any other failure to read it (a 5xx, a rate limit, a dropped connection) ends the
+sweep instead, so a re-run can read it. A commit no pull request merged records `approver: none`, as there
+is no approval to match.
 Likewise a commit whose manifest cannot be read (not JSON, nested too deeply,
 a repeated key, an ambiguous ai-tc entry) is never a pin change and never stops
 the sweep: every run reports it as a warning and goes on, comparing each later
@@ -43,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
 import time
@@ -50,7 +52,7 @@ from datetime import datetime
 from typing import Callable
 
 import release_checks
-from ghapi import GitHub, GitHubError
+from ghapi import GitHub, GitHubError, one_line_error
 from gitrepo import Git, GitError
 from import_release import Refused, entry_of, list_pulls
 from release_checks import GITHUB_ACTIONS_APP_ID, MANIFEST, SAFETY_FILE, SEMVER, InfraError, parse_json, vkey
@@ -225,13 +227,17 @@ def store_migration(git: Git, sha: str, version: str, previous: str) -> tuple[st
     return "unknown", f"store-migration unknown: the classification of {version} in {SAFETY_FILE} is not a string"
 
 
-def noted(facts: dict, *reasons: str) -> dict:
-    """`facts` with each non-empty reason added to the note, joined the way pr_facts joins its notes."""
-    note = facts["note"]
+def join_note(note: str | None, *reasons: str) -> str | None:
+    """`note` with each non-empty reason added after a semicolon: the one place a tag's notes are joined."""
     for reason in reasons:
         if reason:
             note = f"{note}; {reason}" if note else reason
-    return {**facts, "note": note}
+    return note
+
+
+def noted(facts: dict, *reasons: str) -> dict:
+    """`facts` with each non-empty reason added to the note, joined the way pr_facts joins its notes."""
+    return {**facts, "note": join_note(facts["note"], *reasons)}
 
 
 def merged_into_main(pull: dict) -> bool:
@@ -300,7 +306,22 @@ def pull_reviews(gh: GitHub, number: int) -> list[dict]:
 PUSH_ACTIVITIES = ("push", "force_push", "branch_creation")
 
 
-def head_pusher(gh: GitHub, pull: dict) -> tuple[str | None, str | None]:
+def feed_refusal(error: GitHubError) -> str | None:
+    """"HTTP 403: <GitHub's message>" when `error` is GitHub declining to serve the feed to this token, or None
+    when it is not that: a rate limit (a 429, or a 403 whose answer says so) and any 5xx are failures a
+    re-run may not see again, and a status outside the few a refusal uses is not understood as one. The
+    message is what tells a missing permission from the rest, so it is kept (cut short) for the tag."""
+    if error.status not in (401, 403, 404, 410, 422, 451) or "rate limit" in error.body.lower():
+        return None
+    try:
+        message = json.loads(error.body).get("message")
+    except (ValueError, RecursionError, AttributeError):
+        message = None
+    detail = " ".join(message.split())[:100] if isinstance(message, str) else ""
+    return f"HTTP {error.status}: {detail}" if detail else f"HTTP {error.status}"
+
+
+def head_pusher(gh: GitHub, pull: dict, *, strict: bool = False) -> tuple[str | None, str | None]:
     """(the login that pushed the PR's final head to its branch, why the feed could not be read). The login is as
     the repository's activity feed records it, or None when the feed cannot say: a head in a fork (the push is in
     the fork's feed), a feed GitHub refuses to serve, one whose newest hundred records hold no push that left the
@@ -309,19 +330,27 @@ def head_pusher(gh: GitHub, pull: dict) -> tuple[str | None, str | None]:
     which no approval is made by.
 
     The feed is asked newest first, so the first record that left the branch at this head is the most recent
-    push to do so: a branch reset to a commit it held before is attributed to whoever reset it. The second item is
-    set only when the feed was asked and GitHub refused it or the request failed (a short reason, also printed as
-    a workflow annotation), which is not the same as a feed with no such push: a token the endpoint is not
-    served to would otherwise send every PR to the fallback with nothing to show for it."""
+    push to do so: a branch reset to a commit it held before is attributed to whoever reset it. The second item
+    is set only when the feed was asked and the request failed: GitHub declined to serve it (feed_refusal,
+    which is also printed as a workflow annotation), which is not the same as a feed with no such push, since a
+    token the endpoint is not served to would otherwise send every PR to the fallback with nothing to show. Any
+    other failure (a 5xx, a rate limit, a dropped connection, an answer that is not JSON) is InfraError when
+    `strict`, as it is for a tag: the fallback would be written into a permanent record that a re-run seconds
+    later could have kept clean. Otherwise, for the audit, it is the same fallback with the failure as the
+    reason."""
     head = pull.get("head") or {}
     ref, sha, repo = head.get("ref"), head.get("sha"), (head.get("repo") or {}).get("full_name")
     if not ref or not sha or not isinstance(repo, str) or repo.casefold() != gh.repo.casefold():
         return None, None
     try:
         feed = gh.get(gh.repo_path("activity"), {"ref": f"refs/heads/{ref}", "direction": "desc", "per_page": 100})
-    except (GitHubError, OSError) as error:
-        reason = f"HTTP {error.status}" if isinstance(error, GitHubError) else type(error).__name__
-        print(f"::warning::the activity feed for refs/heads/{ref} was not read ({' '.join(str(error).split())[:300]}); "
+    except (GitHubError, OSError, ValueError, RecursionError) as error:
+        refusal = feed_refusal(error) if isinstance(error, GitHubError) else None
+        if refusal is None and strict:
+            raise InfraError("github", f"the activity feed for refs/heads/{ref} could not be read "
+                                       f"({one_line_error(error)}); a re-run reads it again") from error
+        reason = refusal or (f"HTTP {error.status}" if isinstance(error, GitHubError) else type(error).__name__)
+        print(f"::warning::the activity feed for refs/heads/{ref} was not read ({one_line_error(error)}); "
               "the head commit's author and committer stand in for its pusher")
         return None, reason
     for activity in feed if isinstance(feed, list) else ():
@@ -359,11 +388,12 @@ class Approvals:
     feed_refused: str | None = None
 
 
-def approvals(gh: GitHub, number: int, pull: dict) -> Approvals:
-    """The approvals of `pull`'s final head (`pulls/{number}`), judged against the account that pushed it."""
+def approvals(gh: GitHub, number: int, pull: dict, *, strict: bool = False) -> Approvals:
+    """The approvals of `pull`'s final head (`pulls/{number}`), judged against the account that pushed it
+    (`strict` is head_pusher's)."""
     head = pull["head"]["sha"]
     reviews = pull_reviews(gh, number)
-    pusher, refused = head_pusher(gh, pull)
+    pusher, refused = head_pusher(gh, pull, strict=strict)
     candidates = set() if pusher else last_pushers(gh, head)
     if not pusher and not candidates:
         return Approvals([], [], [], None, True, refused)
@@ -500,15 +530,16 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
     head = full["head"]["sha"]
     drill = any(label.get("name") == "drill" for label in full.get("labels", []))
     merger = (full.get("merged_by") or {}).get("login") or "unknown"
-    found = approvals(gh, number, full)
+    found = approvals(gh, number, full, strict=True)
     merger_named = True
     if found.counted:
         approver, note, merger_named = found.counted[-1], None, False
     elif found.unnameable:
         approver = "unknown"
-        note = ("could not identify who pushed the PR's final head (the activity feed does not name them, and "
-                "neither the commit's author nor its committer is a GitHub account other than web-flow), so an "
-                f"approval could not be told from the pusher's own; merged by {merger}")
+        feed = f"was not read ({found.feed_refused})" if found.feed_refused else "does not name them"
+        note = (f"could not identify who pushed the PR's final head (the activity feed {feed}, and neither the "
+                "commit's author nor its committer is a GitHub account other than web-flow), so an approval "
+                f"could not be told from the pusher's own; merged by {merger}")
     elif found.undecided or found.unconfirmed:
         approver = "unknown"
         parts = []
@@ -519,20 +550,19 @@ def pr_facts(gh: GitHub, sha: str, sleep: Callable[[float], None] = time.sleep,
         if found.unconfirmed:
             parts.append(f"approval by {', '.join(found.unconfirmed)} not counted: GitHub reports no push access "
                          "for them as of this read (they may never have had it, or may have lost it since the review)")
-        note = f"{'; '.join(parts)}; merged by {merger}"
+        note = join_note(None, *parts, f"merged by {merger}")
     else:
         approver, note = "none", f"ruleset bypass by {merger}"
-    if found.feed_refused:
-        unread = (f"the activity feed was not read ({found.feed_refused}), so the head commit's author and "
-                  "committer stood in for the PR's pusher")
-        note = f"{note}; {unread}" if note else unread
+    if found.feed_refused and not found.unnameable:
+        note = join_note(note, f"the activity feed was not read ({found.feed_refused}), so the head commit's "
+                               "author and committer stood in for the PR's pusher")
     conclusion = validate_conclusion(gh if reader is None else reader, head, pull["merged_at"])
     if conclusion != "success":
         unvalidated = ("validate had not passed on the PR's final head "
                        f"({'no run' if conclusion is None else f'latest run: {conclusion}'})")
         # The merger is already named by every note but an approver's; there it names who merged past the check.
         unvalidated += f"; merged by {merger}" if not merger_named else ""
-        note = f"{note}; {unvalidated}" if note else unvalidated
+        note = join_note(note, unvalidated)
     return {"pr": str(number), "approver": approver, "note": note, "drill": drill}
 
 
