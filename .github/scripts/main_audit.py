@@ -12,8 +12,12 @@ account the repository's activity feed records as leaving the PR's branch at its
 feed cannot say (a head in a fork, a feed GitHub refuses to serve), the head commit's author and committer
 (web-flow, GitHub's committer for web edits, is skipped) are only candidates: an approval by one of them is
 reported as undecided, since if someone else pushed the head GitHub counted it, and a head for which they
-name nobody is red, since an approval could then be the pusher's own. The main ruleset's "most recent push
-approved by someone else" is what enforces the rule, and this records when it was bypassed.
+name nobody is red, since an approval could then be the pusher's own. A feed that was asked and failed
+(GitHub declined it, or the request did not complete) is printed as a workflow annotation and named in the
+issue, whatever the failure: an issue can be closed, so the audit does not stop on a failure a re-run might
+not see again, as a tag-release sweep does. It files nothing when an approval still counts, so for a merge
+that gets no tag the annotation in the run is the only trace. The main ruleset's "most recent push approved
+by someone else" is what enforces the rule, and this records when it was bypassed.
 Detective only, and it cannot vouch for itself: main-audit runs from the pushed
 commit, so a push that bypasses the `main` ruleset can also change, disable or
 remove main-audit. That push is then audited by the changed copy, or not at all,
@@ -31,7 +35,7 @@ import sys
 import time
 from typing import Callable
 
-from ghapi import GitHub
+from ghapi import GitHub, one_line_error
 from gitrepo import Git
 from import_release import write_output
 from issue_router import Result, results_to_json
@@ -66,10 +70,10 @@ def approval_problem(gh: GitHub, sha: str, number: int, pull: dict) -> str | Non
     if found.unnameable:
         # With no login for the pusher, an empty exclusion would let every member's approval through, the pusher's
         # own included. Not knowing who pushed is not a pass.
-        unread = f" The activity feed was not read ({found.feed_refused})." if found.feed_refused else ""
+        feed = f"was not read ({found.feed_refused})" if found.feed_refused else "does not name them"
         return (f"`{sha}` merged PR #{number}, but the audit could not identify who pushed its final head `{head}` "
-                "(the activity feed does not name them, and neither the commit's author nor its committer is a "
-                f"GitHub account other than web-flow), so an approval could not be told from the pusher's own.{unread}")
+                f"(the activity feed {feed}, and neither the commit's author nor its committer is a GitHub account "
+                "other than web-flow), so an approval could not be told from the pusher's own.")
     lead = (f"`{sha}` merged PR #{number} without an approving review from someone with write access on its "
             f"final head `{head}`")
     problem = f"{lead} by someone other than its last pusher ({found.pusher})." if found.pusher else f"{lead}."
@@ -203,7 +207,7 @@ def audit(git: Git, gh: GitHub, before: str, after: str, sleep: Callable[[float]
                     detail=problem + "\n\nIf this was a break-glass merge, record the incident and who merged it "
                                      "here; a person closes this issue once it is explained."))
     except Exception as error:  # noqa: BLE001 - whatever stopped the audit must not end as an unrecorded push
-        reason = " ".join(f"{type(error).__name__}: {error}".split())[:300]
+        reason = one_line_error(error)
         results.append(Result(
             rule=f"{UNAUDITED_RULE}{after[:12]}", label=LABEL, red=True, auto_close=False,
             title=f"main-audit: the push to {after[:12]} could not be audited",

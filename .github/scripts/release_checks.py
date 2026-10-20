@@ -472,22 +472,31 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def http_fetch(url: str, headers: dict) -> tuple:
-    """GET url. An HTTP error status is returned, not raised, and a redirect is not followed
-    (its status is returned like any other); no answer at all is InfraError, and so is an
-    answer that stops partway: http.client raises its own errors from the status line and
-    the body, which urllib does not wrap, and reading an error status's body can fail the
-    same way. The request is cut to what remains of the run's budget (start_budget), and is
-    not started at all when nothing remains: InfraError("deadline")."""
-    timeout = _time_for(HTTP_TIMEOUT, f"GET {url}")
-    request = urllib.request.Request(url, headers=_headers_for(url, headers))
+def exchange(request: urllib.request.Request, timeout: float) -> tuple:
+    """(status, body) of one request, the one transport every script here uses. An HTTP error status is
+    returned, not raised, and a redirect is not followed (its status is returned like any other). An answer
+    that stops partway raises ConnectionError: http.client raises its own errors from the status line and
+    the body, which urllib does not wrap and which are no OSError, and reading an error status's body can
+    fail the same way. Everything else that goes wrong on the wire is already an OSError."""
     try:
         try:
             with _OPENER.open(request, timeout=timeout) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
-    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+    except http.client.HTTPException as exc:
+        raise ConnectionError(f"{type(exc).__name__}: {exc}") from exc
+
+
+def http_fetch(url: str, headers: dict) -> tuple:
+    """GET url through `exchange`. No answer at all is InfraError, and so is an answer that stops partway.
+    The request is cut to what remains of the run's budget (start_budget), and is not started at all when
+    nothing remains: InfraError("deadline")."""
+    timeout = _time_for(HTTP_TIMEOUT, f"GET {url}")
+    request = urllib.request.Request(url, headers=_headers_for(url, headers))
+    try:
+        return exchange(request, timeout)
+    except (urllib.error.URLError, OSError) as exc:
         if _budget_spent():
             raise _out_of_time(f"during GET {url}") from exc
         raise InfraError("network", f"GET {url} failed: {exc}") from exc

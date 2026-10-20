@@ -401,10 +401,15 @@ true only once it is.
   both ways (a commit carries whatever author fields its pusher wrote), so it never turns an approval
   into a bypass: an approval by a candidate is reported as not counted, never dropped. It cannot see a
   writer who pushed under another identity. The feed is asked newest first, so the first record that
-  left the branch at the head is the latest push to do so. A feed refused to the workflow's token falls
-  back the same way and does not fail the job, but it is not silent: the run prints a `::warning::`,
-  the tag's `approver-note` says the activity feed was not read, and the audit's issue says so too.
-  A push
+  left the branch at the head is the latest push to do so. A feed that GitHub declines to serve to the
+  workflow's token (a 401, 403, 404, 410, 422 or 451, not a rate limit) falls back the same way and does
+  not fail the job, but it is not silent: the run prints a `::warning::`, the tag's `approver-note`
+  says the activity feed was not read and gives GitHub's message, and the audit's issue says so too when
+  it files one. The audit files nothing when an approval still counts, so for a merge that gets no tag
+  the annotation in the run is the only trace. `tag-release` does not write the fallback into a tag
+  for any other failure (a 5xx, a rate limit, a dropped connection, an answer that is not JSON): the
+  sweep ends red with one annotation and the next run reads the feed again, because a tag is permanent.
+  The audit, whose issues can be closed, falls back on those too. A push
   that moves `main` without extending it (the old tip is
   not an ancestor of the new one) gets its own issue and audits the first-parent commits after the
   two tips' merge base. It audits only the new tip when there is no merge base to start from (for

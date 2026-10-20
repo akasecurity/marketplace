@@ -5,12 +5,12 @@ replace, so no test touches the network.
 """
 from __future__ import annotations
 
-import http.client
 import json
-import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterator
+
+import release_checks
 
 API = "https://api.github.com"
 Transport = Callable[[str, str, "dict[str, str]", "bytes | None"], "tuple[int, bytes]"]
@@ -27,31 +27,18 @@ class GitHubError(Exception):
         self.body = body
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Follows no redirect, so a 30x comes back as its own status. urllib's default handler
-    copies the request's headers onto the follow-up request, Authorization included, even
-    when it goes to another host."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_OPENER = urllib.request.build_opener(_NoRedirect)
-
-
 def urllib_transport(method: str, url: str, headers: dict[str, str], data: bytes | None) -> tuple[int, bytes]:
-    """One request; a status other than 2xx comes back as itself, and so does a redirect, which is
-    never followed: the bot's token must not reach a host the API named in a Location header. A
-    response cut short or garbled on the wire (http.client raises HTTPException, which is no OSError)
-    is raised as a ConnectionError, so every caller that guards a failed transport sees this one too."""
-    request = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with _OPENER.open(request, timeout=60) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read()
-    except http.client.HTTPException as error:
-        raise ConnectionError(f"{type(error).__name__}: {error}") from error
+    """One request through release_checks.exchange: a status other than 2xx comes back as itself, and so does a
+    redirect, which is never followed (the bot's token must not reach a host the API named in a Location
+    header). An answer cut short on the wire is a ConnectionError, so every caller that guards a failed
+    transport sees it."""
+    return release_checks.exchange(urllib.request.Request(url, data=data, method=method, headers=headers), 60)
+
+
+def one_line_error(error: BaseException, limit: int = 300) -> str:
+    """`error` as the one line of a workflow annotation: its type, then its message with every run of
+    whitespace made a space, cut to `limit` characters (a GitHubError carries up to 500 of a response body)."""
+    return f"{type(error).__name__}: {' '.join(str(error).split())[:limit]}"
 
 
 class GitHub:
