@@ -143,10 +143,14 @@ def _names_ai_tc(value) -> bool:
 #     exception is as narrow as the importer's own job (AGENTS.md, "The workflows", says an
 #     administrator reads the secret scope back);
 #   * a step that uses the App-token action at all, anywhere but in a job of the importer's workflow
-#     or tag-release.yml that itself enters the marketplace-bot environment: with no permission
-#     input the action mints a token with every permission the App's installation has. The
-#     INPUT_PERMISSION-* variables the action also reads count as the inputs they name. This is a
-#     backup to where the bot's secrets are stored, which is the control that bounds its token;
+#     or tag-release.yml that itself enters the marketplace-bot environment, and there without
+#     naming a permission-* input: with none the action mints a token with every permission the
+#     App's installation has. The INPUT_PERMISSION-* variables the action also reads, set in an env:
+#     block or through $GITHUB_ENV, count as the inputs they name (pull-requests is the importer's
+#     alone), and any other is refused;
+#   * a reference to a MARKETPLACE_BOT_* secret outside such a job, whatever action or script reads it.
+#     These are a backup to where the bot's secrets are stored, which is the control that bounds its
+#     token;
 #   * a file with jobs that declares no `permissions:` at the top level and has a job that declares
 #     none of its own: that job takes the repository's default token, and a repository setting nobody
 #     here can read decides whether it can write, so the scan fails closed;
@@ -157,7 +161,7 @@ def _names_ai_tc(value) -> bool:
 # This is a best-effort read of the text, not a YAML parser, and it refuses only what it finds.
 # It does not see:
 #   * the action reached through a composite action (a file under .github/actions, which this scan does
-#     not read), or the bot's secrets read without the action;
+#     not read);
 #   * a flow-style or complex-key file whose `jobs` key is itself spelled with an escape (the
 #     refusal above looks for the word jobs, so a file that never spells it out is not refused);
 #   * a change to validate.yml itself, for example another trigger: that file is exempt only from the
@@ -201,10 +205,13 @@ _WRITE_ALL = _grant("permissions", "write-all")
 _APPROVES_PRS = _grant("pull-requests")
 _APP_TOKEN_PRS = _grant("permission-pull-requests")
 # The App-token action takes its inputs from INPUT_PERMISSION-* environment variables as well, so a step can
-# ask for a permission without writing the input. The value is not read: any such variable is refused as the
-# grant it names.
-_INPUT_ENV = re.compile(r"""(?:^|[\s{,])["']?INPUT_PERMISSION[-_](checks|statuses|pull[-_]requests)["']?\s*:""",
-                        re.IGNORECASE | re.MULTILINE)
+# ask for a permission without writing the input, in an env: block or by appending to $GITHUB_ENV. The name is
+# matched wherever it appears and the value is not read: any such variable is refused as the grant it names.
+_INPUT_ENV = re.compile(r"INPUT_PERMISSION[-_]([a-z][a-z_-]*)", re.IGNORECASE)
+# A permission input a step names, whatever its value.
+_PERMISSION_INPUT = re.compile(r"""(?:^|[\s{,])["']?permission-[a-z-]+["']?\s*:""", re.IGNORECASE | re.MULTILINE)
+# The bot's secrets, by name: only the bot jobs may read them, whatever reads them.
+_BOT_SECRET = re.compile(r"MARKETPLACE_BOT_", re.IGNORECASE)
 # A step that uses the App-token action at all: with no permission-* input it mints a token carrying every
 # permission the App's installation has.
 _APP_TOKEN_STEP = re.compile(r"""(?:^|[\s{,])["']?uses["']?\s*:\s*["']?actions/create-github-app-token\b""",
@@ -366,9 +373,55 @@ def _environment_name(job_id: str, nested: list, indent: int):
     return name
 
 
+def _env_kinds(text: str) -> list:
+    """The permission each INPUT_PERMISSION-* variable in `text` names, as the input is spelled."""
+    return [kind.lower().replace("_", "-") for kind in _INPUT_ENV.findall(text)]
+
+
 def _pr_token_asks(text: str) -> int:
     """How many times `text` asks the App-token action for pull-requests: write, as the input or as the variable."""
-    return len(_APP_TOKEN_PRS.findall(text)) + sum(1 for kind in _INPUT_ENV.findall(text) if kind.lower().startswith("pull"))
+    return len(_APP_TOKEN_PRS.findall(text)) + _env_kinds(text).count("pull-requests")
+
+
+def _other_env_inputs(text: str) -> int:
+    """How many INPUT_PERMISSION-* variables in `text` name a permission other than the three the rules above know."""
+    return sum(1 for kind in _env_kinds(text) if kind not in ("checks", "statuses", "pull-requests"))
+
+
+def _bot_secrets(text: str) -> int:
+    return len(_BOT_SECRET.findall(text))
+
+
+def _steps(job) -> list:
+    """The text of each step of the job's block-style `steps:` list, from one `- ` item to the next; [] when it
+    has none in that form."""
+    rows = job.rows
+    if not rows:
+        return []
+    indent = rows[0][0]
+    for at, (row_indent, content) in enumerate(rows):
+        if row_indent != indent or (_key_line(content) or (None,))[0] != "steps":
+            continue
+        body = []
+        for inner_indent, inner in rows[at + 1:]:
+            if inner_indent <= indent:
+                break
+            body.append((inner_indent, inner))
+        steps = []
+        for inner_indent, inner in body:
+            if inner_indent == body[0][0] and inner.startswith("-"):
+                steps.append([inner])
+            elif steps:
+                steps[-1].append(inner)
+        return ["\n".join(step) for step in steps]
+    return []
+
+
+def _unnamed_token_steps(job) -> int:
+    """How many of the job's App-token steps name no permission input. A step the job's `steps:` list does not
+    show in block style counts as one that names none."""
+    named = sum(1 for step in _steps(job) if _token_steps(step) and _PERMISSION_INPUT.search(step))
+    return max(_token_steps(_job_text(job)) - named, 0)
 
 
 def _token_steps(text: str) -> int:
@@ -423,8 +476,7 @@ def workflow_problems(path: str, text: str) -> list:
     clean = [_uncommented(line) for line in text.splitlines()]
     body = "\n".join(clean)
     problems = []
-    env_kinds = [kind.lower() for kind in _INPUT_ENV.findall(body)]
-    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body) or any(kind[0] in "cs" for kind in env_kinds):
+    if _CREATES_CHECKS.search(body) or _WRITE_ALL.search(body) or {"checks", "statuses"} & set(_env_kinds(body)):
         problems.append(
             "writes checks: write, statuses: write or write-all out plainly, which would let a job create a check "
             f"run or a status named {REQUIRED_CHECK}, and any such check satisfies the required check"
@@ -459,6 +511,21 @@ def workflow_problems(path: str, text: str) -> list:
             f"{' and '.join(BOT_WORKFLOWS)} may do, and only in a job that itself enters the {BOT_ENVIRONMENT} "
             "environment: with no permission input it mints a token with every permission the App's installation "
             "has, and nothing here can read where its secrets are stored"
+        )
+    if path in BOT_WORKFLOWS and sum(_unnamed_token_steps(job) for job in entering):
+        problems.append(
+            "has an App-token step that names no permission input, so it mints a token with every permission the "
+            "App's installation has: name each permission the step needs (`permission-contents: write`)"
+        )
+    if _other_env_inputs(body):
+        problems.append(
+            "sets an INPUT_PERMISSION-* variable the App-token action reads, which changes what it mints behind "
+            "the inputs the step names: write the permission as an input"
+        )
+    if _bot_secrets(body) > inside(_bot_secrets, BOT_WORKFLOWS):
+        problems.append(
+            f"reads a MARKETPLACE_BOT_* secret outside a job of {' and '.join(BOT_WORKFLOWS)} that itself enters the "
+            f"{BOT_ENVIRONMENT} environment: whatever reads them, those are the release bot's credentials"
         )
     missing = _jobs_without_permissions(rows, jobs)
     if missing:
