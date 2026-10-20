@@ -10,8 +10,8 @@ ref, never a force-push (an existing branch with an open bot PR is skipped, and 
 open PR of anyone else's is a red refusal, since deleting the branch would close that PR; one
 the bot's closed PR used is skipped on a plain forward run, and deleted and created again only
 by a reimport or rollback dispatch; one no PR ever used was left by a run that died before
-opening it, and any run deletes it and creates it again), opens the PR, asks the release
-approvers to review it and enables auto-merge. A release the checks cannot reach a verdict on (a registry, network, npm or
+opening it, and any run deletes it and creates it again), opens the PR, enables auto-merge and
+asks the release approvers to review it. A release the checks cannot reach a verdict on (a registry, network, npm or
 GitHub API failure) stops the plan red, and the importer never falls back to a lower
 version while a higher one has no verdict. Every decision about an open or closed PR looks at
 the pull requests the release bot opened and no others (release_checks.BOT_LOGIN), so a person's
@@ -600,9 +600,9 @@ def release_approvers(gh: GitHub, ref: str) -> list[str]:
     """The logins .github/release-approvers.json lists at `ref`, each once (GitHub logins are case-insensitive),
     in order; [] with a warning when the file cannot be read as a list of approvers, whatever the reason: a
     failed or rate-limited read, a path that is not a file, bytes that are not UTF-8, JSON that is invalid or
-    nested too deeply, or a shape the importer does not read. The request is a courtesy, and the PR it follows
-    is already open, so nothing here may end the run before auto-merge is enabled. An entry that is not a
-    GitHub login is left out, so nothing a file holds can reach a request as anything but a name."""
+    nested too deeply, or a shape the importer does not read. The request is a courtesy, and runs after auto-merge
+    is enabled, so a failure here costs the request and nothing else. An entry that is not a GitHub login is left
+    out, so nothing a file holds can reach a request as anything but a name."""
     try:
         raw = read_file(gh, APPROVERS_FILE, ref)
         listed = None if raw is None else json.loads(raw)["approvers"]
@@ -630,10 +630,9 @@ def release_approvers(gh: GitHub, ref: str) -> list[str]:
 
 def request_reviews(gh: GitHub, pr: dict, ref: str) -> None:
     """Ask the release approvers to review `pr`, one request each so a login GitHub refuses (one without write
-    access) does not stop the others. It is the request GitHub's own CODEOWNERS routing makes while that file
-    exists, and the only one once it is gone; a PR waits for its approval, and this is how an approver learns
-    it is waiting. A nudge, not a gate: a refusal or a failure warns and the run goes on, because the PR and
-    its auto-merge matter more. The PR's author and the bot are never asked (GitHub refuses a review request to
+    access) does not stop the others. A PR waits for its approval, and this is how an approver learns it is
+    waiting. A nudge, not a gate: it runs after auto-merge is enabled, and a refusal or a failure to deliver
+    warns and the run goes on. The PR's author and the bot are never asked (GitHub refuses a review request to
     a PR's author); the bot's login carries a [bot] suffix that no entry can, so both are compared without it."""
     skipped = {name.removesuffix("[bot]").casefold()
                for name in ((pr.get("user") or {}).get("login"), release_checks.BOT_LOGIN) if name}
@@ -642,7 +641,7 @@ def request_reviews(gh: GitHub, pr: dict, ref: str) -> None:
             continue
         try:
             gh.post(gh.repo_path(f"pulls/{pr['number']}/requested_reviewers"), {"reviewers": [login]})
-        except (GitHubError, OSError) as error:
+        except (GitHubError, OSError, ValueError) as error:
             print(f"::warning::could not request a review from {login} on #{pr['number']}: {error}")
 
 
@@ -840,8 +839,9 @@ def open_pr(gh: GitHub, plan: dict, run_url: str) -> str:
                                          "body": pr_body(plan, run_url)})
     if plan["labels"]:
         gh.post(gh.repo_path(f"issues/{pr['number']}/labels"), {"labels": plan["labels"]})
+    result = actions["after"](gh, plan, pr)
     request_reviews(gh, pr, main_sha)
-    return actions["after"](gh, plan, pr)
+    return result
 
 
 def write_output(key: str, value: str) -> None:

@@ -23,8 +23,8 @@ name: import-plugin-release
 # bot's closed PR used is skipped on a plain forward run, and deleted and created
 # again only by a reimport or rollback dispatch; one no PR ever used was left by a
 # run that died before opening it, and any run deletes it and creates it again), the
-# PR, a review request to each release approver, and auto-merge
-# (squash). Acting as the App, not with the workflow's own token, is what lets
+# PR, auto-merge (squash), and a review request to each release approver.
+# Acting as the App, not with the workflow's own token, is what lets
 # validate start on the PR and lets the merge start tag-release: events the
 # workflow token causes start no pull_request_target or push runs.
 #
@@ -156,7 +156,7 @@ jobs:
           private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - name: create the bot branch, open the PR, request reviews, enable auto-merge
+      - name: create the bot branch, open the PR, enable auto-merge, request reviews
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
