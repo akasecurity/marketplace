@@ -309,9 +309,11 @@ PUSH_ACTIVITIES = ("push", "force_push", "branch_creation")
 def feed_refusal(error: GitHubError) -> str | None:
     """"HTTP 403: <GitHub's message>" when `error` is GitHub declining to serve the feed to this token, or None
     when it is not that: a rate limit (a 429, or a 403 whose answer says so) and any 5xx are failures a
-    re-run may not see again, and a status outside the few a refusal uses is not understood as one. The
-    message is what tells a missing permission from the rest, so it is kept (cut short) for the tag."""
-    if error.status not in (401, 403, 404, 410, 422, 451) or "rate limit" in error.body.lower():
+    re-run may not see again, and a status outside the few a refusal uses is not understood as one: a 422
+    from this endpoint means the request itself was malformed, a bug here and not GitHub withholding access,
+    so it must stop the sweep and not be recorded as a refusal. The message is what tells a missing
+    permission from the rest, so it is kept (cut short) for the tag."""
+    if error.status not in (401, 403, 404, 410, 451) or "rate limit" in error.body.lower():
         return None
     try:
         message = json.loads(error.body).get("message")
