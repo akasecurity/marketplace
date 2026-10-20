@@ -185,7 +185,8 @@ def rule_ii(gh: GitHub, now: dt.datetime) -> Result:
     return result("staleness-ii", bool(old),
                   "Open for more than 24 hours:\n"
                   + "\n".join(f"- #{p['number']} `{p['head']}`, opened {p['created_at']}" for p in old)
-                  + "\n\nOne code-owner approval merges a bot PR; a rollback PR waiting this long is an incident.")
+                  + "\n\nOne approval from someone with write access merges a bot PR; "
+                  "a rollback PR waiting this long is an incident.")
 
 
 def rule_iii(git: Git, frozen: list[dict], now: dt.datetime) -> Result:

@@ -238,7 +238,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive; "
-            "the approving code owner owns this classification",
+            "the approving reviewer owns this classification",
             report.notes,
         )
 
@@ -249,7 +249,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "HUMAN EDIT of rollback-safety.json 0.9.13: additive -> not-rollback-safe; "
-            "the approving code owner owns this classification",
+            "the approving reviewer owns this classification",
             report.notes,
         )
         self.assertFalse(any("LOWERS THE ROLLBACK FLOOR" in n for n in report.notes), report.notes)
@@ -272,7 +272,7 @@ class TestHumanRules(unittest.TestCase):
                 self.assertEqual((report.exit_code, report.failures), (0, []))
                 self.assertIn(
                     f"HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> not-rollback-safe "
-                    f"(class unchanged; changes {fields}); the approving code owner owns this classification",
+                    f"(class unchanged; changes {fields}); the approving reviewer owns this classification",
                     report.notes,
                 )
 
@@ -281,7 +281,7 @@ class TestHumanRules(unittest.TestCase):
         self.assertEqual(report.failures, [])
         self.assertIn(
             "LOWERS THE ROLLBACK FLOOR: HUMAN EDIT of rollback-safety.json 0.9.14: not-rollback-safe -> additive "
-            "(also changes migrations); the approving code owner owns this classification",
+            "(also changes migrations); the approving reviewer owns this classification",
             report.notes,
         )
 
@@ -527,7 +527,7 @@ class TestBotRules(unittest.TestCase):
         entry = {"classification": "additive", "from": ts.ATTESTED["0.9.14"], "to": ATTESTED[NEXT], "migrations": []}
         report = self.recorded_forward(entry)
         failed_with(self, report, "records 0.9.15 as additive, but validate computes not-rollback-safe (0036_migration)")
-        failed_with(self, report, "a code owner corrects the entry in a reviewed PR")
+        failed_with(self, report, "a person corrects the entry in a reviewed PR")
 
     def test_a_recorded_entry_for_another_commit_fails(self):
         entry = {**NEXT_ENTRY, "to": "2" * 40}

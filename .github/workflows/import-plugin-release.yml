@@ -23,15 +23,15 @@ name: import-plugin-release
 # bot's closed PR used is skipped on a plain forward run, and deleted and created
 # again only by a reimport or rollback dispatch; one no PR ever used was left by a
 # run that died before opening it, and any run deletes it and creates it again), the
-# PR, and auto-merge
-# (squash). Acting as the App, not with the workflow's own token, is what lets
+# PR, auto-merge (squash), and a review request to each release approver.
+# Acting as the App, not with the workflow's own token, is what lets
 # validate start on the PR and lets the merge start tag-release: events the
 # workflow token causes start no pull_request_target or push runs.
 #
 # Direction. The schedule only moves the pin up, and only above every version
 # ever pinned (on main, by a fleet-v tag, or by a merged pull request of the
 # release bot's, since a merged pin may be untagged): a version a rollback moved
-# away from, or whose PR a code owner closed unmerged, comes back only through a
+# away from, or whose PR was closed unmerged, comes back only through a
 # dispatch with reimport: true.
 # Moving the pin down is mode rollback, to a version a fleet-v tag has pinned
 # and not below the rollback floor in rollback-safety.json (below_floor opens the
@@ -39,7 +39,7 @@ name: import-plugin-release
 # lands it). While a rollback PR is open the schedule opens nothing, and a pull
 # request that a forward dispatch opens gets no auto-merge.
 #
-# One code owner's approval, after running the candidate in one real session
+# One approval from someone with write access, after running the candidate in one real session
 # (the PR's checklist), is the only human act per release; tag-release then
 # cuts the next fleet-v<N> tag at the squash commit.
 
@@ -59,7 +59,7 @@ on:
         required: false
         default: ""
       reimport:
-        description: "forward only: re-import a version a rollback moved away from, or whose bot PR a code owner closed"
+        description: "forward only: re-import a version a rollback moved away from, or whose bot PR was closed"
         type: boolean
         default: false
       below_floor:
@@ -156,7 +156,7 @@ jobs:
           private-key: ${{ secrets.MARKETPLACE_BOT_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - name: create the bot branch, open the PR, enable auto-merge
+      - name: create the bot branch, open the PR, enable auto-merge, request reviews
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           BOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}

@@ -1856,9 +1856,14 @@ def main_ruleset_problems(rules: dict) -> list:
     count = review.get("required_approving_review_count")
     if not isinstance(count, int) or isinstance(count, bool) or count < 1:
         problems.append(f"ruleset 'main': required_approving_review_count is {count!r}, not at least 1")
-    for key in ("require_code_owner_review", "dismiss_stale_reviews_on_push", "require_last_push_approval"):
+    for key in ("dismiss_stale_reviews_on_push", "require_last_push_approval"):
         if review.get(key) is not True:
             problems.append(f"ruleset 'main': {key} is {review.get(key)!r}, not True")
+    # Any approval from someone with write access counts and there is no CODEOWNERS file, so the setting must be
+    # off: a file added later would otherwise hand every approval to whoever it names.
+    if review.get("require_code_owner_review", False) is not False:
+        problems.append(f"ruleset 'main': require_code_owner_review is {review.get('require_code_owner_review')!r}, "
+                        "not False")
     if review.get("allowed_merge_methods") != ["squash"]:
         problems.append(f"ruleset 'main': allowed_merge_methods is {review.get('allowed_merge_methods')!r}, not ['squash']")
     checks = rules.get("required_status_checks", {}).get("required_status_checks")
