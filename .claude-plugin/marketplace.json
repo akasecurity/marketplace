@@ -21,7 +21,7 @@
       "name": "aka-claude-tools",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/akasecurity/claude-tools.git",
+        "url": "https://github.com/akasecurity/aka-claude-tools.git",
         "path": "plugins/claude-tools"
       },
       "description": "The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave. The full kit installs via shell/npm/Homebrew; this is the guard-hooks plugin."
@@ -30,7 +30,7 @@
       "name": "claude-tools",
       "source": {
         "source": "git-subdir",
-        "url": "https://github.com/akasecurity/claude-tools.git",
+        "url": "https://github.com/akasecurity/aka-claude-tools.git",
         "path": "plugins/claude-tools"
       },
       "description": "Renamed to aka-claude-tools. This entry stays one release (0.5.2) so existing installs keep working; uninstall claude-tools@akasecurity, then install aka-claude-tools@akasecurity."
