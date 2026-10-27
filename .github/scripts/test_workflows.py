@@ -284,7 +284,8 @@ class TagAuditWorkflow(WorkflowCase):
             ts.git(work, "commit", "-q", "--allow-empty", "-m", "not on main")
             off_main = ts.git(work, "rev-parse", "HEAD").strip()
             ts.git(work, "checkout", "-q", "main")
-            env["RUNS"] = runs.replace("@ON_MAIN@", on_main).replace("@OFF_MAIN@", off_main).replace("@TIP@", tip)
+            env["RUNS"] = (runs.replace("@ON_MAIN_SHORT@", on_main[:12]).replace("@ON_MAIN_UPPER@", on_main.upper())
+                           .replace("@ON_MAIN@", on_main).replace("@OFF_MAIN@", off_main).replace("@TIP@", tip))
             done = subprocess.run(["bash", "-c", self.fetch_script()], cwd=work, env=env, text=True,
                                   capture_output=True)
             calls = []
@@ -374,6 +375,8 @@ class TagAuditWorkflow(WorkflowCase):
                                             artifacts=READY), "none"),
             "an expired snapshot": (dict(runs=RUN_77, artifacts='{"artifacts": [{"name": "fleet-tags-snapshot", "expired": true}]}'), "none"),
             "no snapshot listed": (dict(runs=RUN_77, artifacts='{"artifacts": []}'), "none"),
+            "a commit a rewrite dropped": (dict(runs='[{"databaseId": 77, "event": "schedule", "headSha": "%s"}]' % ("f" * 40),
+                                                artifacts=READY), "none"),
         }
         for label, (kwargs, baseline) in cases.items():
             with self.subTest(label):
@@ -462,9 +465,10 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertTrue(calls[-1].startswith("run download 77 "))
         refused = {
             "a commit off main": "[" + run(77, '"@OFF_MAIN@"') + "]",
-            "a commit the checkout does not have": "[" + run(77, '"' + "f" * 40 + '"') + "]",
             "no commit reported": '[{"databaseId": 77, "event": "schedule"}]',
             "a null commit": "[" + run(77, "null") + "]",
+            "an abbreviated commit": "[" + run(77, '"@ON_MAIN_SHORT@"') + "]",
+            "a commit in capitals": "[" + run(77, '"@ON_MAIN_UPPER@"') + "]",
             "the newest run off main, an older one on it": "[" + run(88, '"@OFF_MAIN@"') + ", " + run(77, '"@ON_MAIN@"') + "]",
             "a deletion run off main": "[" + run(55, '"@OFF_MAIN@"', "delete") + "]",
         }
@@ -475,6 +479,27 @@ class TagAuditWorkflow(WorkflowCase):
                 self.assertRegex(done.stdout, r"::error::run \d+ reports branch main, but its commit \S+ is not on main")
                 self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
                 self.assertEqual(self.fetch_outputs, {})
+
+    def test_a_green_run_whose_commit_a_rewrite_dropped_takes_the_no_baseline_path(self):
+        # After main's history is rewritten, every earlier green run names a commit the checkout no longer has.
+        # Its snapshot describes the replaced tags, so the run goes on without a baseline and tag_audit.py
+        # requires the frozen list to record every fleet-v tag. Only the newest run is judged, as above.
+        gone = '"' + "f" * 40 + '"'
+        cases = {
+            "the only green run": '[{"databaseId": 77, "event": "schedule", "headSha": %s}]' % gone,
+            "the newest run gone, an older one on main": ('[{"databaseId": 88, "event": "workflow_dispatch", "headSha": %s},'
+                                                          ' {"databaseId": 77, "event": "schedule", "headSha": "@ON_MAIN@"}]'
+                                                          % gone),
+        }
+        for label, runs in cases.items():
+            with self.subTest(label):
+                done, calls = self.run_fetch(runs=runs, artifacts=READY)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertRegex(done.stdout, r"::notice::run (?:88|77) is the last green run, but its commit f{40} is no "
+                                              r"longer in the repository")
+                self.assertIn("the frozen list has to record every fleet-v tag", done.stdout)
+                self.assertEqual(self.fetch_outputs, {"baseline": "none"})
+                self.assertFalse([call for call in calls if call.startswith(("api ", "run download"))])
 
     def test_the_fetch_step_fails_on_every_other_failure(self):
         listed = dict(runs=RUN_77,
