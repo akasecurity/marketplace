@@ -1,47 +1,62 @@
 [
   {
     "tag": "fleet-v1",
-    "object": "c521df22db51f2e556475a9e267e574988a3e6fb",
-    "commit": "abb08977a9a2dbd4e651ec041135345e976a2452"
+    "object": "7227ed34f4baf18f0a6b2da9c223862a76e71818",
+    "commit": "37d4f6ba879cd5caca9f17f26c4528fd75ca5b57"
   },
   {
     "tag": "fleet-v2",
-    "object": "a2c946060a74e1002faba4b916430a66e87f6f42",
-    "commit": "a2639b73b92cd6ae87a8f0e252b239bbc5136120"
+    "object": "5a9a9a6c0bbf7cad1a89e33ca3307566514b4828",
+    "commit": "79c8762f627746b2e7ec06de199f1f9b6609a316"
   },
   {
     "tag": "fleet-v3",
-    "object": "50cf989430d2fe8210106a6206f13183860f5e29",
-    "commit": "f3e43d5363838bdba1d1dd2b247f7e937e4b7b70"
+    "object": "73c3dfd8d50e40d7c36ea56edc274b1a649871f9",
+    "commit": "ca37c339008c9aebe70fef3c51de7ebe28559155"
   },
   {
     "tag": "fleet-v4",
-    "object": "982eb03de2a64dd15304cdc91b208c616ff1da03",
-    "commit": "313865ce2e15df9bc255d48853bdb030adc98766"
+    "object": "4e37e11e46be5c5da3a3a104f351256a81aaef93",
+    "commit": "369f103e34631fe89e770bd2cbd08ec0bcc9a7d3"
   },
   {
     "tag": "fleet-v5",
-    "object": "4456144d7014af9e3e4a10356812f91a72301e25",
-    "commit": "fa3c0fcd1caea1a841d8c38f08536c68b6faf5ba"
+    "object": "ddd2a470cb892302897ec03f01d6ef7af3080995",
+    "commit": "0f357d9a4a73a907a103c1e7be6053f05f47822b"
   },
   {
     "tag": "fleet-v6",
-    "object": "112002d7bf0a7cfac4c15f1edba2b87cb1f16508",
-    "commit": "7a72cb864642c3ac47ab4470c195b4b480067d2a"
+    "object": "41b5c710a1bffad69152d65601b173f3403592b7",
+    "commit": "c09ff0b14890ab70f126e4e0d859fec12f6e0f53"
   },
   {
     "tag": "fleet-v7",
-    "object": "191b2da083d8b80b32c1d7fc6282b95525761fbb",
-    "commit": "fc29263cf89a472e7fc93e42dc7dc8f8d2abd47a"
+    "object": "11e7d26eef8b8465a742113273dbc80ce719a23c",
+    "commit": "0296f944e82e074b24a32f554ea44823ee873dd9"
   },
   {
     "tag": "fleet-v8",
-    "object": "df4ce5f19f42cddc3beea2e7126912fa7a437291",
-    "commit": "31e4249caf50050d7787dc6462954fef42afe6e7"
+    "object": "6c0b9c1c57d7e290b998442c56c548096146c29d",
+    "commit": "47792309d886ecdb31d40a8a8d867c34115733ba"
   },
   {
     "tag": "fleet-v9",
-    "object": "766a93cbde3a1299663d9884d6f55d60e76b8ce9",
-    "commit": "89e8fd499fbe7e151e0d41500ec9766dfdeecaf7"
+    "object": "389cd48a3a1cda55ac6455d5da5af4733b98ba7e",
+    "commit": "f80a1018f5d70ebd778ce399c8be4749697a28cc"
+  },
+  {
+    "tag": "fleet-v10",
+    "object": "7a96010c860aaa80593e54af8b914035db4ac1fe",
+    "commit": "d0a55f36544d11732d9da144f2bd50d4fe46e9d8"
+  },
+  {
+    "tag": "fleet-v11",
+    "object": "4fcbde22f8d1c7c990766a73a2e965da34d7a25c",
+    "commit": "6890e927046a30f5f750e183c916ae5875296d04"
+  },
+  {
+    "tag": "fleet-v12",
+    "object": "243c964bab6e0cf476a854425c4dd421d1eb4e7b",
+    "commit": "a18468e1814f7f082f06b1b7939a664d878a5ba2"
   }
 ]
