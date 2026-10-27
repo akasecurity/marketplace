@@ -256,18 +256,44 @@ def _reject_constant(name):
     raise ValueError(f"non-standard JSON constant {name}")
 
 
+# The deepest nesting parse_json reads. Before Python 3.14 the JSON parser itself stopped just
+# under 10,000 levels with RecursionError; from 3.14 it reads far deeper. The limit is checked
+# here, below where the older parser stopped, so a document is refused at the same depth on
+# every version.
+MAX_PARSE_DEPTH = 9_000
+
+
+def _nesting_depth(value) -> int:
+    """How many containers deep `value` nests. Iterative, so measuring cannot hit the limit."""
+    deepest, pending = 0, [(value, 1)]
+    while pending:
+        item, level = pending.pop()
+        if isinstance(item, dict):
+            children = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        deepest = max(deepest, level)
+        pending.extend((child, level + 1) for child in children)
+    return deepest
+
+
 def parse_json(text: str):
     """json.loads that refuses duplicate keys and NaN/Infinity, which jq and json.loads accept.
 
-    Every refusal is a ValueError, including text nested deeper than the parser reads:
-    json.loads raises RecursionError for that, which is not a ValueError, so a caller that
-    treats an unreadable document as a ValueError would crash on it. A fleet tag is permanent
-    and each tag's manifest is read on every run, so one such tag would otherwise stop every
-    later run."""
+    Every refusal is a ValueError, including text nested deeper than MAX_PARSE_DEPTH:
+    json.loads raises RecursionError for some of that, which is not a ValueError, so a caller
+    that treats an unreadable document as a ValueError would crash on it. A fleet tag is
+    permanent and each tag's manifest is read on every run, so one such tag would otherwise
+    stop every later run."""
     try:
-        return json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
+        doc = json.loads(text, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant)
     except RecursionError as exc:
         raise ValueError("the document is too deeply nested to read") from exc
+    if _nesting_depth(doc) > MAX_PARSE_DEPTH:
+        raise ValueError("the document is too deeply nested to read")
+    return doc
 
 
 def dump_json(doc) -> str:
