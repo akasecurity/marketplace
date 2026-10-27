@@ -80,8 +80,20 @@ jobs:
           fi
           run_id=${picked%% *}
           head_sha=${picked#* }
-          # The checkout is full history of main (fetch-depth 0), so a commit that is not an ancestor of it, or
-          # that is not here at all, is a run from somewhere else.
+          # The checkout is full history of main and every tag (fetch-depth 0). A commit that is here but is
+          # not an ancestor of main is a run from somewhere else, and fails the step. A commit that is not
+          # here at all was dropped by a rewrite of main's history; that run's snapshot describes tags the
+          # rewrite replaced, so it gives no baseline (the same notice path as an expired snapshot). Only a
+          # full commit id is looked up, so a malformed or missing one still fails the step.
+          if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::run $run_id reports branch main, but its commit $head_sha is not on main"
+            exit 1
+          fi
+          if ! git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+            echo "::notice::run $run_id is the last green run, but its commit $head_sha is no longer in the repository (main's history was rewritten); the frozen list has to record every fleet-v tag"
+            echo "baseline=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if ! git merge-base --is-ancestor "$head_sha" origin/main; then
             echo "::error::run $run_id reports branch main, but its commit $head_sha is not on main"
             exit 1
