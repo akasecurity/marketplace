@@ -48,6 +48,14 @@ class TestJsonHelpers(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "too deeply nested"):
                     rc.parse_json(text)
 
+    def test_exactly_the_depth_limit_reads_and_one_level_more_is_refused(self):
+        # From Python 3.14 the JSON parser reads far past where it used to stop, so the limit is
+        # parse_json's own: exactly MAX_PARSE_DEPTH levels read, one more is refused.
+        depth = rc.MAX_PARSE_DEPTH
+        self.assertEqual(rc.parse_json("[" * depth + "]" * depth), json.loads("[" * depth + "]" * depth))
+        with self.assertRaisesRegex(ValueError, "too deeply nested"):
+            rc.parse_json("[" * (depth + 1) + "]" * (depth + 1))
+
     def test_the_writer_keeps_non_ascii_and_ends_in_a_newline(self):
         text = rc.dump_json(ts.manifest())
         self.assertIn("—", text)
