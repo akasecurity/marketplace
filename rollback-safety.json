@@ -80,6 +80,12 @@
         "0040_human_label_columns",
         "0041_label_reported_at"
       ]
+    },
+    "0.9.21": {
+      "classification": "additive",
+      "from": "90f332534cc8aedcef95671bb12cc49b7bfd00a2",
+      "to": "9658cf296301056ac107065f3d6ab7114cee7cfd",
+      "migrations": []
     }
   }
 }
