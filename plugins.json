@@ -13,7 +13,7 @@
     },
     {
       "name": "aka-claude-tools",
-      "url": "https://github.com/akasecurity/claude-tools",
+      "url": "https://github.com/akasecurity/aka-claude-tools",
       "category": "Security",
       "status": "available",
       "harnesses": ["claude"],
