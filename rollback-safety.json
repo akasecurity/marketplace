@@ -86,6 +86,12 @@
       "from": "90f332534cc8aedcef95671bb12cc49b7bfd00a2",
       "to": "9658cf296301056ac107065f3d6ab7114cee7cfd",
       "migrations": []
+    },
+    "0.9.23": {
+      "classification": "additive",
+      "from": "9658cf296301056ac107065f3d6ab7114cee7cfd",
+      "to": "e22f05ed036c09ecf6eb44fa5be26bdd2087bb0f",
+      "migrations": []
     }
   }
 }
