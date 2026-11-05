@@ -6,7 +6,7 @@ repository (nothing is vendored here), so a tool's own releases flow through aut
 except **ai-tc**, whose npm source is pinned to an exact version and moves only when an
 approved pull request here moves it (see [Version pinning](#version-pinning)).
 
-From [akasecurity](https://akasecurity.io). Each listed tool is licensed in its own repository.
+From [akasecurity](https://akasecurity.io). Documentation: [akasecurity.github.io/marketplace-docs](https://akasecurity.github.io/marketplace-docs/). Each listed tool is licensed in its own repository.
 
 ## The tools
 
