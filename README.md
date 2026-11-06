@@ -1,6 +1,19 @@
-# AKA Security marketplace
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/cover-dark.svg">
+  <img src="assets/cover-light.svg" alt="The AKA Security marketplace, one place to install AKA Security's tools for coding agents. Illustration: an overhead sign gantry over three lanes signed ai-tc, aka-claude-tools and preflight, with lane arrows splitting off to each." width="100%">
+</picture>
 
-**One place to install AKA Security's tools for coding agents.** Add the marketplace once and
+<p align="center">
+  <a href="#the-tools"><b>The tools</b></a> &nbsp;·&nbsp;
+  <a href="#install"><b>Install</b></a> &nbsp;·&nbsp;
+  <a href="#version-pinning"><b>Version pinning</b></a> &nbsp;·&nbsp;
+  <a href="#about"><b>About</b></a>
+</p>
+
+<h3 align="center">One place to install AKA Security's tools for coding agents.</h3>
+
+
+Add the marketplace once and
 install any tool your harness supports. First-party today; the manifests reference each tool's own
 repository (nothing is vendored here), so a tool's own releases flow through automatically —
 except **ai-tc**, whose npm source is pinned to an exact version and moves only when an
@@ -60,6 +73,9 @@ then run `aka init` — it detects whether the Claude Code plugin is installed a
 
 ## Version pinning
 
+<details>
+<summary><b>How the ai-tc pin moves</b>, fleet tags, and break-glass merges</summary>
+
 The `ai-tc` entry in `.claude-plugin/marketplace.json` names an **exact** npm version
 (`source.version`) on the public npm registry (`source.registry`), so `/plugin install ai-tc@akasecurity`
 — and the plugin auto-update pass on machines that have it on — resolves to that version rather
@@ -74,7 +90,7 @@ Managed fleets either follow `main`, which moves only through an approved pull r
 register this marketplace at a `fleet-v<N>` tag and move only when their own configuration names a
 later one.
 
-The one exception is break-glass: a few organisation owners can merge past the `main` ruleset's
+The one exception is break-glass: a few organization owners can merge past the `main` ruleset's
 approval and `validate` requirements when nobody else with write access is reachable, for example to roll a bad
 release back. An automated audit of `main` opens an issue for each commit that reached it without an
 approved pull request whose final head passed `validate`. The audit runs from the pushed
@@ -85,6 +101,8 @@ moved the ai-tc pin, its `fleet-v<N>` tag also records it: `approver: none` and 
 pusher's own; or a note that `validate` had not passed on the final head.
 
 `preflight` and `aka-claude-tools` still float on their default branches.
+
+</details>
 
 ## About
 
