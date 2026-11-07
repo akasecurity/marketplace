@@ -17,7 +17,7 @@
       "category": "Security",
       "status": "available",
       "harnesses": ["claude"],
-      "description": "The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard) that block pipe-to-shell and catch secrets before they leave, on an isolated profile. Full kit installs via shell/npm/Homebrew; the guard-hooks plugin installs via the marketplace."
+      "description": "The security defaults Claude Code doesn't ship with: guard hooks (command-guard, leak-guard, mcp-guard, post-guard) that block pipe-to-shell and catch secrets before they leave, on an isolated profile. Full kit installs via shell/npm/Homebrew; the guard-hooks plugin installs via the marketplace."
     },
     {
       "name": "ai-tc",
