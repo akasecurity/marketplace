@@ -98,6 +98,12 @@
       "from": "e22f05ed036c09ecf6eb44fa5be26bdd2087bb0f",
       "to": "2e378699bd7e6da98820f6561062e4b4f94dc9dc",
       "migrations": []
+    },
+    "0.9.25": {
+      "classification": "additive",
+      "from": "2e378699bd7e6da98820f6561062e4b4f94dc9dc",
+      "to": "370136d2bac202a8cde87c77b3a261a40d88a376",
+      "migrations": []
     }
   }
 }
