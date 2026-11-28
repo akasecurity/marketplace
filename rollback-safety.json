@@ -104,6 +104,14 @@
       "from": "2e378699bd7e6da98820f6561062e4b4f94dc9dc",
       "to": "370136d2bac202a8cde87c77b3a261a40d88a376",
       "migrations": []
+    },
+    "0.9.27": {
+      "classification": "not-rollback-safe",
+      "from": "370136d2bac202a8cde87c77b3a261a40d88a376",
+      "to": "0ebf91c5e2565da4534b6f472095c581cca4f381",
+      "migrations": [
+        "0042_usage_channel"
+      ]
     }
   }
 }

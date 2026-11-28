@@ -40,12 +40,12 @@
       "source": {
         "source": "npm",
         "package": "@akasecurity/ai-tc-claude-code",
-        "version": "0.9.25",
+        "version": "0.9.27",
         "registry": "https://registry.npmjs.org"
       },
       "description": "AI Traffic Control (ai-tc) — an open-source control plane for coding agents: intercepts prompts, tool calls, and responses, scans them against rule packs for secrets and sensitive data, then enforces policy (monitor, warn, redact, or block) before anything reaches the model. Runs entirely locally with 100+ built-in detections — no backend, nothing leaves your machine.",
       "metadata": {
-        "integrity": "sha512-xOGW8WudWI3sdnC5Sy8a8bvi0Y3FLbWAQHiTVf4Jt51oz0WLYbrLvnYPXh6CkV3l9OnJyLtnVDjJiVTg6xKUgg=="
+        "integrity": "sha512-UJogGaodTryGkZ5JvD6Pmgnvy6A9s5FlT5LJIVU/88VLo8Gca0lVChmZgQKIgtKTwg3ca02g9G5j8UK1g75H5Q=="
       }
     }
   ]
